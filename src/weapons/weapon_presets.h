@@ -39,6 +39,9 @@ Snapshot GetSnapshot();
 void WorkerTick(); // Own read-only HID input runs on a separate I/O thread.
 void OnGameThreadGuarded();
 bool BeforeTravel(); // No UObject references held; retire stale world identity.
+// Game thread: the equipped main weapon's native ID (e.g. "Tang"), read from the
+// backpack's own cache. Works while presets are off; the backpack is found once per world.
+bool CurrentMainWeaponId(std::string& id);
 void Shutdown();    // Worker thread: stops only this module's own HID reader.
 bool HandleCommand(const char* verb, const char* arguments);
 }

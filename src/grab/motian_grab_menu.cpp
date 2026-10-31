@@ -14,8 +14,8 @@ namespace MotianGrabMenu {
 namespace {
 constexpr wchar_t kClass[]=L"PBZMotianGrabWindow";
 constexpr int kEnable=101,kVariant=102,kRange=103,kApply=104,kTrigger=105,kCancel=106,kBoss=107,kPosition=108,kSourceBoss=109,kRecommended=110;
-constexpr int kHideWeapon=111,kDamageMode=112,kDamageValue=113,kInvulnerable=114;
-HWND window_=nullptr,enabled_=nullptr,boss_=nullptr,position_=nullptr,variant_=nullptr,range_=nullptr,range_label_=nullptr,status_=nullptr,detail_=nullptr;
+constexpr int kHideWeapon=111,kDamageMode=112,kDamageValue=113,kInvulnerable=114,kTangExecution=115;
+HWND window_=nullptr,enabled_=nullptr,boss_=nullptr,position_=nullptr,tang_=nullptr,variant_=nullptr,range_=nullptr,range_label_=nullptr,status_=nullptr,detail_=nullptr;
 HWND variant_label_=nullptr,apply_=nullptr,trigger_=nullptr,cancel_=nullptr,status_section_=nullptr,detail_section_=nullptr;
 HWND source_label_=nullptr,source_boss_=nullptr,source_status_=nullptr;
 HWND range_hint_=nullptr,recommended_=nullptr;
@@ -89,6 +89,7 @@ void Apply() {
     options.enabled=SendMessageW(enabled_,BM_GETCHECK,0,0)==BST_CHECKED;
     options.allow_bosses=SendMessageW(boss_,BM_GETCHECK,0,0)==BST_CHECKED;
     options.position_correction=SendMessageW(position_,BM_GETCHECK,0,0)==BST_CHECKED;
+    options.tang_execution=SendMessageW(tang_,BM_GETCHECK,0,0)==BST_CHECKED;
     const auto state=MotianGrab::GetSnapshot();
     const auto* selected=FindVariant(state,SelectedVariant());
     if (options.enabled) {
@@ -134,6 +135,7 @@ void Refresh(bool options) {
         SendMessageW(enabled_,BM_SETCHECK,state.options.enabled?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(boss_,BM_SETCHECK,state.options.allow_bosses?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(position_,BM_SETCHECK,state.options.position_correction?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(tang_,BM_SETCHECK,state.options.tang_execution?BST_CHECKED:BST_UNCHECKED,0);
         wchar_t value[32]{}; swprintf_s(value,L"%.0f",state.options.range); SetWindowTextW(range_,value);
         const GrabExtras::Options extras=GrabExtras::GetOptions();
         SendMessageW(hide_weapon_,BM_SETCHECK,extras.hide_weapon?BST_CHECKED:BST_UNCHECKED,0);
@@ -165,6 +167,11 @@ void Refresh(bool options) {
     status+=L"\r\n请求 / 双能力激活："+std::to_wstring(state.attempts)+L" / "+std::to_wstring(state.activations);
     status+=L"　会话类引用："+std::to_wstring(state.retained_classes);
     if (!state.alignment_status.empty()) status+=L"\r\n位置："+state.alignment_status;
+    if (state.options.tang_execution) {
+        status+=std::wstring(L"\r\n")+(state.execution_prepared?L"黑伤处决：魔渊 · 完整擒拿已预载":L"黑伤处决：魔渊 · 完整擒拿准备中")+
+            L"；已替换处决次数："+std::to_wstring(state.executions_redirected);
+        if (!state.execution_status.empty()) status+=L"\r\n"+state.execution_status;
+    }
     UiI18n::SetText(status_,status.c_str());
     const auto* selected=FindVariant(state,SelectedVariant());
     const bool selectable=selected&&selected->supported;
@@ -180,7 +187,8 @@ void Refresh(bool options) {
         L"投技附加：可在投技期间隐藏主角武器（结束后恢复原显示），并在原投技结束后按倍率或最大生命百分比补足伤害；伤害经游戏属性接口写入。未开启“无视无敌”时，只在目标本次确实受到原生伤害时追加。\r\n"
         L"位置修正：先验证地面。直线对位招式只在安全距离内修正主角一次；其他招式保留原生参考系和完整位移曲线。不移动目标，可关闭对比。\r\n"
         L"每招的搜索距离和推荐距离不同；使用推荐距离只填写编辑框，应用设置后生效。\r\n"
-        L"支持范围：地面近处敌对、存活且可受投的人形敌人。\r\n"
+        L"支持范围：地面近处敌对、存活且可受投的人形敌人；人形小怪在受击硬直或特殊动作中也可投。\r\n"
+        L"黑伤处决：持黑伤处决时，原处决在开始时取消，改为对同一目标施放魔渊 · 完整擒拿（不受“开启投技”开关影响；伤害按投技附加设置）。目标不适配时保留原处决。\r\n"
         L"人形 Boss 可由独立选项开启；仍检查体型、受投条件、双方状态和结束恢复。巨型、动物、友军及剧情状态不触发。\r\n"
         L"不更换主角 Actor / ASC / 进度；原 Hun 与 NPC 外观皆可尝试，动作和武器适配仍需实机验证。";
     if (selected) {
@@ -198,6 +206,7 @@ void Layout() {
     UiLayout::Flow flow(x,y,width,m.Check(),gap*3,gap/2);
     flow.Add(enabled_,UiLayout::CheckWidth(enabled_,m)); flow.Add(boss_,UiLayout::CheckWidth(boss_,m));
     flow.Break(); flow.Add(position_,UiLayout::CheckWidth(position_,m));
+    flow.Break(); flow.Add(tang_,UiLayout::CheckWidth(tang_,m));
     y=flow.Bottom()+gap;
     UiLayout::Flow source_row(x,y,width,m.Row(),gap,gap);
     source_row.Add(source_label_,UiLayout::TextWidth(source_label_),m.Line());
@@ -285,6 +294,7 @@ bool Create() {
     enabled_=Control(L"BUTTON",L"开启投技",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kEnable);
     boss_=Control(L"BUTTON",L"目标允许人形 Boss（实验）",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kBoss);
     position_=Control(L"BUTTON",L"按原投技距离修正位置（一次；地面 / 碰撞验证）",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kPosition);
+    tang_=Control(L"BUTTON",L"黑伤处决改为魔渊 · 完整擒拿",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kTangExecution);
     source_label_=Control(L"STATIC",L"来源 Boss",SS_LEFT,0,0,10,10,0);
     source_boss_=Control(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,0,0,10,10,kSourceBoss);
     source_status_=Control(L"STATIC",L"",SS_LEFT,0,0,10,10,0);

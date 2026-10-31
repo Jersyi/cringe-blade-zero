@@ -967,6 +967,11 @@ void OnGameThreadGuarded() {
     }
 }
 bool BeforeTravel() { if (rollback_pending) return false; cached_backpack = {}; current_equipment.known=false; Publish(false); return true; }
+bool CurrentMainWeaponId(std::string& id) {
+    Context c; Name current;
+    if (!ContextNow(c) || !Read(c.backpack, "CurrentMainWeaponID", 0x2000, current)) return false;
+    char text[128]{}; ue::NameText(current, text, sizeof(text)); id = text; return !id.empty();
+}
 void Shutdown() {
     InterlockedExchange(&hid_allowed, 0);
     if (hid_stop) SetEvent(hid_stop);

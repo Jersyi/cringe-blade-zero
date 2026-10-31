@@ -12,6 +12,9 @@ struct Options {
     bool position_correction = true; // Authored pair alignment; never a per-frame teleport.
     int32_t variant = 0; // Global move index. Original MoTian moves remain 0..3.
     float range = 280.0f; // Capsule-surface distance; clamped to the selected move's range.
+    // 黑伤 (Tang) executions play MoTian's full grab instead: the native execution is
+    // cancelled as it starts and that move runs on its target. Independent of `enabled`.
+    bool tang_execution = true;
 };
 struct Variant {
     std::wstring id, name, detail;
@@ -37,6 +40,9 @@ struct Snapshot {
     std::wstring preparation_status;
     bool position_corrected = false;
     std::wstring alignment_status;
+    bool execution_prepared = false; // MoTian's full grab is loaded for 黑伤 executions.
+    uint32_t executions_redirected = 0;
+    std::wstring execution_status;
     std::wstring target, ability;
     std::wstring status = L"投技默认关闭；选择来源 Boss 的招式，开启后 PS5 三角 + 圈触发一次";
     std::vector<Variant> variants;
