@@ -1,0 +1,17 @@
+# Source only: everything is ignored except the build inputs listed below.
+*
+!*/
+!.gitignore
+!README.md
+!CMakeLists.txt
+!build.ps1
+!*.cpp
+!*.h
+!*.asm
+!*.def
+
+# Local build output, history and tooling stay out of the repository.
+build/
+versions/
+uninstalled_*/
+__pycache__/

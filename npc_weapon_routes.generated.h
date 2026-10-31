@@ -1,0 +1,3 @@
+// From typed native WeaponDisplayData, not metadata/VFX name candidates.
+constexpr const char* kWeaponDirectAttachmentBones[] = {"lowerarm_l","lowerarm_r","Pt_LongBladeScabbard_Back","weapon_l","weapon_r","weapon_r_child"};
+constexpr const char* kWeaponAttachmentNames[] = {"lowerarm_l","lowerarm_r","pt_chakram_l_back_socket","pt_chakram_r_back_socket","pt_doubleblade_l_back_socket","pt_doubleblade_r_back_socket","pt_doublebladescabbard_back_socket","pt_longblade_back_socket","pt_longbladescabbard_back","pt_tangblade_back_socket","pt_tangbladescabbard_back_socket","weapon_l","weapon_l_socket","weapon_r","weapon_r_child","weapon_r_socket"};
