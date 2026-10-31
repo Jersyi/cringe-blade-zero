@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/title.jpg" alt="豪之刃 · Cringe Blade Zero" width="100%">
+
 # 豪之刃 · Cringe Blade Zero
 
 **《影之刃零》（Phantom Blade Zero）单机游戏内工具箱**
@@ -48,7 +50,8 @@
 需要 **Visual Studio 2022**（含 C++ 桌面开发与 MASM）和 **CMake ≥ 3.24**。
 
 ```powershell
-.\build.ps1
+.\build.ps1            # 构建全部目标（Release）
+.\build.ps1 -Package   # 另外打包 dist\CringeBladeZero_<日期>_<提交>.zip
 ```
 
 或手动：
@@ -57,6 +60,8 @@
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --target version
 ```
+
+发布包内含完整版与精简版 `version.dll`，以及一份安装说明 `README.txt`。
 
 | 目标 | 产物 |
 |---|---|
@@ -97,24 +102,25 @@ cmake --build build --config Release --target version
 ## 项目结构
 
 ```text
-proxy.cpp                 DLL 入口：转发系统 version.dll、校验游戏版本、启动工作线程与游戏线程钩子
-game_thread.*             UGameEngine::Tick 虚表钩子，所有引擎调用都在游戏线程执行
-ue_runtime.*              UObject 反射访问：查找对象 / 函数 / 属性、ProcessEvent 调用
-debug_hub.*  ui_*         面板、主题、动画、输入焦点与鼠标捕获、双语、快捷键、横幅
-gear_widget.*             右下角挡位胶囊与面板
-hub_pause.*               打开面板时暂停游戏
-boss_*  entry_*           Boss 连战、Boss AI、入场保护与存档保护
-motian_grab*  grab_*      投技：原生成对激活、状态租约、Boss 武器与姿态代理、伤害
-air_skills*               空中技能、空中闪避、JC 与奖励
-weapon_presets*  weapon_icons.*   武器预设与游戏内武器图标
-character_swap.*  npc_*   角色替换与 NPC 外观重定向
-groom_force.*  hair_controls.*    毛发显示与 Groom
-pad_triggers.*            DualSense 自适应扳机
-*.generated.h             从游戏数据生成的表（投技目录、武器、骨骼、UI 资源）
-triggers_only/            精简版 version.dll
+src/
+├─ core/          DLL 入口与转发（proxy.cpp、forwarders.asm、version.def）、游戏线程钩子、UObject 反射、设置文件
+├─ ui/            面板、主题、动画、输入焦点与鼠标捕获、双语、快捷键、横幅、挡位胶囊、面板暂停
+├─ boss/          Boss 连战、Boss AI、入场保护与存档保护
+├─ grab/          投技：原生成对激活、状态租约、Boss 武器与姿态代理、伤害
+├─ air/           空中技能、空中闪避、JC 与奖励
+├─ weapons/       武器预设与游戏内武器图标
+├─ character/     角色替换与 NPC 外观重定向
+├─ hair/          毛发显示与 Groom
+├─ pad/           DualSense 自适应扳机
+├─ generated/     从游戏数据生成的表（投技目录、武器、骨骼、UI 资源、导出表）
+└─ triggers_only/ 精简版 version.dll
+tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点测试
+docs/             README 图片
 ```
+
+每个 `src/` 子目录都是头文件搜索路径，源码里直接写 `#include "ue_runtime.h"`。
 
 ## 说明
 
 - 仅用于单机游戏，与游戏开发商无关。
-- `*.generated.h` 内的图标、字体子集与数据表取自游戏文件，版权归原权利人所有。
+- `src/generated/` 内的图标、字体子集与数据表取自游戏文件，版权归原权利人所有。

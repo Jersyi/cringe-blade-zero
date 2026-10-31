@@ -9,9 +9,9 @@
 !*.h
 !*.asm
 !*.def
+!docs/title.jpg
 
-# Local build output, history and tooling stay out of the repository.
+# Build output, release ZIPs and local notes / scripts / archives stay out of the repository.
 build/
-versions/
-uninstalled_*/
-__pycache__/
+dist/
+local/

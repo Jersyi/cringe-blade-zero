@@ -4,8 +4,8 @@
 #include <array>
 #include <cstdio>
 #include <cwchar>
-#include "../exports.generated.h"
-#include "../pad_triggers.h"
+#include "exports.generated.h"
+#include "pad_triggers.h"
 
 namespace {
 HMODULE self_module = nullptr;
