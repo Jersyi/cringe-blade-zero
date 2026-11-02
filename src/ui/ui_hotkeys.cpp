@@ -35,6 +35,7 @@ constexpr unsigned kSwipeMask = kSwipeL | kSwipeR | kSwipeU | kSwipeD;
 constexpr int kCount = static_cast<int>(Action::Count);
 constexpr wchar_t kPageClass[] = L"PBZHotkeyPage_v1";
 constexpr wchar_t kBindClass[] = L"PBZHotkeyBind_v1";
+constexpr wchar_t kGlyphClass[] = L"PBZHotkeyGlyphs_v1";
 constexpr COLORREF kGreen = RGB(16, 124, 16), kRed = RGB(232, 17, 35), kBlue = RGB(0, 120, 215), kYellow = RGB(255, 185, 0);
 constexpr COLORREF kPsCross = RGB(90, 150, 255), kPsCircle = RGB(255, 79, 79), kPsSquare = RGB(214, 92, 204), kPsTriangle = RGB(52, 196, 96);
 
@@ -95,9 +96,18 @@ std::array<std::function<void()>, kCount> handlers_{};
 std::array<bool, kCount> was_{};
 std::wstring config_;
 bool ready_ = false;
-HWND page_ = nullptr;
+HWND page_ = nullptr, glyph_box_ = nullptr;
 std::array<HWND, kCount> boxes_{};
-Device pad_style_ = Device::Xbox;
+// Pad chords store button bits only, so one chord fires on Xbox and
+// PlayStation pads alike; the device just names the glyphs.
+enum class Glyphs : int { Auto, Xbox, PlayStation };
+const wchar_t* const kGlyphNames[] = {L"auto", L"xbox", L"ps"};
+Glyphs glyphs_ = Glyphs::Auto;
+int glyph_hot_ = -1, shown_ = -1;
+Device pad_style_ = Device::Xbox;    // From the device list.
+Device last_pad_ = Device::Keyboard; // Pad behind the latest press; Keyboard = none yet.
+bool pad_hid_ = false, xinput_live_ = false;
+unsigned xbox_was_ = 0, sony_was_ = 0;
 ULONGLONG next_devices_ = 0;
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, void*);
 XInputGetStateFn xinput_ = nullptr;
@@ -218,32 +228,42 @@ void EnsureXInput() {
 }
 unsigned ReadPad() {
     EnsureXInput();
-    unsigned mask = 0;
+    unsigned xbox = 0;
+    bool live = false;
     if (xinput_) for (DWORD user = 0; user < 4; ++user) {
         XState state{};
         if (xinput_(user, &state) != 0) continue;
+        live = true;
         const WORD bits = state.pad.buttons;
-        if (bits & 0x0001) mask |= kUp;
-        if (bits & 0x0002) mask |= kDown;
-        if (bits & 0x0004) mask |= kLeft;
-        if (bits & 0x0008) mask |= kRight;
-        if (bits & 0x0010) mask |= kMenu;
-        if (bits & 0x0020) mask |= kView;
-        if (bits & 0x0040) mask |= kL3;
-        if (bits & 0x0080) mask |= kR3;
-        if (bits & 0x0100) mask |= kLB;
-        if (bits & 0x0200) mask |= kRB;
-        if (bits & 0x1000) mask |= kA;
-        if (bits & 0x2000) mask |= kB;
-        if (bits & 0x4000) mask |= kX;
-        if (bits & 0x8000) mask |= kY;
-        if (state.pad.left > 30) mask |= kLT;
-        if (state.pad.right > 30) mask |= kRT;
+        if (bits & 0x0001) xbox |= kUp;
+        if (bits & 0x0002) xbox |= kDown;
+        if (bits & 0x0004) xbox |= kLeft;
+        if (bits & 0x0008) xbox |= kRight;
+        if (bits & 0x0010) xbox |= kMenu;
+        if (bits & 0x0020) xbox |= kView;
+        if (bits & 0x0040) xbox |= kL3;
+        if (bits & 0x0080) xbox |= kR3;
+        if (bits & 0x0100) xbox |= kLB;
+        if (bits & 0x0200) xbox |= kRB;
+        if (bits & 0x1000) xbox |= kA;
+        if (bits & 0x2000) xbox |= kB;
+        if (bits & 0x4000) xbox |= kX;
+        if (bits & 0x8000) xbox |= kY;
+        if (state.pad.left > 30) xbox |= kLT;
+        if (state.pad.right > 30) xbox |= kRT;
     }
-    mask |= polled_buttons_.load(std::memory_order_relaxed);
+    xinput_live_ = live;
+    unsigned sony = polled_buttons_.load(std::memory_order_relaxed);
     if (GetTickCount64() - snoop_time_.load(std::memory_order_relaxed) < 150)
-        mask |= snoop_buttons_.load(std::memory_order_relaxed);
-    mask |= TakeSwipe();
+        sony |= snoop_buttons_.load(std::memory_order_relaxed);
+    sony |= TakeSwipe();
+    // A new press names the pad in hand. Steam Input and DS4Windows mirror a
+    // DualSense into XInput, so a Sony press wins over its mirrored copy.
+    if (sony & ~sony_was_) last_pad_ = Device::PlayStation;
+    else if ((xbox & ~xbox_was_) && !sony) last_pad_ = Device::Xbox;
+    sony_was_ = sony;
+    xbox_was_ = xbox;
+    const unsigned mask = xbox | sony;
     NoteLevel(mask);
     return mask;
 }
@@ -260,6 +280,7 @@ void RefreshDevices() {
     UINT count = 0;
     if (GetRawInputDeviceList(nullptr, &count, sizeof(RAWINPUTDEVICELIST)) != 0 || !count) {
         pad_style_ = Device::Xbox;
+        pad_hid_ = false;
         return;
     }
     std::vector<RAWINPUTDEVICELIST> devices(count);
@@ -267,14 +288,22 @@ void RefreshDevices() {
     bool sony = false, xbox = false;
     for (UINT i = 0; i < count; ++i) {
         if (devices[i].dwType != RIM_TYPEHID) continue;
+        // Game controllers only: a Microsoft keyboard's media keys are a VID_045E HID too.
+        RID_DEVICE_INFO info{};
+        info.cbSize = sizeof(info);
+        UINT bytes = sizeof(info);
+        if (GetRawInputDeviceInfoW(devices[i].hDevice, RIDI_DEVICEINFO, &info, &bytes) == static_cast<UINT>(-1)) continue;
+        if (info.hid.usUsagePage != 0x01 || (info.hid.usUsage != 0x04 && info.hid.usUsage != 0x05)) continue;
         wchar_t name[256]{};
-        UINT bytes = sizeof(name);
-        if (GetRawInputDeviceInfoW(devices[i].hDevice, RIDI_DEVICENAME, name, &bytes) == static_cast<UINT>(-1)) continue;
-        if (ContainsI(name, L"VID_054C")) sony = true;
-        if (ContainsI(name, L"VID_045E")) xbox = true;
+        UINT chars = ARRAYSIZE(name); // RIDI_DEVICENAME counts characters, not bytes.
+        if (GetRawInputDeviceInfoW(devices[i].hDevice, RIDI_DEVICENAME, name, &chars) == static_cast<UINT>(-1)) continue;
+        // USB paths read VID_054C&PID_..., Bluetooth ones ..._VID&0002054c_PID&...
+        if (ContainsI(name, L"VID_054C") || ContainsI(name, L"054C_PID")) sony = true;
+        else if (ContainsI(name, L"VID_045E") || ContainsI(name, L"045E_PID") || ContainsI(name, L"IG_")) xbox = true;
     }
     // XInput cannot tell two pads apart. A lone DualSense (no Xbox HID) keeps the PS glyphs.
     pad_style_ = sony && !xbox ? Device::PlayStation : Device::Xbox;
+    pad_hid_ = sony || xbox;
 }
 bool ParseSony(int kind, const unsigned char* data, int size, unsigned& buttons) {
     if (!data || size < 10 || (kind != 1 && kind != 2)) return false;
@@ -722,6 +751,19 @@ std::wstring KeyCaption(unsigned vk) {
     if (GetKeyNameTextW(flags, text, 64) > 0 && text[0]) return text;
     return KeyToken(vk);
 }
+// Pad glyph style: the user's pick, else the pad in hand. Keyboard means no
+// pad is known, and each chord keeps the glyphs it was recorded with.
+Device ShownPad() {
+    if (glyphs_ == Glyphs::Xbox) return Device::Xbox;
+    if (glyphs_ == Glyphs::PlayStation) return Device::PlayStation;
+    if (last_pad_ != Device::Keyboard) return last_pad_;
+    return pad_hid_ || xinput_live_ ? pad_style_ : Device::Keyboard;
+}
+Chord Shown(Chord chord) {
+    const Device pad = ShownPad();
+    if (chord.device != Device::Keyboard && pad != Device::Keyboard) chord.device = pad;
+    return chord;
+}
 void AddPad(std::vector<Part>& parts, const Chord& chord) {
     const bool ps = chord.device == Device::PlayStation;
     const bool mono = UiTheme::HighContrast();
@@ -780,9 +822,10 @@ void AddPad(std::vector<Part>& parts, const Chord& chord) {
         }
     }
 }
-std::vector<Part> Parts(const Chord& chord) {
+std::vector<Part> Parts(const Chord& recorded) {
     std::vector<Part> parts;
-    if (chord.empty()) return parts;
+    if (recorded.empty()) return parts;
+    const Chord chord = Shown(recorded);
     if (chord.device == Device::Keyboard) {
         auto cap = [](unsigned vk) { Part part; part.mark = Mark::Key; part.text = KeyCaption(vk); part.color = UiTheme::Text(); return part; };
         if (chord.modifiers & kCtrl) parts.push_back(cap(VK_CONTROL));
@@ -1032,7 +1075,7 @@ void StepCapture() {
         arm_.pad_held = true;
         arm_.pad_union |= pad;
         arm_.live = {};
-        arm_.live.device = pad_style_;
+        arm_.live.device = last_pad_ != Device::Keyboard ? last_pad_ : pad_style_;
         arm_.live.buttons = arm_.pad_union;
         arm_.live_valid = true;
         InvalidateArm();
@@ -1117,14 +1160,93 @@ LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
+// Redraws everything that shows a pad chord (bind boxes, hub sidebar hint).
+void RepaintChords() {
+    for (HWND box : boxes_) if (box) InvalidateRect(box, nullptr, FALSE);
+    if (glyph_box_) InvalidateRect(glyph_box_, nullptr, FALSE);
+    DebugHub::RefreshChrome();
+}
+void SetGlyphs(int mode) {
+    if (mode < 0 || mode > 2 || mode == static_cast<int>(glyphs_)) return;
+    glyphs_ = static_cast<Glyphs>(mode);
+    if (!config_.empty()) WritePrivateProfileStringW(L"Hotkeys", L"PadGlyphs", kGlyphNames[mode], config_.c_str());
+    shown_ = static_cast<int>(ShownPad());
+    RepaintChords();
+}
+int GlyphHit(HWND window, LPARAM lparam) {
+    RECT client{}; GetClientRect(window, &client);
+    const int x = static_cast<short>(LOWORD(lparam));
+    return (std::max)(0, (std::min)(2, x * 3 / (std::max)(1, static_cast<int>(client.right))));
+}
+// Auto / Xbox / PlayStation switch for pad glyphs, styled like a bind box.
+LRESULT CALLBACK GlyphProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE;
+    case WM_GETDLGCODE: return DLGC_WANTARROWS;
+    case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(window, nullptr, FALSE); return 0;
+    case WM_LBUTTONDOWN: SetFocus(window); SetGlyphs(GlyphHit(window, lparam)); return 0;
+    case WM_MOUSEMOVE: {
+        const int hit = GlyphHit(window, lparam);
+        if (hit != glyph_hot_) { glyph_hot_ = hit; InvalidateRect(window, nullptr, FALSE); }
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0}; TrackMouseEvent(&track);
+        return 0;
+    }
+    case WM_MOUSELEAVE: glyph_hot_ = -1; InvalidateRect(window, nullptr, FALSE); return 0;
+    case WM_KEYDOWN:
+        if (wparam == VK_LEFT || wparam == VK_RIGHT) { SetGlyphs((static_cast<int>(glyphs_) + (wparam == VK_LEFT ? 2 : 1)) % 3); return 0; }
+        break;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        const HDC target = BeginPaint(window, &paint);
+        RECT client{}; GetClientRect(window, &client);
+        HDC dc = CreateCompatibleDC(target);
+        HBITMAP bitmap = dc ? CreateCompatibleBitmap(target, (std::max)(1L, client.right), (std::max)(1L, client.bottom)) : nullptr;
+        const HGDIOBJ old = bitmap ? SelectObject(dc, bitmap) : nullptr;
+        HDC draw = bitmap ? dc : target;
+        const int current = static_cast<int>(glyphs_), third = client.right / 3, inset = Scale(window, 3);
+        FillRect(draw, &client, UiTheme::Background());
+        {
+            Gdiplus::Graphics graphics(draw);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+            RECT inner = client; inner.right -= 1; inner.bottom -= 1;
+            const COLORREF edge = GetFocus() == window ? UiTheme::Accent() : UiTheme::Mix(UiTheme::Border(), UiTheme::Base(), 15);
+            Round(graphics, inner, static_cast<float>(Scale(window, 8)), UiTheme::Mix(UiTheme::Base(), UiTheme::Panel(), 72), edge);
+            const RECT thumb{current * third + inset, inset, (current == 2 ? inner.right : (current + 1) * third) - inset, inner.bottom - inset};
+            Round(graphics, thumb, static_cast<float>(Scale(window, 6)), UiTheme::Mix(UiTheme::Panel(), UiTheme::Selection(), 70),
+                UiTheme::Mix(UiTheme::Accent(), UiTheme::Panel(), 55));
+        }
+        const wchar_t* const labels[3] = {L"自动", L"Xbox", L"PlayStation"};
+        for (int i = 0; i < 3; ++i) {
+            const RECT cell{i * third, 0, i == 2 ? client.right : (i + 1) * third, client.bottom};
+            const COLORREF color = i == current ? UiTheme::Text()
+                : glyph_hot_ == i ? UiTheme::Mix(UiTheme::MutedText(), UiTheme::Text(), 55) : UiTheme::MutedText();
+            TextIn(draw, UiI18n::Translate(labels[i]), cell, UiTheme::GetFont(UiTheme::Font::Small, window), color);
+        }
+        if (bitmap) {
+            BitBlt(target, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, old); DeleteObject(bitmap);
+        }
+        if (dc) DeleteDC(dc);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    default: break;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+// Page rows: the glyph switch first, then every editable action.
+int PageRow(int index) { const int row = RowOf(index); return row < 0 ? -1 : row + 1; }
 void LayoutPage(HWND window) {
     if (!window) return;
     RECT client{}; GetClientRect(window, &client);
     const int margin = Scale(window, 16), row = Scale(window, 40), box_w = Scale(window, 280), box_h = Scale(window, 32);
     const int top = Scale(window, 64);
+    const int x = (std::max)(margin + Scale(window, 180), static_cast<int>(client.right) - margin - box_w);
+    if (glyph_box_) SetWindowPos(glyph_box_, nullptr, x, top + (row - box_h) / 2, box_w, box_h, SWP_NOZORDER | SWP_NOACTIVATE);
     for (int i = 0; i < kCount; ++i) if (boxes_[static_cast<size_t>(i)]) {
-        const int y = top + RowOf(i) * row + (row - box_h) / 2;
-        const int x = (std::max)(margin + Scale(window, 180), static_cast<int>(client.right) - margin - box_w);
+        const int y = top + PageRow(i) * row + (row - box_h) / 2;
         SetWindowPos(boxes_[static_cast<size_t>(i)], nullptr, x, y, box_w, box_h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
@@ -1151,8 +1273,22 @@ LRESULT CALLBACK PageProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, old);
         const int row = Scale(window, 40), top = Scale(window, 64);
+        {
+            RECT label{Scale(window, 16), top, client.right - Scale(window, 300), top + row};
+            if (glyph_box_) {
+                RECT box{}; GetWindowRect(glyph_box_, &box);
+                MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&box), 2);
+                label.right = box.left - Scale(window, 12);
+            }
+            const HFONT body = UiTheme::GetFont(UiTheme::Font::Body, window), muted = UiTheme::GetFont(UiTheme::Font::Small, window);
+            const std::wstring name = UiI18n::Translate(L"手柄图标");
+            TextIn(dc, name, label, body, UiTheme::Text(), DT_LEFT);
+            RECT note = label;
+            note.left += Measure(dc, body, name) + Scale(window, 12);
+            if (note.left < note.right) TextIn(dc, UiI18n::Translate(L"手柄组合键在 Xbox 与 PlayStation 手柄上通用"), note, muted, UiTheme::MutedText(), DT_LEFT);
+        }
         for (int i = 0; i < kCount; ++i) {
-            const int at = RowOf(i);
+            const int at = PageRow(i);
             if (at < 0) continue;
             RECT label{Scale(window, 16), top + at * row, client.right - Scale(window, 300), top + (at + 1) * row};
             if (boxes_[static_cast<size_t>(i)]) {
@@ -1171,6 +1307,7 @@ LRESULT CALLBACK PageProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     case WM_DESTROY:
         if (page_ == window) page_ = nullptr;
         boxes_.fill(nullptr);
+        glyph_box_ = nullptr;
         if (arm_.control && !IsWindow(arm_.control)) Disarm();
         return 0;
     default: break;
@@ -1181,7 +1318,7 @@ bool RegisterClasses() {
     WNDCLASSEXW cls{sizeof(cls)};
     cls.hInstance = GetModuleHandleW(nullptr);
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    const std::pair<const wchar_t*, WNDPROC> items[] = {{kPageClass, PageProc}, {kBindClass, BindProc}};
+    const std::pair<const wchar_t*, WNDPROC> items[] = {{kPageClass, PageProc}, {kBindClass, BindProc}, {kGlyphClass, GlyphProc}};
     for (const auto& item : items) {
         cls.lpszClassName = item.first;
         cls.lpfnWndProc = item.second;
@@ -1205,10 +1342,17 @@ void NoteDualSenseTouch(const unsigned char* data, int size) {
     snoop_time_.store(GetTickCount64(), std::memory_order_relaxed);
 }
 void YieldSony(bool yield) { yield_sony_.store(yield, std::memory_order_relaxed); }
+void SetXInputForTest(PadStateReader reader) {
+    xinput_ = reader;
+    xinput_tried_ = true;
+}
 void Initialize(const wchar_t* config_file) {
     Ensure();
     config_ = config_file ? config_file : L"";
     if (config_.empty()) return;
+    wchar_t glyphs[16]{};
+    GetPrivateProfileStringW(L"Hotkeys", L"PadGlyphs", L"auto", glyphs, 16, config_.c_str());
+    for (int i = 0; i < 3; ++i) if (!_wcsicmp(glyphs, kGlyphNames[i])) glyphs_ = static_cast<Glyphs>(i);
     for (int i = 0; i < kCount; ++i) {
         if (Fixed(i)) continue;
         wchar_t buffer[160]{};
@@ -1240,6 +1384,12 @@ void Tick() {
     const bool fire = !arm_.active && UiHost::InGame() && !TextEntry();
     Snapshot(fire);
     RememberKeys();
+    // Picking up the other pad switches every pad glyph on screen.
+    const int shown = static_cast<int>(ShownPad());
+    if (shown != shown_) {
+        shown_ = shown;
+        RepaintChords();
+    }
     if (!arm_.active) {
         esc_was_ = Down(VK_ESCAPE);
         wipe_was_ = Down(VK_BACK) || Down(VK_DELETE);
@@ -1284,9 +1434,10 @@ int Draw(HDC dc, int x, int y, int height, const Chord& chord, int limit_x) {
     const COLORREF paper = UiTheme::Mix(UiTheme::Base(), UiTheme::Panel(), 70);
     const COLORREF edge = UiTheme::Mix(UiTheme::Border(), UiTheme::Base(), 18);
     const std::vector<Part> parts = Parts(chord);
+    const bool xbox = Shown(chord).device == Device::Xbox;
     bool first = true;
     for (const Part& part : parts) {
-        const bool art = part.asset >= 0 || part.mark == Mark::Key || (part.mark == Mark::View && chord.device == Device::Xbox && !UiTheme::HighContrast());
+        const bool art = part.asset >= 0 || part.mark == Mark::Key || (part.mark == Mark::View && xbox && !UiTheme::HighContrast());
         const int width = art ? PartWidth(dc, part, height)
             : ShowsText(part.mark) ? (std::max)(height, (part.text.empty() ? 0 : Measure(dc, font, part.text)) + height / 2) : height;
         const int gap = height / 5;
@@ -1334,9 +1485,11 @@ HWND CreatePage(HWND parent) {
     if (page_ && IsWindow(page_)) return page_;
     Ensure();
     const int width = Scale(parent, 760);
-    const int height = Scale(parent, 72) + Rows() * Scale(parent, 40) + Scale(parent, 20);
+    const int height = Scale(parent, 72) + (Rows() + 1) * Scale(parent, 40) + Scale(parent, 20);
     page_ = CreateWindowExW(0, kPageClass, L"", WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, width, height, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!page_) return nullptr;
+    glyph_box_ = CreateWindowExW(0, kGlyphClass, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, 0, 10, 10, page_, nullptr, GetModuleHandleW(nullptr), nullptr);
     for (int i = 0; i < kCount; ++i) {
         if (Fixed(i)) continue;
         boxes_[static_cast<size_t>(i)] = CreateWindowExW(0, kBindClass, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,

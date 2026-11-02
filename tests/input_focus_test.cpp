@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,8 @@ HWND game_ = nullptr;
 DWORD game_tid_ = 0;
 std::atomic<int> game_keys_{0}, game_setfocus_{0}, game_killfocus_{0}, game_clicks_{0};
 std::atomic<bool> stop_{false};
+std::atomic<unsigned> fake_pad_{0};
+std::atomic<int> pad_fires_{0};
 std::atomic<long long> sent_at_{0};
 std::atomic<long long> worst_latency_us_{0};
 LARGE_INTEGER frequency_{};
@@ -137,9 +140,26 @@ HWND MockPage(HWND parent) {
     DebugHub::Attach(page, parent, 640, 420);
     return page;
 }
-DWORD WINAPI WorkerMain(void* ready) {
+std::wstring IniPath() {
     wchar_t ini[MAX_PATH]{}; GetTempPathW(MAX_PATH, ini); wcscat_s(ini, L"PBZInputFocusTest.ini");
+    return ini;
+}
+// One fake Xbox pad in XInput slot 0: the test machine has none. Buttons come from fake_pad_.
+DWORD WINAPI FakeXInput(DWORD user, void* state) {
+    if (user != 0) return ERROR_DEVICE_NOT_CONNECTED;
+    static DWORD packet = 0;
+    auto* bytes = static_cast<unsigned char*>(state);
+    std::memset(bytes, 0, 16);
+    ++packet; std::memcpy(bytes, &packet, 4);
+    const WORD buttons = static_cast<WORD>(fake_pad_.load());
+    std::memcpy(bytes + 4, &buttons, 2);
+    return ERROR_SUCCESS;
+}
+DWORD WINAPI WorkerMain(void* ready) {
+    const std::wstring path = IniPath(); const wchar_t* ini = path.c_str();
+    UiHotkeys::SetXInputForTest(&FakeXInput);
     UiI18n::Initialize(ini); UiTheme::Initialize(); DebugHub::Initialize(); UiHotkeys::Initialize(ini);
+    UiHotkeys::Bind(UiHotkeys::Action::GearUp, [] { ++pad_fires_; });
     UiLoadBanner::Initialize(&LogLine); EntryFocus::Initialize();
     SettingsStore::Initialize(ini); HubPause::Initialize(&LogLine); GrabExtras::Initialize(&LogLine); MotianGrabMenu::Initialize(&LogLine); GearWidget::Initialize(&LogLine);
     for (int page = 0; page < static_cast<int>(DebugHub::Page::Count); ++page)
@@ -239,6 +259,33 @@ BOOL CALLBACK FindChild(HWND child, LPARAM data) {
 HWND Visible(const wchar_t* cls, LONG mask = 0, LONG style = 0) { Find f{cls, mask, style, nullptr}; EnumChildWindows(game_, FindChild, reinterpret_cast<LPARAM>(&f)); return f.found; }
 POINT Center(HWND w) { RECT r{}; GetWindowRect(w, &r); return {(r.left + r.right) / 2, (r.top + r.bottom) / 2}; }
 POINT Left(HWND w) { RECT r{}; GetWindowRect(w, &r); return {r.left + 10, (r.top + r.bottom) / 2}; }
+struct BindFind { LONG_PTR index; HWND found; };
+BOOL CALLBACK FindBind(HWND child, LPARAM data) {
+    auto* f = reinterpret_cast<BindFind*>(data);
+    wchar_t name[64]{}; GetClassNameW(child, name, 64);
+    if (_wcsicmp(name, L"PBZHotkeyBind_v1") || GetWindowLongPtrW(child, GWLP_USERDATA) != f->index) return TRUE;
+    f->found = child; return FALSE;
+}
+HWND BindBox(UiHotkeys::Action action) { BindFind f{static_cast<LONG_PTR>(action), nullptr}; EnumChildWindows(game_, FindBind, reinterpret_cast<LPARAM>(&f)); return f.found; }
+std::wstring Saved(const wchar_t* key) {
+    wchar_t value[64]{}; GetPrivateProfileStringW(L"Hotkeys", key, L"", value, 64, IniPath().c_str());
+    return value;
+}
+std::wstring Shown(UiHotkeys::Action action) { return UiHotkeys::Plain(UiHotkeys::Get(action)); }
+// DualSense USB input report: Triangle + Square, d-pad neutral (hat 8).
+void FeedDualSense(DWORD ms) {
+    unsigned char report[64]{}; report[0] = 0x01; report[8] = 0x08 | 0x10 | 0x80;
+    for (DWORD at = 0; at < ms; at += 10) { UiHotkeys::NoteSonyReport(1, report, sizeof(report)); Sleep(10); }
+}
+// Clicks a bind box, holds the fake Xbox buttons, releases; true when the box was armed.
+bool BindXbox(HWND box, unsigned buttons, DWORD sony_ms = 0) {
+    PostMessageW(box, WM_LBUTTONDOWN, MK_LBUTTON, 0); PostMessageW(box, WM_LBUTTONUP, 0, 0); Sleep(300);
+    const bool armed = UiHotkeys::Capturing();
+    fake_pad_.store(buttons); Sleep(30);
+    if (sony_ms) FeedDualSense(sony_ms); else Sleep(270);
+    fake_pad_.store(0); Sleep(350);
+    return armed;
+}
 int Click() {
     if (!OursForeground()) { Log("  skipped click: another process owns the foreground"); return -1; }
     RECT rect{}; GetWindowRect(game_, &rect);
@@ -310,6 +357,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         WaitForSingleObject(w, 5000); WaitForSingleObject(g, 5000);
         return 0;
     }
+    // Hotkeys start from the defaults; the pad checks write their own chords.
+    WritePrivateProfileStringW(L"Hotkeys", nullptr, nullptr, IniPath().c_str());
     HANDLE game = CreateThread(nullptr, 0, GameMain, ready, 0, nullptr);
     WaitForSingleObject(ready, 5000);
     Foreground(game_); Sleep(300);
@@ -388,6 +437,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         Log("  gear rail drag: %d -> %d", from, GearWidget::Level());
         Check(GearWidget::Level() == 2, "gear rail thumb drags to gear 2");
     } else Check(false, "gear widget found while the hub is open");
+    // Pads: a fake XInput slot drives the real capture path (no Xbox pad on this machine).
+    DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(900);
+    if (!DebugHub::Visible()) { DebugHub::Toggle(); Sleep(900); }
+    if (!OursForeground()) { Foreground(game_); Sleep(150); }
+    const HWND up = BindBox(UiHotkeys::Action::GearUp), down = BindBox(UiHotkeys::Action::GearDown);
+    const HWND glyphs = up ? FindWindowExW(GetParent(up), nullptr, L"PBZHotkeyGlyphs_v1", nullptr) : nullptr;
+    if (!OursForeground()) Log("  skipped pad checks: another process owns the foreground");
+    else if (up && down && glyphs) {
+        Check(BindXbox(up, 0x0100 | 0x0200), "bind box waits for a chord after a click");
+        Log("  GearUp saved as %ls, shown as %ls", Saved(L"GearUp").c_str(), Shown(UiHotkeys::Action::GearUp).c_str());
+        Check(Saved(L"GearUp") == L"xb:LB+RB", "Xbox LB+RB records as xb:LB+RB");
+        Check(Shown(UiHotkeys::Action::GearUp) == L"LB + RB", "an Xbox press shows Xbox glyphs");
+        RECT g{}; GetClientRect(glyphs, &g);
+        PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(g.right - 6, g.bottom / 2)); Sleep(300);
+        Log("  PlayStation glyphs: PadGlyphs=%ls, GearUp shown as %ls", Saved(L"PadGlyphs").c_str(), Shown(UiHotkeys::Action::GearUp).c_str());
+        Check(Saved(L"PadGlyphs") == L"ps" && Shown(UiHotkeys::Action::GearUp) == L"L1 + R1", "glyph switch draws the same chord as L1 + R1");
+        PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(6, g.bottom / 2)); Sleep(300);
+        Check(Saved(L"PadGlyphs") == L"auto" && Shown(UiHotkeys::Action::GearUp) == L"LB + RB", "glyph switch back to auto follows the Xbox pad");
+        const int fired = pad_fires_.load();
+        fake_pad_.store(0x0100 | 0x0200); Sleep(250); fake_pad_.store(0); Sleep(250);
+        Check(pad_fires_.load() == fired + 1, "Xbox LB+RB fires its action once");
+        fake_pad_.store(0x0100); Sleep(250); fake_pad_.store(0); Sleep(250);
+        Check(pad_fires_.load() == fired + 1, "LB alone does not fire LB+RB");
+        // Steam Input / DS4Windows: a DualSense press also shows up as XInput, a moment earlier.
+        BindXbox(down, 0x8000 | 0x4000, 300);
+        Log("  mirrored DualSense: GearDown saved as %ls", Saved(L"GearDown").c_str());
+        Check(Saved(L"GearDown") == L"ps:Triangle+Square", "a DualSense mirrored into XInput records as PlayStation");
+    } else Check(false, "hotkey page has the gear bind boxes and the glyph switch");
     DebugHub::Toggle(); Sleep(900);
     Check(Keys(3) == 3, "keys reach the game after the mouse checks");
     Log("worst F24 delivery latency: %.1f ms", worst_latency_us_.load() / 1000.0);
@@ -396,6 +473,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     stop_.store(true);
     PostThreadMessageW(game_tid_, WM_NULL, 0, 0);
     WaitForSingleObject(worker, 5000); WaitForSingleObject(game, 5000);
+    WritePrivateProfileStringW(L"Hotkeys", nullptr, nullptr, IniPath().c_str());
     Log("failures=%d", failures_);
     if (log_) std::fclose(log_);
     return failures_;

@@ -5,7 +5,9 @@
 
 // UI worker only. Custom chords for debug-menu actions. The bind control is a
 // capture box: it never inserts characters. Keyboard, Xbox and PlayStation
-// chords can be combined. The stored device picks the glyph style.
+// chords can be combined. A pad chord is a set of buttons that fires on either
+// pad; [Hotkeys] PadGlyphs (auto / xbox / ps) picks the glyphs, auto = the pad
+// in hand, or the recorded device when no pad is connected.
 namespace UiHotkeys {
 enum class Action : int {
     ToggleHub = 0,
@@ -54,4 +56,7 @@ void NoteSonyReport(int kind, const unsigned char* data, int size);
 void NoteDualSenseTouch(const unsigned char* data, int size);
 // While true, this module closes its own Sony handles so the weapon reader can own the device.
 void YieldSony(bool yield);
+// Offline tests only, before the first Tick: stands in for XInputGetState.
+using PadStateReader = DWORD(WINAPI*)(DWORD user, void* state);
+void SetXInputForTest(PadStateReader reader);
 }
