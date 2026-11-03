@@ -87,15 +87,17 @@ cmake --build build --config Release --target version
 
 所有快捷键都可在面板“快捷键”页重新绑定（键盘、Xbox、PlayStation 组合键）。
 
+打开面板的键也可以直接在 `PBZDebugMenu.ini` 里改：首次启动会写入 `[Hotkeys]` 下的 `ToggleHub=kb:F10`，改成例如 `ToggleHub=F11` 或 `ToggleHub=Ctrl + F10` 后重启游戏生效；留空或写错时仍用 F10。
+
 ## 设置文件
 
-`PBZDebugMenu.ini` 与 DLL 放在一起，修改时才写盘：
+`PBZDebugMenu.ini` 与 DLL 放在一起，修改时才写盘（面板快捷键 `ToggleHub` 例外，首次启动写入默认值）：
 
 | 节 | 内容 |
 |---|---|
 | `[UI]` | 界面语言 |
 | `[Hub]` | 打开面板时暂停游戏 |
-| `[Hotkeys]` | 自定义快捷键 |
+| `[Hotkeys]` | 自定义快捷键；`ToggleHub` 为打开面板的键（默认 `kb:F10`，可写不带前缀的 `F11`、`Ctrl + F10`） |
 | `[Gear]` | 当前挡位 |
 | `[Grab]` · `[GrabExtras]` · `[GrabDamage]` | 投技招式与开关、换武器 / 伤害模式 / 无视无敌、各招实测伤害 |
 | `[NpcSkill]` | NPC 技能伤害倍率 `DamageMultiplier`（1–10，默认 3） |

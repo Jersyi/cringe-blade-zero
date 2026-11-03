@@ -374,13 +374,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         WaitForSingleObject(w, 5000); WaitForSingleObject(g, 5000);
         return 0;
     }
-    // Hotkeys start from the defaults; the pad checks write their own chords.
+    // Hotkeys start from the defaults; the pad checks write their own chords. HairMode is typed the
+    // way a player edits the ini by hand: no device prefix, spaces around '+'.
     WritePrivateProfileStringW(L"Hotkeys", nullptr, nullptr, IniPath().c_str());
+    WritePrivateProfileStringW(L"Hotkeys", L"HairMode", L"Shift + F11", IniPath().c_str());
     HANDLE game = CreateThread(nullptr, 0, GameMain, ready, 0, nullptr);
     WaitForSingleObject(ready, 5000);
     Foreground(game_); Sleep(300);
     HANDLE worker = CreateThread(nullptr, 0, WorkerMain, ready, 0, nullptr);
     WaitForSingleObject(ready, 5000);
+    {
+        wchar_t hub[32]{}; GetPrivateProfileStringW(L"Hotkeys", L"ToggleHub", L"", hub, 32, IniPath().c_str());
+        Log("  [ini] ToggleHub=%ls HairMode=%ls", hub, Shown(UiHotkeys::Action::HairMode).c_str());
+        Check(!wcscmp(hub, L"kb:F10"), "the panel key is written to the ini with its default F10");
+        const UiHotkeys::Chord hair = UiHotkeys::Get(UiHotkeys::Action::HairMode);
+        Check(hair.device == UiHotkeys::Device::Keyboard && hair.key == VK_F11 && hair.modifiers == 2, "a hand-typed ini chord without prefix reads as a keyboard chord");
+    }
     Sleep(600);
     Report("banner showing");
     Check(Keys(5) == 5, "keys reach the game while the load banner is up");

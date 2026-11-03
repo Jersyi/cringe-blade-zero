@@ -677,13 +677,14 @@ bool Parse(const wchar_t* text, Chord& out) {
     if (!text || !*text) return true;
     Device device = Device::Keyboard;
     const wchar_t* body = text;
-    if (!_wcsnicmp(text, L"kb:", 3)) device = Device::Keyboard;
-    else if (!_wcsnicmp(text, L"xb:", 3)) device = Device::Xbox;
-    else if (!_wcsnicmp(text, L"ps:", 3)) device = Device::PlayStation;
-    else return false;
-    body += 3;
+    if (!_wcsnicmp(text, L"kb:", 3)) body += 3;
+    else if (!_wcsnicmp(text, L"xb:", 3)) { device = Device::Xbox; body += 3; }
+    else if (!_wcsnicmp(text, L"ps:", 3)) { device = Device::PlayStation; body += 3; }
+    // No prefix: a keyboard chord as typed in the ini by hand ("F10", "Ctrl + F10").
     Chord chord; chord.device = device;
-    const std::wstring value(body);
+    std::wstring value(body);
+    value.erase(std::remove_if(value.begin(), value.end(), [](wchar_t c) { return std::iswspace(c) != 0; }), value.end());
+    if (value.empty()) return false;
     size_t at = 0;
     while (at <= value.size()) {
         const size_t plus = value.find(L'+', at);
@@ -1354,13 +1355,16 @@ void Initialize(const wchar_t* config_file) {
     wchar_t glyphs[16]{};
     GetPrivateProfileStringW(L"Hotkeys", L"PadGlyphs", L"auto", glyphs, 16, config_.c_str());
     for (int i = 0; i < 3; ++i) if (!_wcsicmp(glyphs, kGlyphNames[i])) glyphs_ = static_cast<Glyphs>(i);
+    // The panel key is written with its default (kb:F10) when the ini has none, so it can be changed
+    // there by hand; it never ends up empty (no key would open the panel again).
+    constexpr int kHub = static_cast<int>(Action::ToggleHub);
     for (int i = 0; i < kCount; ++i) {
         if (Fixed(i)) continue;
         wchar_t buffer[160]{};
         GetPrivateProfileStringW(L"Hotkeys", kSpecs[i].id, L"*", buffer, 160, config_.c_str());
-        if (!wcscmp(buffer, L"*")) continue;
+        if (!wcscmp(buffer, L"*")) { if (i == kHub) Save(i); continue; }
         Chord parsed;
-        if (Parse(buffer, parsed)) chords_[static_cast<size_t>(i)] = parsed;
+        if (Parse(buffer, parsed) && !(i == kHub && parsed.empty())) chords_[static_cast<size_t>(i)] = parsed;
     }
     for (int i = 0; i < kCount; ++i) for (int j = 0; j < i; ++j) {
         if (Fixed(i) || !Conflicts(chords_[static_cast<size_t>(i)], chords_[static_cast<size_t>(j)])) continue;

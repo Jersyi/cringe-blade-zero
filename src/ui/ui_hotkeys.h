@@ -7,7 +7,10 @@
 // capture box: it never inserts characters. Keyboard, Xbox and PlayStation
 // chords can be combined. A pad chord is a set of buttons that fires on either
 // pad; [Hotkeys] PadGlyphs (auto / xbox / ps) picks the glyphs, auto = the pad
-// in hand, or the recorded device when no pad is connected.
+// in hand, or the recorded device when no pad is connected. Each [Hotkeys] value is
+// kb: / xb: / ps: plus tokens joined by '+'; a value without a prefix is a keyboard
+// chord ("F10", "Ctrl + F10"). ToggleHub (the panel, default F10) is written to the
+// ini on first start and falls back to F10 when empty or unreadable.
 namespace UiHotkeys {
 enum class Action : int {
     ToggleHub = 0,
