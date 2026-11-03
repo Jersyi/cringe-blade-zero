@@ -32,7 +32,7 @@ ULONGLONG last_failure_ = 0;
 
 void Log(const char* format, ...) {
     if (!logger_) return;
-    char message[768]{}; va_list args; va_start(args, format); vsprintf_s(message, format, args); va_end(args); logger_(message);
+    char message[768]{}; va_list args; va_start(args, format); _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args); va_end(args); logger_(message);
 }
 bool Fail(const char* text) {
     const ULONGLONG now = GetTickCount64();

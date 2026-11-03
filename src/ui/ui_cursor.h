@@ -5,6 +5,8 @@
 // the cursor, recentering it, and reading raw mouse look. The gate stops that
 // without taking the game window out of the foreground.
 namespace UiCursor {
+// Logs the game window's activation changes (UI_FOCUS lines).
+void SetLogger(void (*log)(const char*));
 void Sync(bool open);
 void AfterTick();
 }

@@ -24,7 +24,12 @@ struct HiddenActor { Object* actor = nullptr; ue::Name name; bool was_hidden = f
 struct alignas(16) Transform { double rotation[4]{0, 0, 0, 1}, translation[4]{}, scale[4]{1, 1, 1, 0}; };
 struct Vector { double x = 0, y = 0, z = 0; };
 struct Rotator { double pitch = 0, yaw = 0, roll = 0; };
-struct Display { Object* component = nullptr; ue::Name name; bool visible = true; };
+// parent / socket / base: where the stand-in hangs and its relative location there; hand: the hand
+// bone above that socket, which the skin display's same-named hand replaces (FollowSkinHands).
+struct Display {
+    Object* component = nullptr; ue::Name name; bool visible = true;
+    Object* parent = nullptr; ue::Name parent_name, socket, hand; double base[3]{}, moved[3]{}; bool follow_refused = false;
+};
 struct Session {
     bool active = false;
     Object* pawn = nullptr; ue::Name pawn_name;
@@ -39,20 +44,30 @@ struct Session {
     ULONGLONG next_scan = 0;
     // Invisible Boss-skeleton mesh replaying the player's montage.
     Object* proxy = nullptr; ue::Name proxy_name; Object* proxy_montage = nullptr; double proxy_scale = 1;
+    // The grab's own montage on the player (Posing): the one playing at Begin, or the first within
+    // kMontageSettleMs; pose_over once another montage or none replaces it.
+    Object* grab_montage = nullptr; ULONGLONG began = 0; bool pose_over = false;
+    // Current model / executing boss (skin size * hero_over_boss): the boss weapon's size. The player's
+    // model size scales the pose proxy. Neither the models nor the victim are moved or scaled.
+    double scale = 1, model = 1;
 };
 Session session_;
+SkinDisplay skin_display_ = nullptr;
+constexpr ULONGLONG kMontageSettleMs = 300, kMontageWaitMs = 1000;
+// A skin hand further than this from the hand the weapon hangs on is a wrong bone, not a pose.
+constexpr double kFollowMaxCm = 150;
 struct Attribute { alignas(8) unsigned char bytes[56]{}; };
 
 void Logf(const char* format, ...) {
     if (!logger_) return;
-    char text[600]{}; va_list args; va_start(args, format); vsprintf_s(text, format, args); va_end(args); logger_(text);
+    char text[600]{}; va_list args; va_start(args, format); _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, args); va_end(args); logger_(text);
 }
 // Shown on the grab page and logged, so every damage outcome is traceable.
 void Result(const wchar_t* format, ...) {
-    wchar_t text[400]{}; va_list args; va_start(args, format); vswprintf_s(text, format, args); va_end(args);
+    wchar_t text[400]{}; va_list args; va_start(args, format); _vsnwprintf_s(text, _countof(text), _TRUNCATE, format, args); va_end(args);
     AcquireSRWLockExclusive(&lock_); result_ = text; ReleaseSRWLockExclusive(&lock_);
     char utf8[1200]{}; WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
-    if (logger_) { char line[1300]{}; sprintf_s(line, "GRAB_EXTRAS result %s", utf8); logger_(line); }
+    if (logger_) { char line[1300]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "GRAB_EXTRAS result %s", utf8); logger_(line); }
 }
 bool Same(Object* object, ue::Name name) { return object && ue::Alive(object) && ue::NameOf(object) == name; }
 Object* Field(Object* cls, const char* name) {
@@ -303,6 +318,83 @@ void RemoveProxy() {
     if (session_.proxy && Same(session_.proxy, session_.proxy_name)) Call(session_.proxy, "K2_DestroyComponent").Set("Object", session_.proxy).Invoke();
     session_.proxy = nullptr; session_.proxy_montage = nullptr;
 }
+Object* CurrentMontage(Object* pawn) {
+    Object* mesh = nullptr; ReadField(pawn, "Mesh", mesh);
+    if (!ue::Alive(mesh)) return nullptr;
+    Call instance(mesh, "GetAnimInstance"); if (!instance.Invoke()) return nullptr;
+    Object* anim = instance.Get<Object*>("ReturnValue"); if (!ue::Alive(anim)) return nullptr;
+    Call active(anim, "GetCurrentActiveMontage"); if (!active.Invoke()) return nullptr;
+    Object* montage = active.Get<Object*>("ReturnValue");
+    return ue::Alive(montage) ? montage : nullptr;
+}
+void UpdatePosing() {
+    if (session_.pose_over) return;
+    Object* montage = CurrentMontage(session_.pawn);
+    const ULONGLONG ms = GetTickCount64() - session_.began;
+    if (montage == session_.grab_montage) return;
+    // Right after Begin the paired montage may still be replacing the move the grab started from.
+    if (montage && (!session_.grab_montage || ms < kMontageSettleMs)) { session_.grab_montage = montage; return; }
+    if (!session_.grab_montage && ms < kMontageWaitMs) return;
+    session_.pose_over = true;
+    char name[160] = "none"; if (montage) ue::NameText(ue::NameOf(montage), name, sizeof(name));
+    Logf("GRAB_EXTRAS grab pose over after %llu ms (now %s)", ms, name);
+}
+// The hand bone a socket hangs under (the socket's bone or one of its parents), or None.
+ue::Name HandBone(Object* mesh, ue::Name socket) {
+    ue::Name bone = socket;
+    Call socket_bone(mesh, "GetSocketBoneName");
+    if (socket_bone.Set("InSocketName", socket).Invoke() && !socket_bone.Get<ue::Name>("ReturnValue").None()) bone = socket_bone.Get<ue::Name>("ReturnValue");
+    for (int depth = 0; depth < 6 && !bone.None(); ++depth) {
+        char text[96]{}; ue::NameText(bone, text, sizeof(text));
+        if (!_strnicmp(text, "hand_", 5)) return bone;
+        Call parent(mesh, "GetParentBone");
+        if (!parent.Set("BoneName", bone).Invoke()) break;
+        bone = parent.Get<ue::Name>("ReturnValue");
+    }
+    return {};
+}
+bool SocketLocation(Object* mesh, ue::Name socket, Vector& at) {
+    Call get(mesh, "GetSocketLocation");
+    if (!get.Set("InSocketName", socket).Invoke()) return false;
+    at = get.Get<Vector>("ReturnValue");
+    return std::isfinite(at.x) && std::isfinite(at.y) && std::isfinite(at.z);
+}
+// With an NPC skin the player is drawn by another mesh, whose hands are not where the proxy's (or
+// the hidden player's) are. Each stand-in moves by the skin hand minus the hand it hangs on, so it
+// stays in the visible fist and keeps the Boss's own motion relative to that hand.
+void FollowSkinHands() {
+    double size = 1;
+    Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(size)) : nullptr;
+    if (!ue::Alive(skin)) skin = nullptr;
+    for (Display& d : session_.displays) {
+        if (d.hand.None() || !Same(d.component, d.name) || !Same(d.parent, d.parent_name)) continue;
+        double world[3]{};
+        Vector from{}, to{};
+        if (skin && SocketLocation(d.parent, d.hand, from) && SocketLocation(skin, d.hand, to)) {
+            world[0] = to.x - from.x; world[1] = to.y - from.y; world[2] = to.z - from.z;
+            const double length = std::sqrt(world[0] * world[0] + world[1] * world[1] + world[2] * world[2]);
+            if (!(length <= kFollowMaxCm)) {
+                if (!d.follow_refused) Logf("GRAB_EXTRAS skin hand %.1f cm from the stand-in's hand; correction skipped", length);
+                d.follow_refused = true; world[0] = world[1] = world[2] = 0;
+            }
+        } else if (!d.moved[0] && !d.moved[1] && !d.moved[2]) continue; // no skin and nothing to undo
+        // World offset -> the attach socket's space (UE: child world = relative * socket).
+        Call socket(d.parent, "GetSocketTransform");
+        if (!socket.Set("InSocketName", d.socket).Set("TransformSpace", uint8_t{0}).Invoke()) continue;
+        const Transform frame = socket.Get<Transform>("ReturnValue");
+        const double inverse[4] = {-frame.rotation[0], -frame.rotation[1], -frame.rotation[2], frame.rotation[3]};
+        double local[3]{}; Rotate(inverse, world, local);
+        bool same = true;
+        for (int i = 0; i < 3; ++i) {
+            const double scale = std::fabs(frame.scale[i]) > 1e-4 ? frame.scale[i] : 1;
+            local[i] /= scale; if (std::fabs(local[i] - d.moved[i]) > .05) same = false;
+        }
+        if (same) continue;
+        const Vector at{d.base[0] + local[0], d.base[1] + local[1], d.base[2] + local[2]};
+        if (Call(d.component, "K2_SetRelativeLocation").Set("NewLocation", at).Set("bSweep", false).Set("bTeleport", true).Invoke())
+            for (int i = 0; i < 3; ++i) d.moved[i] = local[i];
+    }
+}
 bool ShowWeapon(Object* pawn, const Weapon& weapon) {
     Object* mesh = nullptr; ReadField(pawn, "Mesh", mesh);
     Object* cdo = DefaultOf(weapon.class_path);
@@ -326,11 +418,13 @@ bool ShowWeapon(Object* pawn, const Weapon& weapon) {
     ue::Name attach_to = socket;
     const ue::Name proxy_socket = session_.proxy ? Socket(session_.proxy, weapon.socket) : ue::Name{};
     if (!proxy_socket.None()) {
-        // Exactly the Boss weapon actor's placement on the Boss skeleton; the
-        // weapon keeps its real size inside the height-scaled proxy.
+        // Exactly the Boss weapon actor's placement on the Boss skeleton; the proxy has the current
+        // model's size, so the weapon is scaled with it (current model / boss).
         parent = session_.proxy; attach_to = proxy_socket; mode = "boss-pose";
-        for (int i = 0; i < 3; ++i) relative.scale[i] /= session_.proxy_scale;
-    } else attach_to = Grip(mesh, socket, weapon.rest, relative, mode);
+    } else {
+        attach_to = Grip(mesh, socket, weapon.rest, relative, mode);
+        for (int i = 0; i < 3; ++i) relative.scale[i] *= session_.scale;
+    }
     Call add(pawn, "AddComponentByClass");
     if (!add.Set("Class", is_skeletal ? skeletal : static_type).Set("bManualAttachment", true).Set("RelativeTransform", relative).Set("bDeferredFinish", true).Invoke()) return false;
     Object* component = add.Get<Object*>("ReturnValue");
@@ -352,9 +446,12 @@ bool ShowWeapon(Object* pawn, const Weapon& weapon) {
         return false;
     }
     Display display; display.component = component; display.name = ue::NameOf(component);
+    display.parent = parent; display.parent_name = ue::NameOf(parent); display.socket = attach_to;
+    for (int i = 0; i < 3; ++i) display.base[i] = relative.translation[i];
+    display.hand = HandBone(parent, attach_to);
     session_.displays.push_back(display);
     char socket_text[96]{}, attach_text[96]{}; ue::NameText(socket, socket_text, sizeof(socket_text)); ue::NameText(attach_to, attach_text, sizeof(attach_text));
-    Logf("GRAB_EXTRAS boss weapon shown %s socket=%s attached=%s mode=%s %s", weapon.class_path, socket_text, attach_text, mode, is_skeletal ? "skeletal" : "static");
+    Logf("GRAB_EXTRAS boss weapon shown %s socket=%s attached=%s mode=%s %s scale=%.3f", weapon.class_path, socket_text, attach_text, mode, is_skeletal ? "skeletal" : "static", session_.scale);
     return true;
 }
 // The grab's own visibility actions (GAAction_ForceWeaponVisibility) call
@@ -525,7 +622,7 @@ void SetOptions(const Options& value) {
 }
 Options GetOptions() { AcquireSRWLockShared(&lock_); const Options o = options_; ReleaseSRWLockShared(&lock_); return o; }
 std::wstring LastResult() { AcquireSRWLockShared(&lock_); std::wstring text = result_; ReleaseSRWLockShared(&lock_); return text; }
-void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move) {
+void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move, double hero_over_boss) {
     if (session_.active) Finish(false);
     session_ = {};
     if (!ue::Alive(pawn) || !ue::Alive(target)) return;
@@ -533,6 +630,12 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
     for (const char* c = move; c && *c; ++c) session_.move.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*c)));
     session_.pawn = pawn; session_.pawn_name = ue::NameOf(pawn);
     session_.target = target; session_.target_name = ue::NameOf(target);
+    session_.began = GetTickCount64(); session_.grab_montage = CurrentMontage(pawn);
+    double size = 1; if (skin_display_ && !ue::Alive(reinterpret_cast<Object*>(skin_display_(size)))) size = 1;
+    if (!std::isfinite(size) || size < .1 || size > 10) size = 1;
+    if (!std::isfinite(hero_over_boss) || hero_over_boss < .1 || hero_over_boss > 10) hero_over_boss = 1;
+    session_.model = size; session_.scale = size * hero_over_boss;
+    Logf("GRAB_EXTRAS grab size: model %.3f x hero/boss %.3f = boss weapon scale %.3f (victim as authored)", size, hero_over_boss, session_.scale);
     float hp = 0, maximum = 0;
     if (ReadHealth(target, hp, maximum)) { session_.hp_begin = hp; session_.hp_max = maximum; }
     if (session_.options.hide_weapon) {
@@ -541,18 +644,19 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
         if (holder.Invoke()) session_.weapons_component = holder.Get<Object*>("ReturnValue");
         for (size_t i = 0; weapons && i < weapon_count && i < kMaxWeapons; ++i) if (weapons[i].proxy_mesh) {
             Object* mesh = nullptr; ReadField(pawn, "Mesh", mesh);
-            if (CreateProxy(pawn, mesh, weapons[i].proxy_mesh, weapons[i].proxy_scale > .05 ? weapons[i].proxy_scale : 1.0)) { SyncProxy(); break; }
+            if (CreateProxy(pawn, mesh, weapons[i].proxy_mesh, (weapons[i].proxy_scale > .05 ? weapons[i].proxy_scale : 1.0) * session_.model)) { SyncProxy(); break; }
         }
         for (size_t i = 0; weapons && i < weapon_count && i < kMaxWeapons; ++i) ShowWeapon(pawn, weapons[i]);
-        UpdateDisplays();
+        UpdateDisplays(); FollowSkinHands();
     }
     session_.next_scan = GetTickCount64() + 100;
     Logf("GRAB_EXTRAS begin hide_weapon=%d own_weapons=%zu boss_weapons=%zu/%zu target_hp=%.1f/%.1f damage_mode=%d", session_.options.hide_weapon ? 1 : 0,
         session_.hidden.size(), session_.displays.size(), weapon_count, session_.hp_begin, session_.hp_max, static_cast<int>(session_.options.damage));
 }
 void Tick() {
-    if (!session_.active || !session_.options.hide_weapon) return;
-    if (!Same(session_.pawn, session_.pawn_name)) return;
+    if (!session_.active || !Same(session_.pawn, session_.pawn_name)) return;
+    UpdatePosing();
+    if (!session_.options.hide_weapon) return;
     // Cheap re-check of known actors every tick; full re-scan for newly
     // attached weapons a few times per second.
     for (const HiddenActor& item : session_.hidden) {
@@ -563,6 +667,7 @@ void Tick() {
     if (GetTickCount64() >= session_.next_scan) { session_.next_scan = GetTickCount64() + 250; HideWeapons(); }
     SyncProxy();
     UpdateDisplays();
+    FollowSkinHands();
 }
 void Finish(bool completed) {
     if (!session_.active) return;
@@ -573,6 +678,8 @@ void Finish(bool completed) {
     session_ = {};
 }
 bool Active() { return session_.active; }
+bool Posing() { return session_.active && !session_.pose_over; }
+void SetSkinDisplay(SkinDisplay provider) { skin_display_ = provider; }
 void SourceEnded() {
     if (!session_.active || session_.damage_done) return;
     session_.damage_done = true; ApplyDamage();

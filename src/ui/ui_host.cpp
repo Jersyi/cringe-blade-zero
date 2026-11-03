@@ -1,4 +1,5 @@
 #include "ui_host.h"
+#include <cstdio>
 #include <cwchar>
 
 namespace UiHost {
@@ -8,6 +9,30 @@ POINT origin_{};
 int client_w_ = 0, client_h_ = 0;
 bool ready_ = false, foreground_ = false;
 ULONGLONG next_scan_ = 0;
+HHOOK guard_ = nullptr;
+void (*log_)(const char*) = nullptr;
+int guard_logs_ = 0;
+
+// A popup made a child after creation (glass plate) and a child detached before
+// destruction (load banner) were both activated on the way. Windows with a caption
+// are real standalone windows and keep normal activation.
+LRESULT CALLBACK Guard(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HCBT_ACTIVATE) {
+        const HWND window = reinterpret_cast<HWND>(wparam);
+        if (window && GetWindowThreadProcessId(window, nullptr) == GetCurrentThreadId() &&
+            (GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) != WS_CAPTION) {
+            if (log_ && guard_logs_ < 8) {
+                ++guard_logs_;
+                wchar_t type[96]{}; GetClassNameW(window, type, 96);
+                char line[200]{};
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "UI_FOCUS kept the game active: activation of %ls refused", type);
+                log_(line);
+            }
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
 
 bool IsGame(HWND window) {
     DWORD process = 0;
@@ -51,6 +76,10 @@ void Refresh() {
     if (foreground) GetWindowThreadProcessId(foreground, &process);
     foreground_ = process == GetCurrentProcessId();
 }
+}
+void GuardActivation(void (*log)(const char*)) {
+    log_ = log;
+    if (!guard_) guard_ = SetWindowsHookExW(WH_CBT, &Guard, nullptr, GetCurrentThreadId());
 }
 void Tick() { Refresh(); }
 HWND Game() { return IsGame(game_) ? game_ : nullptr; }

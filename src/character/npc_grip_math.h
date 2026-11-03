@@ -111,23 +111,25 @@ inline bool GeometryBasis(const double a[3][3],const double b[3][3],double* q) {
     double n=0;for(size_t i=0;i<4;++i)n+=q[i]*q[i];if(!std::isfinite(n)||n<1e-10)return false;n=std::sqrt(n);for(size_t i=0;i<4;++i)q[i]/=n;return true;
 }
 
-template<class T> bool MapSourceMountPose(const T* source,const T* target,size_t anchor,size_t target_anchor,int32_t palm,int32_t target_palm,const T& mount,const double* basis,const T& component_space,T& result) {
-    // This is a rigid left mapping in component space. Scaling by either
-    // character's hand/torso would resize swords and would not commute with
-    // the weapon actor's existing relative TRS. Native source mount scale is
-    // retained, including authored zero-scale visibility / mirrored effects.
-    T mapped;if(!FiniteMount(mount)||!FiniteMount(source[anchor])||!FiniteMount(target[target_anchor]))return false;
+template<class T> bool MapSourceMountPose(const T* source,const T* target,size_t anchor,size_t target_anchor,int32_t palm,int32_t target_palm,const T& mount,const double* basis,const T& component_space,T& result,double scale=1) {
+    // A left mapping in component space: turn by the hand frame, move the palm
+    // (or anchor bone) onto the target's, and scale uniformly about it by the
+    // body size ratio (NpcPoseTransfer::WeaponScale), so a giant holds a giant's
+    // weapon and the grip point stays in its fist. A uniform scale commutes
+    // with the weapon actor's relative TRS. Native mount scale is multiplied,
+    // keeping authored zero-scale visibility / mirrored effects.
+    T mapped;if(!FiniteMount(mount)||!FiniteMount(source[anchor])||!FiniteMount(target[target_anchor])||!std::isfinite(scale)||!(scale>0))return false;
     double inverse[4],tmp[4],rotation[4],offset[3],moved[3];Inverse(source[anchor].rotation,inverse);Mul(target[target_anchor].rotation,basis,tmp);Mul(tmp,inverse,rotation);Mul(rotation,mount.rotation,mapped.rotation);
     const T& source_pivot=palm>=0?source[static_cast<size_t>(palm)]:source[anchor];const T& target_pivot=target_palm>=0?target[static_cast<size_t>(target_palm)]:target[target_anchor];
     if(!FiniteMount(source_pivot)||!FiniteMount(target_pivot))return false;
-    for(size_t i=0;i<3;++i)offset[i]=mount.translation[i]-source_pivot.translation[i];Rotate(rotation,offset,moved);
-    for(size_t i=0;i<3;++i){mapped.translation[i]=target_pivot.translation[i]+moved[i];mapped.scale[i]=mount.scale[i];}
+    for(size_t i=0;i<3;++i)offset[i]=(mount.translation[i]-source_pivot.translation[i])*scale;Rotate(rotation,offset,moved);
+    for(size_t i=0;i<3;++i){mapped.translation[i]=target_pivot.translation[i]+moved[i];mapped.scale[i]=mount.scale[i]*scale;}
     return ComposeMount(mapped,component_space,result);
 }
 
-template<class T> bool MapSourceMount(const T* source,const T* target,size_t bone,size_t anchor,size_t target_anchor,int32_t palm,int32_t target_palm,const T& socket_local,const double* basis,const T& component_space,T& result) {
+template<class T> bool MapSourceMount(const T* source,const T* target,size_t bone,size_t anchor,size_t target_anchor,int32_t palm,int32_t target_palm,const T& socket_local,const double* basis,const T& component_space,T& result,double scale=1) {
     T mount;if(!ComposeMount(socket_local,source[bone],mount))return false;
-    return MapSourceMountPose(source,target,anchor,target_anchor,palm,target_palm,mount,basis,component_space,result);
+    return MapSourceMountPose(source,target,anchor,target_anchor,palm,target_palm,mount,basis,component_space,result,scale);
 }
 
 }

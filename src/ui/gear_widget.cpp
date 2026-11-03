@@ -91,7 +91,7 @@ void Apply(int g) {
     SettingsStore::PutInt(L"Gear", L"Level", g);
     applied_ = g;
     char line[200]{};
-    sprintf_s(line, "GEAR level=%d jc=%d radius=%.0f grab=%d rewards=%d/%d/%d damage=x%.1f ignore_invulnerable=%d accepted air=%d grab=%d",
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "GEAR level=%d jc=%d radius=%.0f grab=%d rewards=%d/%d/%d damage=x%.1f ignore_invulnerable=%d accepted air=%d grab=%d",
         g, plan.jc ? 1 : 0, plan.radius, plan.grab ? 1 : 0, plan.rewards1 ? 1 : 0, plan.rewards2 ? 1 : 0, plan.rewards3 ? 1 : 0,
         plan.multiplier, plan.invulnerable ? 1 : 0, air_ok ? 1 : 0, grab_ok ? 1 : 0);
     Log(line);
@@ -110,12 +110,12 @@ Live Current() {
     live.chips[4] = air.stomp_jump && air.enemy_radius > 250.f;
     wchar_t text[160]{};
     if (live.chips[1]) {
-        if (extras.damage == GrabExtras::Damage::Multiplier) swprintf_s(text, L"%s ×%.1f", UiI18n::Translate(L"投技伤害").c_str(), static_cast<double>(extras.multiplier));
-        else swprintf_s(text, L"%s %.0f%%", UiI18n::Translate(L"投技伤害").c_str(), static_cast<double>(extras.percent));
+        if (extras.damage == GrabExtras::Damage::Multiplier) _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s ×%.1f", UiI18n::Translate(L"投技伤害").c_str(), static_cast<double>(extras.multiplier));
+        else _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s %.0f%%", UiI18n::Translate(L"投技伤害").c_str(), static_cast<double>(extras.percent));
         live.detail = text;
     }
     if (air.stomp_jump) {
-        swprintf_s(text, L"%s %.0f cm", UiI18n::Translate(L"JC 触发").c_str(), static_cast<double>(air.enemy_radius));
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s %.0f cm", UiI18n::Translate(L"JC 触发").c_str(), static_cast<double>(air.enemy_radius));
         if (!live.detail.empty()) live.detail += L"  ·  ";
         live.detail += text;
     }
@@ -131,9 +131,9 @@ Live Preview(int g) {
     live.chips[0] = plan.grab; live.chips[1] = plan.grab && plan.multiplier > 1.f; live.chips[2] = plan.jc;
     live.chips[3] = plan.jc && plan.rewards1; live.chips[4] = plan.jc && plan.radius > 250.f;
     wchar_t text[160]{};
-    if (live.chips[1]) { swprintf_s(text, L"%s ×%.1f", UiI18n::Translate(L"投技伤害").c_str(), static_cast<double>(plan.multiplier)); live.detail = text; }
+    if (live.chips[1]) { _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s ×%.1f", UiI18n::Translate(L"投技伤害").c_str(), static_cast<double>(plan.multiplier)); live.detail = text; }
     if (plan.jc) {
-        swprintf_s(text, L"%s %.0f cm", UiI18n::Translate(L"JC 触发").c_str(), static_cast<double>(plan.radius));
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s %.0f cm", UiI18n::Translate(L"JC 触发").c_str(), static_cast<double>(plan.radius));
         if (!live.detail.empty()) live.detail += L"  ·  ";
         live.detail += text;
     }
@@ -326,7 +326,7 @@ void RenderPanel(ULONGLONG now, const Live& live) {
             const bool selected = TierOf(value_) == k;
             const std::wstring name = UiI18n::Translate(kTiers[k].name);
             Text(name, UiTheme::GetFontFor(UiTheme::Font::Heading, dpi, name.c_str()), R(82, top + 7 + k * 34, 120, 32), selected ? RGB(0x14, 0x12, 0x10) : text, DT_SINGLELINE | DT_LEFT | DT_VCENTER, menu);
-            wchar_t level[32]{}; swprintf_s(level, UiI18n::Translate(L"%d 档").c_str(), kTiers[k].preset);
+            wchar_t level[32]{}; _snwprintf_s(level, _countof(level), _TRUNCATE, UiI18n::Translate(L"%d 档").c_str(), kTiers[k].preset);
             Text(level, small_font, R(200, top + 7 + k * 34, 86, 32), selected ? RGB(0x3a, 0x30, 0x22) : muted, DT_SINGLELINE | DT_RIGHT | DT_VCENTER, menu);
         }
     }
@@ -358,7 +358,7 @@ void RenderPill(double alpha) {
         g.DrawLine(&arrow, Gdiplus::PointF(static_cast<float>(S(cx)), static_cast<float>(S(cy - 3))), Gdiplus::PointF(static_cast<float>(S(cx + 4)), static_cast<float>(S(cy + 2))));
     }
     const UINT dpi = static_cast<UINT>(std::lround(96 * scale_));
-    wchar_t number[8]{}; swprintf_s(number, L"%d", static_cast<int>(std::lround(displayed_)));
+    wchar_t number[8]{}; _snwprintf_s(number, _countof(number), _TRUNCATE, L"%d", static_cast<int>(std::lround(displayed_)));
     Text(number, UiTheme::GetFont(UiTheme::Font::Strong, dpi), R(ring_x, ring_y, ring_d, ring_d), text, DT_SINGLELINE | DT_CENTER | DT_VCENTER, alpha);
     const std::wstring name = UiI18n::Translate(kTiers[tier].name);
     Text(name, UiTheme::GetFontFor(UiTheme::Font::Heading, dpi, name.c_str()), R(ring_x + ring_d + 10, kPillY, kPillW - ring_d - 50, kPillH),
@@ -395,7 +395,7 @@ void RenderBubble(ULONGLONG now, double expand) {
         g.FillEllipse(&shade, circle);
         Gdiplus::Pen gilt(Argb(gold, bubble), static_cast<float>(S(3))); g.DrawEllipse(&gilt, circle.X + static_cast<float>(S(1.5)), circle.Y + static_cast<float>(S(1.5)), circle.Width - static_cast<float>(S(3)), circle.Height - static_cast<float>(S(3)));
     }
-    wchar_t level[32]{}; swprintf_s(level, UiI18n::Translate(L"%d 档").c_str(), static_cast<int>(std::lround(displayed_)));
+    wchar_t level[32]{}; _snwprintf_s(level, _countof(level), _TRUNCATE, UiI18n::Translate(L"%d 档").c_str(), static_cast<int>(std::lround(displayed_)));
     Text(level, UiTheme::GetFont(UiTheme::Font::Small, static_cast<UINT>(std::lround(96 * scale_))), R(cx - size / 2, cy + size / 2 - 30, size, 22), RGB(0xf6, 0xf1, 0xe6), DT_SINGLELINE | DT_CENTER | DT_VCENTER, bubble);
 }
 void Render(ULONGLONG now) {

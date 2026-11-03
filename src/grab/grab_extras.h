@@ -34,7 +34,8 @@ std::wstring LastResult();
 // rest: the source skeleton's weapon bone under its hand (quat xyzw, translation), or null.
 // proxy_mesh: a loaded skeletal mesh on the source Boss's skeleton; an invisible
 // copy replays the player's grab montage so the weapon moves exactly as in the
-// Boss's own performance (proxy_scale maps the Boss's height to the player's).
+// Boss's own performance (proxy_scale maps the Boss's height to the hero's; with an
+// NPC skin it is further scaled by the skin's size, and the weapon with it).
 struct Weapon {
     unsigned char* actor_class = nullptr; const char* class_path = nullptr; const char* socket = nullptr; const double* rest = nullptr;
     unsigned char* proxy_mesh = nullptr; double proxy_scale = 1;
@@ -42,10 +43,21 @@ struct Weapon {
 constexpr size_t kMaxWeapons = 4; // both hands, two pieces each (e.g. forearm guards)
 // Game thread.
 // move: the grab move id, used to remember its native damage.
-void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons = nullptr, size_t weapon_count = 0, const char* move = nullptr);
+// hero_over_boss: the hero's height over the executing boss's (kGrabScales). The boss weapon is
+// scaled to the current model, skin size * hero_over_boss, and follows its hand; the models and the
+// victim keep their own size and the place the paired timeline gives them.
+void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons = nullptr, size_t weapon_count = 0, const char* move = nullptr, double hero_over_boss = 1);
 void Tick();
 void Finish(bool completed);
 bool Active();
+// True from Begin while the player still plays the grab's own montage; false once another montage
+// (or none) takes over, even if the grab ability has not ended yet.
+bool Posing();
+// Game thread: the mesh the player is drawn with when it is not the pawn's own (an NPC skin), else
+// null, and size: that model's height over the hero's (1 without a skin). Each boss weapon is moved
+// every tick by that mesh's hand minus the hand it hangs on.
+using SkinDisplay = unsigned char* (*)(double& size);
+void SetSkinDisplay(SkinDisplay provider);
 // The executor's own grab ended: grab damage is measured and applied now, so
 // hits landed while the target is still getting up are never scaled.
 void SourceEnded();

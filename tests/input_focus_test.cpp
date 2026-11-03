@@ -72,6 +72,9 @@ namespace {
 HWND game_ = nullptr;
 DWORD game_tid_ = 0;
 std::atomic<int> game_keys_{0}, game_setfocus_{0}, game_killfocus_{0}, game_clicks_{0};
+// UE marks Slate inactive on WM_ACTIVATEAPP(FALSE); CommonUI then ignores the mouse in game menus.
+std::atomic<int> game_app_off_{0}, game_app_on_{0}, game_inactive_{0}, game_active_{0}, game_off_by_worker_{0};
+std::atomic<DWORD> game_app_off_thread_{0}, worker_tid_{0};
 std::atomic<bool> stop_{false};
 std::atomic<unsigned> fake_pad_{0};
 std::atomic<int> pad_fires_{0};
@@ -107,6 +110,8 @@ LRESULT CALLBACK GameProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     case WM_SETFOCUS: ++game_setfocus_; break;
     case WM_KILLFOCUS: ++game_killfocus_; break;
     case WM_LBUTTONDOWN: ++game_clicks_; break;
+    case WM_ACTIVATEAPP: if (!wparam) { ++game_app_off_; game_app_off_thread_.store(static_cast<DWORD>(lparam)); if (static_cast<DWORD>(lparam) == worker_tid_.load()) ++game_off_by_worker_; } else ++game_app_on_; break;
+    case WM_ACTIVATE: if (LOWORD(wparam) == WA_INACTIVE) ++game_inactive_; else ++game_active_; break;
     case WM_PAINT: {
         PAINTSTRUCT paint{}; HDC dc = BeginPaint(window, &paint);
         FillRect(dc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
@@ -155,9 +160,21 @@ DWORD WINAPI FakeXInput(DWORD user, void* state) {
     std::memcpy(bytes + 4, &buttons, 2);
     return ERROR_SUCCESS;
 }
+// Which worker window takes activation (the game thread then sees WM_ACTIVATEAPP FALSE).
+LRESULT CALLBACK WorkerCbt(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HCBT_ACTIVATE) {
+        wchar_t name[96]{}; GetClassNameW(reinterpret_cast<HWND>(wparam), name, 96);
+        Log("  [cbt] worker activates %p (%ls) child=%d", reinterpret_cast<void*>(wparam), name,
+            (GetWindowLongPtrW(reinterpret_cast<HWND>(wparam), GWL_STYLE) & WS_CHILD) ? 1 : 0);
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
 DWORD WINAPI WorkerMain(void* ready) {
+    worker_tid_.store(GetCurrentThreadId());
+    SetWindowsHookExW(WH_CBT, &WorkerCbt, nullptr, GetCurrentThreadId());
     const std::wstring path = IniPath(); const wchar_t* ini = path.c_str();
     UiHotkeys::SetXInputForTest(&FakeXInput);
+    UiHost::GuardActivation(&LogLine); UiCursor::SetLogger(&LogLine);
     UiI18n::Initialize(ini); UiTheme::Initialize(); DebugHub::Initialize(); UiHotkeys::Initialize(ini);
     UiHotkeys::Bind(UiHotkeys::Action::GearUp, [] { ++pad_fires_; });
     UiLoadBanner::Initialize(&LogLine); EntryFocus::Initialize();
@@ -199,9 +216,9 @@ std::string Describe(HWND window) {
 void Report(const char* phase) {
     GUITHREADINFO info{sizeof(info)};
     GetGUIThreadInfo(game_tid_, &info);
-    Log("[%s] foreground=%s game-thread focus=%s active=%s game set/kill focus=%d/%d", phase,
+    Log("[%s] foreground=%s game-thread focus=%s active=%s game set/kill focus=%d/%d app off/on=%d/%d window off/on=%d/%d (off by tid %lu)", phase,
         Describe(GetForegroundWindow()).c_str(), Describe(info.hwndFocus).c_str(), Describe(info.hwndActive).c_str(),
-        game_setfocus_.load(), game_killfocus_.load());
+        game_setfocus_.load(), game_killfocus_.load(), game_app_off_.load(), game_app_on_.load(), game_inactive_.load(), game_active_.load(), game_app_off_thread_.load());
 }
 // Presses F24 (unbound everywhere) count times; returns how many the fake game saw.
 int Keys(int count) {
@@ -467,6 +484,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     } else Check(false, "hotkey page has the gear bind boxes and the glyph switch");
     DebugHub::Toggle(); Sleep(900);
     Check(Keys(3) == 3, "keys reach the game after the mouse checks");
+    Report("end");
+    Check(game_off_by_worker_.load() == 0, "the hub's thread never deactivates the game window (UE would drop menu mouse input)");
     Log("worst F24 delivery latency: %.1f ms", worst_latency_us_.load() / 1000.0);
     Check(worst_latency_us_.load() < 120000, "key delivery stays under 120 ms");
 

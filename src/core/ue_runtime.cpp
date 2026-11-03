@@ -58,7 +58,7 @@ bool NameIs(Name name, const char* wanted) {
     const unsigned char* text = nullptr; size_t length = 0; bool wide = false;
     if (!Entry(name, text, length, wide)) return false;
     char suffix[16]{};
-    if (name.number) sprintf_s(suffix, "_%u", name.number - 1);
+    if (name.number) _snprintf_s(suffix, sizeof(suffix), _TRUNCATE, "_%u", name.number - 1);
     const size_t want = std::strlen(wanted), extra = std::strlen(suffix);
     if (want != length + extra) return false;
     for (size_t i = 0; i < length; ++i) {
@@ -72,14 +72,14 @@ bool NameIs(Name name, const char* wanted) {
 void NameText(Name name, char* out, size_t size) {
     const unsigned char* text = nullptr; size_t length = 0; bool wide = false;
     if (!size) return;
-    if (!Entry(name, text, length, wide)) { strcpy_s(out, size, "?"); return; }
+    if (!Entry(name, text, length, wide)) { strncpy_s(out, size, "?", _TRUNCATE); return; }
     size_t n = 0;
     for (; n < length && n + 1 < size; ++n) {
         const unsigned c = wide ? (text[n * 2] | text[n * 2 + 1] << 8) : text[n];
         out[n] = c < 128 ? static_cast<char>(c) : '?';
     }
     out[n] = 0;
-    if (name.number) { char suffix[16]{}; sprintf_s(suffix, "_%u", name.number - 1); strcat_s(out, size, suffix); }
+    if (name.number) { char suffix[16]{}; _snprintf_s(suffix, sizeof(suffix), _TRUNCATE, "_%u", name.number - 1); strncat_s(out, size, suffix, _TRUNCATE); }
 }
 bool NameContains(Name name, const char* const* needles, size_t count) {
     char text[256]{}; NameText(name, text, sizeof(text));
@@ -118,9 +118,11 @@ Object* FindObject(const char* path) {
     }
     const char* leaf = path + std::strlen(path);
     while (leaf > path && leaf[-1] != '.' && leaf[-1] != ':' ) --leaf;
+    // Only a live object: one the collector has already marked unreachable (a blueprint class nothing
+    // holds any more) is purged a moment later, and using it then crashes the game.
     Object* found = nullptr;
     ForEachObject([&](Object* o) {
-        if (NameIs(NameOf(o), leaf) && MatchPath(o, path)) { found = o; return false; }
+        if (NameIs(NameOf(o), leaf) && MatchPath(o, path) && Alive(o)) { found = o; return false; }
         return true;
     });
     if (found) object_cache[path] = found;
@@ -173,11 +175,11 @@ bool ValidateLayout(char* why, size_t size) {
     };
     for (const Expect& e : expected) {
         Object* s = FindObject(e.strukt);
-        if (!s || Offset(s, e.property) != e.offset) { sprintf_s(why, size, "layout %s.%s", e.strukt, e.property); return false; }
+        if (!s || Offset(s, e.property) != e.offset) { _snprintf_s(why, size, _TRUNCATE, "layout %s.%s", e.strukt, e.property); return false; }
     }
     Object* object_cdo = FindObject("/Script/CoreUObject.Default__Object");
     if (!object_cdo || Read<uintptr_t>(Read<uintptr_t>(Addr(object_cdo)) + layout::kProcessEventSlot * 8) != base_ + layout::kProcessEvent) {
-        strcpy_s(why, size, "ProcessEvent slot"); return false;
+        strncpy_s(why, size, "ProcessEvent slot", _TRUNCATE); return false;
     }
     return true;
 }

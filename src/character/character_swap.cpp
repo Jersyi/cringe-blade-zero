@@ -34,10 +34,10 @@ ULONGLONG waiting_deadline_ = 0;
 
 void Logf(const char* format, ...) {
     if (!logger_) return;
-    char line[800]{}; va_list arguments; va_start(arguments, format); vsprintf_s(line, format, arguments); va_end(arguments); logger_(line);
+    char line[800]{}; va_list arguments; va_start(arguments, format); _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, arguments); va_end(arguments); logger_(line);
 }
 void Status(const wchar_t* format, ...) {
-    wchar_t text[640]{}; va_list arguments; va_start(arguments, format); vswprintf_s(text, format, arguments); va_end(arguments);
+    wchar_t text[640]{}; va_list arguments; va_start(arguments, format); _vsnwprintf_s(text, _countof(text), _TRUNCATE, format, arguments); va_end(arguments);
     AcquireSRWLockExclusive(&state_lock); snapshot_.status = text; ReleaseSRWLockExclusive(&state_lock);
 }
 void Active(bool active, bool busy = false) {

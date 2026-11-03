@@ -114,10 +114,10 @@ bool GameplayInputAllowed(const Context& context);
 
 void Logf(const char* format, ...) {
     if (!logger_) return;
-    char text[1024]{}; va_list args; va_start(args, format); vsprintf_s(text, format, args); va_end(args); logger_(text);
+    char text[1024]{}; va_list args; va_start(args, format); _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, args); va_end(args); logger_(text);
 }
 void Status(const wchar_t* format, ...) {
-    wchar_t text[640]{}; va_list args; va_start(args, format); vswprintf_s(text, format, args); va_end(args);
+    wchar_t text[640]{}; va_list args; va_start(args, format); _vsnwprintf_s(text, _countof(text), _TRUNCATE, format, args); va_end(args);
     AcquireSRWLockExclusive(&state_lock); state_.status = text; ReleaseSRWLockExclusive(&state_lock);
 }
 bool Readable(const void* pointer, size_t bytes) {
@@ -1220,7 +1220,7 @@ void JcGate(const char* reason,const wchar_t* message,Object* ability=nullptr,Na
     char tag_text[192]{}; if (!tag.None()) ue::NameText(tag,tag_text,sizeof(tag_text));
     const std::wstring object=ue::Alive(ability)?ObjectText(ue::ClassOf(ability)):L"";
     wchar_t text[512]{};
-    swprintf_s(text,L"%s%s%s%hs",message,object.empty()?L"":L"：",object.c_str(),tag_text);
+    _snwprintf_s(text,_countof(text),_TRUNCATE,L"%s%s%s%hs",message,object.empty()?L"":L"：",object.c_str(),tag_text);
     AcquireSRWLockExclusive(&state_lock); state_.jc_status=text; const uint32_t edges=state_.jump_edges; ReleaseSRWLockExclusive(&state_lock);
     const ULONGLONG now=GetTickCount64();
     auto gate=std::find_if(gate_logs_.begin(),gate_logs_.end(),[&](const GateLog& item) { return !std::strcmp(item.reason,reason); });

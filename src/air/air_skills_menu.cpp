@@ -43,8 +43,8 @@ void Populate() {
     SendMessageW(step_,BM_SETCHECK,state.options.stomp_jump?BST_CHECKED:BST_UNCHECKED,0);
     SendMessageW(slow_,BM_SETCHECK,state.options.slow_fall?BST_CHECKED:BST_UNCHECKED,0);
     for (const auto& reward:rewards_) SendMessageW(reward.window,BM_SETCHECK,state.options.*(reward.option)?BST_CHECKED:BST_UNCHECKED,0);
-    wchar_t text[80]{}; swprintf_s(text,L"%.0f",state.options.bounce_speed); SetWindowTextW(speed_,text);
-    swprintf_s(text,L"%.0f",state.options.enemy_radius); SetWindowTextW(radius_,text);
+    wchar_t text[80]{}; _snwprintf_s(text, _countof(text), _TRUNCATE,L"%.0f",state.options.bounce_speed); SetWindowTextW(speed_,text);
+    _snwprintf_s(text, _countof(text), _TRUNCATE,L"%.0f",state.options.enemy_radius); SetWindowTextW(radius_,text);
 }
 bool Number(HWND edit,float& value) {
     wchar_t text[80]{}; GetWindowTextW(edit,text,static_cast<int>(sizeof(text)/sizeof(text[0])));
@@ -81,18 +81,18 @@ void Refresh() {
     UiI18n::SetText(status_,state.status.c_str());
     UiI18n::SetText(jc_gate_,state.jc_status.c_str());
     wchar_t distance[48]{};
-    if (state.nearest_enemy_surface>=0) swprintf_s(distance,L"%.0f cm",state.nearest_enemy_surface);
-    else wcscpy_s(distance,L"尚未识别/测量");
+    if (state.nearest_enemy_surface>=0) _snwprintf_s(distance, _countof(distance), _TRUNCATE,L"%.0f cm",state.nearest_enemy_surface);
+    else wcsncpy_s(distance,L"尚未识别/测量", _TRUNCATE);
     wchar_t pure[128]{},shadow[128]{};
     const auto resource=[](wchar_t* text,size_t count,const AirSkills::ResourceReward& value,const wchar_t* label) {
-        if (!value.known) swprintf_s(text,count,L"%s：尚无奖励读回",label);
-        else swprintf_s(text,count,L"%s %.0f→%.0f / %.0f（+%.0f，%s）",label,value.before,value.after,value.maximum,value.after-value.before,value.verified?L"已核对":L"未通过");
+        if (!value.known) _snwprintf_s(text,count, _TRUNCATE,L"%s：尚无奖励读回",label);
+        else _snwprintf_s(text,count, _TRUNCATE,L"%s %.0f→%.0f / %.0f（+%.0f，%s）",label,value.before,value.after,value.maximum,value.after-value.before,value.verified?L"已核对":L"未通过");
     };
     resource(pure,std::size(pure),state.pure_shachi,L"精纯杀气"); resource(shadow,std::size(shadow),state.spirit_shadow,L"意识之影");
-    if (!state.options.reward_pure_shachi) wcscpy_s(pure,L"精纯杀气：奖励关闭");
-    if (!state.options.reward_spirit_shadow) wcscpy_s(shadow,L"意识之影：奖励关闭");
+    if (!state.options.reward_pure_shachi) wcsncpy_s(pure,L"精纯杀气：奖励关闭", _TRUNCATE);
+    if (!state.options.reward_spirit_shadow) wcsncpy_s(shadow,L"意识之影：奖励关闭", _TRUNCATE);
     wchar_t text[1200]{};
-    swprintf_s(text,L"已应用开关：空中/打断 %s　近敌 JC %s　真实跳跃边沿 %u　JC 已确认 %u\r\n主角：%s　跳跃输入：%s　优先级 %d（%s）　已打断技能 %u\r\n近敌候选 %u/%u；AI/队伍/生命拒绝 %u/%u/%u；最近按跳距离 %s（范围 %.0f cm）\r\n技能奖励[%s]累计CD %u / 充能 %u / 未通过 %u　杀气[%s] %.1f / %.1f；扫描 %u 输入资产/%u 技能项\r\n%s　%s\r\n武器切换CD：%s；上次读回 %u 槽，累计成功 %u / 未通过 %u（不跳过切换动作）\r\n仅本次JC下降 %s　重力 %.3f → %.3f　下降上限 %.0f cm/s；待适配 %zu\r\n输入副本 %u　强引用 %u　恢复：%s",
+    _snwprintf_s(text, _countof(text), _TRUNCATE,L"已应用开关：空中/打断 %s　近敌 JC %s　真实跳跃边沿 %u　JC 已确认 %u\r\n主角：%s　跳跃输入：%s　优先级 %d（%s）　已打断技能 %u\r\n近敌候选 %u/%u；AI/队伍/生命拒绝 %u/%u/%u；最近按跳距离 %s（范围 %.0f cm）\r\n技能奖励[%s]累计CD %u / 充能 %u / 未通过 %u　杀气[%s] %.1f / %.1f；扫描 %u 输入资产/%u 技能项\r\n%s　%s\r\n武器切换CD：%s；上次读回 %u 槽，累计成功 %u / 未通过 %u（不跳过切换动作）\r\n仅本次JC下降 %s　重力 %.3f → %.3f　下降上限 %.0f cm/s；待适配 %zu\r\n输入副本 %u　强引用 %u　恢复：%s",
         state.options.air_skills?L"开":L"关",state.options.stomp_jump?L"开":L"关",state.jump_edges,state.bounces,
         state.ready?L"已就绪":L"等待",state.jump_input_ready?L"已识别":L"未识别",state.jump_priority,state.jump_priority_ready?L"已应用":L"未应用",state.jump_cancels,
         state.stomp_targets,state.scanned_pawns,state.enemy_ai_rejected,state.enemy_team_rejected,state.enemy_health_rejected,distance,state.options.enemy_radius,
@@ -105,7 +105,7 @@ void Refresh() {
     wchar_t guard[220]{};
     const std::wstring guard_format=UiI18n::Translate(L"\r\nL1 防御闪避 CD：%s；自身冷却效果 %d→%d，累计成功 %u / 未通过 %u");
     const std::wstring guard_state=UiI18n::Translate(!state.options.reward_guard_dodge?L"奖励关闭":state.last_guard_dodge_verified?L"已归零":state.guard_dodge_known?L"未通过":L"尚无奖励读回");
-    swprintf_s(guard,guard_format.c_str(),guard_state.c_str(),
+    _snwprintf_s(guard,_countof(guard),_TRUNCATE,guard_format.c_str(),guard_state.c_str(),
         state.guard_dodge_effects_before,state.guard_dodge_effects_after,state.guard_dodge_resets,state.guard_dodge_failures);
     UiI18n::SetText(summary_,(std::wstring(text)+guard).c_str());
     const LRESULT selection=SendMessageW(skills_,LB_GETCURSEL,0,0),top=SendMessageW(skills_,LB_GETTOPINDEX,0,0);
@@ -113,7 +113,7 @@ void Refresh() {
     if (state.skills.empty()) UiI18n::AddString(skills_,LB_ADDSTRING,0,L"当前未识别到战技/杀气技能实例；不开启时不扫描主角。");
     for (const auto& skill:state.skills) {
         wchar_t row[1000]{};
-        swprintf_s(row,L"[%s] %s　充能 %d/%d　CD %.3f s　%s",skill.input_action.c_str(),skill.ability.c_str(),skill.charges,skill.maximum_charges,skill.cooldown,skill.restored?L"充能和CD已恢复":L"充能或CD未满");
+        _snwprintf_s(row, _countof(row), _TRUNCATE,L"[%s] %s　充能 %d/%d　CD %.3f s　%s",skill.input_action.c_str(),skill.ability.c_str(),skill.charges,skill.maximum_charges,skill.cooldown,skill.restored?L"充能和CD已恢复":L"充能或CD未满");
         UiI18n::AddString(skills_,LB_ADDSTRING,0,row);
     }
     for (const auto& skill:state.unadapted_skills) {

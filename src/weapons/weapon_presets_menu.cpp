@@ -110,7 +110,7 @@ void PaintGroup(HDC dc,Gdiplus::Graphics& graphics,HWND window,const Geometry& g
         const std::wstring name=info.name?info.name:weapons[i];
         Label(dc,name,{text_left,tile.top+m.S(6),tile.right-m.S(10),middle+m.S(2)},UiTheme::GetFont(on?UiTheme::Font::Strong:UiTheme::Font::Body,window),
             on?UiTheme::Text():UiTheme::Mix(UiTheme::MutedText(),UiTheme::Text(),70),DT_SINGLELINE|DT_BOTTOM|DT_LEFT|DT_END_ELLIPSIS);
-        wchar_t slot[64]{}; swprintf_s(slot,Tr(L"槽位 %d").c_str(),static_cast<int>(i)+1);
+        wchar_t slot[64]{}; _snwprintf_s(slot, _countof(slot), _TRUNCATE,Tr(L"槽位 %d").c_str(),static_cast<int>(i)+1);
         Label(dc,on?Tr(L"使用中"):std::wstring(slot),{text_left,middle+m.S(3),tile.right-m.S(10),tile.bottom-m.S(4)},UiTheme::GetFont(UiTheme::Font::Small,window),
             on?UiTheme::Accent():UiTheme::MutedText(),DT_SINGLELINE|DT_TOP|DT_LEFT|DT_END_ELLIPSIS);
     }

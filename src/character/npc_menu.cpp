@@ -66,16 +66,28 @@ std::wstring BoneEvidence(const std::string& id) {
             L"NPC 另有 86 根专有骨；保留主角完整动画骨架，武器按当前姿势与 NPC 手部比例适配。";
     if (id == "MoTian")
         return L"骨架差异：Hun 1134 骨 → 魔渊 1004 骨；已核定共享骨 1004。\r\n"
+            L"保留主角完整动画骨架与武器子骨骼运动。包含原 NPC 的头部静态附件与胡须。";
+    if (id == "MoTianYoung")
+        return L"骨架差异：Hun 1134 骨 → 魔渊 1004 骨；已核定共享骨 1004。\r\n"
             L"保留主角完整动画骨架与武器子骨骼运动。包含原 NPC 的头部静态附件。";
-    return L"此项尚未附骨架差异核定资料。";
+    if (id == "ZuoShang")
+        return L"骨架差异：Hun 1134 骨 → 左殇 1004 骨；已核定共享骨 1004。\r\n"
+            L"终战造型：白发发片、Hair02 发束与对应面部材质；保留主角完整动画骨架与武器子骨骼运动。";
+    if (id == "ZuoShangLongTi")
+        return L"骨架差异：Hun 1134 骨 → 左殇：真龙之躯 1035 骨；已核定共享骨 999。\r\n"
+            L"NPC 另有 36 根专有骨；独立面部为 856 骨，按自身 DNA 驱动。";
+    if (id == "AHua")
+        return L"骨架差异：Hun 1134 骨 → 新娘阿花 161 骨；已核定共享骨 161。\r\n"
+            L"简化骨架，头部在身体网格中，没有独立面部；手部与武器骨完整。";
+    return L""; // Boss profiles carry their skeleton comparison in the generated detail.
 }
 void SelectionChanged() {
     const NpcRetarget::Entry* entry = Selected();
     if (entry) {
-        const std::wstring id(entry->id.begin(), entry->id.end());
+        const std::wstring id(entry->id.begin(), entry->id.end()), evidence = BoneEvidence(entry->id);
         SetText(detail_, entry->name + L" · 原 NPC 模型 / 实验适配\r\n标识：" + id + L"\r\n\r\n" +
-            BoneEvidence(entry->id) + L"\r\n\r\n" + entry->detail);
-    } else SetText(detail_, L"选择沐小葵或魔渊查看来源、骨架差异与适配范围。\r\n这两项属于原 NPC 模型，不属于主角的同名套装。");
+            (evidence.empty() ? L"" : evidence + L"\r\n\r\n") + entry->detail);
+    } else SetText(detail_, L"选择一个 NPC 查看来源、骨架差异与适配范围。\r\n这些项目属于原 NPC 模型，不属于主角的同名套装。");
     const bool can_request = snapshot_.ready && !snapshot_.busy && entry;
     EnableWindow(inspect_, can_request); EnableWindow(apply_, can_request && snapshot_.experimental && snapshot_.appearance_gate && !snapshot_.cleanup_pending && !snapshot_.disabled);
     EnableWindow(restore_, snapshot_.active || snapshot_.busy || snapshot_.cleanup_pending);
@@ -257,7 +269,7 @@ bool Create() {
     dpi_ = static_cast<int>(GetDpiForWindow(window_)); if (dpi_ <= 0) dpi_ = 96; Font();
     title_ = Control(L"STATIC", L"NPC 原模型 · 实验重定向", SS_LEFT, 0);
     UiTheme::SetRole(title_, UiTheme::Role::Section);
-    introduction_ = Control(L"EDIT", L"保留主角操作与能力，使用沐小葵 / 魔渊的原 NPC 外观。\r\n更换会等待空闲；可随时提交恢复请求。这里的模型仍需完成实机动作与部件验收。", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0);
+    introduction_ = Control(L"EDIT", L"保留主角操作与能力，使用沐小葵、魔渊、左殇、虚空等原 NPC 与全部人形 Boss 的外观（可搜索）。\r\n更换会等待空闲；可随时提交恢复请求。这里的模型仍需完成实机动作与部件验收。", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0);
     search_label_ = Control(L"STATIC", L"搜索", SS_LEFT, 0);
     search_ = Control(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, kSearch, WS_EX_CLIENTEDGE);
     SendMessageW(search_, EM_SETLIMITTEXT, 128, 0);

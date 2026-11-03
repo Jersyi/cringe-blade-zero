@@ -25,7 +25,7 @@ void Log(const char* message) {
     LARGE_INTEGER size{};
     if (GetFileSizeEx(file, &size) && size.QuadPart >= 256 * 1024) {  // keep one previous log
         CloseHandle(file);
-        wchar_t previous[MAX_PATH + 16]{}; swprintf_s(previous, L"%s.previous", log_path);
+        wchar_t previous[MAX_PATH + 16]{}; _snwprintf_s(previous, _countof(previous), _TRUNCATE, L"%s.previous", log_path);
         if (!MoveFileExW(log_path, previous, MOVEFILE_REPLACE_EXISTING)) return;
         file = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE) return;
@@ -41,7 +41,7 @@ BOOL CALLBACK LoadSystem(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t directory[MAX_PATH]{};
     const UINT n = GetSystemDirectoryW(directory, MAX_PATH);
     if (n > 0 && n + 13 < MAX_PATH) {
-        wcscat_s(directory, L"\\version.dll");
+        wcsncat_s(directory, L"\\version.dll", _TRUNCATE);
         HMODULE real = LoadLibraryExW(directory, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (real && real != self_module)
             for (size_t i = 0; i < kExportCount; ++i) system_functions[i] = GetProcAddress(real, kExportNames[i]);
@@ -56,7 +56,7 @@ DWORD WINAPI Worker(void*) {
     HMODULE pinned = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&Worker), &pinned);
     if (GetModuleFileNameW(self_module, log_path, MAX_PATH)) {
-        if (wchar_t* slash = wcsrchr(log_path, L'\\')) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - log_path), L"PBZTriggersOff.log");
+        if (wchar_t* slash = wcsrchr(log_path, L'\\')) wcsncpy_s(slash + 1, MAX_PATH - (slash + 1 - log_path), L"PBZTriggersOff.log", _TRUNCATE);
         else log_path[0] = 0;
     }
     PadTriggers::Attach(&Log, nullptr);

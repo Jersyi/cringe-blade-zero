@@ -24,7 +24,7 @@ Snapshot snapshot_;
 void Log(const char* format, ...) {
     if (!logger_) return;
     char line[400]{}; va_list args; va_start(args, format);
-    vsprintf_s(line, format, args); va_end(args); logger_(line);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args); va_end(args); logger_(line);
 }
 void Publish() {
     Snapshot value{actor_owned_, tag_state_ == TagState::Owned, pause_owned_,

@@ -95,11 +95,11 @@ bool outfit_disable_deferred_ = false;
 
 void Logf(const char* format, ...) {
     if (!log_) return;
-    char line[600]{}; va_list args; va_start(args, format); vsprintf_s(line, format, args); va_end(args); log_(line);
+    char line[600]{}; va_list args; va_start(args, format); _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args); va_end(args); log_(line);
 }
 void SetStatus(const wchar_t* format, ...) {
-    wchar_t text[320]{}; va_list args; va_start(args, format); vswprintf_s(text, format, args); va_end(args);
-    AcquireSRWLockExclusive(&status_lock); wcscpy_s(status_, text); ReleaseSRWLockExclusive(&status_lock);
+    wchar_t text[320]{}; va_list args; va_start(args, format); _vsnwprintf_s(text, _countof(text), _TRUNCATE, format, args); va_end(args);
+    AcquireSRWLockExclusive(&status_lock); wcsncpy_s(status_, text, _TRUNCATE); ReleaseSRWLockExclusive(&status_lock);
 }
 std::string Text(Object* o) { char t[160]{}; if (o) ue::NameText(ue::NameOf(o), t, sizeof(t)); return t; }
 bool Same(Object* actor, Name name) { return ue::Alive(actor) && ue::NameOf(actor) == name; }
@@ -433,8 +433,8 @@ void Refresh() {
     stage_ = "idle";
 }
 void SetOutfitStatus(const wchar_t* format, ...) {
-    wchar_t text[200]{}; va_list args; va_start(args, format); vswprintf_s(text, format, args); va_end(args);
-    AcquireSRWLockExclusive(&status_lock); wcscpy_s(outfit_status_, text); ReleaseSRWLockExclusive(&status_lock);
+    wchar_t text[200]{}; va_list args; va_start(args, format); _vsnwprintf_s(text, _countof(text), _TRUNCATE, format, args); va_end(args);
+    AcquireSRWLockExclusive(&status_lock); wcsncpy_s(outfit_status_, text, _TRUNCATE); ReleaseSRWLockExclusive(&status_lock);
 }
 Object* PlayerAppearance() {
     Object* controller = nullptr; Object* pawn = nullptr;
@@ -482,7 +482,7 @@ Object* credits_widget_ = nullptr;
 ULONGLONG credits_deadline_ = 0, next_credits_scan_ = 0;
 wchar_t credits_status_[160] = L"Credits: idle (Shift+F7)";
 void SetCreditsStatus(const wchar_t* text) {
-    AcquireSRWLockExclusive(&status_lock); wcscpy_s(credits_status_, text); ReleaseSRWLockExclusive(&status_lock);
+    AcquireSRWLockExclusive(&status_lock); wcsncpy_s(credits_status_, text, _TRUNCATE); ReleaseSRWLockExclusive(&status_lock);
 }
 void StartCredits() {
     Object* controller = nullptr; Object* pawn = nullptr;
@@ -647,9 +647,9 @@ void OnFault(DWORD code, uintptr_t address, DWORD faults, bool disabled) {
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             reinterpret_cast<LPCSTR>(address), &module) && GetModuleFileNameA(module, path, MAX_PATH)) {
         const char* file = std::strrchr(path, '\\');
-        sprintf_s(where, "%s+0x%llx", file ? file + 1 : path, static_cast<unsigned long long>(address - reinterpret_cast<uintptr_t>(module)));
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "%s+0x%llx", file ? file + 1 : path, static_cast<unsigned long long>(address - reinterpret_cast<uintptr_t>(module)));
     } else {
-        sprintf_s(where, "0x%llx", static_cast<unsigned long long>(address));
+        _snprintf_s(where, sizeof(where), _TRUNCATE, "0x%llx", static_cast<unsigned long long>(address));
     }
     Object* actor = ue::Alive(current_) ? current_ : nullptr;
     Logf("FORCE_GROOM fault %lu/%lu: code 0x%08lx at %s during %s, actor %s", faults, GameThread::kMaxFaults, code, where, stage_,

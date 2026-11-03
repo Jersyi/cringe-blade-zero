@@ -22,6 +22,14 @@ struct Snapshot {
 enum class Action { Apply, Restore, Inspect };
 void Initialize(Logger logger, ReleaseAppearance release_appearance = nullptr);
 bool Request(Action action, int32_t entry = -1);
+// Any thread, no engine calls. While an NPC skin is on, the game thread casts the skin's boss skills
+// (kNpcSkillSets) in random rounds on the hero's own ASC, locked on the nearest enemy; while one runs
+// the boss's weapons hang on the NPC display and the hero's weapons are hidden. False when no skin is active.
+bool RequestSkill();
+// Game thread. The NPC display component while a skin is on, else null: a grab's boss weapon follows
+// its hands. size: the skin's height over the hero's (rest pelvis), 1 without a skin; the grab
+// scales the boss weapon by it, the display and the victim keep their own size.
+unsigned char* GrabDisplay(double& size);
 // Any thread, no engine calls. Off queues a normal guarded Restore.
 bool SetExperimental(bool enabled);
 Snapshot GetSnapshot();

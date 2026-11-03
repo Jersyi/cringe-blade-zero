@@ -42,7 +42,7 @@ std::wstring Text(HWND window) {
 }
 std::wstring Number(float value) {
     wchar_t text[80]{};
-    swprintf_s(text, L"%.7g", static_cast<double>(value));
+    _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.7g", static_cast<double>(value));
     return text;
 }
 std::wstring Lower(std::wstring text) {

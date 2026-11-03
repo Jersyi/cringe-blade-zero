@@ -20,9 +20,11 @@
 #include "ui_load_banner.h"
 #include "ui_hotkeys.h"
 #include "ui_cursor.h"
+#include "ui_host.h"
 #include "settings_store.h"
 #include "grab_extras.h"
 #include "gear_widget.h"
+#include "skill_toast.h"
 #include "hub_pause.h"
 #include "boss_rush.h"
 #include "boss_ai.h"
@@ -90,7 +92,7 @@ BOOL CALLBACK LoadSystem(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t directory[MAX_PATH]{};
     const UINT n = GetSystemDirectoryW(directory, MAX_PATH);
     if (n > 0 && n + 13 < MAX_PATH) {
-        wcscat_s(directory, L"\\version.dll");
+        wcsncat_s(directory, L"\\version.dll", _TRUNCATE);
         HMODULE real = LoadLibraryExW(directory, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (real && real != self_module) {
             for (size_t i = 0; i < kExportCount; ++i)
@@ -150,7 +152,7 @@ bool HashExecutable(const wchar_t* path) {
         std::array<unsigned char, 32> digest{};
         if (ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0) {
             char hex[65]{};
-            for (size_t i = 0; i < digest.size(); ++i) sprintf_s(hex + i * 2, 3, "%02x", digest[i]);
+            for (size_t i = 0; i < digest.size(); ++i) _snprintf_s(hex + i * 2, 3, _TRUNCATE, "%02x", digest[i]);
             valid = std::strcmp(hex, kSha256) == 0;
         }
     }
@@ -305,7 +307,7 @@ void DispatchGameThread() {
 }
 void DispatchFault(DWORD code, uintptr_t address, DWORD faults, bool disabled) {
     char text[220]{};
-    sprintf_s(text, "GAME_THREAD dispatcher fault %lu/%lu code=0x%08lx address=%p disabled=%d", faults,
+    _snprintf_s(text, sizeof(text), _TRUNCATE, "GAME_THREAD dispatcher fault %lu/%lu code=0x%08lx address=%p disabled=%d", faults,
         GameThread::kMaxFaults, code, reinterpret_cast<void*>(address), disabled ? 1 : 0);
     Log(text);
 }
@@ -315,9 +317,9 @@ void InstallGameThread(uintptr_t base, ue::Object* engine) {
     char why[160]{}, line[256]{};
     GameThread::SetPost(&UiCursor::AfterTick);
     if (GameThread::Install(engine, base + ue::layout::kGameEngineTick, &DispatchGameThread, &DispatchFault, why, sizeof(why)))
-        sprintf_s(line, "GAME_THREAD_HOOK installed engine=%p slot=%zu", static_cast<void*>(engine), ue::layout::kTickSlot);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "GAME_THREAD_HOOK installed engine=%p slot=%zu", static_cast<void*>(engine), ue::layout::kTickSlot);
     else
-        sprintf_s(line, "GAME_THREAD_HOOK refused (%s); game-thread features unavailable", why);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "GAME_THREAD_HOOK refused (%s); game-thread features unavailable", why);
     Log(line);
 }
 
@@ -354,7 +356,7 @@ void PollCommand(HairControls& controls) {
     else if (!std::strcmp(text, "boss") || !std::strcmp(text, "rush")) ok = BossRush::HandleCommand(text, argument);
     else if (strcmp(text, "status")) ok = false;
     wchar_t status[320]{}, outfit[200]{}; GroomForce::Status(status, 320); GroomForce::OutfitStatus(outfit, 200);
-    char line[768]{}; sprintf_s(line, "COMMAND %s ok=%d hair=0x%lx force=%ls outfit=%ls", text, ok ? 1 : 0, controls.Status(), status, outfit);
+    char line[768]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "COMMAND %s ok=%d hair=0x%lx force=%ls outfit=%ls", text, ok ? 1 : 0, controls.Status(), status, outfit);
     Log(line);
 }
 
@@ -388,6 +390,8 @@ DWORD WINAPI Worker(void*) {
     SettingsStore::Initialize((directory+L"PBZDebugMenu.ini").c_str());
     HubPause::Initialize(&LogLine);
     GrabExtras::Initialize(&LogLine);
+    // With an NPC skin on, a grab's boss weapon follows the NPC display's hands.
+    GrabExtras::SetSkinDisplay(&NpcRetarget::GrabDisplay);
     BossAI::Initialize(&LogLine);
     BossRush::Initialize(&LogLine, directory.c_str());
     CharacterSwap::Initialize(&LogLine, &ReleaseNpcForOutfit);
@@ -398,6 +402,8 @@ DWORD WINAPI Worker(void*) {
     MotianGrab::Initialize(&LogLine, &EntryFocus::GameplayFocused);
     MotianGrabMenu::Initialize(&LogLine);
     WeaponPresets::Initialize(&LogLine, &EntryFocus::GameplayFocused);
+    UiHost::GuardActivation(&LogLine);
+    UiCursor::SetLogger(&LogLine);
     DebugHub::Initialize();
     UiLoadBanner::Initialize(&LogLine);
     BossMenu::Initialize();
@@ -433,6 +439,10 @@ DWORD WINAPI Worker(void*) {
     GearWidget::Initialize(&LogLine);
     UiHotkeys::Bind(UiHotkeys::Action::GearUp, [] { GearWidget::Nudge(1); });
     UiHotkeys::Bind(UiHotkeys::Action::GearDown, [] { GearWidget::Nudge(-1); });
+    UiHotkeys::Bind(UiHotkeys::Action::NpcSkill, [] {
+        if (DebugHub::ObscuresGameplay() || !EntryFocus::GameplayFocused()) return;
+        NpcRetarget::RequestSkill();
+    });
     UiHotkeys::Bind(UiHotkeys::Action::WeaponSwap, [] {
         if (DebugHub::ObscuresGameplay() || !EntryFocus::GameplayFocused()) return;
         const auto state = WeaponPresets::GetSnapshot();
@@ -450,6 +460,7 @@ DWORD WINAPI Worker(void*) {
         DebugHub::Tick();
         UiLoadBanner::Tick();
         GearWidget::Tick();
+        SkillToast::Tick();
         BossMenu::Tick();
         BossAIMenu::Tick();
         NpcMenu::Tick();
@@ -459,7 +470,7 @@ DWORD WINAPI Worker(void*) {
         WeaponPresetsMenu::Tick();
         EntryFocus::Poll();
         controls.Tick();
-        if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()?16:25); continue; }
+        if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25); continue; }
         next_settings = GetTickCount64() + 1000;
         if (!hook_attempted) if (ue::Object* engine = ue::FindEngine()) { InstallGameThread(base, engine); hook_attempted = true; }
         PollCommand(controls);
@@ -488,16 +499,16 @@ DWORD WINAPI Worker(void*) {
                 Log("UI_LOAD_BANNER success; main tool window remains hidden until user request");
             }
             if (!announced || wrote) {
-                char line[256]{}; sprintf_s(line, "ENABLED cdo=%p slot=%u bool=%p console=%p values=1/1", reinterpret_cast<void*>(cdo), index,
+                char line[256]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "ENABLED cdo=%p slot=%u bool=%p console=%p values=1/1", reinterpret_cast<void*>(cdo), index,
                     reinterpret_cast<void*>(cdo + kDebugBoolOffset), reinterpret_cast<void*>(console)); Log(line); announced = true;
             }
         } else if (!announced && GetTickCount64() > deadline) {
             Log("INITIALIZATION_TIMEOUT; no further attempts"); InterlockedExchange(&worker_status, 0x4000); return 0;
         }
-        Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()?16:25);
+        Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25);
     }
     WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown();
-    GearWidget::Shutdown(); DebugHub::Shutdown();
+    SkillToast::Shutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
     UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
     return 0;
 }

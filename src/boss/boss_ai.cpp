@@ -264,7 +264,7 @@ bool Set(int32_t index, float value) {
     Publish(L"原生实例参数已修改并读回；实际攻击频率需在战斗中观察");
     if (logger_) {
         char line[200]{};
-        sprintf_s(line, "BOSS_AI_VALUE generation=%llu index=%d kind=%d requested=%.6g readback=%.6g",
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "BOSS_AI_VALUE generation=%llu index=%d kind=%d requested=%.6g readback=%.6g",
             static_cast<unsigned long long>(generation_), index, static_cast<int>(row.ui.kind), value, row.ui.current);
         logger_(line);
     }

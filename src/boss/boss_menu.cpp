@@ -161,7 +161,7 @@ bool ReadOptions(BossRush::Options& options) {
         const std::wstring text = Text(cycle_); wchar_t* end = nullptr;
         const long cycle = wcstol(text.c_str(), &end, 10);
         if (text.empty() || !end || *end || cycle < 1 || cycle > snapshot_.cycle_max) {
-            wchar_t notice[120]{}; swprintf_s(notice, L"周目请输入 1 至 %d 的整数。", snapshot_.cycle_max); Notice(notice); return false;
+            wchar_t notice[120]{}; _snwprintf_s(notice, _countof(notice), _TRUNCATE, L"周目请输入 1 至 %d 的整数。", snapshot_.cycle_max); Notice(notice); return false;
         }
         options.cycle_number = static_cast<int32_t>(cycle);
     }
@@ -430,7 +430,7 @@ bool CreateCharacters() {
                 character_window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
             SendMessageW(result, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE); UiI18n::Bind(result,text); return result;
         };
-        character_intro_ = child(L"STATIC", L"主角套装使用原生完整装配并保留动画。沐小葵、魔渊的原模型请进入实验重定向菜单。", SS_LEFT, 0);
+        character_intro_ = child(L"STATIC", L"主角套装使用原生完整装配并保留动画。沐小葵、魔渊、左殇等原 NPC 模型请进入实验重定向菜单。", SS_LEFT, 0);
         character_advanced_ = child(L"BUTTON", L"显示内部变体", WS_TABSTOP | BS_AUTOCHECKBOX, kCharacterAdvanced);
         character_list_ = child(L"LISTBOX", L"", WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, kCharacterList);
         character_detail_ = child(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0);

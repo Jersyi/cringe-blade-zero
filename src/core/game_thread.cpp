@@ -54,12 +54,12 @@ bool Install(void* engine, uintptr_t expected_tick, Callback callback, FaultHand
     size_t count = 0;
     while (count < 1024 && Code(vtable[count])) ++count;
     if (count <= ue::layout::kTickSlot || vtable[ue::layout::kTickSlot] != expected_tick) {
-        sprintf_s(why, size, "Tick slot mismatch (%zu entries)", count); return false;
+        _snprintf_s(why, size, _TRUNCATE, "Tick slot mismatch (%zu entries)", count); return false;
     }
     // Keep vtable[-1] (MSVC complete-object locator) in front of the copy. Never freed:
     // the engine may still be inside a virtual call through it at process exit.
     auto* copy = static_cast<uintptr_t*>(VirtualAlloc(nullptr, (count + 1) * sizeof(uintptr_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!copy) { strcpy_s(why, size, "VirtualAlloc"); return false; }
+    if (!copy) { strncpy_s(why, size, "VirtualAlloc", _TRUNCATE); return false; }
     copy[0] = vtable[-1];
     for (size_t i = 0; i < count; ++i) copy[i + 1] = vtable[i];
     engine_ = engine; callback_ = callback; on_fault_ = on_fault; original_ = reinterpret_cast<Tick>(vtable[ue::layout::kTickSlot]);
@@ -67,7 +67,7 @@ bool Install(void* engine, uintptr_t expected_tick, Callback callback, FaultHand
     if (static_cast<uintptr_t>(InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(engine),
             static_cast<LONG64>(reinterpret_cast<uintptr_t>(copy + 1)), static_cast<LONG64>(reinterpret_cast<uintptr_t>(vtable)))) !=
         reinterpret_cast<uintptr_t>(vtable)) {
-        strcpy_s(why, size, "engine vtable changed"); return false;
+        strncpy_s(why, size, "engine vtable changed", _TRUNCATE); return false;
     }
     InterlockedExchange(&installed_, 1);
     return true;

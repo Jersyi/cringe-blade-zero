@@ -64,13 +64,13 @@ bool last_runtime_special=false;
 
 void Logf(const char* format, ...) {
     if (!logger) return;
-    char text[800]{}; va_list args; va_start(args, format); vsprintf_s(text, format, args); va_end(args); logger(text);
+    char text[800]{}; va_list args; va_start(args, format); _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, args); va_end(args); logger(text);
 }
 void Status(const wchar_t* text) {
     AcquireSRWLockExclusive(&snapshot_lock); snapshot.status = text; ReleaseSRWLockExclusive(&snapshot_lock);
 }
 bool Diagnose(const wchar_t* format, ...) {
-    wchar_t text[640]{}; va_list args; va_start(args, format); vswprintf_s(text, format, args); va_end(args);
+    wchar_t text[640]{}; va_list args; va_start(args, format); _vsnwprintf_s(text, _countof(text), _TRUNCATE, format, args); va_end(args);
     diagnostic = text; return false;
 }
 void DetailedStatus(const wchar_t* prefix) { const std::wstring text = std::wstring(prefix) + L"：" + diagnostic; Status(text.c_str()); }
@@ -249,7 +249,7 @@ bool ConfigRequests(Object* backpack,int& pending) {
         auto* row=data+static_cast<size_t>(i)*48;const uint8_t shaqi=ue::At<uint8_t>(row,0);const int32_t index=ue::At<int32_t>(row,4);
         if(shaqi>1||index<0||index>1)return Diagnose(L"原生装备加载请求键与已审计的两槽布局不同");
         const uint64_t generation=ue::At<uint64_t>(row,16);++pending;
-        char item[100]{};sprintf_s(item,"%s%d:g%llu;",shaqi?"Shaqi":"Main",index,static_cast<unsigned long long>(generation));fingerprint+=item;
+        char item[100]{};_snprintf_s(item, sizeof(item), _TRUNCATE,"%s%d:g%llu;",shaqi?"Shaqi":"Main",index,static_cast<unsigned long long>(generation));fingerprint+=item;
     }
     static std::string last;
     if(fingerprint!=last){last=fingerprint;Logf("WEAPON_PRESETS native config jobs count=%d keys=%s",pending,fingerprint.c_str());}
@@ -308,7 +308,7 @@ bool RuntimeSelection(Object* component,bool main,const std::vector<Name>& ids,S
         if(!ExpectedConfigs(ids[static_cast<size_t>(i)],main,normal,snap))return false;
         if(actual!=normal&&actual!=snap) {
             char id[120]{},actual_name[120]{};ue::NameText(ids[static_cast<size_t>(i)],id,sizeof(id));ue::NameText(ue::NameOf(actual),actual_name,sizeof(actual_name));
-            char state[640]{};sprintf_s(state,"slot=%s index=%d id=%s raw=%u/%u actual=%s ptr=%p expected_normal=%p expected_snap=%p",slot_name,i,id,ids[static_cast<size_t>(i)].index,ids[static_cast<size_t>(i)].number,actual_name,static_cast<void*>(actual),static_cast<void*>(normal),static_cast<void*>(snap));
+            char state[640]{};_snprintf_s(state,sizeof(state),_TRUNCATE,"slot=%s index=%d id=%s raw=%u/%u actual=%s ptr=%p expected_normal=%p expected_snap=%p",slot_name,i,id,ids[static_cast<size_t>(i)].index,ids[static_cast<size_t>(i)].number,actual_name,static_cast<void*>(actual),static_cast<void*>(normal),static_cast<void*>(snap));
             if(last_mismatch[main?0:1]!=state){last_mismatch[main?0:1]=state;Logf("WEAPON_PRESETS config mismatch %s",state);}
             return Diagnose(L"%hs 配置对象与武器ID不匹配（槽位=%d），等待原生装备重建",slot_name,i);
         }
@@ -342,7 +342,7 @@ bool Capture(Object* backpack, Set& output) {
     char cache_name[100]{},id_name[100]{};ue::NameText(cached_id,cache_name,sizeof(cache_name));
     if(main.committed>=0&&static_cast<size_t>(main.committed)<result.main.size())ue::NameText(result.main[static_cast<size_t>(main.committed)],id_name,sizeof(id_name));
     char main_config[80]{},sha_config[80]{};if(ue::Alive(main.selected_config))ue::NameText(ue::NameOf(main.selected_config),main_config,sizeof(main_config));if(ue::Alive(sha.selected_config))ue::NameText(ue::NameOf(sha.selected_config),sha_config,sizeof(sha_config));
-    char raw[720]{};sprintf_s(raw,"cache_id=%s(%u/%u) cache_selection=%d/%d runtime_committed=%d/%d runtime_pending=%d/%d main_id=%s main_config=%p:%s shaqi_config=%p:%s ready=%d/%d",cache_name,cached_id.index,cached_id.number,cached_main,cached_sha,main.committed,sha.committed,main.pending,sha.pending,id_name,static_cast<void*>(main.selected_config),main_config,static_cast<void*>(sha.selected_config),sha_config,main_ready?1:0,sha_ready?1:0);
+    char raw[720]{};_snprintf_s(raw,sizeof(raw),_TRUNCATE,"cache_id=%s(%u/%u) cache_selection=%d/%d runtime_committed=%d/%d runtime_pending=%d/%d main_id=%s main_config=%p:%s shaqi_config=%p:%s ready=%d/%d",cache_name,cached_id.index,cached_id.number,cached_main,cached_sha,main.committed,sha.committed,main.pending,sha.pending,id_name,static_cast<void*>(main.selected_config),main_config,static_cast<void*>(sha.selected_config),sha_config,main_ready?1:0,sha_ready?1:0);
     if(last_raw!=raw){last_raw=raw;Logf("WEAPON_PRESETS capture %s",raw);}
     if(!main_ready){diagnostic=main_error;return false;}if(!sha_ready)return false;
     // CurrentMainWeaponID is a gameplay/backpack cache. Replacing the currently

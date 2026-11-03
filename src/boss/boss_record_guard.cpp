@@ -32,7 +32,7 @@ void Log(const char* format, ...) {
     char line[640]{};
     va_list args;
     va_start(args, format);
-    vsprintf_s(line, format, args);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args);
     va_end(args);
     logger_(line);
 }

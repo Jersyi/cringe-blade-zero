@@ -61,7 +61,7 @@ void Put(const wchar_t* section, const wchar_t* key, const std::wstring& value) 
 }
 void PutBool(const wchar_t* section, const wchar_t* key, bool value) { Put(section, key, value ? L"1" : L"0"); }
 void PutFloat(const wchar_t* section, const wchar_t* key, float value) {
-    wchar_t text[64]{}; swprintf_s(text, L"%.3f", value); Put(section, key, text);
+    wchar_t text[64]{}; _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.3f", value); Put(section, key, text);
 }
 void PutInt(const wchar_t* section, const wchar_t* key, int value) { Put(section, key, std::to_wstring(value)); }
 }

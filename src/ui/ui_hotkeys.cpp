@@ -59,6 +59,7 @@ const Spec kSpecs[kCount] = {
     {L"WeaponSwap", L"切换武器预设", {Device::PlayStation, 0, 0, kSwipeL | kSwipeR}},
     {L"GearUp", L"提升挡位", {}},
     {L"GearDown", L"降低挡位", {}},
+    {L"NpcSkill", L"施放 NPC 技能", {Device::PlayStation, 0, 0, kL3 | kR3}},
 };
 
 struct PadToken { unsigned bit; const wchar_t* xbox; const wchar_t* ps; };

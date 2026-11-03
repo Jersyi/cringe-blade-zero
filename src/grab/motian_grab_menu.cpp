@@ -102,7 +102,7 @@ void Apply() {
     const auto* range_move=options.enabled?selected:FindVariant(state,options.variant);
     const double maximum=range_move?range_move->max_range:400.0;
     if (end==text || *end || !std::isfinite(value) || value<80 || value>maximum) {
-        wchar_t message[128]{};swprintf_s(message,L"距离需为 80–%.0f 厘米；尚未提交设置",maximum);
+        wchar_t message[128]{};_snwprintf_s(message, _countof(message), _TRUNCATE,L"距离需为 80–%.0f 厘米；尚未提交设置",maximum);
         UiI18n::SetText(status_,message); return;
     }
     options.range=static_cast<float>(value);
@@ -124,7 +124,7 @@ void Apply() {
 }
 void ShowDamageValue(const GrabExtras::Options& extras,int mode) {
     wchar_t value[32]{};
-    if (mode==2) swprintf_s(value,L"%.0f",static_cast<double>(extras.percent)); else swprintf_s(value,L"%.2g",static_cast<double>(extras.multiplier));
+    if (mode==2) _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",static_cast<double>(extras.percent)); else _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.2g",static_cast<double>(extras.multiplier));
     SetWindowTextW(damage_value_,value);
     UiI18n::SetText(damage_unit_,mode==2?L"% 最大生命":mode==1?L"× 原生伤害":L"");
     EnableWindow(damage_value_,mode!=0);
@@ -136,7 +136,7 @@ void Refresh(bool options) {
         SendMessageW(boss_,BM_SETCHECK,state.options.allow_bosses?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(position_,BM_SETCHECK,state.options.position_correction?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(tang_,BM_SETCHECK,state.options.tang_execution?BST_CHECKED:BST_UNCHECKED,0);
-        wchar_t value[32]{}; swprintf_s(value,L"%.0f",state.options.range); SetWindowTextW(range_,value);
+        wchar_t value[32]{}; _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",state.options.range); SetWindowTextW(range_,value);
         const GrabExtras::Options extras=GrabExtras::GetOptions();
         SendMessageW(hide_weapon_,BM_SETCHECK,extras.hide_weapon?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(invulnerable_,BM_SETCHECK,extras.ignore_invulnerable?BST_CHECKED:BST_UNCHECKED,0);
@@ -156,7 +156,7 @@ void Refresh(bool options) {
     status+=L"投技资源："+std::wstring(!state.options.enabled?L"已关闭":state.prepared?L"已预载":state.preparing?L"准备中，完成后再按组合键":L"尚未就绪");
     if (!state.preparation_status.empty()) status+=L" — "+state.preparation_status;
     if (state.preparation_last_ms>0) {
-        wchar_t elapsed[64]{}; swprintf_s(elapsed,L"（本步骤 %.1f ms）",static_cast<double>(state.preparation_last_ms)); status+=elapsed;
+        wchar_t elapsed[64]{}; _snwprintf_s(elapsed, _countof(elapsed), _TRUNCATE,L"（本步骤 %.1f ms）",static_cast<double>(state.preparation_last_ms)); status+=elapsed;
     }
     status+=L"\r\n施放条件："+std::wstring(state.ready?L"角色与资源已就绪":L"等待角色或投技资源")+
         L"　会话："+(state.active?std::wstring(L"运行中"):std::wstring(L"空闲"))+L"　清理："+(state.cleanup_pending?std::wstring(L"待完成，切图受阻"):std::wstring(L"无残留"));
@@ -176,7 +176,7 @@ void Refresh(bool options) {
     const auto* selected=FindVariant(state,SelectedVariant());
     const bool selectable=selected&&selected->supported;
     wchar_t range_hint[160]{};
-    if (selected) swprintf_s(range_hint,L"此招式距离：80–%.0f 厘米；推荐 %.0f 厘米",static_cast<double>(selected->max_range),static_cast<double>(selected->recommended_range));
+    if (selected) _snwprintf_s(range_hint, _countof(range_hint), _TRUNCATE,L"此招式距离：80–%.0f 厘米；推荐 %.0f 厘米",static_cast<double>(selected->max_range),static_cast<double>(selected->recommended_range));
     UiI18n::SetText(range_hint_,range_hint);
     EnableWindow(recommended_,selectable);
     EnableWindow(apply_,!state.active&&!state.cleanup_pending&&!state.disabled&&(!SendMessageW(enabled_,BM_GETCHECK,0,0)||selectable));
@@ -261,7 +261,7 @@ LRESULT CALLBACK WindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam
         else if (LOWORD(wparam)==kCancel && HIWORD(wparam)==BN_CLICKED) MotianGrab::RequestCancel();
         else if (LOWORD(wparam)==kRecommended&&HIWORD(wparam)==BN_CLICKED) {
             const auto state=MotianGrab::GetSnapshot();const auto* selected=FindVariant(state,SelectedVariant());
-            if (selected&&selected->supported) { wchar_t value[32]{};swprintf_s(value,L"%.0f",static_cast<double>(selected->recommended_range));SetWindowTextW(range_,value); }
+            if (selected&&selected->supported) { wchar_t value[32]{};_snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",static_cast<double>(selected->recommended_range));SetWindowTextW(range_,value); }
         }
         else if (LOWORD(wparam)==kSourceBoss&&HIWORD(wparam)==CBN_SELCHANGE) {
             const auto state=MotianGrab::GetSnapshot();const LRESULT row=SendMessageW(source_boss_,CB_GETCURSEL,0,0);

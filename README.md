@@ -6,7 +6,7 @@
 
 **《影之刃零》（Phantom Blade Zero）单机游戏内工具箱**
 
-一个 `version.dll` 代理 MOD：游戏内自绘面板、Boss 连战、Boss 投技、空中技能、武器预设与挡位系统。
+一个 `version.dll` 代理 MOD：游戏内自绘面板、Boss 连战、Boss 投技、空中技能、武器预设与挡位系统，以及用 75 个 NPC / 人形 Boss 外观操作主角。
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-1f2328?style=flat-square)
 ![Language](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square)
@@ -28,7 +28,8 @@
 | **空中技能 / JC** | 空中施放战技与杀气技、空中闪避、跳跃打断、近敌 JC 弹跳与资源奖励、缓落 |
 | **武器预设** | 两套装备一键或滑动触控板切换，显示游戏内武器图标与官方名称，重启后保留 |
 | **挡位** | 右下角 0–10 档胶囊：挡位越高开启越多（JC、投技、奖励、伤害倍数、无视无敌），10 档滑条燃起游戏手绘火焰 |
-| **角色 / NPC** | 主角兼容装束替换、以 NPC 外观操作主角（实验） |
+| **角色 / NPC** | 主角兼容装束替换；以 NPC / 人形 Boss 外观操作主角（75 个，实验）：保留主角的动作与能力，手臂、武器、碰撞半径和相机按 NPC 体型适配 |
+| **NPC 技能** | 套用 NPC 外观后按 L3 + R3 施放该 Boss 的技能（随机轮换、自动锁定、右下角提示），技能期间换成 Boss 自己的武器；长鸿·雷电枪骑的马播放 Boss 自己的动作 |
 | **毛发 / Groom** | 头发表示切换、强制 Groom、GPU 包围盒调试 |
 | **其他** | DualSense 自适应扳机可关闭；全部设置写入 `PBZDebugMenu.ini` |
 
@@ -67,7 +68,7 @@ cmake --build build --config Release --target version
 |---|---|
 | `version` | `build/Release/version.dll`，完整 MOD |
 | `version_triggers` | `build/triggers_only/version.dll`，只关闭自适应扳机的精简版 |
-| `proxy_test` · `hair_controls_test` · `game_thread_test` · `pad_triggers_test` · `input_focus_test` | 测试（`input_focus_test` 用假 UnrealWindow 线程验证面板焦点、鼠标捕获与按键投递） |
+| `proxy_test` · `hair_controls_test` · `game_thread_test` · `pad_triggers_test` · `input_focus_test` · `npc_pose_transfer_test` | 测试（`input_focus_test` 用假 UnrealWindow 线程验证面板焦点、鼠标捕获与按键投递；`npc_pose_transfer_test` 用合成骨架验证 NPC 姿势重定向、双手握持、武器缩放与坐骑代理） |
 
 编译选项：`/W4 /WX /utf-8`，静态 CRT。
 
@@ -81,6 +82,7 @@ cmake --build build --config Release --target version
 | 强制 Groom · 套装解锁 | `F6` · `Shift` + `F6` |
 | GPU 包围盒 · 自适应扳机 | `F9` · `Shift` + `F9` |
 | 释放投技 | PlayStation `△` + `○` |
+| 施放 NPC 技能 | PlayStation `L3` + `R3` |
 | 切换武器预设 | 触控板左右滑动 |
 
 所有快捷键都可在面板“快捷键”页重新绑定（键盘、Xbox、PlayStation 组合键）。
@@ -104,21 +106,25 @@ cmake --build build --config Release --target version
 ```text
 src/
 ├─ core/          DLL 入口与转发（proxy.cpp、forwarders.asm、version.def）、游戏线程钩子、UObject 反射、设置文件
-├─ ui/            面板、主题、动画、输入焦点与鼠标捕获、双语、快捷键、横幅、挡位胶囊、面板暂停
+├─ ui/            面板、主题、动画、输入焦点与鼠标捕获、双语、快捷键、横幅、挡位胶囊、面板暂停、技能提示
 ├─ boss/          Boss 连战、Boss AI、入场保护与存档保护
 ├─ grab/          投技：原生成对激活、状态租约、Boss 武器与姿态代理、伤害
 ├─ air/           空中技能、空中闪避、JC 与奖励
 ├─ weapons/       武器预设与游戏内武器图标
-├─ character/     角色替换与 NPC 外观重定向
+├─ character/     角色替换、NPC 外观重定向（姿势传递、武器适配、碰撞体、技能、坐骑代理）
 ├─ hair/          毛发显示与 Groom
 ├─ pad/           DualSense 自适应扳机
-├─ generated/     从游戏数据生成的表（投技目录、武器、骨骼、UI 资源、导出表）
+├─ generated/     从游戏数据生成的表（投技目录、武器、骨骼、NPC 档案 / 技能 / 坐骑、UI 资源、导出表）
 └─ triggers_only/ 精简版 version.dll
-tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点测试
+tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点 / NPC 姿势测试
 docs/             README 图片
 ```
 
 每个 `src/` 子目录都是头文件搜索路径，源码里直接写 `#include "ue_runtime.h"`。
+
+## 更新日志
+
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 说明
 

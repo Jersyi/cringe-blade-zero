@@ -1218,7 +1218,7 @@ HFONT MakeFont(Font role, UINT dpi) {
         if (icon_face_.empty()) {
             icon_face_ = L"Segoe MDL2 Assets";
             HDC screen = GetDC(nullptr);
-            LOGFONTW query{}; query.lfCharSet = DEFAULT_CHARSET; wcscpy_s(query.lfFaceName, L"Segoe Fluent Icons");
+            LOGFONTW query{}; query.lfCharSet = DEFAULT_CHARSET; wcsncpy_s(query.lfFaceName, L"Segoe Fluent Icons", _TRUNCATE);
             if (screen && EnumFontFamiliesExW(screen, &query, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM) -> int { return 0; }, 0, 0) == 0)
                 icon_face_ = L"Segoe Fluent Icons";
             if (screen) ReleaseDC(nullptr, screen);
@@ -1231,7 +1231,7 @@ HFONT MakeFont(Font role, UINT dpi) {
         // installed copy when present. Titles use the embedded game title face.
         body_face_ = L"Microsoft YaHei UI";
         HDC screen = GetDC(nullptr);
-        LOGFONTW query{}; query.lfCharSet = DEFAULT_CHARSET; wcscpy_s(query.lfFaceName, L"STZhongsong");
+        LOGFONTW query{}; query.lfCharSet = DEFAULT_CHARSET; wcsncpy_s(query.lfFaceName, L"STZhongsong", _TRUNCATE);
         if (screen && EnumFontFamiliesExW(screen, &query, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM) -> int { return 0; }, 0, 0) == 0)
             body_face_ = L"STZhongsong";
         if (screen) ReleaseDC(nullptr, screen);

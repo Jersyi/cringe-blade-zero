@@ -4,6 +4,7 @@
 #include <tlhelp32.h>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <cwchar>
 
 namespace UiCursor {
@@ -13,6 +14,9 @@ LONG hooks_ready_ = 0;
 int forced_ = 0;
 HWND subclass_hwnd_ = nullptr;
 WNDPROC old_proc_ = nullptr;
+void (*log_)(const char*) = nullptr;
+std::atomic<DWORD> worker_{0};
+int focus_logs_ = 0;
 
 using ShowFn = int (WINAPI*)(BOOL);
 using CursorFn = HCURSOR (WINAPI*)(HCURSOR);
@@ -70,15 +74,31 @@ void Snoop(HRAWINPUT input, HANDLE device) {
     const auto* data = raw->data.hid.bRawData;
     for (DWORD i = 0; i < count; ++i) UiHotkeys::NoteSonyReport(kind, data + static_cast<size_t>(i) * each, static_cast<int>(each));
 }
+// Game thread. Activation changes are rare; a change made by the UI worker is a bug
+// (UiHost::GuardActivation), so each one is logged with the thread that caused it.
+void NoteActivation(WPARAM active, LPARAM thread) {
+    if (!log_ || focus_logs_ >= 40) return;
+    ++focus_logs_;
+    const DWORD other = static_cast<DWORD>(thread), worker = worker_.load(std::memory_order_relaxed);
+    char line[200]{};
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "UI_FOCUS game %s by tid=%lu%s", active ? "activated" : "deactivated", other,
+        other && other == worker ? " (hub worker)" : "");
+    log_(line);
+}
+bool ButtonUp(UINT message) {
+    return message == WM_LBUTTONUP || message == WM_RBUTTONUP || message == WM_MBUTTONUP || message == WM_XBUTTONUP;
+}
 LRESULT CALLBACK GameProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_ACTIVATEAPP) NoteActivation(wparam, lparam);
     if (message == WM_INPUT) {
         RAWINPUTHEADER header{};
         UINT bytes = sizeof(header);
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lparam), RID_HEADER, &header, &bytes, sizeof(header)) != static_cast<UINT>(-1)) {
             if (header.dwType == RIM_TYPEHID) Snoop(reinterpret_cast<HRAWINPUT>(lparam), header.hDevice);
-            else if (header.dwType == RIM_TYPEMOUSE && Captured()) return 0;
+            else if (header.dwType == RIM_TYPEMOUSE && Captured()) return DefWindowProcW(hwnd, message, wparam, lparam);
         }
-    } else if (Captured() && message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) {
+    } else if (Captured() && message >= WM_MOUSEFIRST && message <= WM_MOUSELAST && !ButtonUp(message)) {
+        // Releases still reach the game: a button held when the hub opened must not stay down in Unreal.
         return 0;
     }
     if (!old_proc_ || old_proc_ == GameProc) return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -193,7 +213,9 @@ void SubclassGame() {
     subclass_hwnd_ = game;
 }
 }
+void SetLogger(void (*log)(const char*)) { log_ = log; }
 void Sync(bool open) {
+    worker_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     EnsureHooks();
     if (open) hold_.store(true, std::memory_order_relaxed);
     open_.store(open, std::memory_order_relaxed);

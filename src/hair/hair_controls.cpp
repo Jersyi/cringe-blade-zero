@@ -75,20 +75,20 @@ DWORD HairControls::Status() const {
 bool HairControls::ToggleHair() {
     uintptr_t pointer = 0; uint64_t current = 0;
     if (!HairMemory::Read(base_ + kHairWrapper + 16, &pointer, sizeof(pointer)) || !HairMemory::Pair(pointer, 2, current)) {
-        wcscpy_s(notice_, L"Hair CVar unavailable; no change."); return false;
+        wcsncpy_s(notice_, L"Hair CVar unavailable; no change.", _TRUNCATE); return false;
     }
     if (hair_saved_ && pointer != hair_pointer_) {
-        wcscpy_s(notice_, L"Hair CVar identity changed; restore/restart before retrying."); return false;
+        wcsncpy_s(notice_, L"Hair CVar identity changed; restore/restart before retrying.", _TRUNCATE); return false;
     }
     const int32_t old_mode = static_cast<int32_t>(current & 0xffffffffu);
     const int32_t next_mode = old_mode == 1 ? 0 : 1;
     const uint64_t next = PairOf(next_mode);
     if (!HairMemory::Exchange64(pointer, current, next)) {
-        wcscpy_s(notice_, L"Hair value changed concurrently; press again."); return false;
+        wcsncpy_s(notice_, L"Hair value changed concurrently; press again.", _TRUNCATE); return false;
     }
     if (!hair_saved_) { hair_saved_ = true; hair_pointer_ = pointer; hair_original_ = current; }
     hair_written_ = next;
-    swprintf_s(notice_, L"Requested %s; waiting for the game's own refresh.", ModeName(next_mode));
+    _snwprintf_s(notice_, _countof(notice_), _TRUNCATE, L"Requested %s; waiting for the game's own refresh.", ModeName(next_mode));
     UpdatePanel(); return true;
 }
 bool HairControls::ToggleBounds() {
@@ -97,50 +97,50 @@ bool HairControls::ToggleBounds() {
     if (!HairMemory::Read(base_ + kViewModeCache, &pointer, sizeof(pointer)) || !HairMemory::Pair(pointer, 40, view) ||
         !HairMemory::Read(base_ + kShaderPrint, &shader, sizeof(shader)) || shader < 0 || shader > 1 ||
         !HairMemory::Writable(base_ + kShaderPrint, sizeof(shader))) {
-        wcscpy_s(notice_, L"GPU debug CVar not initialized; no change."); return false;
+        wcsncpy_s(notice_, L"GPU debug CVar not initialized; no change.", _TRUNCATE); return false;
     }
     if (!HairMemory::Exchange32(base_ + kShaderPrint, shader, 1)) {
-        wcscpy_s(notice_, L"ShaderPrint changed concurrently; no change."); return false;
+        wcsncpy_s(notice_, L"ShaderPrint changed concurrently; no change.", _TRUNCATE); return false;
     }
     if (!HairMemory::Exchange64(pointer, view, kBoundsMode)) {
         HairMemory::Exchange32(base_ + kShaderPrint, 1, shader);
-        wcscpy_s(notice_, L"View mode changed concurrently; no change."); return false;
+        wcsncpy_s(notice_, L"View mode changed concurrently; no change.", _TRUNCATE); return false;
     }
     bounds_pointer_ = pointer; bounds_original_ = view; shader_original_ = shader; bounds_on_ = true;
-    wcscpy_s(notice_, L"GPU cluster/group AABB requested (strand geometry only).");
+    wcsncpy_s(notice_, L"GPU cluster/group AABB requested (strand geometry only).", _TRUNCATE);
     UpdatePanel(); return true;
 }
 bool HairControls::ToggleForce() {
-    if (!GroomForce::Ready()) { wcscpy_s(notice_, L"Force Groom not ready (engine hook/layout pending)."); UpdatePanel(); return false; }
+    if (!GroomForce::Ready()) { wcsncpy_s(notice_, L"Force Groom not ready (engine hook/layout pending).", _TRUNCATE); UpdatePanel(); return false; }
     if (!GroomForce::Active()) {
         // Forced Grooms carry bIsMainHair, so they only show while MainHairMode allows Groom.
         uintptr_t pointer = 0; uint64_t current = 0;
         if (HairMemory::Read(base_ + kHairWrapper + 16, &pointer, sizeof(pointer)) && HairMemory::Pair(pointer, 2, current) &&
             static_cast<int32_t>(current & 0xffffffffu) == 0) ToggleHair();
-        wcscpy_s(notice_, L"Force Groom requested: loading Groom assets on the game thread.");
+        wcsncpy_s(notice_, L"Force Groom requested: loading Groom assets on the game thread.", _TRUNCATE);
     } else {
-        wcscpy_s(notice_, L"Force Groom off requested: removing added Grooms.");
+        wcsncpy_s(notice_, L"Force Groom off requested: removing added Grooms.", _TRUNCATE);
     }
     GroomForce::Request(GroomForce::kToggle);
     UpdatePanel(); return true;
 }
 bool HairControls::PlayCredits() {
-    if (!GroomForce::Ready()) { wcscpy_s(notice_, L"Credits not ready (engine hook/layout pending)."); UpdatePanel(); return false; }
+    if (!GroomForce::Ready()) { wcsncpy_s(notice_, L"Credits not ready (engine hook/layout pending).", _TRUNCATE); UpdatePanel(); return false; }
     GroomForce::RequestCredits();
-    wcscpy_s(notice_, L"Credits requested: pushing WB_PersonnelList (no save, closes before settlement).");
+    wcsncpy_s(notice_, L"Credits requested: pushing WB_PersonnelList (no save, closes before settlement).", _TRUNCATE);
     UpdatePanel(); return true;
 }
 bool HairControls::ToggleOutfit() {
-    if (!GroomForce::Ready()) { wcscpy_s(notice_, L"Outfit unlock not ready (engine hook/layout pending)."); UpdatePanel(); return false; }
+    if (!GroomForce::Ready()) { wcsncpy_s(notice_, L"Outfit unlock not ready (engine hook/layout pending).", _TRUNCATE); UpdatePanel(); return false; }
     const bool on = !GroomForce::OutfitUnlockActive();
     GroomForce::RequestOutfitUnlock(on);
-    wcscpy_s(notice_, on ? L"Outfit unlock requested: enabling the game's outfit logic on the player." : L"Outfit unlock off requested.");
+    wcsncpy_s(notice_, on ? L"Outfit unlock requested: enabling the game's outfit logic on the player." : L"Outfit unlock off requested.", _TRUNCATE);
     UpdatePanel(); return true;
 }
 bool HairControls::ToggleTriggers() {
     const bool off = !PadTriggers::ForcedOff();
     PadTriggers::SetForcedOff(off);
-    wcscpy_s(notice_, off ? L"Adaptive triggers forced off (saved in PBZDebugMenu.ini)." : L"Adaptive triggers left to the game (saved).");
+    wcsncpy_s(notice_, off ? L"Adaptive triggers forced off (saved in PBZDebugMenu.ini)." : L"Adaptive triggers left to the game (saved).", _TRUNCATE);
     UpdatePanel(); return true;
 }
 bool HairControls::RestoreBounds() {
@@ -153,7 +153,7 @@ bool HairControls::RestoreBounds() {
     if (HairMemory::Read(base_ + kShaderPrint, &shader, sizeof(shader)))
         shader_ok = shader != 1 || HairMemory::Exchange32(base_ + kShaderPrint, 1, shader_original_);
     bounds_on_ = false;
-    wcscpy_s(notice_, view_ok && shader_ok ? L"GPU AABB off; original debug values restored." : L"Restore skipped changed/unavailable data.");
+    wcsncpy_s(notice_, view_ok && shader_ok ? L"GPU AABB off; original debug values restored." : L"Restore skipped changed/unavailable data.", _TRUNCATE);
     return view_ok && shader_ok;
 }
 bool HairControls::RestoreHair() {
@@ -166,7 +166,7 @@ bool HairControls::RestoreHair() {
 void HairControls::Restore() {
     if (GroomForce::Active()) GroomForce::Request(GroomForce::kOff);
     const bool bounds = RestoreBounds(); const bool hair = RestoreHair();
-    wcscpy_s(notice_, bounds && hair ? L"Original hair/debug values restored where still owned." : L"Restore skipped changed/unavailable data.");
+    wcsncpy_s(notice_, bounds && hair ? L"Original hair/debug values restored where still owned." : L"Restore skipped changed/unavailable data.", _TRUNCATE);
     UpdatePanel();
 }
 void HairControls::ShowPanel(bool show) {
@@ -272,7 +272,7 @@ void HairControls::UpdatePanel() {
     const auto format=UiI18n::Translate(L"Hair CVar: %s     Game cache: %s\r\nGPU AABB request: %s  (ViewMode 32 + ShaderPrint)\r\n%s\r\nEmpty/hidden/card-only Grooms may show no boxes.");
     const auto mode=UiI18n::Translate(hair_ok?ModeName(static_cast<int32_t>(pair & 0xffffffffu)):L"Unavailable"),cache=UiI18n::Translate(ModeName(applied));
     const auto bounds=UiI18n::Translate(bounds_on_?L"ON":L"OFF"),notice=UiI18n::Translate(notice_);
-    swprintf_s(text,format.c_str(),mode.c_str(),cache.c_str(),bounds.c_str(),notice.c_str());
+    _snwprintf_s(text,_countof(text),_TRUNCATE,format.c_str(),mode.c_str(),cache.c_str(),bounds.c_str(),notice.c_str());
     UiI18n::SetText(status_text_, text);
     const bool hub = DebugHub::Enabled();
     UiI18n::SetText(bounds_button_, bounds_on_ ? (hub ? L"GPU AABB：开" : L"F9  GPU AABB: ON") : (hub ? L"GPU AABB：关" : L"F9  GPU AABB: OFF"));

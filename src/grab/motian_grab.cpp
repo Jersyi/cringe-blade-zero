@@ -1,6 +1,7 @@
 #include "motian_grab.h"
 #include "grab_extras.h"
 #include "grab_weapons.generated.h"
+#include "grab_scales.generated.h"
 #include "settings_store.h"
 #include "ui_hotkeys.h"
 #include "ue_runtime.h"
@@ -227,7 +228,7 @@ struct StartSegments {
     }
 };
 void Status(const wchar_t* format,...) {
-    wchar_t value[600]{}; va_list args; va_start(args,format); vswprintf_s(value,format,args); va_end(args);
+    wchar_t value[600]{}; va_list args; va_start(args,format); _vsnwprintf_s(value, _countof(value), _TRUNCATE, format, args); va_end(args);
     AcquireSRWLockExclusive(&state_lock); state_.status=value; ReleaseSRWLockExclusive(&state_lock);
 }
 std::string Text(Object* object) {
@@ -414,7 +415,7 @@ void AlignmentStatus(bool corrected,const wchar_t* text) {
 }
 bool AlignmentFailure(const wchar_t* text) {
     char reason[1800]{};
-    if (!WideCharToMultiByte(CP_UTF8,0,text,-1,reason,static_cast<int>(sizeof(reason)),nullptr,nullptr)) strcpy_s(reason,"UTF8 conversion failed");
+    if (!WideCharToMultiByte(CP_UTF8,0,text,-1,reason,static_cast<int>(sizeof(reason)),nullptr,nullptr)) strncpy_s(reason,"UTF8 conversion failed", _TRUNCATE);
     Logf("MOTIAN_GRAB_ALIGNMENT refused stage=%s gate=%s reason=%s",stage_,alignment_gate_,reason);
     AlignmentStatus(false,text); Status(L"投技位置修正未通过：%s；未进入成功动作",text); return false;
 }
@@ -794,7 +795,7 @@ bool Enemy(Object* actor,const Context& c,Object*& asc,Object*& execution,bool& 
     const bool relaxed=!boss||GrabExtras::GetOptions().ignore_invulnerable||redirect_attempt_;
     if (!precheck && !SafeState(actor,relaxed,redirect_attempt_)) return Reject("protected_state");
     Object* movement=Property<Object*>(actor,"CharacterMovement"); const uint8_t mode=Property<uint8_t>(movement,"MovementMode");
-    if (!ue::Alive(movement)||(!precheck&&mode!=1&&mode!=2)) { sprintf_s(reject_detail_,"movement_mode=%u",mode); return Reject("not_walking"); }
+    if (!ue::Alive(movement)||(!precheck&&mode!=1&&mode!=2)) { _snprintf_s(reject_detail_, sizeof(reject_detail_), _TRUNCATE,"movement_mode=%u",mode); return Reject("not_walking"); }
     Object* teams=Default("/Script/SGameAI.Default__SGameAIController");
     Call own(teams,"GetTeam"),other(teams,"GetTeam"),attitude(teams,"GetDefaultTeamAttitude");
     if (!own.Set("Actor",c.pawn).Invoke() || !other.Set("Actor",actor).Invoke() ||
@@ -808,7 +809,7 @@ bool Enemy(Object* actor,const Context& c,Object*& asc,Object*& execution,bool& 
     Call height(capsule,"GetScaledCapsuleHalfHeight"),radius(capsule,"GetScaledCapsuleRadius");
     if (!height.Invoke() || !radius.Invoke()) return false;
     const float h=height.Get<float>("ReturnValue"),r=radius.Get<float>("ReturnValue");
-    if (!std::isfinite(h+r) || h<40 || h>160 || r<15 || r>100 || h<r) { sprintf_s(reject_detail_,"capsule=%.0fx%.0f",h,r); return Reject("body_size"); }
+    if (!std::isfinite(h+r) || h<40 || h>160 || r<15 || r>100 || h<r) { _snprintf_s(reject_detail_, sizeof(reject_detail_), _TRUNCATE,"capsule=%.0fx%.0f",h,r); return Reject("body_size"); }
     execution=Component(actor,"/Script/SGameExecution.ExecutionComponent"); asc=Asc(actor);
     if (!ue::Alive(execution) || !ue::Alive(asc) || !ue::Alive(Component(actor,"/Script/SGameCombatSystem.HitreactComponent")) ||
         !ue::Alive(Component(actor,"/Script/SGameLocomotionDriver.CharacterLocomotionComponent"))) return Reject("missing_components");
@@ -1197,7 +1198,7 @@ void AdvancePreparation(bool wanted) {
     } else {
         ++prepared_.step;
         wchar_t summary[300]{};
-        swprintf_s(summary,L"%s：%zu/%zu 步；累计 %.1f ms，最大单步 %.1f ms。%s",prepared_.ready?L"已预载":L"分步准备中",prepared_.step,total,prepared_.total_ms,prepared_.max_ms,prepared_.ready?L"可以重按三角 + 圈；空闲保留资产引用":L"请等已预载后重按，触发帧不加载");
+        _snwprintf_s(summary,_countof(summary),_TRUNCATE,L"%s：%zu/%zu 步；累计 %.1f ms，最大单步 %.1f ms。%s",prepared_.ready?L"已预载":L"分步准备中",prepared_.step,total,prepared_.total_ms,prepared_.max_ms,prepared_.ready?L"可以重按三角 + 圈；空闲保留资产引用":L"请等已预载后重按，触发帧不加载");
         prepared_.status=summary;
     }
     Logf("MOTIAN_GRAB_PREPARE step=%zu/%zu label=%s ok=%d stepMs=%.3f assetRefs=%zu ready=%d lookup=%s",
@@ -1356,7 +1357,7 @@ bool OwnedSpec(Grant& grant,Spec& out,bool& found) {
     if (!type||!container||ue::StructSize(type)!=240||Offset(grant.asc.object,"ActivatableAbilities")!=1048||ue::Offset(container,"Items")!=264||
         ue::Offset(type,"Handle")!=12||ue::Offset(type,"Ability")!=16||ue::Offset(type,"ActiveCount")!=40) return Admission("spec_layout");
     const Array array=ue::At<Array>(grant.asc.object,1048+264);
-    if (!ArrayOk(array,240,4096)) { sprintf_s(reject_detail_,"num=%d max=%d",array.num,array.max); return Admission("spec_array"); }
+    if (!ArrayOk(array,240,4096)) { _snprintf_s(reject_detail_, sizeof(reject_detail_), _TRUNCATE,"num=%d max=%d",array.num,array.max); return Admission("spec_array"); }
     for (int32_t i=0;i<array.num;++i) {
         Object* row=static_cast<Object*>(array.data)+static_cast<size_t>(i)*240;
         if (ue::At<int32_t>(row,12)!=grant.handle) continue;
@@ -1813,9 +1814,9 @@ bool StartAttempt(const Context& c) {
         eligible=eligible&&OriginalGrabTags(event,asc,!boss||GrabExtras::GetOptions().ignore_invulnerable||redirect_attempt_);
         if (eligible && !(PointDistance(c,actor,distance,&player_position) && distance<=best)) eligible=Reject("distance_or_visibility");
         if (eligible) { best=distance; target=actor; target_asc=asc;target_execution=execution; }
-        if (actor==near_boss) { near_reason=reject_reason_; strcpy_s(near_detail,reject_detail_); }
+        if (actor==near_boss) { near_reason=reject_reason_; strncpy_s(near_detail,reject_detail_, _TRUNCATE); }
         if (!eligible&&std::strcmp(reject_reason_,"class_not_listed")&&std::strcmp(reject_reason_,"not_in_world")&&dx*dx+dy*dy<refused_distance) {
-            refused=actor; refused_distance=dx*dx+dy*dy; refused_reason=reject_reason_; strcpy_s(refused_detail,reject_detail_);
+            refused=actor; refused_distance=dx*dx+dy*dy; refused_reason=reject_reason_; strncpy_s(refused_detail,reject_detail_, _TRUNCATE);
         }
         return true;
     };
@@ -2023,7 +2024,8 @@ bool StartAttempt(const Context& c) {
         if(i<prepared_.proxies.size()&&Same(prepared_.proxies[i])){shown[shown_count].proxy_mesh=prepared_.proxies[i].object;shown[shown_count].proxy_scale=prepared_.weapon_rows[i]->proxy_scale;}
         ++shown_count;
     }
-    GrabExtras::Begin(c.pawn,target,shown,shown_count,variant.id);
+    double hero_over_boss=1;for(const GrabScaleData& row:kGrabScales)if(variant.id&&!std::strcmp(row.variant,variant.id)){hero_over_boss=row.hero_over_boss;break;}
+    GrabExtras::Begin(c.pawn,target,shown,shown_count,variant.id,hero_over_boss);
     if(!session_.phases.empty())session_.phases.front().admitted=true;
     AcquireSRWLockExclusive(&state_lock); ++state_.activations; ++state_.paired_hits; ReleaseSRWLockExclusive(&state_lock);
     Status(L"%s：原生施放 / 受投双能力已配对；伤害与位移由原 Timeline 负责",variant.name);
@@ -2072,7 +2074,7 @@ bool Combo(const Context& c) {
 // grab runs on the same target through the normal paired path.
 constexpr const char* kTangWeapons[]={"Tang","Tang_HorseCartCombat","TangPrologue"};
 void ExecutionStatus(const wchar_t* format,...) {
-    wchar_t value[300]{}; va_list args; va_start(args,format); vswprintf_s(value,format,args); va_end(args);
+    wchar_t value[300]{}; va_list args; va_start(args,format); _vsnwprintf_s(value, _countof(value), _TRUNCATE, format, args); va_end(args);
     AcquireSRWLockExclusive(&state_lock); state_.execution_status=value; ReleaseSRWLockExclusive(&state_lock);
 }
 void ReadTangEquipped() {
@@ -2146,7 +2148,7 @@ bool FinishRedirect(const Context& c) {
     const bool ok=Start(c);
     forced_target_=nullptr; redirect_attempt_=false;
     if (!session_.began) RestoreSlot();
-    char ability[128]{}; strcpy_s(ability,redirect_.ability); redirect_={};
+    char ability[128]{}; strncpy_s(ability,redirect_.ability, _TRUNCATE); redirect_={};
     if (ok) {
         AcquireSRWLockExclusive(&state_lock); ++state_.executions_redirected; ReleaseSRWLockExclusive(&state_lock);
         ExecutionStatus(L"已将 %hs 改为魔渊 · 完整擒拿",ability);
@@ -2195,7 +2197,7 @@ bool RedirectExecution(const Context& c) {
     }
     if (!CancelInstance(instance)) Logf("TANG_EXECUTION executor %s did not end on cancel; waiting",name);
     redirect_={}; redirect_.pending=true; redirect_.deadline=GetTickCount64()+1500;
-    redirect_.target=Id(target); redirect_.executor=instance; redirect_.victim=victim; strcpy_s(redirect_.ability,name);
+    redirect_.target=Id(target); redirect_.executor=instance; redirect_.victim=victim; strncpy_s(redirect_.ability,name, _TRUNCATE);
     Logf("TANG_EXECUTION cancel ability=%s target=%s paired=%d victim=%d",name,Text(target).c_str(),paired?1:0,victim.object?1:0);
     return true;
 }

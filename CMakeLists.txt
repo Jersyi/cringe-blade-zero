@@ -22,7 +22,7 @@ add_library(version SHARED
     src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp
     src/air/air_skills.cpp src/air/air_skills_menu.cpp
     src/grab/motian_grab.cpp src/grab/motian_grab_menu.cpp src/grab/grab_extras.cpp
-    src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp
+    src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp src/ui/skill_toast.cpp
     src/weapons/weapon_presets.cpp src/weapons/weapon_icons.cpp src/weapons/weapon_presets_menu.cpp
     src/pad/pad_triggers.cpp src/core/ue_runtime.cpp src/core/game_thread.cpp src/hair/groom_force.cpp
     src/core/forwarders.asm src/core/version.def)
@@ -60,6 +60,10 @@ target_link_libraries(input_focus_test PRIVATE user32 gdi32 comctl32)
 # Tick hook fault recovery and ue:: cache revalidation after garbage collection (map changes).
 add_executable(game_thread_test tests/game_thread_test.cpp src/core/game_thread.cpp src/core/ue_runtime.cpp)
 pbz_settings(game_thread_test)
+
+# NPC retarget two-handed grip: left-arm contact IK on a synthetic hero/NPC skeleton pair.
+add_executable(npc_pose_transfer_test tests/npc_pose_transfer_test.cpp)
+pbz_settings(npc_pose_transfer_test)
 
 # DualSense adaptive-trigger rewrite (pad_triggers.h): report layouts, Steam vtable hook, import-table path.
 add_executable(pad_triggers_test tests/pad_triggers_test.cpp src/pad/pad_triggers.cpp)
