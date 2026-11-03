@@ -3,14 +3,18 @@
 #include <functional>
 #include <string>
 
-// UI worker only. Custom chords for debug-menu actions. The bind control is a
-// capture box: it never inserts characters. Keyboard, Xbox and PlayStation
-// chords can be combined. A pad chord is a set of buttons that fires on either
-// pad; [Hotkeys] PadGlyphs (auto / xbox / ps) picks the glyphs, auto = the pad
-// in hand, or the recorded device when no pad is connected. Each [Hotkeys] value is
-// kb: / xb: / ps: plus tokens joined by '+'; a value without a prefix is a keyboard
-// chord ("F10", "Ctrl + F10"). ToggleHub (the panel, default F10) is written to the
-// ini on first start and falls back to F10 when empty or unreadable.
+// UI worker only, except Hint and Bound (any thread). Custom chords for debug-menu
+// actions. The bind control is a capture box: it never inserts characters. Every
+// editable action has three bindings, keyboard, Xbox and PlayStation. The keyboard
+// one always fires; of the pad ones only the set of the pad in use ([Hotkeys]
+// PadGlyphs: auto / xbox / ps; auto = the pad behind the latest press, else the
+// connected one). Prompts (Get, Hint) follow the device used last: the keyboard set
+// after a key or mouse press, the pad's after a press on it. [Hotkeys] keys are
+// <Action> (keyboard), <Action>.Xbox and <Action>.PS; each value is kb: / xb: / ps:
+// plus tokens joined by '+', and a value without a prefix is a chord of that key's
+// device ("F10", "Ctrl + F10", "Y + B"). Bindings missing from the ini are written
+// with their defaults (Layout=2; an ini from the one-binding layout is migrated).
+// ToggleHub (the panel, default F10) falls back to F10 when empty or unreadable.
 namespace UiHotkeys {
 enum class Action : int {
     ToggleHub = 0,
@@ -47,8 +51,18 @@ void Bind(Action action, std::function<void()> handler);
 void Tick();
 bool Capturing();
 HWND CreatePage(HWND parent);
+// The chord prompts show: the set of the device used last, another set when that one is unbound.
 Chord Get(Action action);
+// One binding: device Keyboard, Xbox or PlayStation.
+Chord Get(Action action, Device device);
+// Any thread: some binding is set.
 bool Bound(Action action);
+// Any thread: Get(action) as text in the UI language ("G", "Y + B", "三角 + 圈").
+std::wstring Hint(Action action);
+// The pad set that fires now (Xbox or PlayStation).
+Device ActivePad();
+// The device prompts follow: Keyboard, or the active pad.
+Device InputDevice();
 std::wstring Plain(const Chord& chord);
 // Draws keycaps or pad glyphs. Returns the x position after the last glyph.
 int Draw(HDC dc, int x, int y, int height, const Chord& chord, int limit_x);

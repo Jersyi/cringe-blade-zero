@@ -283,12 +283,21 @@ BOOL CALLBACK FindBind(HWND child, LPARAM data) {
     if (_wcsicmp(name, L"PBZHotkeyBind_v1") || GetWindowLongPtrW(child, GWLP_USERDATA) != f->index) return TRUE;
     f->found = child; return FALSE;
 }
-HWND BindBox(UiHotkeys::Action action) { BindFind f{static_cast<LONG_PTR>(action), nullptr}; EnumChildWindows(game_, FindBind, reinterpret_cast<LPARAM>(&f)); return f.found; }
+// A bind box of one set: its user data is action * 4 + device (keyboard, Xbox, PlayStation).
+HWND BindBox(UiHotkeys::Action action, UiHotkeys::Device device) {
+    BindFind f{static_cast<LONG_PTR>(action) * 4 + static_cast<LONG_PTR>(device), nullptr}; EnumChildWindows(game_, FindBind, reinterpret_cast<LPARAM>(&f)); return f.found;
+}
 std::wstring Saved(const wchar_t* key) {
     wchar_t value[64]{}; GetPrivateProfileStringW(L"Hotkeys", key, L"", value, 64, IniPath().c_str());
     return value;
 }
 std::wstring Shown(UiHotkeys::Action action) { return UiHotkeys::Plain(UiHotkeys::Get(action)); }
+// A key held long enough for the worker's poll to see it (SendInput taps are over within a poll).
+void Hold(WORD vk, DWORD ms) {
+    INPUT key[1]{}; key[0].type = INPUT_KEYBOARD; key[0].ki.wVk = vk;
+    SendInput(1, key, sizeof(INPUT)); Sleep(ms);
+    key[0].ki.dwFlags = KEYEVENTF_KEYUP; SendInput(1, key, sizeof(INPUT)); Sleep(150);
+}
 // DualSense USB input report: Triangle + Square, d-pad neutral (hat 8).
 void FeedDualSense(DWORD ms) {
     unsigned char report[64]{}; report[0] = 0x01; report[8] = 0x08 | 0x10 | 0x80;
@@ -374,10 +383,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         WaitForSingleObject(w, 5000); WaitForSingleObject(g, 5000);
         return 0;
     }
-    // Hotkeys start from the defaults; the pad checks write their own chords. HairMode is typed the
-    // way a player edits the ini by hand: no device prefix, spaces around '+'.
+    // Hotkeys start from an ini of the one-binding layout (no Layout=2): HairMode typed the way a player
+    // edits the ini by hand (no device prefix, spaces around '+'), GrabRelease rebound to a pad chord.
+    // The pad checks write their own chords.
     WritePrivateProfileStringW(L"Hotkeys", nullptr, nullptr, IniPath().c_str());
     WritePrivateProfileStringW(L"Hotkeys", L"HairMode", L"Shift + F11", IniPath().c_str());
+    WritePrivateProfileStringW(L"Hotkeys", L"GrabRelease", L"ps:Triangle+Cross", IniPath().c_str());
     HANDLE game = CreateThread(nullptr, 0, GameMain, ready, 0, nullptr);
     WaitForSingleObject(ready, 5000);
     Foreground(game_); Sleep(300);
@@ -389,6 +400,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         Check(!wcscmp(hub, L"kb:F10"), "the panel key is written to the ini with its default F10");
         const UiHotkeys::Chord hair = UiHotkeys::Get(UiHotkeys::Action::HairMode);
         Check(hair.device == UiHotkeys::Device::Keyboard && hair.key == VK_F11 && hair.modifiers == 2, "a hand-typed ini chord without prefix reads as a keyboard chord");
+        Log("  [ini] Layout=%ls GrabRelease=%ls / %ls / %ls", Saved(L"Layout").c_str(), Saved(L"GrabRelease").c_str(), Saved(L"GrabRelease.Xbox").c_str(), Saved(L"GrabRelease.PS").c_str());
+        Check(Saved(L"Layout") == L"2" && Saved(L"GrabRelease") == L"kb:G" && Saved(L"GrabRelease.Xbox") == L"xb:Y+A" && Saved(L"GrabRelease.PS") == L"ps:Triangle+Cross",
+            "a one-binding pad chord migrates into the Xbox and PlayStation sets, the keyboard gets its default");
+        Check(Saved(L"NpcSkill") == L"kb:X" && Saved(L"NpcSkill.Xbox") == L"xb:L3+R3" && Saved(L"WeaponSwap.Xbox") == L"xb:LB+L3" && Saved(L"WeaponSwap.PS") == L"ps:SwipeLeft+SwipeRight",
+            "every device's defaults are written to the ini");
     }
     Sleep(600);
     Report("banner showing");
@@ -467,32 +483,43 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(900);
     if (!DebugHub::Visible()) { DebugHub::Toggle(); Sleep(900); }
     if (!OursForeground()) { Foreground(game_); Sleep(150); }
-    const HWND up = BindBox(UiHotkeys::Action::GearUp), down = BindBox(UiHotkeys::Action::GearDown);
+    using UiHotkeys::Device;
+    const HWND up = BindBox(UiHotkeys::Action::GearUp, Device::Xbox), down = BindBox(UiHotkeys::Action::GearDown, Device::PlayStation);
     const HWND glyphs = up ? FindWindowExW(GetParent(up), nullptr, L"PBZHotkeyGlyphs_v1", nullptr) : nullptr;
     if (!OursForeground()) Log("  skipped pad checks: another process owns the foreground");
-    else if (up && down && glyphs) {
+    else if (up && down && glyphs && BindBox(UiHotkeys::Action::GearUp, Device::Keyboard)) {
         Check(BindXbox(up, 0x0100 | 0x0200), "bind box waits for a chord after a click");
-        Log("  GearUp saved as %ls, shown as %ls", Saved(L"GearUp").c_str(), Shown(UiHotkeys::Action::GearUp).c_str());
-        Check(Saved(L"GearUp") == L"xb:LB+RB", "Xbox LB+RB records as xb:LB+RB");
-        Check(Shown(UiHotkeys::Action::GearUp) == L"LB + RB", "an Xbox press shows Xbox glyphs");
-        RECT g{}; GetClientRect(glyphs, &g);
-        PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(g.right - 6, g.bottom / 2)); Sleep(300);
-        Log("  PlayStation glyphs: PadGlyphs=%ls, GearUp shown as %ls", Saved(L"PadGlyphs").c_str(), Shown(UiHotkeys::Action::GearUp).c_str());
-        Check(Saved(L"PadGlyphs") == L"ps" && Shown(UiHotkeys::Action::GearUp) == L"L1 + R1", "glyph switch draws the same chord as L1 + R1");
-        PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(6, g.bottom / 2)); Sleep(300);
-        Check(Saved(L"PadGlyphs") == L"auto" && Shown(UiHotkeys::Action::GearUp) == L"LB + RB", "glyph switch back to auto follows the Xbox pad");
+        Log("  GearUp saved as %ls / %ls, shown as %ls", Saved(L"GearUp").c_str(), Saved(L"GearUp.Xbox").c_str(), Shown(UiHotkeys::Action::GearUp).c_str());
+        Check(Saved(L"GearUp.Xbox") == L"xb:LB+RB" && Saved(L"GearUp") == L"kb:plus", "Xbox LB+RB records into the Xbox set; the keyboard binding stays");
+        Check(UiHotkeys::InputDevice() == Device::Xbox && Shown(UiHotkeys::Action::GearUp) == L"LB + RB", "after an Xbox press the prompts show the Xbox set");
         const int fired = pad_fires_.load();
         fake_pad_.store(0x0100 | 0x0200); Sleep(250); fake_pad_.store(0); Sleep(250);
         Check(pad_fires_.load() == fired + 1, "Xbox LB+RB fires its action once");
         fake_pad_.store(0x0100); Sleep(250); fake_pad_.store(0); Sleep(250);
         Check(pad_fires_.load() == fired + 1, "LB alone does not fire LB+RB");
+        RECT g{}; GetClientRect(glyphs, &g);
+        PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(g.right - 6, g.bottom / 2)); Sleep(300);
+        Log("  pad type PlayStation: PadGlyphs=%ls, active=%d", Saved(L"PadGlyphs").c_str(), static_cast<int>(UiHotkeys::ActivePad()));
+        Check(Saved(L"PadGlyphs") == L"ps" && UiHotkeys::ActivePad() == Device::PlayStation, "the pad type switch picks the PlayStation set");
+        fake_pad_.store(0x0100 | 0x0200); Sleep(250); fake_pad_.store(0); Sleep(250);
+        Check(pad_fires_.load() == fired + 1, "with the PlayStation set in use the Xbox chord does not fire");
+        PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(6, g.bottom / 2)); Sleep(300);
+        Check(Saved(L"PadGlyphs") == L"auto" && UiHotkeys::ActivePad() == Device::Xbox, "back to auto: the Xbox pad in hand picks the Xbox set");
         // Steam Input / DS4Windows: a DualSense press also shows up as XInput, a moment earlier.
         BindXbox(down, 0x8000 | 0x4000, 300);
-        Log("  mirrored DualSense: GearDown saved as %ls", Saved(L"GearDown").c_str());
-        Check(Saved(L"GearDown") == L"ps:Triangle+Square", "a DualSense mirrored into XInput records as PlayStation");
-    } else Check(false, "hotkey page has the gear bind boxes and the glyph switch");
+        Sleep(100);
+        Log("  mirrored DualSense: GearDown.PS saved as %ls, hint %ls", Saved(L"GearDown.PS").c_str(), UiHotkeys::Hint(UiHotkeys::Action::GearDown).c_str());
+        Check(Saved(L"GearDown.PS") == L"ps:Triangle+Square", "a DualSense mirrored into XInput records into the PlayStation set");
+        Check(UiHotkeys::ActivePad() == Device::PlayStation && UiHotkeys::Hint(UiHotkeys::Action::GearDown) == L"三角 + 方块",
+            "a DualSense press switches to the PlayStation set; prompts name its buttons");
+    } else Check(false, "hotkey page has the per-device gear bind boxes and the pad type switch");
     DebugHub::Toggle(); Sleep(900);
     Check(Keys(3) == 3, "keys reach the game after the mouse checks");
+    if (OursForeground()) {
+        Hold(VK_F23, 120); Sleep(100);
+        Log("  after a key: device=%d grab hint=%ls", static_cast<int>(UiHotkeys::InputDevice()), UiHotkeys::Hint(UiHotkeys::Action::GrabRelease).c_str());
+        Check(UiHotkeys::InputDevice() == Device::Keyboard && UiHotkeys::Hint(UiHotkeys::Action::GrabRelease) == L"G", "after a key press the prompts show the keyboard set");
+    }
     Report("end");
     Check(game_off_by_worker_.load() == 0, "the hub's thread never deactivates the game window (UE would drop menu mouse input)");
     Log("worst F24 delivery latency: %.1f ms", worst_latency_us_.load() / 1000.0);

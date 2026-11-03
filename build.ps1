@@ -20,6 +20,13 @@ $readme = @"
     <PBZ 安装目录>\platform\steam\version.dll
   启动游戏，进入游戏后按 F10 打开面板。
 
+默认快捷键（键盘 / Xbox / PlayStation；按最近使用的设备自动识别）
+  释放投技          G       Y + B      三角 + 圈
+  施放 NPC 技能     X       L3 + R3    L3 + R3
+  切换武器预设      Z       LB + L3    触控板左右滑
+  提升 / 降低挡位   = / -
+  都可在面板“快捷键”页或 PBZDebugMenu.ini 的 [Hotkeys] 修改。
+
 精简版
   triggers_only\version.dll 只关闭 DualSense 自适应扳机，没有面板和其他功能。
   两个文件同名，只装其中一个。
@@ -30,6 +37,7 @@ $readme = @"
 说明
   MOD 只在匹配的 PBZ.exe 版本上启用（启动时校验 SHA-256），版本不符时只转发系统 version.dll。
   设置保存在 DLL 旁的 PBZDebugMenu.ini，日志写在 PBZDebugMenu.log。
+  更新内容见同目录的 CHANGELOG.md。
   仅用于单机游戏，与游戏开发商无关。
 
 构建 $name
@@ -37,6 +45,7 @@ $readme = @"
 $files = [ordered]@{
     "$name/version.dll"               = Join-Path $buildRoot 'Release\version.dll'
     "$name/triggers_only/version.dll" = Join-Path $buildRoot 'triggers_only\version.dll'
+    "$name/CHANGELOG.md"              = Join-Path $projectRoot 'CHANGELOG.md'
 }
 $distRoot = Join-Path $projectRoot 'dist'
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null

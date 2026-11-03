@@ -44,7 +44,7 @@ struct Snapshot {
     uint32_t executions_redirected = 0;
     std::wstring execution_status;
     std::wstring target, ability;
-    std::wstring status = L"投技默认关闭；选择来源 Boss 的招式，开启后 PS5 三角 + 圈触发一次";
+    std::wstring status = L"投技默认关闭；选择来源 Boss 的招式，开启后按投技快捷键触发一次";
     std::vector<Variant> variants;
     std::vector<BossInfo> bosses;
 };

@@ -5,6 +5,7 @@
 #include "npc_pose_transfer.h"
 #include "grab_extras.h"
 #include "skill_toast.h"
+#include "ui_hotkeys.h"
 #include "settings_store.h"
 #include <windows.h>
 #include <algorithm>
@@ -2176,7 +2177,7 @@ void CastSkill() {
     const NpcSkillSet& set=kNpcSkillSets[selected_];const Profile& profile=kProfiles[selected_];
     if(!set.skill_count){Status(L"%s 没有可施放的战斗技能：游戏里没有它的战斗蓝图",profile.name);Logf("NPC_SKILL none profile=%s (no combat blueprint)",set.profile);return;}
     WatchSkill(); // the last skill may have ended since the 250 ms maintenance pass
-    if(skill_.handle>0){Status(L"技能 %s 仍在施放，结束后再按 L3 + R3",SkillLabel(skill_.name).c_str());Logf("NPC_SKILL busy ability=%s elapsedMs=%llu",skill_.name.c_str(),GetTickCount64()-skill_.started);return;}
+    if(skill_.handle>0){Status(L"技能 %s 仍在施放，结束后再按 %s",SkillLabel(skill_.name).c_str(),UiHotkeys::Hint(UiHotkeys::Action::NpcSkill).c_str());Logf("NPC_SKILL busy ability=%s elapsedMs=%llu",skill_.name.c_str(),GetTickCount64()-skill_.started);return;}
     if(pending_.handle>0){Status(L"技能 %s 等主角收招后施放",SkillLabel(pending_.name).c_str());return;}
     Context context;Object* asc=nullptr;
     if(!ContextNow(context)||context.pawn!=pawn_.object||!ue::Alive(asc=PawnAsc(context.pawn))){Logf("NPC_SKILL refused: player / ability system not ready");return;}
@@ -2310,12 +2311,13 @@ void ScaleSkillDamage() {
 //            bullet.Initialize(null, self, ability, DragonPillarData, false); bullet.BeginPrepareMotion()
 //   Throw:   bullet.LaunchTowardPoint(target location, 1 s)
 //   Cancel:  bullet.StopPillarFlight(); bullet.Deactivate(0.1)
-// DriveBossCalls replays them for the hero at the same skill montage positions, with the boss's values read
+// DriveDragonPillar replays them for the hero at the same skill montage positions, with the boss's values read
 // from its class default object and the nearest hostile pawn as the target (the boss aims at the player).
 // The bullet's native parameters are filled by position (bytecode carries no names), sizes checked.
 // Initialize and Deactivate are BulletInterface functions (the bytecode calls them through an interface
 // context, 0x51): they are not on the bullet class, so they are looked up on the interface.
 Object* DefaultObject(Object* cls);
+Object* LoadAssetPath(const char* path);
 struct BossCall { const char* ability; const char* montage; float prepare_at, throw_at, flight_seconds; };
 constexpr BossCall kDragonPillar{"GA_ZuoShang_P2_Skill_23","ZuoShang_LongTi_Skill_23_Montage",0.681f,2.015f,1.0f};
 struct PillarState { int32_t handle=0;Identity bullet;bool prepared=false,thrown=false; };
@@ -2400,7 +2402,7 @@ void CancelPillar(const char* why) {
         Logf("NPC_SKILL pillar cancelled reason=%s deactivated=%d",why,stop.Invoke()?1:0);}
     pillar_={};
 }
-void DriveBossCalls() {
+void DriveDragonPillar() {
     const bool mine=active_&&skill_.handle>0&&skill_.name==kDragonPillar.ability&&Same(pawn_)&&Same(skill_.asc);
     if(!mine){if(pillar_.handle){if(pillar_.prepared&&!pillar_.thrown)CancelPillar(active_?"skill-ended":"skin-off");else pillar_={};}return;}
     if(pillar_.handle!=skill_.handle){if(pillar_.prepared&&!pillar_.thrown)CancelPillar("next-skill");pillar_={};pillar_.handle=skill_.handle;}
@@ -2409,6 +2411,186 @@ void DriveBossCalls() {
     const float position=at.Get<float>("ReturnValue");
     if(!pillar_.prepared&&position>=kDragonPillar.prepare_at){pillar_.prepared=true;PreparePillar(pawn_.object,skill_.asc.object);}
     if(pillar_.prepared&&!pillar_.thrown&&position>=kDragonPillar.throw_at){pillar_.thrown=true;ThrowPillar(pawn_.object);}
+}
+// ---- Boss-only calls found by the full scan --------------------------------------------------------
+// scan_all.py (same folder) decodes the blueprint closure of every skin skill (1713) and lists the code that only
+// works on the boss: casts to the boss blueprint and calls into its post-process AnimBP. Besides the dragon pillar
+// these are replayed:
+//   weapon trace: 55 skills of 左殇, 白赤练, 火流星, 断肠, 烟千岁, 梦华圣母, 虚空      RedirectWeaponTrace
+//   魔渊 skill 06: the pillar on the body                                            DriveSkillPillar
+//   魔渊 skill 08: the pillar group behind the caster                                PlacePillarGroup
+//   雷当 special attack 03, 左殇 skill 20: the counter flash                          DriveCounterFlash
+// Not replayed: arena actors (火流星 P2 safe zone, 白赤练 P2 wires), 火流星's chains (components of the boss actor),
+// 左殇 CA_02 / CA_03 QTE mesh scale, the boss's head / body look-at toggles, 火流星 P2 BEd_01 (the victim's side).
+Object* Niagara() { return ue::Default("/Script/Niagara.Default__NiagaraFunctionLibrary"); }
+// A Niagara system on a display socket: not pooled (it may be destroyed here) and never pre-culled.
+Object* SpawnEffectAttached(const char* path,Object* parent,Name socket,const Vector& at,const RotatorD& turn,uint8_t location_type) {
+    Object* system=LoadAssetPath(path);if(!ue::Alive(system)||!ue::Alive(parent))return nullptr;Call spawn(Niagara(),"SpawnSystemAttached");
+    if(!spawn.Set("SystemTemplate",system).Set("AttachToComponent",parent).Set("AttachPointName",socket).Set("Location",at).Set("Rotation",turn).Set("LocationType",location_type)
+        .Set("bAutoDestroy",true).Set("bAutoActivate",true).Set("PoolingMethod",uint8_t{0}).Set("bPreCullCheck",false).Invoke())return nullptr;
+    Object* component=spawn.Get<Object*>("ReturnValue");return ue::Alive(component)?component:nullptr;
+}
+bool IsBlueprint(Object* object,const char* class_name) {
+    for(Object* cls=ue::Alive(object)?ue::ClassOf(object):nullptr;cls;cls=ue::At<Object*>(cls,ue::layout::kSuper))if(ue::NameIs(ue::NameOf(cls),class_name))return true;
+    return false;
+}
+// Weapon trace: GA_WeaponTraceAttack_Base keeps PP = the avatar's socket mesh's post-process instance (set on
+// activation), sends BPI_EnemyWeaponTrace.SetTraceTarget(alpha R / L / custom from its curves, the target's
+// location) to PP every tick and zeros it at the end. The boss's post-process AnimBP implements the interface (its
+// weapon bones bend toward the target); the hero's does not, so on a skin nothing moved. Every running instance
+// (the skill itself or a move its combo tree starts) gets the display's post-process instance as PP, and the
+// ability's own tick drives the boss's weapon. A skin taken off mid-skill hands the old PP back.
+struct TracedAbility { Identity ability,original;Object* pp=nullptr; };
+std::vector<TracedAbility> traced_;
+void RedirectWeaponTrace() {
+    if(!active_||skill_.handle<=0||!Same(skill_.asc)||!Same(display_)){traced_.clear();return;}
+    Object* pp=Property<Object*>(display_.object,"PostProcessAnimInstance");if(!ue::Alive(pp))return;
+    Object* asc=skill_.asc.object,*type=Class("/Script/GameplayAbilities.GameplayAbilitySpec"),*container=Class("/Script/GameplayAbilities.GameplayAbilitySpecContainer");
+    const int32_t specs=Offset(asc,"ActivatableAbilities"),items=container?ue::Offset(container,"Items"):-1,size=type?ue::StructSize(type):0,
+        handle_at=type?ue::Offset(type,"Handle"):-1,count_at=type?ue::Offset(type,"ActiveCount"):-1;
+    if(specs<0||items<0||size<=0||handle_at<0||count_at<0)return;
+    const Array array=ue::At<Array>(asc,specs+items);
+    if(array.num<0||array.num>4096||array.max<array.num||(array.num&&!FaceReadable(array.data,static_cast<size_t>(array.num)*static_cast<size_t>(size))))return;
+    std::vector<int32_t> running; // handles first: the calls below must not walk the array they could change
+    for(int32_t i=0;i<array.num;++i){Object* row=static_cast<Object*>(array.data)+static_cast<size_t>(i)*static_cast<size_t>(size);if(ue::At<uint8_t>(row,count_at))running.push_back(ue::At<int32_t>(row,handle_at));}
+    for(const int32_t handle:running){
+        bool instance=false;Object* ability=SpecAbility(asc,handle,instance);
+        if(!instance||!IsBlueprint(ability,"GA_WeaponTraceAttack_Base_C"))continue;
+        Object* was=Property<Object*>(ability,"PP");if(was==pp||!Put(ability,"PP",pp))continue;
+        const auto known=std::find_if(traced_.begin(),traced_.end(),[&](const TracedAbility& t){return t.ability.object==ability&&Same(t.ability);});
+        if(known==traced_.end())traced_.push_back({Id(ability),Id(was),pp});else{known->original=Id(was);known->pp=pp;}
+        Logf("NPC_SKILL weapon trace %s: PP %s -> %s",Text(ability).c_str(),Text(was).c_str(),Text(pp).c_str());
+    }
+}
+// 魔渊 skill 06 (GA_MoTian_Skill_06): its timeline holds CharacterState.AbilityState.MoYuan.SpawnPillar on the caster
+// from 0.12 s for 4.47 s; the ability waits for the tag and calls BP_Monster_MoTian.SpawnPillar / DespawnPillar:
+//   Spawn:   Pillar = SpawnSystemAttached(NS_MoYuan_Pillar_001_Main, Mesh, "interaction", (0,0,0), (0,90,0), SnapToTarget,
+//            auto destroy, AutoRelease pool, pre-cull); Pillar.SetWorldScale3D(1.6, 1.4, 1.6)
+//   Despawn: Pillar.Deactivate(); 0.5 s later Pillar.K2_DestroyComponent()
+// The hero's ability system holds the same tag; DriveSkillPillar follows it on the display mesh.
+struct SkillPillar { const char* ability; const wchar_t* tag; const char* system; const char* socket; RotatorD turn; Vector scale; ULONGLONG linger_ms; };
+const SkillPillar kMoYuanPillar{"GA_MoTian_Skill_06",L"CharacterState.AbilityState.MoYuan.SpawnPillar",
+    "/PBZVFXPack/VFX/BattleFX/MoYuan/NS_MoYuan_Pillar_001_Main.NS_MoYuan_Pillar_001_Main","interaction",{0,90,0},{1.6,1.4,1.6},500};
+struct Lingering { Identity component;ULONGLONG destroy_at=0; };
+struct SkillPillarState { ULONGLONG skill_started=0;Identity component;bool spawned=false,despawned=false; };
+SkillPillarState skill_pillar_;std::vector<Lingering> lingering_;
+void DespawnSkillPillar(const char* why) {
+    if(skill_pillar_.spawned&&!skill_pillar_.despawned&&Same(skill_pillar_.component)){Object* component=skill_pillar_.component.object;
+        const bool off=Call(component,"Deactivate").Invoke();lingering_.push_back({skill_pillar_.component,GetTickCount64()+kMoYuanPillar.linger_ms});
+        Logf("NPC_SKILL %s pillar despawned reason=%s deactivated=%d",kMoYuanPillar.ability,why,off?1:0);}
+    skill_pillar_.despawned=true;
+}
+void DriveSkillPillar() {
+    const ULONGLONG now=GetTickCount64();
+    lingering_.erase(std::remove_if(lingering_.begin(),lingering_.end(),[&](const Lingering& l){if(active_&&now<l.destroy_at)return false;if(Same(l.component))Destroy(l.component.object);return true;}),lingering_.end());
+    const SkillPillar& e=kMoYuanPillar;
+    const bool mine=active_&&skill_.handle>0&&skill_.name==e.ability&&Same(pawn_)&&Same(skill_.asc)&&Same(display_);
+    if(skill_pillar_.skill_started&&(!mine||skill_pillar_.skill_started!=skill_.started)){DespawnSkillPillar(!active_?"skin-off":!mine?"skill-ended":"next-skill");skill_pillar_={};}
+    if(!mine)return;
+    skill_pillar_.skill_started=skill_.started;if(skill_pillar_.despawned)return;
+    static const Name tag=ue::MakeName(e.tag);Call has(skill_.asc.object,"HasMatchingGameplayTag","/Script/GameplayTags.GameplayTagAssetInterface");
+    const bool held=!tag.None()&&has.Set("TagToCheck",tag).Invoke()&&has.Get<bool>("ReturnValue");
+    if(held&&!skill_pillar_.spawned){
+        skill_pillar_.spawned=true;Object* display=display_.object;const Name socket=DisplaySocket(display,e.socket);
+        Object* component=SpawnEffectAttached(e.system,display,socket,Vector{},e.turn,2);
+        const bool scaled=component&&Call(component,"SetWorldScale3D").Set("NewScale",e.scale).Invoke();if(component)skill_pillar_.component=Id(component);
+        Logf("NPC_SKILL %s pillar %s socket=%s on %s scaled=%d",e.ability,component?"spawned":"failed",socket.None()?"none (mesh origin)":Text(socket).c_str(),Text(display).c_str(),scaled?1:0);}
+    else if(!held&&skill_pillar_.spawned)DespawnSkillPillar("tag-removed");
+}
+// 魔渊 skill 08 (GA_MoTian_Skill_08): on CharacterState.Combat.ComboPoint.ComboPoint_1 it spawns BP_MoYuan_CA_PillarGroup_001
+// (pillars rising behind the boss, child actors) with the avatar's rotation at the avatar's location - 1000 x
+// forward(look-at from it to the player), at the height of the boss's Mesh. On the hero that Mesh comes from the failed
+// boss cast (0) and the player is the hero itself (no direction, forward = world +X): the group appears 10 m along
+// world -X at height 0. PlacePillarGroup moves such a group, the frame it appears, to the boss's spot: 10 m behind the
+// hero away from the nearest enemy (behind its facing when there is none), at the height of the hero's mesh.
+struct PillarGroups { ULONGLONG skill_started=0;Identity cls;std::vector<Identity> placed; };
+PillarGroups groups_;
+void PlacePillarGroup() {
+    if(!(active_&&skill_.handle>0&&skill_.name=="GA_MoTian_Skill_08"&&Same(pawn_)&&Same(primary_))){if(groups_.skill_started)groups_={};return;}
+    if(groups_.skill_started!=skill_.started){groups_={};groups_.skill_started=skill_.started;
+        Object* cls=LoadClassPackage("/PBZVFXPack/VFX/BattleFX/MoYuan/BP_MoYuan_CA_PillarGroup_001");if(cls)groups_.cls=Id(cls);
+        else Logf("NPC_SKILL GA_MoTian_Skill_08 pillar group class not loaded; group left where the skill puts it");}
+    if(!Same(groups_.cls))return;
+    Object* hero=pawn_.object;Vector self{};{Call where(hero,"K2_GetActorLocation");if(!where.Invoke())return;self=where.Get<Vector>("ReturnValue");}
+    Call actors(ue::Default("/Script/Engine.Default__GameplayStatics"),"GetAllActorsOfClass");
+    if(!actors.Set("WorldContextObject",hero).Set("ActorClass",groups_.cls.object).Invoke())return;
+    const Array list=actors.Get<Array>("OutActors");std::vector<Object*> found;
+    if(list.data&&list.num>0&&list.num<=256&&FaceReadable(list.data,static_cast<size_t>(list.num)*sizeof(Object*)))
+        for(int32_t i=0;i<list.num;++i)if(Object* group=static_cast<Object**>(list.data)[i];ue::Alive(group))found.push_back(group);
+    ue::Free(list.data);
+    for(Object* group:found){
+        if(std::any_of(groups_.placed.begin(),groups_.placed.end(),[&](const Identity& p){return p.object==group&&Same(p);}))continue;
+        Vector at{};{Call where(group,"K2_GetActorLocation");if(!where.Invoke())continue;at=where.Get<Vector>("ReturnValue");}
+        if(std::abs(at.z)>1||std::hypot(at.x-(self.x-1000),at.y-self.y)>400)continue; // not the hero's misplaced one (a boss's own is elsewhere)
+        groups_.placed.push_back(Id(group));
+        Vector toward{},enemy{};const bool aimed=NearestEnemy(hero,enemy);
+        if(aimed){Call look(Math(),"FindLookAtRotation");Call forward(Math(),"GetForwardVector");
+            if(look.Set("Start",self).Set("Target",enemy).Invoke()&&forward.Set("InRot",look.Get<RotatorD>("ReturnValue")).Invoke())toward=forward.Get<Vector>("ReturnValue");}
+        else{Call forward(hero,"GetActorForwardVector");if(forward.Invoke())toward=forward.Get<Vector>("ReturnValue");}
+        double z=self.z;{Call mesh(primary_.object,"K2_GetComponentLocation");if(mesh.Invoke())z=mesh.Get<Vector>("ReturnValue").z;}
+        const Vector spot{self.x-toward.x*1000,self.y-toward.y*1000,z};
+        Call move(group,"K2_SetActorLocation");const bool moved=move.Set("NewLocation",spot).Set("bSweep",false).Set("bTeleport",true).Invoke()&&move.Get<bool>("ReturnValue");
+        Logf("NPC_SKILL GA_MoTian_Skill_08 pillar group %s moved=%d from (%.0f,%.0f,%.0f) to (%.0f,%.0f,%.0f) %s",Text(group).c_str(),moved?1:0,at.x,at.y,at.z,spot.x,spot.y,spot.z,
+            aimed?"behind the hero, away from the nearest enemy":"behind the hero (no enemy)");
+    }
+}
+// 雷当 special attack 03 and 左殇 skill 20 open a counter window (GAA_DeflectFrame); a successful counter sends
+// GameplayEvent.Ability.LeiDang.Deflect to the caster and the ability answers with a flash (NS_GP_Triggered_001) and a
+// short slow motion:
+//   雷当: SpawnSystemAtLocation(at the boss Mesh's Weapon_r socket, scale 1.5)
+//   左殇: SpawnSystemAttached(Mesh, "root", (0, 50, 120), KeepRelativeOffset); SetRelativeScale3D(1.5)
+// On the hero the Mesh is the failed boss cast: the flash lands at the world origin or is not spawned at all. The
+// ability keeps the event's payload in its persistent ubergraph frame (K2Node_CustomEvent_Payload): DriveCounterFlash
+// clears its EventTag when the skill starts and shows the flash on the display each time the tag is set again.
+struct CounterFlash { const char* ability; bool attached; const char* socket; Vector at; };
+constexpr CounterFlash kCounterFlashes[]={{"GA_LeiDang_SpecialAttack_03",false,"Weapon_r",{}},{"GA_ZuoShang_Skill_20",true,"root",{0,50,120}}};
+constexpr char kCounterFlashSystem[]="/PBZVFXPack/VFX/BattleFX/Common/NS_GP_Triggered_001.NS_GP_Triggered_001";
+constexpr ULONGLONG kCounterFrameWaitMs=500;
+struct CounterState { ULONGLONG skill_started=0;Identity ability;Name* tag=nullptr;bool logged=false;uint32_t flashes=0; };
+CounterState counter_;
+// The EventTag of the event payload in the ability's ubergraph frame; nullptr when the layout is not the expected one.
+Name* PayloadTag(Object* ability,const std::string& name) {
+    Object* cls=ue::ClassOf(ability),*data=Class("/Script/GameplayAbilities.GameplayEventData");const uintptr_t frame_field=Field(cls,"UberGraphFrame");
+    Object* graph=ue::FindFunction(cls,("ExecuteUbergraph_"+name).c_str());const uintptr_t payload=graph?Field(graph,"K2Node_CustomEvent_Payload"):0;
+    if(!frame_field||!payload||!data||ue::Offset(data,"EventTag")!=0||ue::At<int32_t>(reinterpret_cast<void*>(payload),ue::layout::kPropElementSize)!=ue::StructSize(data))return nullptr;
+    unsigned char* frame=ue::At<unsigned char*>(ability,ue::At<int32_t>(reinterpret_cast<void*>(frame_field),ue::layout::kPropOffset));
+    const int32_t at=ue::At<int32_t>(reinterpret_cast<void*>(payload),ue::layout::kPropOffset);
+    return frame&&at>=0&&FaceReadable(frame+at,sizeof(Name))?reinterpret_cast<Name*>(frame+at):nullptr;
+}
+void ShowCounterFlash(const CounterFlash& row) {
+    Object* display=display_.object;const Name socket=DisplaySocket(display,row.socket);Object* flash=nullptr;
+    if(row.attached){flash=SpawnEffectAttached(kCounterFlashSystem,display,socket,row.at,RotatorD{},0);if(flash)Call(flash,"SetRelativeScale3D").Set("NewScale",Vector{1.5,1.5,1.5}).Invoke();}
+    else{Call where(display,socket.None()?"K2_GetComponentLocation":"GetSocketLocation");if(!socket.None())where.Set("InSocketName",socket);
+        Object* system=LoadAssetPath(kCounterFlashSystem);Call spawn(Niagara(),"SpawnSystemAtLocation");
+        if(where.Invoke()&&ue::Alive(system)&&spawn.Set("WorldContextObject",display).Set("SystemTemplate",system).Set("Location",where.Get<Vector>("ReturnValue")).Set("Rotation",RotatorD{})
+            .Set("Scale",Vector{1.5,1.5,1.5}).Set("bAutoDestroy",true).Set("bAutoActivate",true).Set("PoolingMethod",uint8_t{0}).Set("bPreCullCheck",false).Invoke())flash=spawn.Get<Object*>("ReturnValue");}
+    Logf("NPC_SKILL %s counter flash %s socket=%s on %s (flash %u this skill)",row.ability,ue::Alive(flash)?"shown":"failed",socket.None()?"none":Text(socket).c_str(),Text(display).c_str(),++counter_.flashes);
+}
+void DriveCounterFlash() {
+    const CounterFlash* row=nullptr;
+    if(active_&&skill_.handle>0&&Same(skill_.asc)&&Same(display_))for(const CounterFlash& c:kCounterFlashes)if(skill_.name==c.ability)row=&c;
+    if(!row){counter_={};return;}
+    if(counter_.skill_started!=skill_.started){counter_={};counter_.skill_started=skill_.started;}
+    if(!counter_.tag){
+        bool instance=false;Object* ability=SpecAbility(skill_.asc.object,skill_.handle,instance);Name* tag=instance&&ue::Alive(ability)?PayloadTag(ability,skill_.name):nullptr;
+        if(tag){*tag=Name{};counter_.tag=tag;counter_.ability=Id(ability);Logf("NPC_SKILL %s counter flash: event payload watched on %s",row->ability,Text(ability).c_str());}
+        else if(!counter_.logged&&GetTickCount64()-skill_.started>kCounterFrameWaitMs){counter_.logged=true;Logf("NPC_SKILL %s counter flash: no event payload in the ability's ubergraph frame; flash not shown",row->ability);}
+        return;}
+    if(!Same(counter_.ability)){counter_.tag=nullptr;return;}
+    if(counter_.tag->None())return;
+    *counter_.tag=Name{}; // the next counter sets it again
+    ShowCounterFlash(*row);
+}
+void DriveBossCalls() { DriveDragonPillar();RedirectWeaponTrace();DriveSkillPillar();PlacePillarGroup();DriveCounterFlash(); }
+// The skin is coming off: what the replays hold goes now, not a frame later.
+void EndBossCalls(const char* why) {
+    if(pillar_.prepared&&!pillar_.thrown)CancelPillar(why);pillar_={};
+    DespawnSkillPillar(why);skill_pillar_={};
+    for(const Lingering& l:lingering_)if(Same(l.component))Destroy(l.component.object);lingering_.clear();
+    size_t restored=0;
+    for(const TracedAbility& t:traced_)if(Same(t.ability)&&Property<Object*>(t.ability.object,"PP")==t.pp&&Put(t.ability.object,"PP",Same(t.original)?t.original.object:nullptr))++restored;
+    if(!traced_.empty())Logf("NPC_SKILL weapon trace PP handed back=%zu of %zu reason=%s",restored,traced_.size(),why);
+    traced_.clear();groups_={};counter_={};
 }
 // ---- Foreign montages ---------------------------------------------------------------------------
 void HoldForeignMontage() {
@@ -2638,7 +2820,7 @@ bool RestoreSourceSettings();
 bool Restore(bool preserve_external = true) {
     stage_ = "restore";
     ResetCameraLift();
-    ClearSkill("restore");RestoreBodyCollision();ReleasePins();RetireMount("restore");
+    ClearSkill("restore");EndBossCalls("restore");RestoreBodyCollision();ReleasePins();RetireMount("restore");
     cleanup_pending_ = HasResources();
     if (Same(skeleton_edit_.skeleton) && !QuiesceSkeleton(skeleton_edit_.skeleton.object)) {
         Logf("NPC_RETARGET shared animation synchronization pending; cleanup deferred");

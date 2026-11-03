@@ -21,15 +21,16 @@
 
 | 模块 | 内容 |
 |---|---|
-| **面板（Hub）** | 无边框自绘界面，仿游戏 UI 的墨色与金线风格；中英双语；打开时可暂停游戏；键盘 / Xbox / PlayStation 按键图标 |
+| **面板（Hub）** | 无边框自绘界面，仿游戏 UI 的墨色与金线风格；中英双语；打开时可暂停游戏 |
+| **快捷键** | 键盘、Xbox、PlayStation 各一套，自动识别当前手柄和最近使用的设备，提示显示对应按键图标 |
 | **Boss 连战** | 传送到任意 Boss、直接触战、连战流程，附难度与周目设置；入场保护与存档保护 |
 | **Boss AI** | 读取并调整当前 Boss 实例的原生 AI 参数 |
-| **投技** | 53 招人形 Boss 原生投技，三角 + 圈触发；施放时换成该 Boss 的武器，并由不可见的 Boss 骨架代理重放动画，武器演出与 Boss 一致；可放大伤害、无视无敌；受击、倒地时也能触发 |
+| **投技** | 53 招人形 Boss 原生投技，按投技快捷键触发（默认键盘 G、Xbox Y + B、PS 三角 + 圈）；施放时换成该 Boss 的武器，并由不可见的 Boss 骨架代理重放动画，武器演出与 Boss 一致；可放大伤害、无视无敌；受击、倒地时也能触发 |
 | **空中技能 / JC** | 空中施放战技与杀气技、空中闪避、跳跃打断、近敌 JC 弹跳与资源奖励、缓落 |
-| **武器预设** | 两套装备一键或滑动触控板切换，显示游戏内武器图标与官方名称，重启后保留 |
+| **武器预设** | 两套装备一键切换（默认键盘 Z、Xbox LB + L3、PS 触控板左右滑），显示游戏内武器图标与官方名称，重启后保留 |
 | **挡位** | 右下角 0–10 档胶囊：挡位越高开启越多（JC、投技、奖励、伤害倍数、无视无敌），10 档滑条燃起游戏手绘火焰 |
 | **角色 / NPC** | 主角兼容装束替换；以 NPC / 人形 Boss 外观操作主角（75 个，实验）：保留主角的动作与能力，手臂、武器、碰撞半径和相机按 NPC 体型适配 |
-| **NPC 技能** | 套用 NPC 外观后按 L3 + R3 施放该 Boss 的技能（随机轮换、自动锁定、右下角提示），技能期间换成 Boss 自己的武器；伤害倍率可调（默认 3 倍，NPC 页选择）；长鸿·雷电枪骑的马播放 Boss 自己的动作 |
+| **NPC 技能** | 套用 NPC 外观后按 NPC 技能快捷键（默认键盘 X、手柄 L3 + R3）施放该 Boss 的技能（随机轮换、自动锁定、右下角提示），技能期间换成 Boss 自己的武器；伤害倍率可调（默认 3 倍，NPC 页选择）；Boss 蓝图里专有的特效和动作在主角身上重放（龙柱、魔渊柱、武器追踪、反击闪光）；长鸿·雷电枪骑的马播放 Boss 自己的动作 |
 | **毛发 / Groom** | 头发表示切换、强制 Groom、GPU 包围盒调试 |
 | **其他** | DualSense 自适应扳机可关闭；全部设置写入 `PBZDebugMenu.ini` |
 
@@ -62,42 +63,54 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --target version
 ```
 
-发布包内含完整版与精简版 `version.dll`，以及一份安装说明 `README.txt`。
+发布包内含完整版与精简版 `version.dll`、安装说明 `README.txt`（含默认快捷键）和更新日志 `CHANGELOG.md`。
 
 | 目标 | 产物 |
 |---|---|
 | `version` | `build/Release/version.dll`，完整 MOD |
 | `version_triggers` | `build/triggers_only/version.dll`，只关闭自适应扳机的精简版 |
-| `proxy_test` · `hair_controls_test` · `game_thread_test` · `pad_triggers_test` · `input_focus_test` · `npc_pose_transfer_test` | 测试（`input_focus_test` 用假 UnrealWindow 线程验证面板焦点、鼠标捕获与按键投递；`npc_pose_transfer_test` 用合成骨架验证 NPC 姿势重定向、双手握持、武器缩放与坐骑代理） |
+| `proxy_test` · `hair_controls_test` · `game_thread_test` · `pad_triggers_test` · `input_focus_test` · `npc_pose_transfer_test` | 测试（`input_focus_test` 用假 UnrealWindow 线程验证面板焦点、鼠标捕获与按键投递，以及三套快捷键的录制、触发、旧 INI 迁移和设备识别；`npc_pose_transfer_test` 用合成骨架验证 NPC 姿势重定向、双手握持、武器缩放与坐骑代理） |
 
 编译选项：`/W4 /WX /utf-8`，静态 CRT。
 
 ## 默认快捷键
 
-| 操作 | 按键 |
-|---|---|
-| 显示 / 隐藏面板 | `F10` |
-| 隐藏面板 · 切换页面 | `Esc` · `Ctrl` + `Tab` |
-| 毛发页 · 蒙皮 / Groom 切换 | `F7` · `F8` |
-| 强制 Groom · 套装解锁 | `F6` · `Shift` + `F6` |
-| GPU 包围盒 · 自适应扳机 | `F9` · `Shift` + `F9` |
-| 释放投技 | PlayStation `△` + `○` |
-| 施放 NPC 技能 | PlayStation `L3` + `R3` |
-| 切换武器预设 | 触控板左右滑动 |
+| 操作 | 键盘 | Xbox | PlayStation |
+|---|---|---|---|
+| 释放投技 | `G` | `Y` + `B` | `△` + `○` |
+| 施放 NPC 技能 | `X` | `L3` + `R3` | `L3` + `R3` |
+| 切换武器预设 | `Z` | `LB` + `L3` | 触控板左右滑动 |
+| 提升 / 降低挡位 | `=` / `-` | — | — |
+| 显示 / 隐藏面板 | `F10` | — | — |
+| 隐藏面板 · 切换页面 | `Esc` · `Ctrl` + `Tab` | — | — |
+| 毛发页 · 蒙皮 / Groom 切换 | `F7` · `F8` | — | — |
+| 强制 Groom · 套装解锁 | `F6` · `Shift` + `F6` | — | — |
+| GPU 包围盒 · 自适应扳机 | `F9` · `Shift` + `F9` | — | — |
 
-所有快捷键都可在面板“快捷键”页重新绑定（键盘、Xbox、PlayStation 组合键）。
+键盘默认键避开了游戏自己的键位（WASD、E、F、Q、R、T、V、空格、Shift、Ctrl、1、2 等）。手柄的每个键游戏都在用，所以手柄快捷键都是两键同时按（220 毫秒内）。
 
-打开面板的键也可以直接在 `PBZDebugMenu.ini` 里改：首次启动会写入 `[Hotkeys]` 下的 `ToggleHub=kb:F10`，改成例如 `ToggleHub=F11` 或 `ToggleHub=Ctrl + F10` 后重启游戏生效；留空或写错时仍用 F10。
+每个功能有键盘、Xbox、PlayStation 三套绑定，都可在面板“快捷键”页的三列里重新录制：
+
+- 键盘那套始终有效。
+- 手柄只用当前手柄那一套。“手柄类型”默认“自动”，按最近按下的手柄识别（经 Steam Input / DS4Windows 映射的 DualSense 也识别为 PlayStation），也可固定为 Xbox 或 PlayStation。
+- 屏幕上的提示跟随最近使用的设备：按过键盘或鼠标就显示键盘键，按过手柄就显示该手柄的按键。
+
+快捷键也可以直接在 `PBZDebugMenu.ini` 的 `[Hotkeys]` 里改，重启游戏生效：
+
+- 每个功能三项：`GrabRelease=kb:G`（键盘）、`GrabRelease.Xbox=xb:Y+B`、`GrabRelease.PS=ps:Triangle+Circle`。首次启动写入全部默认值。
+- 值可以不带 `kb:` / `xb:` / `ps:` 前缀，空格随意，例如 `ToggleHub=Ctrl + F10`、`NpcSkill.Xbox=LB + RB`；留空表示不绑定。
+- 打开面板的 `ToggleHub` 留空或写错时仍用 F10。
+- 旧版每个功能只有一项；升级后自动迁移：原手柄组合键同时用于 Xbox 和 PlayStation 两套，键盘用新默认键。
 
 ## 设置文件
 
-`PBZDebugMenu.ini` 与 DLL 放在一起，修改时才写盘（面板快捷键 `ToggleHub` 例外，首次启动写入默认值）：
+`PBZDebugMenu.ini` 与 DLL 放在一起，修改时才写盘（`[Hotkeys]` 例外：首次启动写入全部快捷键的默认值）：
 
 | 节 | 内容 |
 |---|---|
 | `[UI]` | 界面语言 |
 | `[Hub]` | 打开面板时暂停游戏 |
-| `[Hotkeys]` | 自定义快捷键；`ToggleHub` 为打开面板的键（默认 `kb:F10`，可写不带前缀的 `F11`、`Ctrl + F10`） |
+| `[Hotkeys]` | 快捷键：每个功能 `<功能>`（键盘）、`<功能>.Xbox`、`<功能>.PS` 三项；`PadGlyphs` 为手柄类型（`auto` / `xbox` / `ps`）；`ToggleHub` 为打开面板的键（默认 `kb:F10`） |
 | `[Gear]` | 当前挡位 |
 | `[Grab]` · `[GrabExtras]` · `[GrabDamage]` | 投技招式与开关、换武器 / 伤害模式 / 无视无敌、各招实测伤害 |
 | `[NpcSkill]` | NPC 技能伤害倍率 `DamageMultiplier`（1–10，默认 3） |

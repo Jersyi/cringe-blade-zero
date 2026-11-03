@@ -37,10 +37,10 @@ constexpr const wchar_t* kSubtitles[kPages]={
     L"主角兼容装束的完整装配替换",
     L"以原 NPC 外观操作主角（实验）",
     L"空中施放、跳跃取消与近敌 JC 奖励",
-    L"选择各 Boss 的原生投技，三角 + 圈触发",
+    L"选择各 Boss 的原生投技，按投技快捷键触发",
     L"头发表示切换、强制 Groom 与调试开关",
-    L"触控板滑动切换两套装备，切换前自动记忆",
-    L"键盘、Xbox 与 PlayStation 组合键",
+    L"快捷键或触控板滑动切换两套装备，切换前自动记忆",
+    L"键盘、Xbox、PlayStation 各一套，自动识别",
 };
 constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE805,0xE7AD,0xE771,0xE8AB,0xE144};
 struct Entry { const wchar_t* title=L""; Factory factory; HWND window=nullptr; int width=0,height=0; double x=0,y=0; int target_x=0,target_y=0; };

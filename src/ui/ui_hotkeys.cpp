@@ -39,28 +39,47 @@ constexpr wchar_t kGlyphClass[] = L"PBZHotkeyGlyphs_v1";
 constexpr COLORREF kGreen = RGB(16, 124, 16), kRed = RGB(232, 17, 35), kBlue = RGB(0, 120, 215), kYellow = RGB(255, 185, 0);
 constexpr COLORREF kPsCross = RGB(90, 150, 255), kPsCircle = RGB(255, 79, 79), kPsSquare = RGB(214, 92, 204), kPsTriangle = RGB(52, 196, 96);
 
-struct Spec { const wchar_t* id; const wchar_t* label; Chord initial; };
+// Default bindings per device. The keyboard ones avoid the game's own keys (its IMC_* contexts
+// map A C D E F I M P Q R S T V W, 1, 2, Space, Shift, Ctrl, Alt, Tab, Esc, the arrows and the
+// mouse); every pad button is the game's, so pad actions are two-button chords.
+struct Spec { const wchar_t* id; const wchar_t* label; Chord keyboard, xbox, ps; };
+constexpr Chord KeyChord(unsigned vk, unsigned modifiers = 0) { return {Device::Keyboard, modifiers, vk, 0}; }
+constexpr Chord XboxChord(unsigned buttons) { return {Device::Xbox, 0, 0, buttons}; }
+constexpr Chord PsChord(unsigned buttons) { return {Device::PlayStation, 0, 0, buttons}; }
 const Spec kSpecs[kCount] = {
-    {L"ToggleHub", L"显示或隐藏面板", {Device::Keyboard, 0, VK_F10, 0}},
-    {L"ShowBoss", L"Boss 连战", {}},
-    {L"ShowAi", L"Boss AI", {}},
-    {L"ShowCharacter", L"角色替换", {}},
-    {L"ShowNpc", L"NPC 重定向", {}},
-    {L"ShowAir", L"空中技能 / JC", {}},
-    {L"ShowGrab", L"投技", {}},
-    {L"ShowGroom", L"毛发 / Groom", {Device::Keyboard, 0, VK_F7, 0}},
-    {L"ShowWeapons", L"武器预设", {}},
-    {L"HairMode", L"蒙皮 / Groom", {Device::Keyboard, 0, VK_F8, 0}},
-    {L"GpuBounds", L"GPU 包围盒", {Device::Keyboard, 0, VK_F9, 0}},
-    {L"ForceGroom", L"强制 Groom", {Device::Keyboard, 0, VK_F6, 0}},
-    {L"OutfitUnlock", L"套装解锁", {Device::Keyboard, kShift, VK_F6, 0}},
-    {L"AdaptiveTriggers", L"自适应扳机", {Device::Keyboard, kShift, VK_F9, 0}},
-    {L"GrabRelease", L"释放投技", {Device::PlayStation, 0, 0, kY | kB}},
-    {L"WeaponSwap", L"切换武器预设", {Device::PlayStation, 0, 0, kSwipeL | kSwipeR}},
-    {L"GearUp", L"提升挡位", {}},
-    {L"GearDown", L"降低挡位", {}},
-    {L"NpcSkill", L"施放 NPC 技能", {Device::PlayStation, 0, 0, kL3 | kR3}},
+    {L"ToggleHub", L"显示或隐藏面板", KeyChord(VK_F10), {}, {}},
+    {L"ShowBoss", L"Boss 连战", {}, {}, {}},
+    {L"ShowAi", L"Boss AI", {}, {}, {}},
+    {L"ShowCharacter", L"角色替换", {}, {}, {}},
+    {L"ShowNpc", L"NPC 重定向", {}, {}, {}},
+    {L"ShowAir", L"空中技能 / JC", {}, {}, {}},
+    {L"ShowGrab", L"投技", {}, {}, {}},
+    {L"ShowGroom", L"毛发 / Groom", KeyChord(VK_F7), {}, {}},
+    {L"ShowWeapons", L"武器预设", {}, {}, {}},
+    {L"HairMode", L"蒙皮 / Groom", KeyChord(VK_F8), {}, {}},
+    {L"GpuBounds", L"GPU 包围盒", KeyChord(VK_F9), {}, {}},
+    {L"ForceGroom", L"强制 Groom", KeyChord(VK_F6), {}, {}},
+    {L"OutfitUnlock", L"套装解锁", KeyChord(VK_F6, kShift), {}, {}},
+    {L"AdaptiveTriggers", L"自适应扳机", KeyChord(VK_F9, kShift), {}, {}},
+    {L"GrabRelease", L"释放投技", KeyChord('G'), XboxChord(kY | kB), PsChord(kY | kB)},
+    {L"WeaponSwap", L"切换武器预设", KeyChord('Z'), XboxChord(kLB | kL3), PsChord(kSwipeL | kSwipeR)},
+    {L"GearUp", L"提升挡位", KeyChord(VK_OEM_PLUS), {}, {}},
+    {L"GearDown", L"降低挡位", KeyChord(VK_OEM_MINUS), {}, {}},
+    {L"NpcSkill", L"施放 NPC 技能", KeyChord('X'), XboxChord(kL3 | kR3), PsChord(kL3 | kR3)},
 };
+// Binding slots in Device order: keyboard, Xbox, PlayStation.
+constexpr int kSlots = 3;
+const wchar_t* const kSlotKey[kSlots] = {L"", L".Xbox", L".PS"};
+const Chord& Initial(int index, int slot) { const Spec& spec = kSpecs[index]; return slot == 0 ? spec.keyboard : slot == 1 ? spec.xbox : spec.ps; }
+// The one-binding layout (before Layout=2) bound these to a pad by default.
+bool LegacyPad(int index) {
+    return index == static_cast<int>(Action::GrabRelease) || index == static_cast<int>(Action::WeaponSwap) || index == static_cast<int>(Action::NpcSkill);
+}
+unsigned DefaultBound() {
+    unsigned mask = 0;
+    for (int i = 0; i < kCount; ++i) for (int slot = 0; slot < kSlots; ++slot) if (!Initial(i, slot).empty()) mask |= 1u << i;
+    return mask;
+}
 
 struct PadToken { unsigned bit; const wchar_t* xbox; const wchar_t* ps; };
 const PadToken kPadTokens[] = {
@@ -92,19 +111,27 @@ int RowOf(int index) {
     return row;
 }
 int Rows() { return RowOf(static_cast<int>(Action::Count) - 1) + 1; }
-std::array<Chord, kCount> chords_{};
+std::array<std::array<Chord, kSlots>, kCount> chords_{};
 std::array<std::function<void()>, kCount> handlers_{};
 std::array<bool, kCount> was_{};
 std::wstring config_;
 bool ready_ = false;
 HWND page_ = nullptr, glyph_box_ = nullptr;
-std::array<HWND, kCount> boxes_{};
+std::array<std::array<HWND, kSlots>, kCount> boxes_{};
+// Any-thread views: which actions have a binding, and the prompt text of each (RefreshHints).
+std::atomic<unsigned> bound_{DefaultBound()};
+SRWLOCK hint_lock_ = SRWLOCK_INIT;
+std::array<std::wstring, kCount> hints_{};
+unsigned version_ = 0, look_ = ~0u;
+// The device behind the latest press: none yet, the keyboard / mouse, or a pad.
+bool input_known_ = false, input_pad_ = false;
+unsigned pad_seen_ = 0;
 // Pad chords store button bits only, so one chord fires on Xbox and
 // PlayStation pads alike; the device just names the glyphs.
 enum class Glyphs : int { Auto, Xbox, PlayStation };
 const wchar_t* const kGlyphNames[] = {L"auto", L"xbox", L"ps"};
 Glyphs glyphs_ = Glyphs::Auto;
-int glyph_hot_ = -1, shown_ = -1;
+int glyph_hot_ = -1;
 Device pad_style_ = Device::Xbox;    // From the device list.
 Device last_pad_ = Device::Keyboard; // Pad behind the latest press; Keyboard = none yet.
 bool pad_hid_ = false, xinput_live_ = false;
@@ -156,6 +183,7 @@ struct Arm {
     bool active = false, ready = false, click_up = false, key_held = false, pad_held = false, live_valid = false;
     HWND control = nullptr;
     Action action = Action::ToggleHub;
+    int slot = 0;
     int primary = 0;
     unsigned pad_union = 0;
     Chord live{};
@@ -672,15 +700,15 @@ unsigned PadBit(const std::wstring& token) {
     if (SameToken(token, L"RSB")) return kR3;
     return 0;
 }
-bool Parse(const wchar_t* text, Chord& out) {
+bool Parse(const wchar_t* text, Chord& out, Device fallback = Device::Keyboard) {
     out = {};
     if (!text || !*text) return true;
-    Device device = Device::Keyboard;
+    Device device = fallback;
     const wchar_t* body = text;
-    if (!_wcsnicmp(text, L"kb:", 3)) body += 3;
+    if (!_wcsnicmp(text, L"kb:", 3)) { device = Device::Keyboard; body += 3; }
     else if (!_wcsnicmp(text, L"xb:", 3)) { device = Device::Xbox; body += 3; }
     else if (!_wcsnicmp(text, L"ps:", 3)) { device = Device::PlayStation; body += 3; }
-    // No prefix: a keyboard chord as typed in the ini by hand ("F10", "Ctrl + F10").
+    // No prefix: a chord of the key's own device, as typed in the ini by hand ("F10", "Ctrl + F10", "Y + B").
     Chord chord; chord.device = device;
     std::wstring value(body);
     value.erase(std::remove_if(value.begin(), value.end(), [](wchar_t c) { return std::iswspace(c) != 0; }), value.end());
@@ -729,14 +757,32 @@ std::wstring Format(const Chord& chord) {
     }
     return text;
 }
-void Save(int index) {
-    if (config_.empty() || index < 0 || index >= kCount) return;
-    WritePrivateProfileStringW(L"Hotkeys", kSpecs[index].id, Format(chords_[static_cast<size_t>(index)]).c_str(), config_.c_str());
+std::wstring KeyName(int index, int slot) { return std::wstring(kSpecs[index].id) + kSlotKey[slot]; }
+void Save(int index, int slot) {
+    if (config_.empty() || index < 0 || index >= kCount || slot < 0 || slot >= kSlots) return;
+    WritePrivateProfileStringW(L"Hotkeys", KeyName(index, slot).c_str(), Format(chords_[static_cast<size_t>(index)][static_cast<size_t>(slot)]).c_str(), config_.c_str());
+}
+// After any binding change: the bound mask for other threads, and new prompts on the next Tick.
+void NoteChange() {
+    unsigned mask = 0;
+    for (int i = 0; i < kCount; ++i) for (const Chord& chord : chords_[static_cast<size_t>(i)]) if (!chord.empty()) mask |= 1u << i;
+    bound_.store(mask, std::memory_order_relaxed);
+    ++version_;
 }
 void Ensure() {
     if (ready_) return;
     ready_ = true;
-    for (int i = 0; i < kCount; ++i) chords_[static_cast<size_t>(i)] = kSpecs[i].initial;
+    for (int i = 0; i < kCount; ++i) for (int slot = 0; slot < kSlots; ++slot) chords_[static_cast<size_t>(i)][static_cast<size_t>(slot)] = Initial(i, slot);
+    NoteChange();
+}
+// A chord read for a slot: a keyboard chord for the keyboard, pad buttons for a pad (an Xbox pad
+// has no touchpad), recorded with the slot's own device. false: it does not fit there.
+bool Fit(Chord& chord, int slot) {
+    if (chord.empty()) { chord = {}; chord.device = static_cast<Device>(slot); return true; }
+    if ((chord.device == Device::Keyboard) != (slot == 0)) return false;
+    chord.device = static_cast<Device>(slot);
+    if (chord.device == Device::Xbox) chord.buttons &= ~(kTouch | kSwipeMask);
+    return !chord.empty();
 }
 std::wstring KeyCaption(unsigned vk) {
     const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
@@ -753,18 +799,26 @@ std::wstring KeyCaption(unsigned vk) {
     if (GetKeyNameTextW(flags, text, 64) > 0 && text[0]) return text;
     return KeyToken(vk);
 }
-// Pad glyph style: the user's pick, else the pad in hand. Keyboard means no
-// pad is known, and each chord keeps the glyphs it was recorded with.
-Device ShownPad() {
+// The pad set in use: the user's pick, else the pad in hand (the latest press, else the
+// connected pad; Xbox while none is known).
+Device PadNow() {
     if (glyphs_ == Glyphs::Xbox) return Device::Xbox;
     if (glyphs_ == Glyphs::PlayStation) return Device::PlayStation;
     if (last_pad_ != Device::Keyboard) return last_pad_;
-    return pad_hid_ || xinput_live_ ? pad_style_ : Device::Keyboard;
+    return pad_style_;
 }
-Chord Shown(Chord chord) {
-    const Device pad = ShownPad();
-    if (chord.device != Device::Keyboard && pad != Device::Keyboard) chord.device = pad;
-    return chord;
+// The device prompts follow: the latest press, else a connected pad, else the keyboard.
+Device InputNow() {
+    if (input_known_) return input_pad_ ? PadNow() : Device::Keyboard;
+    return pad_hid_ || xinput_live_ ? PadNow() : Device::Keyboard;
+}
+// The binding prompts show for an action: the input device's, else the keyboard's, else the pad's.
+Chord Current(int index) {
+    const auto& row = chords_[static_cast<size_t>(index)];
+    const Chord& wanted = row[static_cast<size_t>(InputNow())];
+    if (!wanted.empty()) return wanted;
+    if (!row[0].empty()) return row[0];
+    return row[static_cast<size_t>(PadNow())];
 }
 void AddPad(std::vector<Part>& parts, const Chord& chord) {
     const bool ps = chord.device == Device::PlayStation;
@@ -827,7 +881,7 @@ void AddPad(std::vector<Part>& parts, const Chord& chord) {
 std::vector<Part> Parts(const Chord& recorded) {
     std::vector<Part> parts;
     if (recorded.empty()) return parts;
-    const Chord chord = Shown(recorded);
+    const Chord& chord = recorded;
     if (chord.device == Device::Keyboard) {
         auto cap = [](unsigned vk) { Part part; part.mark = Mark::Key; part.text = KeyCaption(vk); part.color = UiTheme::Text(); return part; };
         if (chord.modifiers & kCtrl) parts.push_back(cap(VK_CONTROL));
@@ -981,8 +1035,15 @@ void ViewDisc(HDC dc, const RECT& rect) {
     graphics.DrawRectangle(&ink, x + d * .26f, y + d * .32f, d * .3f, d * .26f);
     graphics.DrawRectangle(&ink, x + d * .44f, y + d * .44f, d * .3f, d * .26f);
 }
-void RememberKeys() {
-    for (int vk = 1; vk < 256; ++vk) key_was_[vk] = Bindable(vk) && Down(vk);
+// true when a bindable key or a mouse button went down since the last call.
+bool RememberKeys() {
+    bool pressed = false;
+    for (int vk = 1; vk < 256; ++vk) {
+        const bool down = (Bindable(vk) || vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) && Down(vk);
+        if (down && !key_was_[vk]) pressed = true;
+        key_was_[vk] = down;
+    }
+    return pressed;
 }
 int Newest(int previous) {
     if (previous && Down(previous) && Bindable(previous)) return previous;
@@ -1000,31 +1061,34 @@ void Disarm() {
     arm_ = {};
     if (control) InvalidateRect(control, nullptr, FALSE);
 }
-bool Commit(Action action, const Chord& chord) {
+// Each device's set is checked on its own: the keyboard against keyboard chords, a pad set against itself.
+bool Commit(Action action, int slot, Chord chord) {
     const int index = static_cast<int>(action);
-    if (index < 0 || index >= kCount) return false;
+    if (index < 0 || index >= kCount || slot < 0 || slot >= kSlots || !Fit(chord, slot)) return false;
     if (!chord.empty()) for (int i = 0; i < kCount; ++i) {
         if (i == index) continue;
-        if (Conflicts(chord, chords_[static_cast<size_t>(i)])) {
+        if (Conflicts(chord, chords_[static_cast<size_t>(i)][static_cast<size_t>(slot)])) {
             DebugHub::Notify(L"这个快捷键已经用于其他功能");
             return false;
         }
     }
-    chords_[static_cast<size_t>(index)] = chord;
-    Save(index);
+    chords_[static_cast<size_t>(index)][static_cast<size_t>(slot)] = chord;
+    Save(index, slot);
+    NoteChange();
     block_ = chord;
     blocking_ = !chord.empty();
     DebugHub::RefreshChrome();
-    if (boxes_[static_cast<size_t>(index)]) InvalidateRect(boxes_[static_cast<size_t>(index)], nullptr, FALSE);
+    if (const HWND box = boxes_[static_cast<size_t>(index)][static_cast<size_t>(slot)]) InvalidateRect(box, nullptr, FALSE);
     return true;
 }
-void ArmAt(HWND control, int index) {
-    if (index < 0 || index >= kCount) return;
+void ArmAt(HWND control, int index, int slot) {
+    if (index < 0 || index >= kCount || slot < 0 || slot >= kSlots) return;
     if (arm_.active && arm_.control == control) return;
     Disarm();
     arm_.active = true;
     arm_.control = control;
     arm_.action = static_cast<Action>(index);
+    arm_.slot = slot;
     InvalidateArm();
 }
 void StepCapture() {
@@ -1032,8 +1096,9 @@ void StepCapture() {
     if (esc && !esc_was_) { Disarm(); esc_was_ = true; wipe_was_ = wipe; return; }
     if (wipe && !wipe_was_) {
         const Action action = arm_.action;
+        const int slot = arm_.slot;
         Disarm();
-        Commit(action, {});
+        Commit(action, slot, {});
         esc_was_ = esc; wipe_was_ = true;
         return;
     }
@@ -1047,13 +1112,16 @@ void StepCapture() {
     }
     if (!UiHost::InGame()) { Disarm(); return; }
     const int primary = Newest(arm_.primary);
-    const unsigned pad = ReadPad();
+    const unsigned raw = ReadPad();
     if (!arm_.ready) {
-        if (!primary && !pad) arm_.ready = true;
+        if (!primary && !raw) arm_.ready = true;
         InvalidateArm();
         return;
     }
-    if (primary) {
+    // The keyboard box takes keys only, a pad box that pad's buttons only (no touchpad on Xbox).
+    const bool keyboard = arm_.slot == 0;
+    const unsigned pad = keyboard ? 0 : arm_.slot == static_cast<int>(Device::Xbox) ? raw & ~(kTouch | kSwipeMask) : raw;
+    if (primary && keyboard) {
         arm_.key_held = true;
         arm_.primary = primary;
         arm_.pad_held = false;
@@ -1070,14 +1138,14 @@ void StepCapture() {
         const Chord chord = arm_.live;
         const Action action = arm_.action;
         Disarm();
-        Commit(action, chord);
+        Commit(action, 0, chord);
         return;
     }
     if (pad) {
         arm_.pad_held = true;
         arm_.pad_union |= pad;
         arm_.live = {};
-        arm_.live.device = last_pad_ != Device::Keyboard ? last_pad_ : pad_style_;
+        arm_.live.device = static_cast<Device>(arm_.slot);
         arm_.live.buttons = arm_.pad_union;
         arm_.live_valid = true;
         InvalidateArm();
@@ -1086,23 +1154,61 @@ void StepCapture() {
     if (arm_.pad_held && arm_.pad_union) {
         const Chord chord = arm_.live;
         const Action action = arm_.action;
+        const int slot = arm_.slot;
         Disarm();
-        Commit(action, chord);
+        Commit(action, slot, chord);
     }
 }
+// The keyboard set always fires; of the pad sets only the active pad's.
 void Snapshot(bool fire) {
     const unsigned mods = Mods(), pad = ReadPad();
+    if (pad & ~pad_seen_) { input_known_ = true; input_pad_ = true; }
+    pad_seen_ = pad;
+    const size_t active = static_cast<size_t>(PadNow());
     if (blocking_ && !Satisfied(block_, mods, pad)) blocking_ = false;
     for (int i = 0; i < kCount; ++i) {
-        const bool down = Satisfied(chords_[static_cast<size_t>(i)], mods, pad);
-        if (fire && down && !was_[static_cast<size_t>(i)] && !(blocking_ && Conflicts(block_, chords_[static_cast<size_t>(i)]))) {
+        const Chord& key = chords_[static_cast<size_t>(i)][0];
+        const Chord& held = chords_[static_cast<size_t>(i)][active];
+        const bool down = Satisfied(key, mods, pad) || Satisfied(held, mods, pad);
+        const bool blocked = blocking_ && (Conflicts(block_, key) || Conflicts(block_, held));
+        if (fire && down && !was_[static_cast<size_t>(i)] && !blocked) {
             if (handlers_[static_cast<size_t>(i)]) handlers_[static_cast<size_t>(i)]();
         }
         was_[static_cast<size_t>(i)] = down;
     }
 }
+// A prompt in the UI language: key captions, pad buttons as the game names them.
+std::wstring HintText(const Chord& chord) {
+    if (chord.empty()) return UiI18n::Translate(L"未设置");
+    const bool zh = UiI18n::GetLanguage() == UiI18n::Language::SimplifiedChinese;
+    struct PadName { const wchar_t* part; const wchar_t* zh; const wchar_t* en; };
+    static const PadName kNames[] = {
+        {L"Triangle", L"三角", L"Triangle"}, {L"Circle", L"圈", L"Circle"}, {L"Square", L"方块", L"Square"}, {L"Cross", L"叉", L"Cross"},
+        {L"Up", L"方向键上", L"D-pad Up"}, {L"Down", L"方向键下", L"D-pad Down"}, {L"Left", L"方向键左", L"D-pad Left"}, {L"Right", L"方向键右", L"D-pad Right"},
+        {L"触控板", L"触控板", L"Touchpad"}, {L"上滑", L"上滑", L"Swipe up"}, {L"下滑", L"下滑", L"Swipe down"}, {L"左滑", L"左滑", L"Swipe left"}, {L"右滑", L"右滑", L"Swipe right"},
+    };
+    std::wstring text;
+    for (const Part& part : Parts(chord)) {
+        std::wstring piece = part.text;
+        if (part.mark == Mark::Stick) piece += L"3"; // L / R stick clicks: L3, R3
+        else if (chord.device != Device::Keyboard)
+            for (const PadName& name : kNames) if (piece == name.part) { piece = zh ? name.zh : name.en; break; }
+        if (piece.empty()) continue;
+        if (!text.empty()) text += SwipeChoice(chord) ? L" / " : L" + ";
+        text += piece;
+    }
+    return text;
+}
+void RefreshHints() {
+    std::array<std::wstring, kCount> hints;
+    for (int i = 0; i < kCount; ++i) hints[static_cast<size_t>(i)] = HintText(Current(i));
+    AcquireSRWLockExclusive(&hint_lock_);
+    hints_ = std::move(hints);
+    ReleaseSRWLockExclusive(&hint_lock_);
+}
+// A bind box's user data is index * 4 + slot.
 LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    const int index = static_cast<int>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    const int code = static_cast<int>(GetWindowLongPtrW(window, GWLP_USERDATA)), index = code / 4, slot = code % 4;
     switch (message) {
     case WM_NCCREATE: {
         const auto* created = reinterpret_cast<CREATESTRUCTW*>(lparam);
@@ -1110,7 +1216,7 @@ LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         return DefWindowProcW(window, message, wparam, lparam);
     }
     case WM_ERASEBKGND: return 1;
-    case WM_SETFOCUS: ArmAt(window, index); return 0;
+    case WM_SETFOCUS: ArmAt(window, index, slot); return 0;
     case WM_KILLFOCUS:
         if (arm_.active && arm_.control == window) Disarm();
         InvalidateRect(window, nullptr, FALSE); return 0;
@@ -1138,7 +1244,8 @@ LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             RECT inner = client; inner.right -= 1; inner.bottom -= 1;
             Round(graphics, inner, static_cast<float>(Scale(window, 8)), paper, edge);
         }
-        const Chord chord = armed && arm_.live_valid ? arm_.live : (index >= 0 && index < kCount ? chords_[static_cast<size_t>(index)] : Chord{});
+        const Chord chord = armed && arm_.live_valid ? arm_.live
+            : (index >= 0 && index < kCount && slot < kSlots ? chords_[static_cast<size_t>(index)][static_cast<size_t>(slot)] : Chord{});
         const int height = (std::max)(16, static_cast<int>(client.bottom - Scale(window, 8)));
         const int top = (client.bottom - height) / 2;
         if (armed && !arm_.live_valid) {
@@ -1162,17 +1269,17 @@ LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
-// Redraws everything that shows a pad chord (bind boxes, hub sidebar hint).
+// Redraws everything that shows a chord or the device in use (bind boxes, column heads, hub sidebar hint).
 void RepaintChords() {
-    for (HWND box : boxes_) if (box) InvalidateRect(box, nullptr, FALSE);
+    for (const auto& row : boxes_) for (HWND box : row) if (box) InvalidateRect(box, nullptr, FALSE);
     if (glyph_box_) InvalidateRect(glyph_box_, nullptr, FALSE);
+    if (page_) InvalidateRect(page_, nullptr, FALSE);
     DebugHub::RefreshChrome();
 }
 void SetGlyphs(int mode) {
     if (mode < 0 || mode > 2 || mode == static_cast<int>(glyphs_)) return;
     glyphs_ = static_cast<Glyphs>(mode);
     if (!config_.empty()) WritePrivateProfileStringW(L"Hotkeys", L"PadGlyphs", kGlyphNames[mode], config_.c_str());
-    shown_ = static_cast<int>(ShownPad());
     RepaintChords();
 }
 int GlyphHit(HWND window, LPARAM lparam) {
@@ -1238,18 +1345,28 @@ LRESULT CALLBACK GlyphProc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }
-// Page rows: the glyph switch first, then every editable action.
-int PageRow(int index) { const int row = RowOf(index); return row < 0 ? -1 : row + 1; }
+// Page rows: the pad switch, the column heads, then every editable action with a keyboard,
+// an Xbox and a PlayStation box.
+int PageRow(int index) { const int row = RowOf(index); return row < 0 ? -1 : row + 2; }
+struct Grid { int x = 0, box_w = 0, gap = 0, row = 0, top = 0, switch_x = 0, switch_w = 0; };
+Grid PageGrid(HWND window) {
+    RECT client{}; GetClientRect(window, &client);
+    Grid g;
+    const int margin = Scale(window, 16);
+    g.box_w = Scale(window, 168); g.gap = Scale(window, 8); g.row = Scale(window, 40); g.top = Scale(window, 64);
+    const int span = g.box_w * kSlots + g.gap * (kSlots - 1);
+    g.x = (std::max)(margin + Scale(window, 150), static_cast<int>(client.right) - margin - span);
+    g.switch_w = Scale(window, 280); g.switch_x = g.x + span - g.switch_w;
+    return g;
+}
 void LayoutPage(HWND window) {
     if (!window) return;
-    RECT client{}; GetClientRect(window, &client);
-    const int margin = Scale(window, 16), row = Scale(window, 40), box_w = Scale(window, 280), box_h = Scale(window, 32);
-    const int top = Scale(window, 64);
-    const int x = (std::max)(margin + Scale(window, 180), static_cast<int>(client.right) - margin - box_w);
-    if (glyph_box_) SetWindowPos(glyph_box_, nullptr, x, top + (row - box_h) / 2, box_w, box_h, SWP_NOZORDER | SWP_NOACTIVATE);
-    for (int i = 0; i < kCount; ++i) if (boxes_[static_cast<size_t>(i)]) {
-        const int y = top + PageRow(i) * row + (row - box_h) / 2;
-        SetWindowPos(boxes_[static_cast<size_t>(i)], nullptr, x, y, box_w, box_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    const Grid g = PageGrid(window);
+    const int box_h = Scale(window, 32);
+    if (glyph_box_) SetWindowPos(glyph_box_, nullptr, g.switch_x, g.top + (g.row - box_h) / 2, g.switch_w, box_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    for (int i = 0; i < kCount; ++i) for (int slot = 0; slot < kSlots; ++slot) if (const HWND box = boxes_[static_cast<size_t>(i)][static_cast<size_t>(slot)]) {
+        const int y = g.top + PageRow(i) * g.row + (g.row - box_h) / 2;
+        SetWindowPos(box, nullptr, g.x + slot * (g.box_w + g.gap), y, g.box_w, box_h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 LRESULT CALLBACK PageProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -1274,30 +1391,33 @@ LRESULT CALLBACK PageProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         DrawTextW(dc, UiI18n::Translate(L"点击按键框后按下组合，松开保存。Esc 取消，Backspace 清除。").c_str(), -1, &hint,
             DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, old);
-        const int row = Scale(window, 40), top = Scale(window, 64);
+        const Grid g = PageGrid(window);
+        const int row = g.row, top = g.top;
         {
-            RECT label{Scale(window, 16), top, client.right - Scale(window, 300), top + row};
-            if (glyph_box_) {
-                RECT box{}; GetWindowRect(glyph_box_, &box);
-                MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&box), 2);
-                label.right = box.left - Scale(window, 12);
-            }
+            RECT label{Scale(window, 16), top, g.switch_x - Scale(window, 12), top + row};
             const HFONT body = UiTheme::GetFont(UiTheme::Font::Body, window), muted = UiTheme::GetFont(UiTheme::Font::Small, window);
-            const std::wstring name = UiI18n::Translate(L"手柄图标");
+            const std::wstring name = UiI18n::Translate(L"手柄类型");
             TextIn(dc, name, label, body, UiTheme::Text(), DT_LEFT);
             RECT note = label;
             note.left += Measure(dc, body, name) + Scale(window, 12);
-            if (note.left < note.right) TextIn(dc, UiI18n::Translate(L"手柄组合键在 Xbox 与 PlayStation 手柄上通用"), note, muted, UiTheme::MutedText(), DT_LEFT);
+            if (note.left < note.right) TextIn(dc, UiI18n::Translate(L"自动：按最近按下的手柄选用 Xbox 或 PlayStation 组合键"), note, muted, UiTheme::MutedText(), DT_LEFT);
+        }
+        {
+            // Column heads; the set in use is drawn in the accent colour, the other pad's muted.
+            const wchar_t* const heads[kSlots] = {L"键盘", L"Xbox", L"PlayStation"};
+            const Device input = InputNow(), pad = PadNow();
+            for (int slot = 0; slot < kSlots; ++slot) {
+                const RECT cell{g.x + slot * (g.box_w + g.gap), top + row, g.x + slot * (g.box_w + g.gap) + g.box_w, top + 2 * row};
+                const bool in_use = static_cast<int>(input) == slot, live = slot == 0 || static_cast<int>(pad) == slot;
+                std::wstring head = UiI18n::Translate(heads[slot]);
+                if (in_use) head += UiI18n::Translate(L"（使用中）");
+                TextIn(dc, head, cell, UiTheme::GetFont(UiTheme::Font::Small, window), in_use ? UiTheme::Accent() : live ? UiTheme::Text() : UiTheme::MutedText());
+            }
         }
         for (int i = 0; i < kCount; ++i) {
             const int at = PageRow(i);
             if (at < 0) continue;
-            RECT label{Scale(window, 16), top + at * row, client.right - Scale(window, 300), top + (at + 1) * row};
-            if (boxes_[static_cast<size_t>(i)]) {
-                RECT box{}; GetWindowRect(boxes_[static_cast<size_t>(i)], &box);
-                MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&box), 2);
-                label.right = box.left - Scale(window, 12);
-            }
+            RECT label{Scale(window, 16), top + at * row, g.x - Scale(window, 12), top + (at + 1) * row};
             const HGDIOBJ font = SelectObject(dc, UiTheme::GetFont(UiTheme::Font::Body, window));
             SetTextColor(dc, UiTheme::Text());
             DrawTextW(dc, UiI18n::Translate(kSpecs[i].label).c_str(), -1, &label, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -1308,7 +1428,7 @@ LRESULT CALLBACK PageProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
     }
     case WM_DESTROY:
         if (page_ == window) page_ = nullptr;
-        boxes_.fill(nullptr);
+        for (auto& boxes : boxes_) boxes.fill(nullptr);
         glyph_box_ = nullptr;
         if (arm_.control && !IsWindow(arm_.control)) Disarm();
         return 0;
@@ -1348,29 +1468,61 @@ void SetXInputForTest(PadStateReader reader) {
     xinput_ = reader;
     xinput_tried_ = true;
 }
+// Before Layout=2 an action had one binding under its own key: a keyboard chord, or a pad chord
+// both pads shared. It becomes that set's binding; the other sets keep their defaults.
+void Migrate(int index) {
+    wchar_t buffer[160]{};
+    GetPrivateProfileStringW(L"Hotkeys", kSpecs[index].id, L"*", buffer, 160, config_.c_str());
+    Chord old;
+    if (!wcscmp(buffer, L"*") || !Parse(buffer, old)) return;
+    auto& row = chords_[static_cast<size_t>(index)];
+    if (old.empty()) { // cleared: the binding it had by default is gone
+        if (LegacyPad(index)) row[1] = row[2] = {}; else row[0] = {};
+        return;
+    }
+    if (old.device == Device::Keyboard) { row[0] = old; return; }
+    Chord xbox = old, ps = old;
+    if (Fit(xbox, 1)) row[1] = xbox;
+    if (Fit(ps, 2)) row[2] = ps;
+}
 void Initialize(const wchar_t* config_file) {
     Ensure();
     config_ = config_file ? config_file : L"";
-    if (config_.empty()) return;
+    if (config_.empty()) { RefreshHints(); return; }
     wchar_t glyphs[16]{};
     GetPrivateProfileStringW(L"Hotkeys", L"PadGlyphs", L"auto", glyphs, 16, config_.c_str());
     for (int i = 0; i < 3; ++i) if (!_wcsicmp(glyphs, kGlyphNames[i])) glyphs_ = static_cast<Glyphs>(i);
-    // The panel key is written with its default (kb:F10) when the ini has none, so it can be changed
-    // there by hand; it never ends up empty (no key would open the panel again).
-    constexpr int kHub = static_cast<int>(Action::ToggleHub);
+    wchar_t layout[8]{};
+    GetPrivateProfileStringW(L"Hotkeys", L"Layout", L"", layout, 8, config_.c_str());
+    const bool legacy = wcscmp(layout, L"2") != 0;
+    // Bindings missing from the ini are written with their defaults, so each can be changed there by
+    // hand; a migrated ini is written whole. A value that does not parse is left for the user to see.
+    std::array<std::array<bool, kSlots>, kCount> write{};
     for (int i = 0; i < kCount; ++i) {
         if (Fixed(i)) continue;
-        wchar_t buffer[160]{};
-        GetPrivateProfileStringW(L"Hotkeys", kSpecs[i].id, L"*", buffer, 160, config_.c_str());
-        if (!wcscmp(buffer, L"*")) { if (i == kHub) Save(i); continue; }
-        Chord parsed;
-        if (Parse(buffer, parsed) && !(i == kHub && parsed.empty())) chords_[static_cast<size_t>(i)] = parsed;
+        if (legacy) { Migrate(i); write[static_cast<size_t>(i)].fill(true); continue; }
+        for (int slot = 0; slot < kSlots; ++slot) {
+            wchar_t buffer[160]{};
+            GetPrivateProfileStringW(L"Hotkeys", KeyName(i, slot).c_str(), L"*", buffer, 160, config_.c_str());
+            if (!wcscmp(buffer, L"*")) { write[static_cast<size_t>(i)][static_cast<size_t>(slot)] = true; continue; }
+            Chord parsed;
+            if (Parse(buffer, parsed, static_cast<Device>(slot)) && Fit(parsed, slot)) chords_[static_cast<size_t>(i)][static_cast<size_t>(slot)] = parsed;
+        }
     }
-    for (int i = 0; i < kCount; ++i) for (int j = 0; j < i; ++j) {
-        if (Fixed(i) || !Conflicts(chords_[static_cast<size_t>(i)], chords_[static_cast<size_t>(j)])) continue;
-        chords_[static_cast<size_t>(i)] = {};
-        Save(i);
+    // The panel key never ends up empty: no key would open the panel again.
+    constexpr size_t kHub = static_cast<size_t>(Action::ToggleHub);
+    if (chords_[kHub][0].empty()) { chords_[kHub][0] = kSpecs[kHub].keyboard; write[kHub][0] = true; }
+    for (int slot = 0; slot < kSlots; ++slot) for (int i = 0; i < kCount; ++i) for (int j = 0; j < i; ++j) {
+        Chord& chord = chords_[static_cast<size_t>(i)][static_cast<size_t>(slot)];
+        if (Fixed(i) || !Conflicts(chord, chords_[static_cast<size_t>(j)][static_cast<size_t>(slot)])) continue;
+        chord = {};
+        write[static_cast<size_t>(i)][static_cast<size_t>(slot)] = true;
     }
+    for (int i = 0; i < kCount; ++i) for (int slot = 0; slot < kSlots; ++slot) if (!Fixed(i) && write[static_cast<size_t>(i)][static_cast<size_t>(slot)]) Save(i, slot);
+    if (legacy) WritePrivateProfileStringW(L"Hotkeys", L"Layout", L"2", config_.c_str());
+    NoteChange();
+    RefreshHints();
+    look_ = ~0u;
 }
 void Bind(Action action, std::function<void()> handler) {
     const int index = static_cast<int>(action);
@@ -1388,11 +1540,14 @@ void Tick() {
     if (arm_.active) StepCapture();
     const bool fire = !arm_.active && UiHost::InGame() && !TextEntry();
     Snapshot(fire);
-    RememberKeys();
-    // Picking up the other pad switches every pad glyph on screen.
-    const int shown = static_cast<int>(ShownPad());
-    if (shown != shown_) {
-        shown_ = shown;
+    // A key or mouse press in the game names the keyboard as the device in use (a pad press, the pad: Snapshot).
+    if (RememberKeys() && UiHost::InGame()) { input_known_ = true; input_pad_ = false; }
+    // Another device, pad set, language or binding: new prompts, and the page and sidebar redrawn.
+    const unsigned look = static_cast<unsigned>(InputNow()) | static_cast<unsigned>(PadNow()) << 2 |
+        (UiI18n::GetLanguage() == UiI18n::Language::English ? 16u : 0u) | version_ << 5;
+    if (look != look_) {
+        look_ = look;
+        RefreshHints();
         RepaintChords();
     }
     if (!arm_.active) {
@@ -1404,9 +1559,27 @@ bool Capturing() { return arm_.active; }
 Chord Get(Action action) {
     Ensure();
     const int index = static_cast<int>(action);
-    return index >= 0 && index < kCount ? chords_[static_cast<size_t>(index)] : Chord{};
+    return index >= 0 && index < kCount ? Current(index) : Chord{};
 }
-bool Bound(Action action) { return !Get(action).empty(); }
+Chord Get(Action action, Device device) {
+    Ensure();
+    const int index = static_cast<int>(action), slot = static_cast<int>(device);
+    return index >= 0 && index < kCount && slot >= 0 && slot < kSlots ? chords_[static_cast<size_t>(index)][static_cast<size_t>(slot)] : Chord{};
+}
+bool Bound(Action action) {
+    const int index = static_cast<int>(action);
+    return index >= 0 && index < kCount && (bound_.load(std::memory_order_relaxed) >> index & 1u) != 0;
+}
+std::wstring Hint(Action action) {
+    const int index = static_cast<int>(action);
+    if (index < 0 || index >= kCount) return {};
+    AcquireSRWLockShared(&hint_lock_);
+    std::wstring text = hints_[static_cast<size_t>(index)];
+    ReleaseSRWLockShared(&hint_lock_);
+    return text;
+}
+Device ActivePad() { return PadNow(); }
+Device InputDevice() { return InputNow(); }
 std::wstring Plain(const Chord& chord) {
     if (chord.empty()) return UiI18n::Translate(L"未设置");
     std::wstring text;
@@ -1439,7 +1612,7 @@ int Draw(HDC dc, int x, int y, int height, const Chord& chord, int limit_x) {
     const COLORREF paper = UiTheme::Mix(UiTheme::Base(), UiTheme::Panel(), 70);
     const COLORREF edge = UiTheme::Mix(UiTheme::Border(), UiTheme::Base(), 18);
     const std::vector<Part> parts = Parts(chord);
-    const bool xbox = Shown(chord).device == Device::Xbox;
+    const bool xbox = chord.device == Device::Xbox;
     bool first = true;
     for (const Part& part : parts) {
         const bool art = part.asset >= 0 || part.mark == Mark::Key || (part.mark == Mark::View && xbox && !UiTheme::HighContrast());
@@ -1490,15 +1663,16 @@ HWND CreatePage(HWND parent) {
     if (page_ && IsWindow(page_)) return page_;
     Ensure();
     const int width = Scale(parent, 760);
-    const int height = Scale(parent, 72) + (Rows() + 1) * Scale(parent, 40) + Scale(parent, 20);
+    const int height = Scale(parent, 72) + (Rows() + 2) * Scale(parent, 40) + Scale(parent, 20);
     page_ = CreateWindowExW(0, kPageClass, L"", WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, width, height, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!page_) return nullptr;
     glyph_box_ = CreateWindowExW(0, kGlyphClass, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         0, 0, 10, 10, page_, nullptr, GetModuleHandleW(nullptr), nullptr);
     for (int i = 0; i < kCount; ++i) {
         if (Fixed(i)) continue;
-        boxes_[static_cast<size_t>(i)] = CreateWindowExW(0, kBindClass, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            0, 0, 10, 10, page_, nullptr, GetModuleHandleW(nullptr), reinterpret_cast<LPVOID>(static_cast<INT_PTR>(i)));
+        for (int slot = 0; slot < kSlots; ++slot)
+            boxes_[static_cast<size_t>(i)][static_cast<size_t>(slot)] = CreateWindowExW(0, kBindClass, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                0, 0, 10, 10, page_, nullptr, GetModuleHandleW(nullptr), reinterpret_cast<LPVOID>(static_cast<INT_PTR>(i * 4 + slot)));
     }
     DebugHub::Attach(page_, parent, width, height);
     LayoutPage(page_);

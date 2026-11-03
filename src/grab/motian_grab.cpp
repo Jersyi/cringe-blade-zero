@@ -701,8 +701,8 @@ bool InputBaseAllowed(const Context& c) {
 bool InputAllowed(const Context& c) {
     // Hit-stun and knock-down ignore move input; the grab may still start then.
     const uint8_t mode=Property<uint8_t>(c.movement,"MovementMode");
-    if (mode!=1 && mode!=2) return InputGate("not_grounded",L"当前投技要求站在地面；落地后按三角 + 圈");
-    return InputGate("ready",L"输入已就绪：附近人形敌人，三角 + 圈触发",true);
+    if (mode!=1 && mode!=2) return InputGate("not_grounded",(L"当前投技要求站在地面；落地后按 "+UiHotkeys::Hint(UiHotkeys::Action::GrabRelease)).c_str());
+    return InputGate("ready",(L"输入已就绪：附近人形敌人，按 "+UiHotkeys::Hint(UiHotkeys::Action::GrabRelease)+L" 触发").c_str(),true);
 }
 bool Specs(Object* asc,std::vector<Spec>& result,int32_t only_handle=0,bool headers_only=false) {
     Object* type=Type("/Script/GameplayAbilities.GameplayAbilitySpec"),*container=Type("/Script/GameplayAbilities.GameplayAbilitySpecContainer");
@@ -1198,7 +1198,7 @@ void AdvancePreparation(bool wanted) {
     } else {
         ++prepared_.step;
         wchar_t summary[300]{};
-        _snwprintf_s(summary,_countof(summary),_TRUNCATE,L"%s：%zu/%zu 步；累计 %.1f ms，最大单步 %.1f ms。%s",prepared_.ready?L"已预载":L"分步准备中",prepared_.step,total,prepared_.total_ms,prepared_.max_ms,prepared_.ready?L"可以重按三角 + 圈；空闲保留资产引用":L"请等已预载后重按，触发帧不加载");
+        _snwprintf_s(summary,_countof(summary),_TRUNCATE,L"%s：%zu/%zu 步；累计 %.1f ms，最大单步 %.1f ms。%s",prepared_.ready?L"已预载":L"分步准备中",prepared_.step,total,prepared_.total_ms,prepared_.max_ms,prepared_.ready?L"可以重按投技快捷键；空闲保留资产引用":L"请等已预载后重按，触发帧不加载");
         prepared_.status=summary;
     }
     Logf("MOTIAN_GRAB_PREPARE step=%zu/%zu label=%s ok=%d stepMs=%.3f assetRefs=%zu ready=%d lookup=%s",
@@ -1774,7 +1774,7 @@ bool StartAttempt(const Context& c) {
     if (session_.began || !InputBaseAllowed(c) || !InputAllowed(c)) return false;
     if (!ExecutionContext(c.pawn,c.execution,c.asc)) { Status(L"主角原执行组件 / ActorConfig / ASC 未就绪，未施放"); return false; }
     const VariantData& variant=kVariants[run_variant_];
-    if (!PreparedReady()) { Status(L"当前招式资源尚未预载；请等菜单显示已预载后重按三角 + 圈"); return false; }
+    if (!PreparedReady()) { Status(L"当前招式资源尚未预载；请等菜单显示已预载后重按 %s",UiHotkeys::Hint(UiHotkeys::Action::GrabRelease).c_str()); return false; }
     Object* source=prepared_.source.object;
     if (!AcquireClass(source)) { Status(L"无法安全保活原投技类，未施放"); return false; }
     Object* victim=prepared_.victim.object;

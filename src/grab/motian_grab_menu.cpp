@@ -181,7 +181,7 @@ void Refresh(bool options) {
     EnableWindow(recommended_,selectable);
     EnableWindow(apply_,!state.active&&!state.cleanup_pending&&!state.disabled&&(!SendMessageW(enabled_,BM_GETCHECK,0,0)||selectable));
     EnableWindow(GetDlgItem(window_,kTrigger),state.options.enabled&&state.prepared&&!state.active&&!state.cleanup_pending&&!state.disabled&&selectable&&selected->index==state.options.variant);
-    std::wstring detail=L"PS5：三角 + 圈（220 毫秒内）；每次触发后须松开两键。\r\n"
+    std::wstring detail=L"投技快捷键默认为键盘 G、Xbox Y + B、PlayStation 三角 + 圈，可在快捷键页修改；手柄两键须在 220 毫秒内按下，每次触发后须松开。\r\n"
         L"开启或更换招式后先等待资源显示“已预载”，再回到游戏按组合键。资源准备耗时会单独显示。\r\n"
         L"以原生成对能力 / Timeline 负责受投、伤害和位移；关闭或取消走双方原能力结束清理。\r\n"
         L"投技附加：可在投技期间隐藏主角武器（结束后恢复原显示），并在原投技结束后按倍率或最大生命百分比补足伤害；伤害经游戏属性接口写入。未开启“无视无敌”时，只在目标本次确实受到原生伤害时追加。\r\n"
@@ -286,10 +286,10 @@ bool Create() {
     WNDCLASSEXW cls{}; cls.cbSize=sizeof(cls); cls.lpfnWndProc=&WindowProc; cls.hInstance=GetModuleHandleW(nullptr);
     cls.lpszClassName=kClass; cls.hCursor=LoadCursorW(nullptr,IDC_ARROW); cls.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_BTNFACE+1);
     if (!RegisterClassExW(&cls) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return false;
-    window_=CreateWindowExW(WS_EX_APPWINDOW,kClass,L"PBZ 投技 — PS5 三角 + 圈",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
+    window_=CreateWindowExW(WS_EX_APPWINDOW,kClass,L"PBZ 投技",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         CW_USEDEFAULT,CW_USEDEFAULT,750,680,nullptr,nullptr,cls.hInstance,nullptr);
     if (!window_) return false;
-    UiI18n::Bind(window_,L"PBZ 投技 — PS5 三角 + 圈");
+    UiI18n::Bind(window_,L"PBZ 投技");
     font_=UiTheme::GetFont(UiTheme::Font::Body,window_);
     enabled_=Control(L"BUTTON",L"开启投技",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kEnable);
     boss_=Control(L"BUTTON",L"目标允许人形 Boss（实验）",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kBoss);
