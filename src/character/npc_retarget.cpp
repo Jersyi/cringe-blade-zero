@@ -5,6 +5,7 @@
 #include "npc_pose_transfer.h"
 #include "grab_extras.h"
 #include "skill_toast.h"
+#include "settings_store.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -239,6 +241,7 @@ double skin_size_=1;
 // Evaluate foreign), eased over kForeignBlendMs. foreign_weight_ is read on the animation threads.
 // foreign_own_: that montage is the NPC's own skeleton (its skills): the display takes the track back.
 std::atomic<ULONGLONG> skill_route_until_{0};constexpr ULONGLONG kSkillRouteTailMs=2000; // effects a skill leaves behind
+std::atomic<float> skill_damage_{kSkillDamageDefault};constexpr wchar_t kSkillSection[]=L"NpcSkill"; // ScaleSkillDamage
 std::atomic<double> foreign_weight_{0.0};std::atomic<bool> foreign_own_{false};double foreign_from_=0,foreign_to_=0;ULONGLONG foreign_start_=0;Object* foreign_montage_=nullptr;
 constexpr ULONGLONG kForeignBlendMs=150;
 // Mounts (kMountLoops): a pose puppet, an invisible single-node SkeletalMeshComponent on the display mesh,
@@ -2212,6 +2215,196 @@ void WatchSkill() {
     // run and stopped (or never ran within 500 ms), so the next press is free right away.
     if((!active&&(skill_.seen_active||ms>500))||ms>kSkillTimeoutMs)ClearSkill(active?"timeout":"ended-spec-left");
 }
+// ---- Skill damage -------------------------------------------------------------------------------
+// The boss skills deal the boss's own damage (tuned against the hero). ScaleSkillDamage watches the health of
+// the hostile pawns around the hero while one runs and until kSkillRouteTailMs after it (projectiles, lingering
+// hits), unless the hero starts a montage the skill never played; each drop d is topped up to skill_damage_ x d
+// by taking d * (x - 1) more, at most what is left, through GrabExtras::ChangeHealth (the game's attribute call).
+// Health is read in place: PBZCharacter.AttributeSetBase -> BasicAttributeSet.Health.CurrentValue (as AirSkills).
+struct DamageTarget { Identity pawn,set;int32_t offset=-1;float last=0; };
+struct DamageWindow {
+    bool open=false;ULONGLONG skill_started=0,until=0,next_scan=0;std::string skill;float scale=1;
+    std::vector<DamageTarget> targets;std::vector<Object*> montages;float native=0,extra=0;uint32_t hits=0,refused=0;
+};
+DamageWindow damage_;
+constexpr ULONGLONG kSkillDamageScanMs=500;constexpr double kSkillDamageRangeCm=6000;constexpr size_t kSkillDamageTargetsMax=64,kSkillDamageHitLogs=8;
+bool HealthNow(const DamageTarget& target,float& value) {
+    if(target.offset<0||!Same(target.pawn)||!Same(target.set)||!FaceReadable(target.set.object+target.offset,sizeof(float)))return false;
+    value=ue::At<float>(target.set.object,target.offset);return std::isfinite(value)&&value>=0&&value<1e9f;
+}
+// A living AI pawn the hero's team is hostile to (SGameAIController team matrix), with a readable health.
+bool DamageCandidate(Object* pawn,Object* hero,DamageTarget& target) {
+    if(!ue::Alive(pawn)||pawn==hero||ue::IsTemplate(pawn))return false;
+    Object* controller=Property<Object*>(pawn,"Controller"),*ai=Class("/Script/SGameAI.SGameAIController");
+    if(!ue::Alive(controller)||!ai||!ue::IsA(controller,ai))return false;
+    Object* teams=ue::Default("/Script/SGameAI.Default__SGameAIController");Call own(teams,"GetTeam"),other(teams,"GetTeam");
+    if(!own.Set("Actor",hero).Invoke()||!other.Set("Actor",pawn).Invoke())return false;
+    Call attitude(teams,"GetDefaultTeamAttitude");
+    if(!attitude.Set("Team1",other.Get<uint8_t>("ReturnValue")).Set("Team2",own.Get<uint8_t>("ReturnValue")).Invoke()||attitude.Get<uint8_t>("ReturnValue")!=2)return false; // Hostile
+    Call dead(ue::Default("/Script/SGameAI.Default__SGameAIStateUtils"),"IsDead");
+    if(!dead.Set("Pawn",pawn).Invoke()||dead.Get<bool>("ReturnValue"))return false;
+    Object* set=Property<Object*>(pawn,"AttributeSetBase"),*basic=Class("/Script/CharacterBasics.BasicAttributeSet"),*data=Class("/Script/GameplayAbilities.GameplayAttributeData");
+    const int32_t health=Offset(set,"Health");
+    if(!ue::Alive(set)||!basic||!ue::IsA(set,basic)||health<0||!data||ue::StructSize(data)!=16||ue::Offset(data,"CurrentValue")!=12)return false;
+    target={};target.pawn=Id(pawn);target.set=Id(set);target.offset=health+12;
+    return HealthNow(target,target.last)&&target.last>0;
+}
+void ScanDamageTargets(Object* hero) {
+    Vector at{};{Call where(hero,"K2_GetActorLocation");if(!where.Invoke())return;at=where.Get<Vector>("ReturnValue");}
+    Call actors(ue::Default("/Script/Engine.Default__GameplayStatics"),"GetAllActorsOfClass");
+    if(!actors.Set("WorldContextObject",hero).Set("ActorClass",Class("/Script/Engine.Pawn")).Invoke())return;
+    const Array list=actors.Get<Array>("OutActors");
+    if(list.data&&list.num>0&&list.num<=2048&&FaceReadable(list.data,static_cast<size_t>(list.num)*sizeof(Object*)))
+        for(int32_t i=0;i<list.num&&damage_.targets.size()<kSkillDamageTargetsMax;++i){
+            Object* pawn=static_cast<Object**>(list.data)[i];
+            if(!ue::Alive(pawn)||pawn==hero||std::any_of(damage_.targets.begin(),damage_.targets.end(),[&](const DamageTarget& t){return t.pawn.object==pawn;}))continue;
+            Call where(pawn,"K2_GetActorLocation");if(!where.Invoke())continue;
+            const Vector p=where.Get<Vector>("ReturnValue");const double dx=p.x-at.x,dy=p.y-at.y,dz=p.z-at.z;
+            if(!(dx*dx+dy*dy+dz*dz<=kSkillDamageRangeCm*kSkillDamageRangeCm))continue;
+            DamageTarget target;if(DamageCandidate(pawn,hero,target))damage_.targets.push_back(target);
+        }
+    ue::Free(list.data);
+}
+void CloseDamageWindow(const char* why) {
+    if(!damage_.open)return;
+    Logf("NPC_SKILL damage ability=%s x%.2f targets=%zu hits=%u native=%.0f extra=%.0f refused=%u closed=%s",damage_.skill.c_str(),damage_.scale,
+        damage_.targets.size(),damage_.hits,damage_.native,damage_.extra,damage_.refused,why);
+    damage_={};
+}
+void ScaleSkillDamage() {
+    const ULONGLONG now=GetTickCount64();const bool running=active_&&skill_.handle>0;
+    if(running&&damage_.open&&damage_.skill_started!=skill_.started)CloseDamageWindow("next-skill");
+    if(running&&!damage_.open){damage_.open=true;damage_.skill_started=skill_.started;damage_.skill=skill_.name;}
+    if(!damage_.open)return;
+    const bool foreign=foreign_montage_&&std::find(damage_.montages.begin(),damage_.montages.end(),foreign_montage_)==damage_.montages.end();
+    if(running){damage_.until=now+kSkillRouteTailMs;if(foreign)damage_.montages.push_back(foreign_montage_);}
+    else if(!active_||now>=damage_.until||foreign||!Same(pawn_)){CloseDamageWindow(!active_?"skin-off":foreign?"hero-montage":now>=damage_.until?"tail-over":"hero-gone");return;}
+    damage_.scale=std::clamp(skill_damage_.load(std::memory_order_relaxed),kSkillDamageMin,kSkillDamageMax);
+    if(now>=damage_.next_scan&&Same(pawn_)){damage_.next_scan=now+kSkillDamageScanMs;ScanDamageTargets(pawn_.object);}
+    const bool apply=damage_.scale>1.001f&&!GrabExtras::Active(); // a grab measures and scales its own damage
+    for(size_t i=0;i<damage_.targets.size();){
+        DamageTarget& target=damage_.targets[i];float health=0;
+        if(!HealthNow(target,health)){damage_.targets.erase(damage_.targets.begin()+static_cast<std::ptrdiff_t>(i));continue;}
+        const float drop=target.last-health;
+        if(drop>0.01f){
+            damage_.native+=drop;float extra=0;
+            if(apply&&health>0){
+                const float want=std::min(drop*(damage_.scale-1),health);float after=health;
+                if(GrabExtras::ChangeHealth(target.pawn.object,-want)&&HealthNow(target,after)){extra=health-after;health=after;}
+                if(extra<=0.01f)++damage_.refused;}
+            damage_.extra+=std::max(extra,0.0f);
+            if(++damage_.hits<=kSkillDamageHitLogs)
+                Logf("NPC_SKILL damage hit ability=%s target=%s native=%.1f extra=%.1f left=%.0f x%.2f%s",damage_.skill.c_str(),Text(target.pawn.object).c_str(),
+                    drop,extra,health,damage_.scale,apply?"":GrabExtras::Active()?" (grab owns it)":" (x1)");}
+        target.last=health;++i;
+    }
+}
+// ---- Boss-only skill calls ----------------------------------------------------------------------
+// A boss skill that casts its avatar to the boss blueprint and calls into it does nothing of that on the
+// hero: the cast fails. Of 真龙之躯's (ZuoShang P2) skills only GA_ZuoShang_P2_Skill_23 does so
+// (analysis/pbz_bossrush_20261030/npc_skill_fx_20261103: scan_p2.py, decode.py, timeline.py). Its Main
+// timeline sends GameplayEvent.ZuoShang.DragonPillar.Prepare at 0.681 s and ...Throw at 2.015 s, and the
+// ability answers with BP_Monster_ZuoShang_P2.PrepareDragonPillar(self) / ThrowDragonPillar(player, 1 s):
+//   Prepare: at = actor transform * DragonPillarSpawnOffset; yaw = look-at yaw from there to the target;
+//            bullet = DragonPillarData.CreateBullet(Transform(at, (DragonPillarInitialTilt, yaw, 0)), self);
+//            bullet.Initialize(null, self, ability, DragonPillarData, false); bullet.BeginPrepareMotion()
+//   Throw:   bullet.LaunchTowardPoint(target location, 1 s)
+//   Cancel:  bullet.StopPillarFlight(); bullet.Deactivate(0.1)
+// DriveBossCalls replays them for the hero at the same skill montage positions, with the boss's values read
+// from its class default object and the nearest hostile pawn as the target (the boss aims at the player).
+// The bullet's native parameters are filled by position (bytecode carries no names), sizes checked.
+Object* DefaultObject(Object* cls);
+struct BossCall { const char* ability; const char* montage; float prepare_at, throw_at, flight_seconds; };
+constexpr BossCall kDragonPillar{"GA_ZuoShang_P2_Skill_23","ZuoShang_LongTi_Skill_23_Montage",0.681f,2.015f,1.0f};
+struct PillarState { int32_t handle=0;Identity bullet;bool prepared=false,thrown=false; };
+PillarState pillar_;
+struct alignas(16) Transform96 { unsigned char bytes[96]{}; };
+struct RotatorD { double pitch=0,yaw=0,roll=0; };
+struct Param { std::string name;int32_t offset=-1,size=0; };
+// A UFunction's parameters in declaration order (its ChildProperties), the return value among them.
+std::vector<Param> Params(Object* object,const char* function) {
+    std::vector<Param> out;Object* fn=ue::Alive(object)?ue::FindFunction(ue::ClassOf(object),function):nullptr;if(!fn)return out;
+    uintptr_t field=ue::At<uintptr_t>(fn,ue::layout::kChildProperties);
+    for(size_t guard=0;field&&guard<32&&FaceReadable(reinterpret_cast<void*>(field),0x48);++guard,field=ue::At<uintptr_t>(reinterpret_cast<void*>(field),ue::layout::kPropNext))
+        out.push_back({Text(ue::At<Name>(reinterpret_cast<void*>(field),ue::layout::kPropName)),ue::At<int32_t>(reinterpret_cast<void*>(field),ue::layout::kPropOffset),
+            ue::At<int32_t>(reinterpret_cast<void*>(field),ue::layout::kPropElementSize)});
+    return out;
+}
+std::string ParamText(const std::vector<Param>& params) {
+    std::string text;for(const Param& p:params)text+=(text.empty()?"":",")+p.name+":"+std::to_string(p.size);return text.empty()?"-":text;
+}
+// A float or double property (Blueprint reals are doubles).
+bool Real(Object* object,const char* property,double& value) {
+    const uintptr_t field=object?Field(ue::ClassOf(object),property):0;if(!field)return false;
+    const int32_t size=ue::At<int32_t>(reinterpret_cast<void*>(field),ue::layout::kPropElementSize),offset=ue::At<int32_t>(reinterpret_cast<void*>(field),ue::layout::kPropOffset);
+    if(size==8)value=ue::At<double>(object,offset);else if(size==4)value=ue::At<float>(object,offset);else return false;return std::isfinite(value);
+}
+bool NearestEnemy(Object* hero,Vector& at) {
+    Vector self{};{Call where(hero,"K2_GetActorLocation");if(!where.Invoke())return false;self=where.Get<Vector>("ReturnValue");}
+    Call actors(ue::Default("/Script/Engine.Default__GameplayStatics"),"GetAllActorsOfClass");
+    if(!actors.Set("WorldContextObject",hero).Set("ActorClass",Class("/Script/Engine.Pawn")).Invoke())return false;
+    const Array list=actors.Get<Array>("OutActors");double best=kSkillDamageRangeCm*kSkillDamageRangeCm;bool found=false;
+    if(list.data&&list.num>0&&list.num<=2048&&FaceReadable(list.data,static_cast<size_t>(list.num)*sizeof(Object*)))
+        for(int32_t i=0;i<list.num;++i){Object* pawn=static_cast<Object**>(list.data)[i];if(!ue::Alive(pawn)||pawn==hero)continue;
+            Call where(pawn,"K2_GetActorLocation");if(!where.Invoke())continue;const Vector p=where.Get<Vector>("ReturnValue");
+            const double d=(p.x-self.x)*(p.x-self.x)+(p.y-self.y)*(p.y-self.y)+(p.z-self.z)*(p.z-self.z);DamageTarget probe;
+            if(d<best&&DamageCandidate(pawn,hero,probe)){best=d;at=p;found=true;}}
+    ue::Free(list.data);return found;
+}
+// Where the pillar flies: the nearest hostile pawn, else 15 m ahead of the hero.
+Vector PillarTarget(Object* hero) {
+    Vector at{};if(NearestEnemy(hero,at))return at;
+    Vector self{},ahead{};{Call where(hero,"K2_GetActorLocation");if(where.Invoke())self=where.Get<Vector>("ReturnValue");}
+    {Call forward(hero,"GetActorForwardVector");if(forward.Invoke())ahead=forward.Get<Vector>("ReturnValue");}
+    return Vector{self.x+ahead.x*1500,self.y+ahead.y*1500,self.z+ahead.z*1500};
+}
+void PreparePillar(Object* hero,Object* asc) {
+    const NpcSkillSet& set=kNpcSkillSets[selected_];const std::string monster=set.monster?set.monster:"";
+    Object* cls=monster.empty()?nullptr:LoadClassPackage(monster);const std::string leaf=monster.substr(monster.find_last_of('/')+1);
+    Object* cdo=cls?Class((monster+".Default__"+leaf+"_C").c_str()):nullptr;if(cls&&!cdo)cdo=DefaultObject(cls);
+    Object* data=cdo?Property<Object*>(cdo,"DragonPillarData"):nullptr;double tilt=0;const Vector offset=cdo?Property<Vector>(cdo,"DragonPillarSpawnOffset"):Vector{};
+    if(!ue::Alive(data)||!Real(cdo,"DragonPillarInitialTilt",tilt)){Logf("NPC_SKILL pillar skipped: %s has no DragonPillarData / DragonPillarInitialTilt (cdo=%s)",leaf.c_str(),Text(cdo).c_str());return;}
+    const Vector target=PillarTarget(hero);Transform96 actor{};{Call get(hero,"GetTransform");if(!get.Invoke())return;actor=get.Get<Transform96>("ReturnValue");}
+    Call place(Math(),"TransformLocation");if(!place.Set("T",actor).Set("Location",offset).Invoke())return;const Vector at=place.Get<Vector>("ReturnValue");
+    Call look(Math(),"FindLookAtRotation");if(!look.Set("Start",at).Set("Target",target).Invoke())return;
+    RotatorD turn;turn.pitch=tilt;turn.yaw=look.Get<RotatorD>("ReturnValue").yaw;
+    Call make(Math(),"MakeTransform");if(!make.Set("Location",at).Set("Rotation",turn).Set("Scale",Vector{1,1,1}).Invoke())return;const Transform96 spawn=make.Get<Transform96>("ReturnValue");
+    const std::vector<Param> create=Params(data,"CreateBullet");
+    if(create.size()<3||create[0].size!=96||create[1].size!=8){Logf("NPC_SKILL pillar skipped: CreateBullet params=%s",ParamText(create).c_str());return;}
+    Call spawn_call(data,"CreateBullet");if(!spawn_call.Set(create[0].name.c_str(),spawn).Set(create[1].name.c_str(),hero).Invoke())return;
+    Object* bullet=spawn_call.Get<Object*>("ReturnValue");if(!ue::Alive(bullet)){Logf("NPC_SKILL pillar CreateBullet returned no bullet (data=%s)",Text(data).c_str());return;}
+    bool instance=false;Object* ability=SpecAbility(asc,skill_.handle,instance);
+    const std::vector<Param> init=Params(bullet,"Initialize");bool initialized=false;
+    if(init.size()>=5&&init[0].size==16&&init[1].size==8&&init[2].size==8&&init[3].size==8&&init[4].size==1){
+        Call start(bullet,"Initialize");initialized=start.Set(init[1].name.c_str(),hero).Set(init[2].name.c_str(),ability).Set(init[3].name.c_str(),data).Set(init[4].name.c_str(),false).Invoke();}
+    if(!initialized){Logf("NPC_SKILL pillar Initialize params=%s refused; bullet destroyed",ParamText(init).c_str());Call(bullet,"K2_DestroyActor").Invoke();return;}
+    const bool motion=Call(bullet,"BeginPrepareMotion").Invoke();pillar_.bullet=Id(bullet);
+    Logf("NPC_SKILL pillar prepared bullet=%s data=%s at=(%.0f,%.0f,%.0f) offset=(%.0f,%.0f,%.0f) tilt=%.1f yaw=%.1f target=(%.0f,%.0f,%.0f) ability=%s instance=%d motion=%d createParams=%s initParams=%s",
+        Text(bullet).c_str(),Text(data).c_str(),at.x,at.y,at.z,offset.x,offset.y,offset.z,tilt,turn.yaw,target.x,target.y,target.z,Text(ability).c_str(),instance?1:0,motion?1:0,ParamText(create).c_str(),ParamText(init).c_str());
+}
+void ThrowPillar(Object* hero) {
+    if(!Same(pillar_.bullet))return;Object* bullet=pillar_.bullet.object;const Vector target=PillarTarget(hero);
+    const std::vector<Param> launch=Params(bullet,"LaunchTowardPoint");bool ok=false;
+    if(launch.size()>=2&&launch[0].size==24&&(launch[1].size==4||launch[1].size==8)){Call fly(bullet,"LaunchTowardPoint");fly.Set(launch[0].name.c_str(),target);
+        if(launch[1].size==8)fly.Set(launch[1].name.c_str(),static_cast<double>(kDragonPillar.flight_seconds));else fly.Set(launch[1].name.c_str(),kDragonPillar.flight_seconds);ok=fly.Invoke();}
+    Logf("NPC_SKILL pillar thrown=%d target=(%.0f,%.0f,%.0f) params=%s",ok?1:0,target.x,target.y,target.z,ParamText(launch).c_str());
+}
+void CancelPillar(const char* why) {
+    if(Same(pillar_.bullet)){Object* bullet=pillar_.bullet.object;Call(bullet,"StopPillarFlight").Invoke();const std::vector<Param> off=Params(bullet,"Deactivate");Call stop(bullet,"Deactivate");
+        if(!off.empty()&&off[0].size==8)stop.Set(off[0].name.c_str(),0.1);else if(!off.empty()&&off[0].size==4)stop.Set(off[0].name.c_str(),0.1f);
+        Logf("NPC_SKILL pillar cancelled reason=%s deactivated=%d",why,stop.Invoke()?1:0);}
+    pillar_={};
+}
+void DriveBossCalls() {
+    const bool mine=active_&&skill_.handle>0&&skill_.name==kDragonPillar.ability&&Same(pawn_)&&Same(skill_.asc);
+    if(!mine){if(pillar_.handle){if(pillar_.prepared&&!pillar_.thrown)CancelPillar(active_?"skill-ended":"skin-off");else pillar_={};}return;}
+    if(pillar_.handle!=skill_.handle){if(pillar_.prepared&&!pillar_.thrown)CancelPillar("next-skill");pillar_={};pillar_.handle=skill_.handle;}
+    if(pillar_.thrown||!foreign_montage_||!ue::Alive(foreign_montage_)||Text(foreign_montage_)!=kDragonPillar.montage)return;
+    Object* anim=AnimInstance(primary_.object);if(!anim)return;Call at(anim,"Montage_GetPosition");if(!at.Set("Montage",foreign_montage_).Invoke())return;
+    const float position=at.Get<float>("ReturnValue");
+    if(!pillar_.prepared&&position>=kDragonPillar.prepare_at){pillar_.prepared=true;PreparePillar(pawn_.object,skill_.asc.object);}
+    if(pillar_.prepared&&!pillar_.thrown&&position>=kDragonPillar.throw_at){pillar_.thrown=true;ThrowPillar(pawn_.object);}
+}
 // ---- Foreign montages ---------------------------------------------------------------------------
 void HoldForeignMontage() {
     if(!active_||!source_driver_mode_||!Same(primary_))return;
@@ -2730,6 +2923,7 @@ void Tick() {
     if (active_) ProbeCameraLift();
     if (InterlockedExchange(&skill_request_, 0) && active_) CastSkill();
     if (active_) { RetryPendingSkill(); HoldSkillLock(); HoldForeignMontage(); DriveMount(); } // every frame
+    ScaleSkillDamage(); DriveBossCalls(); // every frame; both close what they hold once the skin is off
     int32_t action = -1, entry = -1;
     AcquireSRWLockExclusive(&request_lock); action = pending_action_; entry = pending_entry_; pending_action_ = -1; ReleaseSRWLockExclusive(&request_lock);
     if (InterlockedExchange(&forget_resume_, 0)) ForgetResume(action == static_cast<int32_t>(Action::Restore) ? "restore requested" : "another request");
@@ -2832,7 +3026,9 @@ void Initialize(Logger logger, ReleaseAppearance release_appearance) {
     state.appearance_gate = release_appearance_ != nullptr;
     for (size_t i = 0; i < std::size(kProfiles); ++i) state.entries.push_back({static_cast<int32_t>(i), kProfiles[i].id, kProfiles[i].name, kProfiles[i].detail});
     AcquireSRWLockExclusive(&snapshot_lock); snapshot_ = std::move(state); ReleaseSRWLockExclusive(&snapshot_lock);
-    initialized_ = true; Logf("NPC_RETARGET initialized profiles=%zu native AnimationRelative experiment", std::size(kProfiles));
+    const float damage = SettingsStore::GetFloat(kSkillSection, L"DamageMultiplier", kSkillDamageDefault);
+    skill_damage_.store(std::isfinite(damage) ? std::clamp(damage, kSkillDamageMin, kSkillDamageMax) : kSkillDamageDefault, std::memory_order_relaxed);
+    initialized_ = true; Logf("NPC_RETARGET initialized profiles=%zu native AnimationRelative experiment skillDamage=x%.2f", std::size(kProfiles), skill_damage_.load(std::memory_order_relaxed));
 }
 bool Request(Action action, int32_t entry) {
     if (action == Action::Apply && !InterlockedCompareExchange(&experimental_, 0, 0)) return false;
@@ -2847,6 +3043,13 @@ bool SetExperimental(bool enabled) {
     AcquireSRWLockExclusive(&snapshot_lock); snapshot_.experimental = enabled; ReleaseSRWLockExclusive(&snapshot_lock);
     if (!enabled) return Request(Action::Restore);
     Status(L"NPC 实验开关已打开；仍需通过场景、外观互斥、骨架与挂点校验"); return true;
+}
+float SkillDamageMultiplier() { return skill_damage_.load(std::memory_order_relaxed); }
+bool SetSkillDamageMultiplier(float multiplier) {
+    if (!std::isfinite(multiplier)) return false;
+    const float value = std::clamp(multiplier, kSkillDamageMin, kSkillDamageMax);
+    if (value == skill_damage_.exchange(value, std::memory_order_relaxed)) return true;
+    SettingsStore::PutFloat(kSkillSection, L"DamageMultiplier", value); Logf("NPC_SKILL damage multiplier x%.2f", value); return true;
 }
 bool RequestSkill() {
     AcquireSRWLockShared(&snapshot_lock); const bool active = snapshot_.active; ReleaseSRWLockShared(&snapshot_lock);
@@ -2981,6 +3184,7 @@ bool HandleCommand(const char* verb, const char* arguments) {
     }
     if (action == "restore") return Request(Action::Restore);
     if (action == "skill") return RequestSkill();
+    if (action == "damage") { char* end = nullptr; const float value = std::strtof(id.c_str(), &end); return !id.empty() && end && !*end && SetSkillDamageMultiplier(value); }
     if (action == "status") { const Snapshot state = GetSnapshot(); Logf("NPC_RETARGET_STATUS %s", Utf8(state.status.c_str()).c_str()); return true; }
     if (action == "list") { for (size_t i = 0; i < std::size(kProfiles); ++i) Logf("NPC_RETARGET_PROFILE %zu id=%s name=%s", i, kProfiles[i].id, Utf8(kProfiles[i].name).c_str()); return true; }
     if (action == "apply" || action == "inspect") for (size_t i = 0; i < std::size(kProfiles); ++i)

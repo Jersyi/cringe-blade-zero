@@ -7,6 +7,7 @@
 #include "character_swap.h"
 #include <windows.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cwctype>
 #include <string>
@@ -17,12 +18,15 @@ namespace {
 constexpr wchar_t kClass[] = L"PBZ_NpcRetarget_Window_v1";
 constexpr int kSearch = 4601, kList = 4602, kInspect = 4603;
 constexpr int kApply = 4610, kRestore = 4611, kClose = 4612;
-constexpr int kExperimental = 4613;
+constexpr int kExperimental = 4613, kSkillDamage = 4614;
+// NPC skill damage multiplier choices; an ini value that is none of them gets a row of its own.
+constexpr float kDamageChoices[] = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f, 8.0f, 10.0f};
 HWND window_ = nullptr, return_window_ = nullptr;
 HWND title_ = nullptr, introduction_ = nullptr, search_label_ = nullptr, search_ = nullptr, list_ = nullptr;
 HWND detail_ = nullptr, gates_ = nullptr, active_ = nullptr, status_ = nullptr;
 HWND inspect_ = nullptr, apply_ = nullptr, restore_ = nullptr, close_ = nullptr;
-HWND experimental_ = nullptr;
+HWND experimental_ = nullptr, skill_damage_label_ = nullptr, skill_damage_ = nullptr;
+std::vector<float> damage_values_; // skill_damage_ rows
 HFONT font_ = nullptr;
 Logger logger_ = nullptr;
 DWORD worker_thread_ = 0;
@@ -118,12 +122,28 @@ void Filter() {
     SendMessageW(list_, WM_SETREDRAW, TRUE, 0); InvalidateRect(list_, nullptr, TRUE);
     SelectionChanged();
 }
+void AddDamageChoice(float value) {
+    wchar_t text[48]{};
+    if (value == NpcRetarget::kSkillDamageMin) _snwprintf_s(text, _countof(text), _TRUNCATE, L"×1（Boss 原伤害）");
+    else if (value == NpcRetarget::kSkillDamageDefault) _snwprintf_s(text, _countof(text), _TRUNCATE, L"×3（默认）");
+    else _snwprintf_s(text, _countof(text), _TRUNCATE, L"×%g", static_cast<double>(value));
+    UiI18n::AddString(skill_damage_, CB_ADDSTRING, 0, text); damage_values_.push_back(value);
+}
+void ShowSkillDamage() {
+    if (!skill_damage_ || SendMessageW(skill_damage_, CB_GETDROPPEDSTATE, 0, 0)) return;
+    const float value = NpcRetarget::SkillDamageMultiplier();
+    auto found = std::find_if(damage_values_.begin(), damage_values_.end(), [&](float choice) { return std::fabs(choice - value) < 1e-3f; });
+    if (found == damage_values_.end()) { AddDamageChoice(value); found = damage_values_.end() - 1; }
+    const LRESULT row = found - damage_values_.begin();
+    if (SendMessageW(skill_damage_, CB_GETCURSEL, 0, 0) != row) SendMessageW(skill_damage_, CB_SETCURSEL, static_cast<WPARAM>(row), 0);
+}
 void Update() {
     if (!window_) return;
     updating_ = true;
     snapshot_ = NpcRetarget::GetSnapshot();
     SendMessageW(experimental_, BM_SETCHECK, snapshot_.experimental ? BST_CHECKED : BST_UNCHECKED, 0);
     EnableWindow(experimental_, !snapshot_.disabled);
+    ShowSkillDamage();
     if (CatalogChanged(snapshot_.entries)) { entries_ = snapshot_.entries; Filter(); }
     const CharacterSwap::Snapshot outfit = CharacterSwap::GetSnapshot();
     std::wstring state;
@@ -204,7 +224,12 @@ void Layout() {
     const int label_width = (std::min)(UiLayout::TextWidth(search_label_) + gap, left / 2);
     MoveWindow(search_label_, margin, search_top + (edit_height - line) / 2, label_width, line, TRUE);
     MoveWindow(search_, margin + label_width + gap, search_top, (std::max)(1, left - label_width - gap), edit_height, TRUE);
-    MoveWindow(experimental_, right, search_top, (std::min)(right_width, UiLayout::CheckWidth(experimental_, m)), edit_height, TRUE);
+    const int check_width = (std::min)(right_width, UiLayout::CheckWidth(experimental_, m));
+    MoveWindow(experimental_, right, search_top, check_width, edit_height, TRUE);
+    const int damage_left = right + check_width + 2 * gap, damage_label = UiLayout::TextWidth(skill_damage_label_) + gap / 2;
+    const int damage_width = (std::max)(1, (std::min)(S(180), margin + content - damage_left - damage_label - gap / 2));
+    MoveWindow(skill_damage_label_, damage_left, search_top + (edit_height - line) / 2, damage_label, line, TRUE);
+    MoveWindow(skill_damage_, damage_left + damage_label + gap / 2, search_top, damage_width, edit_height + S(240), TRUE);
     MoveWindow(list_, margin, body_top, left, body_height, TRUE);
     SendMessageW(list_, LB_SETHORIZONTALEXTENT, S(310), 0);
     MoveWindow(detail_, right, body_top, right_width, detail_height, TRUE);
@@ -251,6 +276,13 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wparam, LPARAM lpar
             if (!NpcRetarget::SetExperimental(enabled)) Notice(L"实验开关未接受请求；故障停用时仍可恢复原模型。");
             Update();
         }
+        else if (id == kSkillDamage && notification == CBN_SELCHANGE) {
+            const LRESULT row = SendMessageW(skill_damage_, CB_GETCURSEL, 0, 0);
+            if (row >= 0 && static_cast<size_t>(row) < damage_values_.size() && NpcRetarget::SetSkillDamageMultiplier(damage_values_[static_cast<size_t>(row)]))
+                Notice(L"NPC 技能伤害倍率已保存：技能施放期间及结束后 2 秒内，敌人每次掉血按此倍率补足。");
+            else Notice(L"NPC 技能伤害倍率未被接受。");
+            Update();
+        }
         else if (id == kClose || id == IDCANCEL) Hide();
         return 0;
     }
@@ -275,6 +307,9 @@ bool Create() {
     SendMessageW(search_, EM_SETLIMITTEXT, 128, 0);
     list_ = Control(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP, kList, WS_EX_CLIENTEDGE);
     experimental_ = Control(L"BUTTON", L"启用实验模型切换", BS_AUTOCHECKBOX | WS_TABSTOP, kExperimental);
+    skill_damage_label_ = Control(L"STATIC", L"NPC 技能伤害", SS_LEFT, 0);
+    skill_damage_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kSkillDamage);
+    for (const float value : kDamageChoices) AddDamageChoice(value);
     detail_ = Control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 0, WS_EX_CLIENTEDGE);
     gates_ = Control(L"EDIT", L"待验收：完整身体 / 头部 / 发丝 / 衣料；走跑、攻击、受击与武器位置；恢复与跨图清理。\r\n"
         L"主角保留原生动画、技能与武器骨骼，NPC 外观独立适配。\r\n"

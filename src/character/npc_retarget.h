@@ -26,6 +26,12 @@ bool Request(Action action, int32_t entry = -1);
 // (kNpcSkillSets) in random rounds on the hero's own ASC, locked on the nearest enemy; while one runs
 // the boss's weapons hang on the NPC display and the hero's weapons are hidden. False when no skin is active.
 bool RequestSkill();
+// Any thread, no engine calls. NPC skill damage ([NpcSkill] DamageMultiplier, kSkillDamageMin..Max,
+// default 3): every health drop of a hostile pawn while a skin's boss skill runs, and for the effects it
+// leaves up to 2 s after, is scaled to this many times the native damage. 1 = the boss's own damage.
+constexpr float kSkillDamageDefault = 3.0f, kSkillDamageMin = 1.0f, kSkillDamageMax = 10.0f;
+float SkillDamageMultiplier();
+bool SetSkillDamageMultiplier(float multiplier); // clamped, persisted; false when not finite
 // Game thread. The NPC display component while a skin is on, else null: a grab's boss weapon follows
 // its hands. size: the skin's height over the hero's (rest pelvis), 1 without a skin; the grab
 // scales the boss weapon by it, the display and the victim keep their own size.

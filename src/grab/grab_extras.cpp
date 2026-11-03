@@ -680,6 +680,9 @@ void Finish(bool completed) {
 bool Active() { return session_.active; }
 bool Posing() { return session_.active && !session_.pose_over; }
 void SetSkinDisplay(SkinDisplay provider) { skin_display_ = provider; }
+bool ChangeHealth(unsigned char* character, float delta) {
+    return ue::Alive(character) && std::isfinite(delta) && AttributeLayout() && AddHealth(character, delta);
+}
 void SourceEnded() {
     if (!session_.active || session_.damage_done) return;
     session_.damage_done = true; ApplyDamage();

@@ -61,4 +61,8 @@ void SetSkinDisplay(SkinDisplay provider);
 // The executor's own grab ended: grab damage is measured and applied now, so
 // hits landed while the target is still getting up are never scaled.
 void SourceEnded();
+// Game thread: an additive change of a character's Health through the same game attribute call the grab
+// damage uses (AttributeUtils.ModifyCharacterAttributeValue; negative removes health), so death and
+// hit callbacks stay the game's own. False when the call or the attribute layout is unavailable.
+bool ChangeHealth(unsigned char* character, float delta);
 }
