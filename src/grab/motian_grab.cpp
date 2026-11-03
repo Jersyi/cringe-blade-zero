@@ -739,15 +739,23 @@ bool Specs(Object* asc,std::vector<Spec>& result,int32_t only_handle=0,bool head
     return ue::Alive(asc)&&ue::ClassOf(asc)==owner_class&&ue::NameOf(asc)==owner_name&&
         after.data==array.data&&after.num==array.num&&after.max==array.max;
 }
-bool ExecutionBusy(const std::vector<Spec>& specs) {
+// The first active row whose ability is an execution (or whose tags cannot be read);
+// tag receives the matching tag for the log.
+const Spec* BusySpec(const std::vector<Spec>& specs,char* tag=nullptr,size_t tag_size=0) {
+    const auto note=[&](const char* text){ if (tag) strncpy_s(tag,tag_size,text, _TRUNCATE); };
     for (const Spec& spec:specs) if (spec.active) {
-        if (Offset(spec.cdo.object,"AbilityTags")<0) return true;
-        const Tags tags=Property<Tags>(spec.cdo.object,"AbilityTags"); if (!ArrayOk(tags.tags,8)) return true;
-        for (int32_t i=0;i<tags.tags.num;++i) if (Family(static_cast<Name*>(tags.tags.data)[i],"Ability.Action.Execution") ||
-            Family(static_cast<Name*>(tags.tags.data)[i],"Ability.Executed")) return true;
+        if (Offset(spec.cdo.object,"AbilityTags")<0) { note("no AbilityTags"); return &spec; }
+        const Tags tags=Property<Tags>(spec.cdo.object,"AbilityTags"); if (!ArrayOk(tags.tags,8)) { note("unreadable AbilityTags"); return &spec; }
+        for (int32_t i=0;i<tags.tags.num;++i) {
+            const Name name=static_cast<Name*>(tags.tags.data)[i];
+            if (!Family(name,"Ability.Action.Execution") && !Family(name,"Ability.Executed")) continue;
+            if (tag) ue::NameText(name,tag,tag_size);
+            return &spec;
+        }
     }
-    return false;
+    return nullptr;
 }
+bool ExecutionBusy(const std::vector<Spec>& specs) { return BusySpec(specs)!=nullptr; }
 Object* Load(const char* path,bool is_class) {
     if (!preparing_lookup_||trigger_lookup_) return nullptr;
     if (Object* object=ue::FindObject(path)) return object;
@@ -1768,6 +1776,45 @@ void CancelOwnReactions(const Context& c) {
     }
     if (cancelled) Logf("MOTIAN_GRAB cancelled %u own hit-react / knock-down abilities before the grab",cancelled);
 }
+bool CancelInstance(const Identity& instance);
+// An execution ability can stay active on the hero after its execution was cut short
+// (a boss grab interrupted by death, a boss reset or a scene change); every later grab
+// would wait on it. The native component names the two ability handles of a running
+// execution; an active execution ability outside it is ended through its own path
+// (K2_CancelAbility, then K2_EndAbility when it refuses), like the hit-react ones.
+bool ClearStaleExecutions(const Context& c,std::vector<Spec>& own_specs) {
+    CurrentInfo info; const bool info_ok=Readable(c.execution+0x318,sizeof(info));
+    if (info_ok) info=ue::At<CurrentInfo>(c.execution,0x318);
+    Object* executor=info_ok?Resolve(info.executor):nullptr,*target=info_ok?Resolve(info.target):nullptr;
+    std::vector<int32_t> tried;
+    for (int round=0;round<8;++round) {
+        char tag[160]{}; const Spec* busy=BusySpec(own_specs,tag,sizeof(tag)); if (!busy) return true;
+        const int32_t handle=busy->handle; const unsigned count=busy->active;
+        const std::string ability=ue::Alive(busy->cdo.object)?Text(ue::ClassOf(busy->cdo.object)):"-";
+        if (info_ok&&(executor||target)&&(handle==info.execution||handle==info.executed)) {
+            Logf("MOTIAN_GRAB_GATE busy ability=%s handle=%d tag=%s: native execution running executor=%s target=%s isTarget=%u handles=%d/%d",
+                ability.c_str(),handle,tag,Text(executor).c_str(),Text(target).c_str(),info.is_target,info.execution,info.executed);
+            Status(L"主角正在处决或被处决，结束后再按投技快捷键"); return false;
+        }
+        if (std::find(tried.begin(),tried.end(),handle)!=tried.end()) {
+            Logf("MOTIAN_GRAB_GATE stale execution ability=%s handle=%d tag=%s activeCount=%u did not end; grab refused",ability.c_str(),handle,tag,count);
+            Status(L"主角身上残留的处决能力 %s 无法结束，未施放",Wide(ability).c_str()); return false;
+        }
+        tried.push_back(handle);
+        uint32_t live=0,ended=0; std::vector<Spec> row;
+        if (Specs(c.asc,row,handle)&&row.size()==1) for (const Identity& instance:row.front().instances) {
+            bool active=false; if (!Same(instance)||!IsActive(instance.object,active)||!active) continue;
+            ++live;
+            if (!CancelInstance(instance)) Call(instance.object,"K2_EndAbility").Invoke();
+            bool still=true; if (!Same(instance)||(IsActive(instance.object,still)&&!still)) ++ended;
+        }
+        Logf("MOTIAN_GRAB stale execution ability=%s handle=%d tag=%s activeCount=%u liveInstances=%u ended=%u nativeInfo=%d executor=%s target=%s handles=%d/%d",
+            ability.c_str(),handle,tag,count,live,ended,info_ok?1:0,Text(executor).c_str(),Text(target).c_str(),info.execution,info.executed);
+        own_specs.clear();
+        if (!Specs(c.asc,own_specs,0,true)) { Logf("MOTIAN_GRAB_GATE own ability list unreadable after ending a stale execution"); Status(L"主角能力列表读取未通过，未施放"); return false; }
+    }
+    Logf("MOTIAN_GRAB_GATE stale executions remain after 8 rounds; grab refused"); Status(L"主角身上残留的处决能力无法全部结束，未施放"); return false;
+}
 bool StartAttempt(const Context& c) {
     StartSegments timing;
     stage_="target gate";
@@ -1790,7 +1837,12 @@ bool StartAttempt(const Context& c) {
         ue::Offset(info_type,"Target")!=8 || ue::Offset(info_type,"IsTarget")!=20 || ue::Offset(info_type,"ExecutionHandle")!=24 || ue::Offset(info_type,"ExecutedHandle")!=28) {
         Status(L"原生 ExecutionInfo 布局与当前模块不符，未施放"); return false;
     }
-    std::vector<Spec> own_specs; if (!Specs(c.asc,own_specs,0,true)||ExecutionBusy(own_specs)) return false;
+    std::vector<Spec> own_specs;
+    if (!Specs(c.asc,own_specs,0,true)) {
+        Logf("MOTIAN_GRAB_GATE own ability list unreadable (layout, a dying active ability, or a list changing mid-read)");
+        Status(L"主角能力列表读取未通过，未施放"); return false;
+    }
+    if (ExecutionBusy(own_specs)&&!ClearStaleExecutions(c,own_specs)) return false;
     timing.Next(1);
     // A redirected execution names its target; the move's own range then applies.
     Object* target=nullptr,*target_asc=nullptr,*target_execution=nullptr,*near_boss=nullptr;
@@ -2040,8 +2092,12 @@ bool Start(const Context& c) {
     struct TriggerReset { ~TriggerReset() { trigger_lookup_=false; } } reset;
     const bool ok=StartAttempt(c);
     if (!ok) {
-        Logf("MOTIAN_GRAB_START failed stage=%s began=%d grants=%zu uncertain=%d retainedClasses=%zu; success not reported",
-            stage_,session_.began?1:0,session_.grants.size(),session_.uncertain?1:0,class_leases_.size());
+        // The status line is what the player sees; the log carries it so a refusal names its reason.
+        AcquireSRWLockShared(&state_lock); const std::wstring status=state_.status; ReleaseSRWLockShared(&state_lock);
+        char reason[1800]{};
+        if (!WideCharToMultiByte(CP_UTF8,0,status.c_str(),-1,reason,static_cast<int>(sizeof(reason)),nullptr,nullptr)) strncpy_s(reason,"-", _TRUNCATE);
+        Logf("MOTIAN_GRAB_START failed stage=%s began=%d grants=%zu uncertain=%d retainedClasses=%zu status=%s; success not reported",
+            stage_,session_.began?1:0,session_.grants.size(),session_.uncertain?1:0,class_leases_.size(),reason);
         if (!session_.began) {
             if (!ReleaseClasses()) Status(L"投技准备失败；类引用释放尚未确认，保留清理账本");
             cleanup_pending_=!class_leases_.empty();
