@@ -2313,6 +2313,8 @@ void ScaleSkillDamage() {
 // DriveBossCalls replays them for the hero at the same skill montage positions, with the boss's values read
 // from its class default object and the nearest hostile pawn as the target (the boss aims at the player).
 // The bullet's native parameters are filled by position (bytecode carries no names), sizes checked.
+// Initialize and Deactivate are BulletInterface functions (the bytecode calls them through an interface
+// context, 0x51): they are not on the bullet class, so they are looked up on the interface.
 Object* DefaultObject(Object* cls);
 struct BossCall { const char* ability; const char* montage; float prepare_at, throw_at, flight_seconds; };
 constexpr BossCall kDragonPillar{"GA_ZuoShang_P2_Skill_23","ZuoShang_LongTi_Skill_23_Montage",0.681f,2.015f,1.0f};
@@ -2321,9 +2323,12 @@ PillarState pillar_;
 struct alignas(16) Transform96 { unsigned char bytes[96]{}; };
 struct RotatorD { double pitch=0,yaw=0,roll=0; };
 struct Param { std::string name;int32_t offset=-1,size=0; };
-// A UFunction's parameters in declaration order (its ChildProperties), the return value among them.
-std::vector<Param> Params(Object* object,const char* function) {
-    std::vector<Param> out;Object* fn=ue::Alive(object)?ue::FindFunction(ue::ClassOf(object),function):nullptr;if(!fn)return out;
+constexpr char kBulletInterface[]="/Script/SGameCombatSystem.BulletInterface";
+// A UFunction's parameters in declaration order (its ChildProperties), the return value among them; a
+// function the class lacks is looked up on interface_path.
+std::vector<Param> Params(Object* object,const char* function,const char* interface_path=nullptr) {
+    std::vector<Param> out;Object* fn=ue::Alive(object)?ue::FindFunction(ue::ClassOf(object),function):nullptr;
+    if(!fn&&interface_path)if(Object* face=Class(interface_path))fn=ue::FindFunction(face,function);if(!fn)return out;
     uintptr_t field=ue::At<uintptr_t>(fn,ue::layout::kChildProperties);
     for(size_t guard=0;field&&guard<32&&FaceReadable(reinterpret_cast<void*>(field),0x48);++guard,field=ue::At<uintptr_t>(reinterpret_cast<void*>(field),ue::layout::kPropNext))
         out.push_back({Text(ue::At<Name>(reinterpret_cast<void*>(field),ue::layout::kPropName)),ue::At<int32_t>(reinterpret_cast<void*>(field),ue::layout::kPropOffset),
@@ -2374,9 +2379,9 @@ void PreparePillar(Object* hero,Object* asc) {
     Call spawn_call(data,"CreateBullet");if(!spawn_call.Set(create[0].name.c_str(),spawn).Set(create[1].name.c_str(),hero).Invoke())return;
     Object* bullet=spawn_call.Get<Object*>("ReturnValue");if(!ue::Alive(bullet)){Logf("NPC_SKILL pillar CreateBullet returned no bullet (data=%s)",Text(data).c_str());return;}
     bool instance=false;Object* ability=SpecAbility(asc,skill_.handle,instance);
-    const std::vector<Param> init=Params(bullet,"Initialize");bool initialized=false;
+    const std::vector<Param> init=Params(bullet,"Initialize",kBulletInterface);bool initialized=false;
     if(init.size()>=5&&init[0].size==16&&init[1].size==8&&init[2].size==8&&init[3].size==8&&init[4].size==1){
-        Call start(bullet,"Initialize");initialized=start.Set(init[1].name.c_str(),hero).Set(init[2].name.c_str(),ability).Set(init[3].name.c_str(),data).Set(init[4].name.c_str(),false).Invoke();}
+        Call start(bullet,"Initialize",kBulletInterface);initialized=start.Set(init[1].name.c_str(),hero).Set(init[2].name.c_str(),ability).Set(init[3].name.c_str(),data).Set(init[4].name.c_str(),false).Invoke();}
     if(!initialized){Logf("NPC_SKILL pillar Initialize params=%s refused; bullet destroyed",ParamText(init).c_str());Call(bullet,"K2_DestroyActor").Invoke();return;}
     const bool motion=Call(bullet,"BeginPrepareMotion").Invoke();pillar_.bullet=Id(bullet);
     Logf("NPC_SKILL pillar prepared bullet=%s data=%s at=(%.0f,%.0f,%.0f) offset=(%.0f,%.0f,%.0f) tilt=%.1f yaw=%.1f target=(%.0f,%.0f,%.0f) ability=%s instance=%d motion=%d createParams=%s initParams=%s",
@@ -2390,7 +2395,7 @@ void ThrowPillar(Object* hero) {
     Logf("NPC_SKILL pillar thrown=%d target=(%.0f,%.0f,%.0f) params=%s",ok?1:0,target.x,target.y,target.z,ParamText(launch).c_str());
 }
 void CancelPillar(const char* why) {
-    if(Same(pillar_.bullet)){Object* bullet=pillar_.bullet.object;Call(bullet,"StopPillarFlight").Invoke();const std::vector<Param> off=Params(bullet,"Deactivate");Call stop(bullet,"Deactivate");
+    if(Same(pillar_.bullet)){Object* bullet=pillar_.bullet.object;Call(bullet,"StopPillarFlight").Invoke();const std::vector<Param> off=Params(bullet,"Deactivate",kBulletInterface);Call stop(bullet,"Deactivate",kBulletInterface);
         if(!off.empty()&&off[0].size==8)stop.Set(off[0].name.c_str(),0.1);else if(!off.empty()&&off[0].size==4)stop.Set(off[0].name.c_str(),0.1f);
         Logf("NPC_SKILL pillar cancelled reason=%s deactivated=%d",why,stop.Invoke()?1:0);}
     pillar_={};
