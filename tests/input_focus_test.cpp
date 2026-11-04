@@ -274,6 +274,11 @@ BOOL CALLBACK FindChild(HWND child, LPARAM data) {
     f->found = child; return FALSE;
 }
 HWND Visible(const wchar_t* cls, LONG mask = 0, LONG style = 0) { Find f{cls, mask, style, nullptr}; EnumChildWindows(game_, FindChild, reinterpret_cast<LPARAM>(&f)); return f.found; }
+BOOL CALLBACK FindGrabPage(HWND child, LPARAM data) {
+    wchar_t name[64]{}; GetClassNameW(child, name, 64);
+    if (_wcsicmp(name, L"PBZMotianGrabWindow")) return TRUE;
+    *reinterpret_cast<HWND*>(data) = child; return FALSE;
+}
 POINT Center(HWND w) { RECT r{}; GetWindowRect(w, &r); return {(r.left + r.right) / 2, (r.top + r.bottom) / 2}; }
 POINT Left(HWND w) { RECT r{}; GetWindowRect(w, &r); return {r.left + 10, (r.top + r.bottom) / 2}; }
 struct BindFind { LONG_PTR index; HWND found; };
@@ -479,6 +484,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         Log("  gear rail drag: %d -> %d", from, GearWidget::Level());
         Check(GearWidget::Level() == 2, "gear rail thumb drags to gear 2");
     } else Check(false, "gear widget found while the hub is open");
+    // Grab page vs the gear: a damage mode set outside the page (gear 4+ picks a multiplier)
+    // must survive the page's own Apply, which writes every control back.
+    {
+        GrabExtras::Options outside = GrabExtras::GetOptions();
+        outside.damage = GrabExtras::Damage::Multiplier; outside.multiplier = 4.5f; GrabExtras::SetOptions(outside);
+        Sleep(700);
+        HWND page = nullptr; EnumChildWindows(game_, FindGrabPage, reinterpret_cast<LPARAM>(&page));
+        if (page) {
+            SendMessageW(page, WM_COMMAND, MAKEWPARAM(104, BN_CLICKED), 0);
+            const GrabExtras::Options after = GrabExtras::GetOptions();
+            Log("  grab page Apply after an outside change: damage mode=%d x%.2f", static_cast<int>(after.damage), static_cast<double>(after.multiplier));
+            Check(after.damage == GrabExtras::Damage::Multiplier && after.multiplier > 4.49f && after.multiplier < 4.51f,
+                "the grab page's Apply keeps a damage multiplier set outside the page");
+            // Preset buttons (ids 120..124 = x4.5 / x10 / x15 / x20 / x30) set the multiplier at once, up to x30.
+            SendMessageW(page, WM_COMMAND, MAKEWPARAM(124, BN_CLICKED), 0);
+            const GrabExtras::Options preset = GrabExtras::GetOptions();
+            Log("  grab page preset x30: damage mode=%d x%.2f", static_cast<int>(preset.damage), static_cast<double>(preset.multiplier));
+            Check(preset.damage == GrabExtras::Damage::Multiplier && preset.multiplier > 29.99f && preset.multiplier < 30.01f, "the x30 preset sets the multiplier mode at x30");
+            SendMessageW(page, WM_COMMAND, MAKEWPARAM(104, BN_CLICKED), 0);
+            Check(GrabExtras::GetOptions().multiplier > 29.99f, "Apply keeps the x30 preset (the cap is x30)");
+        } else Check(false, "grab page window found");
+    }
     // Pads: a fake XInput slot drives the real capture path (no Xbox pad on this machine).
     DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(900);
     if (!DebugHub::Visible()) { DebugHub::Toggle(); Sleep(900); }

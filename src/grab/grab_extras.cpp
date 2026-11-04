@@ -38,6 +38,9 @@ struct Session {
     float hp_begin = -1, hp_max = -1;
     std::wstring move;
     bool damage_done = false;
+    // The target's Health.CurrentValue, read every tick to find the grab's own damage events.
+    Object* health_set = nullptr; ue::Name health_set_name; int32_t health_offset = -1; float last_hp = -1;
+    float native = 0, extra = 0; uint32_t hits = 0, refused = 0, forced = 0;
     std::vector<HiddenActor> hidden;
     std::vector<Display> displays;
     Object* weapons_component = nullptr;
@@ -555,47 +558,99 @@ bool ForceHealth(Object* character, float value) {
 // take that move's damage under "ignore invulnerability".
 constexpr wchar_t kDamageSection[] = L"GrabDamage";
 constexpr float kFallbackShare = .06f;
+constexpr uint32_t kHitLogs = 12;
+// Health.CurrentValue of the target's attribute set, the value the grab's damage events lower.
+bool BindHealth(Object* target) {
+    Object* set = nullptr;
+    if (!ReadField(target, "AttributeSetBase", set) || !ue::Alive(set)) return false;
+    Object* field = Field(ue::ClassOf(set), "Health");
+    Object* data = ue::FindObject("/Script/GameplayAbilities.GameplayAttributeData");
+    if (!field || !data || ue::StructSize(data) != 16 || ue::Offset(data, "CurrentValue") != 12) return false;
+    const int32_t offset = ue::At<int32_t>(field, static_cast<int32_t>(ue::layout::kPropOffset));
+    if (offset < 0 || offset > 0x4000) return false;
+    session_.health_set = set; session_.health_set_name = ue::NameOf(set); session_.health_offset = offset + 12;
+    return true;
+}
+bool HealthNow(float& value) {
+    if (session_.health_offset < 0 || !Same(session_.health_set, session_.health_set_name) ||
+        !Readable(session_.health_set + session_.health_offset, sizeof(float))) return false;
+    value = ue::At<float>(session_.health_set, session_.health_offset);
+    return std::isfinite(value) && value >= 0 && value < 1e9f;
+}
+// Each of the grab's own damage events (a drop of the target's health while the executor's
+// grab plays) is scaled the moment it lands, through the game's attribute call, so death and
+// hit handling stay the game's own. A lethal extra kills right there, as a lethal native hit
+// would. A change the target's attributes refuse is written directly only with "ignore
+// invulnerability", and never below 1.
+void ScaleHits() {
+    float health = 0; if (!HealthNow(health)) return;
+    const float drop = session_.last_hp - health; session_.last_hp = health;
+    if (!(drop > .01f)) return;
+    const Options& o = session_.options;
+    session_.native += drop; ++session_.hits;
+    float want = HitExtra(o.damage, drop, o.multiplier, o.percent, session_.hp_max);
+    if (want > health) want = health;
+    float done = 0; bool forced = false;
+    if (std::fabs(want) > .01f) {
+        float after = health;
+        if (AddHealth(session_.target, -want) && HealthNow(after)) done = health - after;
+        if (want > 0 && done < .5f && o.ignore_invulnerable && ForceHealth(session_.target, (std::max)(1.f, health - want)) && HealthNow(after)) {
+            done = health - after; forced = true; ++session_.forced;
+        }
+        if (std::fabs(done) < .01f) ++session_.refused;
+        session_.last_hp = after;
+    }
+    session_.extra += done;
+    if (session_.hits <= kHitLogs)
+        Logf("GRAB_EXTRAS hit %u native=%.1f extra=%.1f wanted=%.1f left=%.0f mode=%d x%.2f pct=%.0f%s", session_.hits, drop, done, want, session_.last_hp,
+            static_cast<int>(o.damage), static_cast<double>(o.multiplier), static_cast<double>(o.percent), forced ? " forced" : "");
+}
 void ApplyDamage() {
     const Options& o = session_.options;
     if (!Same(session_.target, session_.target_name)) { Result(L"投技附加伤害：目标已不存在，未修改"); return; }
+    ScaleHits(); // a hit in the frame the executor's grab ended
     float hp = 0, maximum = 0;
     if (session_.hp_begin < 0 || !ReadHealth(session_.target, hp, maximum)) { Result(L"投技附加伤害：无法读取目标生命，未修改"); return; }
     if (maximum <= 0) maximum = session_.hp_max;
-    const float native = (std::max)(0.f, session_.hp_begin - hp);
-    if (native > .01f && !session_.move.empty()) SettingsStore::PutFloat(kDamageSection, session_.move.c_str(), native);
-    if (hp <= 0) { Result(L"投技附加伤害：原生投技已击倒目标（原生伤害 %.0f）", native); return; }
-    // A boss victim usually takes no native grab damage at all (the victim side
-    // is authored for the player), so a zero is not proof of invulnerability.
-    // Scaling modes then start from the stand-in; Native mode only when told
-    // to ignore invulnerability.
-    const bool blocked = native <= .01f;
-    if (o.damage == Damage::Native && !(blocked && o.ignore_invulnerable)) { Result(L"投技伤害：原生 %.0f", native); return; }
-    float base = native;
-    if (blocked) {
-        base = session_.move.empty() ? -1.f : SettingsStore::GetFloat(kDamageSection, session_.move.c_str(), -1.f);
-        if (!std::isfinite(base) || base <= .01f) base = maximum > 0 ? maximum * kFallbackShare : 0.f;
+    if (session_.health_offset < 0) {
+        Result(L"投技附加伤害：无法逐段读取目标生命，未修改");
+        Logf("GRAB_EXTRAS damage per-hit health unavailable; native total=%.1f, nothing added", (std::max)(0.f, session_.hp_begin - hp)); return;
     }
-    float wanted = base;
-    if (o.damage == Damage::Multiplier) wanted = base * std::clamp(o.multiplier, .1f, 10.f);
-    else if (o.damage == Damage::Percent && maximum > 0) wanted = (std::max)(base, maximum * std::clamp(o.percent, 1.f, 100.f) / 100.f);
-    float delta = native - wanted; // negative removes health
-    if (hp + delta < 0) delta = -hp;
-    if (std::fabs(delta) < .01f) { Result(L"投技附加伤害：原生伤害 %.0f 已满足设置，未追加", native); return; }
-    if (!AddHealth(session_.target, delta)) { Result(L"投技附加伤害：游戏属性接口调用失败，未修改"); return; }
+    const float native = session_.native;
+    if (native > .01f && !session_.move.empty()) SettingsStore::PutFloat(kDamageSection, session_.move.c_str(), native);
+    if (native > .01f) {
+        if (o.damage == Damage::Native) Result(L"投技伤害：原生 %.0f", native);
+        else Result(L"投技伤害：原生 %.0f → 合计 %.0f（生命 %.0f → %.0f，上限 %.0f，共 %u 段命中）", native, native + session_.extra, session_.hp_begin, hp, maximum, session_.hits);
+        Logf("GRAB_EXTRAS damage mode=%d per-hit hits=%u native=%.1f extra=%.1f total=%.1f refused=%u forced=%u hp=%.1f->%.1f max=%.1f x%.2f pct=%.0f ignore_invulnerable=%d",
+            static_cast<int>(o.damage), session_.hits, native, session_.extra, native + session_.extra, session_.refused, session_.forced, session_.hp_begin, hp, maximum,
+            static_cast<double>(o.multiplier), static_cast<double>(o.percent), o.ignore_invulnerable ? 1 : 0);
+        return;
+    }
+    // No damage event reached the target (a boss victim side usually deals none, or the target is
+    // invulnerable). Only "ignore invulnerability" deals the move's damage, directly and once.
+    if (!o.ignore_invulnerable) {
+        Result(L"投技伤害：目标没有受到投技的伤害事件，未追加（开启“无视无敌”才直接扣血）");
+        Logf("GRAB_EXTRAS damage mode=%d no damage event reached the target; ignore_invulnerable=0, nothing added", static_cast<int>(o.damage)); return;
+    }
+    if (hp <= 0) { Result(L"投技附加伤害：目标已倒下，未追加"); return; }
+    float base = session_.move.empty() ? -1.f : SettingsStore::GetFloat(kDamageSection, session_.move.c_str(), -1.f);
+    if (!std::isfinite(base) || base <= .01f) base = maximum > 0 ? maximum * kFallbackShare : 0.f;
+    const float wanted = (std::min)(hp, base + HitExtra(o.damage, base, o.multiplier, o.percent, maximum));
+    if (wanted < .01f) { Result(L"投技附加伤害：没有可用的伤害基数，未追加"); return; }
+    if (!AddHealth(session_.target, -wanted)) { Result(L"投技附加伤害：游戏属性接口调用失败，未修改"); return; }
     float after = 0, ignored = 0; bool read = ReadHealth(session_.target, after, ignored);
-    if (read && o.ignore_invulnerable && delta < 0 && std::fabs(after - hp) < .5f) {
-        const float forced = (std::max)(1.f, hp + delta);
+    if (read && std::fabs(after - hp) < .5f) {
+        const float forced = (std::max)(1.f, hp - wanted);
         const bool written = ForceHealth(session_.target, forced);
         read = ReadHealth(session_.target, after, ignored);
         Logf("GRAB_EXTRAS damage refused by target attributes; forced=%d %.1f->%.1f readback=%.1f", written ? 1 : 0, hp, forced, read ? after : -1.f);
     }
-    Result(L"投技伤害：原生 %.0f → 合计 %.0f（生命 %.0f → %.0f，上限 %.0f）", native, native - delta, session_.hp_begin, read ? after : hp + delta, maximum);
-    Logf("GRAB_EXTRAS damage mode=%d native=%.1f base=%.1f%s total=%.1f hp=%.1f->%.1f max=%.1f ignore_invulnerable=%d readback=%d",
-        static_cast<int>(o.damage), native, base, blocked ? "(stand-in)" : "", native - delta, session_.hp_begin, read ? after : -1.f, maximum,
-        o.ignore_invulnerable ? 1 : 0, read ? 1 : 0);
+    Result(L"投技伤害（无视无敌）：直接扣除 %.0f（生命 %.0f → %.0f，上限 %.0f）", read ? hp - after : wanted, hp, read ? after : hp - wanted, maximum);
+    Logf("GRAB_EXTRAS damage mode=%d direct base=%.1f wanted=%.1f hp=%.1f->%.1f max=%.1f ignore_invulnerable=1 readback=%d",
+        static_cast<int>(o.damage), base, wanted, hp, read ? after : -1.f, maximum, read ? 1 : 0);
 }
 Options Sanitize(Options o) {
-    o.multiplier = std::isfinite(o.multiplier) ? std::clamp(o.multiplier, .1f, 10.f) : 2.f;
+    o.multiplier = std::isfinite(o.multiplier) ? std::clamp(o.multiplier, .1f, kMaxMultiplier) : 2.f;
     o.percent = std::isfinite(o.percent) ? std::clamp(o.percent, 1.f, 100.f) : 30.f;
     if (o.damage != Damage::Multiplier && o.damage != Damage::Percent) o.damage = Damage::Native;
     return o;
@@ -638,6 +693,7 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
     Logf("GRAB_EXTRAS grab size: model %.3f x hero/boss %.3f = boss weapon scale %.3f (victim as authored)", size, hero_over_boss, session_.scale);
     float hp = 0, maximum = 0;
     if (ReadHealth(target, hp, maximum)) { session_.hp_begin = hp; session_.hp_max = maximum; }
+    if (!BindHealth(target) || !HealthNow(session_.last_hp)) { session_.health_offset = -1; Logf("GRAB_EXTRAS per-hit health unavailable; damage events are not scaled"); }
     if (session_.options.hide_weapon) {
         HideWeapons();
         Call holder(pawn, "GetCharacterWeaponsComponent", "/Script/SGameCombatSystem.CharacterWeaponsHolder");
@@ -650,11 +706,14 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
         UpdateDisplays(); FollowSkinHands();
     }
     session_.next_scan = GetTickCount64() + 100;
-    Logf("GRAB_EXTRAS begin hide_weapon=%d own_weapons=%zu boss_weapons=%zu/%zu target_hp=%.1f/%.1f damage_mode=%d", session_.options.hide_weapon ? 1 : 0,
-        session_.hidden.size(), session_.displays.size(), weapon_count, session_.hp_begin, session_.hp_max, static_cast<int>(session_.options.damage));
+    Logf("GRAB_EXTRAS begin hide_weapon=%d own_weapons=%zu boss_weapons=%zu/%zu target_hp=%.1f/%.1f damage_mode=%d x%.2f pct=%.0f ignore_invulnerable=%d perHit=%d",
+        session_.options.hide_weapon ? 1 : 0, session_.hidden.size(), session_.displays.size(), weapon_count, session_.hp_begin, session_.hp_max,
+        static_cast<int>(session_.options.damage), static_cast<double>(session_.options.multiplier), static_cast<double>(session_.options.percent),
+        session_.options.ignore_invulnerable ? 1 : 0, session_.health_offset >= 0 ? 1 : 0);
 }
 void Tick() {
     if (!session_.active || !Same(session_.pawn, session_.pawn_name)) return;
+    if (!session_.damage_done && Same(session_.target, session_.target_name)) ScaleHits();
     UpdatePosing();
     if (!session_.options.hide_weapon) return;
     // Cheap re-check of known actors every tick; full re-scan for newly

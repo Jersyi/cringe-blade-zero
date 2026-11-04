@@ -7,23 +7,42 @@
 // Finish; options from the worker). Weapon hiding keeps the player's weapon
 // actors hidden for the whole grab and restores only what it hid; the source
 // Boss's weapon mesh is shown in their place (a display-only component) and
-// follows the grab's own armed / force-hide state. Damage is
-// applied after the native grab ends, through the game's own attribute call
-// (AttributeUtils.ModifyCharacterAttributeValue), never by raw memory writes.
+// follows the grab's own armed / force-hide state. Damage scales each of the
+// grab's own damage events as it lands, through the game's own attribute call
+// (AttributeUtils.ModifyCharacterAttributeValue).
 namespace GrabExtras {
 enum class Damage : int { Native = 0, Multiplier = 1, Percent = 2 };
+constexpr float kMaxMultiplier = 30.0f;
+constexpr float kMultiplierPresets[] = {4.5f, 10.0f, 15.0f, 20.0f, 30.0f};
 struct Options {
     bool hide_weapon = true;
     Damage damage = Damage::Native;
-    float multiplier = 2.0f;   // x native grab damage, 0.1 to 10
-    float percent = 30.0f;     // % of the target's max health, 1 to 100
-    // When the target took no native damage (a boss victim usually takes none,
-    // or it is invulnerable) the move's last observed native damage ([GrabDamage]
-    // in the ini), else 6 % of max health, is the base the mode scales. Native
-    // mode applies that base only with ignore_invulnerable, which also lets the
-    // grab target a hit-reacting / special-move / invulnerable boss.
+    float multiplier = 2.0f;   // x each native grab hit, 0.1 to kMaxMultiplier
+    float percent = 30.0f;     // each native grab hit deals at least this % of the target's max health, 1 to 100
+    // Only with ignore_invulnerable: a target that took no damage event at all (a boss
+    // victim usually takes none, or it is invulnerable) loses the move's last observed
+    // native damage ([GrabDamage] in the ini), else 6 % of max health, scaled by the
+    // mode, once when the grab ends; a change its attributes refuse is written
+    // directly (never below 1). It also lets the grab target a hit-reacting /
+    // special-move / invulnerable boss.
     bool ignore_invulnerable = false;
 };
+// Extra health the target loses for one of the grab's own damage events (a native hit of
+// drop): Multiplier makes the hit deal drop x multiplier (below 1 gives some back), Percent
+// makes it deal at least percent of maximum, Native adds nothing. Callers cap it at the
+// health left.
+inline float HitExtra(Damage mode, float drop, float multiplier, float percent, float maximum) {
+    if (!(drop > 0)) return 0;
+    if (mode == Damage::Multiplier) {
+        const float m = multiplier < .1f ? .1f : multiplier > kMaxMultiplier ? kMaxMultiplier : multiplier;
+        return drop * (m - 1);
+    }
+    if (mode == Damage::Percent && maximum > 0) {
+        const float p = percent < 1 ? 1 : percent > 100 ? 100 : percent, floor = maximum * p / 100;
+        return floor > drop ? floor - drop : 0;
+    }
+    return 0;
+}
 using Logger = void (*)(const char*);
 void Initialize(Logger logger); // Loads persisted options.
 void SetOptions(const Options& options); // Worker/UI; persisted.
@@ -58,8 +77,8 @@ bool Posing();
 // every tick by that mesh's hand minus the hand it hangs on.
 using SkinDisplay = unsigned char* (*)(double& size);
 void SetSkinDisplay(SkinDisplay provider);
-// The executor's own grab ended: grab damage is measured and applied now, so
-// hits landed while the target is still getting up are never scaled.
+// The executor's own grab ended: hits stop being scaled (hits landed while the
+// target is still getting up never are) and the outcome is reported.
 void SourceEnded();
 // Game thread: an additive change of a character's Health through the same game attribute call the grab
 // damage uses (AttributeUtils.ModifyCharacterAttributeValue; negative removes health), so death and

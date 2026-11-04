@@ -52,6 +52,8 @@ struct Profile {
 #include "npc_weapon_routes.generated.h"
 #include "npc_skills.generated.h"
 static_assert(std::size(kNpcSkillSets)==std::size(kProfiles),"npc_skills.generated.h rows follow kProfiles");
+#include "npc_skill_colliders.generated.h"
+static_assert(std::size(kNpcColliderTagSets)==std::size(kNpcSkillSets),"npc_skill_colliders.generated.h rows follow kNpcSkillSets");
 // A second creature under the display Skeleton root that the hero has no bones for (mount_root, bones in its
 // subtree) and the boss's own locomotion loops; ridden: the rider sits on it (a horse).
 struct MountLoops { const char* skeleton;const char* mount_root;int32_t bones;uint8_t ridden;const char* idle;const char* walk;const char* run; };
@@ -276,9 +278,15 @@ PendingCast pending_;
 constexpr ULONGLONG kSkillTimeoutMs=30000,kSkillWaitMs=2500,kSkillRetryMs=100,kSkillRelockMs=1500;constexpr size_t kMaxSkillPins=96,kSkillTriesPerPress=4; // 64 skills + boss weapons
 constexpr uint32_t kSkillRelocksMax=3;
 // While a skill runs the boss's own weapons (kNpcSkillSets[].weapons) hang on the NPC display and the
-// hero's weapon actors are hidden; both are undone when the skill ends.
-struct HiddenWeapon { Identity actor;bool was_hidden=false; };
-std::vector<Identity> skill_weapons_;std::vector<HiddenWeapon> hidden_weapons_;
+// hero's weapon actors are hidden part by part (HideHeroWeapons); both are undone when the skill ends.
+// boss: the kNpcSkillSets[].weapons row the hero weapon stands for as a bullet / effect source.
+// boss_weapon_rows_: the shown boss weapon component per weapons row (empty when it failed);
+// skill_colliders_: the boss attack colliders copied for the skill (AddSkillColliders);
+// seen_effects_: effects MoveSkillEffects has handled (parent: where it put or left it), or found before the skill.
+struct HiddenPart { Identity component;bool was_hidden=false; };
+struct HiddenWeapon { Identity actor;std::vector<HiddenPart> parts;size_t boss=0; };
+struct SeenEffect { Identity effect;Object* parent=nullptr; };
+std::vector<Identity> skill_weapons_,boss_weapon_rows_,skill_colliders_;std::vector<SeenEffect> seen_effects_;std::vector<HiddenWeapon> hidden_weapons_;size_t moved_effects_=0;
 
 Object* Class(const char* path) { return ue::FindObject(path); }
 bool Same(Identity identity) { return RawIdentity(identity,identity.index,identity.serial)&&ue::Alive(identity.object); }
@@ -296,7 +304,7 @@ Identity Id(Object* object) {
 }
 bool HasResources() {
     return pose_session_ || display_.object || primary_.object || backup_.object || !added_.empty() || !hidden_.empty() || !sockets_.empty() || skeleton_edit_.skeleton.object || !face_hooks_.empty() || grip_hook_ ||
-        body_.owned || skill_.handle > 0 || pending_.handle > 0 || !skill_pins_.empty() || !skill_weapons_.empty() || !hidden_weapons_.empty();
+        body_.owned || skill_.handle > 0 || pending_.handle > 0 || !skill_pins_.empty() || !skill_weapons_.empty() || !hidden_weapons_.empty() || !skill_colliders_.empty();
 }
 std::string Text(Name name) { char text[192]{}; ue::NameText(name, text, sizeof(text)); return text; }
 std::string Text(Object* object) { return object ? Text(ue::NameOf(object)) : "-"; }
@@ -1982,19 +1990,37 @@ std::vector<Object*> HeroWeaponActors(Object* pawn) {
     if(list.data&&list.num>0&&list.num<=256)for(int32_t i=0;i<list.num;++i){Object* actor=static_cast<Object**>(list.data)[i];if(IsWeaponActor(actor))result.push_back(actor);}
     ue::Free(list.data);return result;
 }
-// Every hero weapon actor is hidden for the skill; each one's own hidden state is kept so the end shows
-// only those that were visible. EnforceHiddenFlags hides them again every frame if a skill shows one.
+bool IsEffect(Object* component) {
+    Object* niagara=Class("/Script/Niagara.NiagaraComponent"),*cascade=Class("/Script/Engine.ParticleSystemComponent");
+    return ue::Alive(component)&&((niagara&&ue::IsA(component,niagara))||(cascade&&ue::IsA(component,cascade)));
+}
+// Every hero weapon actor is hidden for the skill one primitive component at a time, each one's own hidden
+// state kept so the end shows only those that were visible. Not the actor: the boss skill's weapon effects
+// spawn on the hero's weapon actors (MoveSkillEffects), and a component renders only while its owner actor is
+// not hidden. A later pass (a weapon the skill attached since) hides new meshes only: an effect that appeared
+// since is the skill's own. Shapes stay as they are (hidden in game anyway; the copied boss colliders are shapes).
+// EnforceHiddenFlags hides a part again every frame if a skill shows one.
 void HideHeroWeapons() {
     if(!Same(pawn_))return;
-    for(Object* actor:HeroWeaponActors(pawn_.object)){bool hidden=false;if(!Bool(actor,"bHidden",hidden))continue;
-        const bool known=std::any_of(hidden_weapons_.begin(),hidden_weapons_.end(),[&](const HiddenWeapon& w){return w.actor.object==actor&&Same(w.actor);});
-        if(!known)hidden_weapons_.push_back({Id(actor),hidden});
-        if(!hidden)Call(actor,"SetActorHiddenInGame").Set("bNewHidden",true).Invoke();}
+    Object* primitive=Class("/Script/Engine.PrimitiveComponent"),*shape=Class("/Script/Engine.ShapeComponent");if(!primitive)return;
+    for(Object* actor:HeroWeaponActors(pawn_.object)){
+        auto known=std::find_if(hidden_weapons_.begin(),hidden_weapons_.end(),[&](const HiddenWeapon& w){return w.actor.object==actor&&Same(w.actor);});
+        const bool fresh=known==hidden_weapons_.end();
+        if(fresh){hidden_weapons_.push_back({Id(actor),{},0});known=std::prev(hidden_weapons_.end());}
+        for(Object* part:Components(actor,primitive)){
+            if((shape&&ue::IsA(part,shape))||(!fresh&&IsEffect(part)))continue;
+            if(std::any_of(known->parts.begin(),known->parts.end(),[&](const HiddenPart& p){return p.component.object==part;}))continue;
+            bool visible=false,hidden=false;if(!VisibilityOf(part,visible,hidden))continue;
+            known->parts.push_back({Id(part),hidden});
+            if(!hidden)Call(part,"SetHiddenInGame").Set("NewHidden",true).Set("bPropagateToChildren",false).Invoke();
+        }
+    }
 }
 void RestoreHeroWeapons() {
     size_t shown=0;
-    for(const HiddenWeapon& w:hidden_weapons_)if(!w.was_hidden&&Same(w.actor)&&Call(w.actor.object,"SetActorHiddenInGame").Set("bNewHidden",false).Invoke())++shown;
-    if(!hidden_weapons_.empty())Logf("NPC_SKILL hero weapons shown again=%zu tracked=%zu",shown,hidden_weapons_.size());
+    for(const HiddenWeapon& w:hidden_weapons_)for(const HiddenPart& p:w.parts)
+        if(!p.was_hidden&&Same(p.component)&&Call(p.component.object,"SetHiddenInGame").Set("NewHidden",false).Set("bPropagateToChildren",false).Invoke())++shown;
+    if(!hidden_weapons_.empty())Logf("NPC_SKILL hero weapons shown again parts=%zu actors=%zu",shown,hidden_weapons_.size());
     hidden_weapons_.clear();
 }
 // FRotator (degrees) -> quaternion xyzw, exactly as UE's FRotator::Quaternion.
@@ -2037,16 +2063,197 @@ bool ShowSkillWeapon(const Context& context,Object* display,const NpcSkillWeapon
         Text(display).c_str(),Text(asset).c_str(),mesh_set?1:0,attached?1:0,dressed?1:0);
     return attached&&mesh_set;
 }
+// ---- Boss attack colliders ------------------------------------------------------------------------
+// A sweep bullet (PBZ_SweepTraceBullet) takes its source components from its data's holder: the avatar's socket
+// component, or each weapon actor WeaponUtils.GetWeaponActorsByDisplayIndex(avatar, slot, index) returns. On the
+// actor owning each source it then sweeps every primitive component tagged AttachColliderData.ComponentTag
+// (PBZ.exe 0x7d72110 -> AttachColliderHelper::GetAttachedCollidersAndShapes 0x5be6aa0 -> AActor::GetComponentsByTag).
+// The hero's weapons carry only "Attack Collider" and the hero's pawn none, so the boss tags (Attack Collider
+// Strong / Stab, LeftLeg, Big Arm, Snake Spine L ...) found nothing and those hits dealt no damage. For the skill,
+// every Box / Sphere / Capsule template in the construction scripts of the boss weapon and of the boss tagged one
+// of the skin's kNpcColliderTagSets is copied (shape, tags, collision profile): weapon ones owned by the hero
+// weapon actors standing for that weapon, at the display's weapon socket (the boss weapon's root) or on the shown
+// boss weapon mesh; body ones owned by the pawn, on the display's bone. RemoveSkillWeapons destroys them.
+#pragma warning(push)
+#pragma warning(disable: 4324) // Transform is 16-byte aligned.
+struct ShapeTemplate { Object* component=nullptr;Transform relative;Name parent,socket;bool on_mesh=false; };
+#pragma warning(pop)
+Transform TemplateRelative(Object* component) {
+    struct Rotator { double pitch=0,yaw=0,roll=0; };
+    const Vector at=Property<Vector>(component,"RelativeLocation"),size=Property<Vector>(component,"RelativeScale3D");const Rotator turn=Property<Rotator>(component,"RelativeRotation");
+    Transform relative;RotatorQuat(turn.pitch,turn.yaw,turn.roll,relative.rotation);
+    relative.translation[0]=at.x;relative.translation[1]=at.y;relative.translation[2]=at.z;relative.scale[0]=size.x;relative.scale[1]=size.y;relative.scale[2]=size.z;
+    return relative;
+}
+bool TagWanted(Object* component,const NpcColliderTags& want,std::string& matched) {
+    const Array tags=Property<Array>(component,"ComponentTags");
+    if(tags.num<=0||tags.num>32||!tags.data)return false;
+    for(int32_t i=0;i<tags.num;++i)for(size_t k=0;k<want.count;++k)if(ue::NameIs(static_cast<Name*>(tags.data)[i],want.tags[k])){matched=want.tags[k];return true;}
+    return false;
+}
+// The tagged shape templates of a blueprint class's construction scripts (its own and its blueprint parents'),
+// each placed relative to its nearest parent outside the scripts (parents inside them composed). on_mesh: that
+// parent is mesh_name (the weapon's mesh / the character mesh) and socket is where it hangs on it.
+std::vector<ShapeTemplate> ShapeTemplates(Object* cls,const NpcColliderTags& want,Name mesh_name,std::string& seen) {
+    std::vector<ShapeTemplate> out;Object* shape=Class("/Script/Engine.ShapeComponent"),*generated=Class("/Script/Engine.BlueprintGeneratedClass");
+    if(!shape||!generated)return out;
+    struct Node { Object* component;Name variable,parent,socket; };std::vector<Node> nodes;
+    for(Object* c=cls;c&&ue::IsA(c,generated)&&nodes.size()<256;c=ue::At<Object*>(c,ue::layout::kSuper)){
+        Object* script=Property<Object*>(c,"SimpleConstructionScript");if(!ue::Alive(script))continue;
+        const Array all=Property<Array>(script,"AllNodes");if(all.num<=0||all.num>256||!all.data)continue;
+        for(int32_t i=0;i<all.num;++i){Object* n=static_cast<Object**>(all.data)[i];if(!ue::Alive(n))continue;
+            nodes.push_back({Property<Object*>(n,"ComponentTemplate"),Property<Name>(n,"InternalVariableName"),Property<Name>(n,"ParentComponentOrVariableName"),Property<Name>(n,"AttachToName")});}
+    }
+    for(const Node& n:nodes){
+        std::string tag;if(!ue::Alive(n.component)||!ue::IsA(n.component,shape)||!TagWanted(n.component,want,tag))continue;
+        ShapeTemplate s;s.component=n.component;s.relative=TemplateRelative(n.component);s.socket=n.socket;Name parent=n.parent;
+        for(size_t depth=0;depth<8;++depth){
+            if(!mesh_name.None()&&parent==mesh_name){s.on_mesh=true;break;}
+            const auto up=std::find_if(nodes.begin(),nodes.end(),[&](const Node& m){return !parent.None()&&m.variable==parent;});
+            if(up==nodes.end()||!ue::Alive(up->component))break;
+            Transform composed;if(!Compose(s.relative,TemplateRelative(up->component),composed))break;
+            s.relative=composed;s.socket=up->socket;parent=up->parent;
+        }
+        s.parent=parent;out.push_back(s);if(seen.find(tag)==std::string::npos)seen+=(seen.empty()?"":",")+tag;
+    }
+    return out;
+}
+// The template's tags, written into an array the game allocated (the display's GetAllSocketNames, cut down) so
+// the component frees it as its own.
+bool CopyTags(Object* from,Object* to) {
+    const Array tags=Property<Array>(from,"ComponentTags");const int32_t at=Offset(to,"ComponentTags");
+    if(at<0||tags.num<=0||tags.num>32||!tags.data||!Same(display_))return false;
+    Call names(display_.object,"GetAllSocketNames");if(!names.Invoke())return false;
+    Array storage=names.Get<Array>("ReturnValue");
+    if(storage.num<tags.num||!storage.data){ue::Free(storage.data);return false;}
+    std::memcpy(storage.data,tags.data,sizeof(Name)*static_cast<size_t>(tags.num));storage.num=tags.num;
+    Array& dest=ue::At<Array>(to,at);if(dest.data)ue::Free(dest.data);dest=storage;return true;
+}
+// One shape template copied onto owner (shape, tags, collision profile; never physics), on parent at socket.
+Object* CopyShape(Object* owner,const ShapeTemplate& s,Object* parent,Name socket) {
+    Object* source=s.component,*box=Class("/Script/Engine.BoxComponent"),*sphere=Class("/Script/Engine.SphereComponent"),*capsule=Class("/Script/Engine.CapsuleComponent");
+    Object* component=Add(owner,ue::ClassOf(source),s.relative);if(!component)return nullptr;
+    skill_colliders_.push_back(Id(component)); // tracked first: RemoveSkillWeapons destroys it whatever fails below
+    if(box&&ue::IsA(source,box))Call(component,"SetBoxExtent").Set("InBoxExtent",Property<Vector>(source,"BoxExtent")).Set("bUpdateOverlaps",false).Invoke();
+    else if(sphere&&ue::IsA(source,sphere))Call(component,"SetSphereRadius").Set("InSphereRadius",Property<float>(source,"SphereRadius")).Set("bUpdateOverlaps",false).Invoke();
+    else if(capsule&&ue::IsA(source,capsule))Call(component,"SetCapsuleSize").Set("InRadius",Property<float>(source,"CapsuleRadius")).Set("InHalfHeight",Property<float>(source,"CapsuleHalfHeight")).Set("bUpdateOverlaps",false).Invoke();
+    Call profile(source,"GetCollisionProfileName");
+    if(profile.Invoke())Call(component,"SetCollisionProfileName").Set("InCollisionProfileName",profile.Get<Name>("ReturnValue")).Set("bUpdateOverlaps",false).Invoke();
+    Call enabled(source,"GetCollisionEnabled");const uint8_t mode=enabled.Invoke()?enabled.Get<uint8_t>("ReturnValue"):0;
+    Call(component,"SetCollisionEnabled").Set("NewType",static_cast<uint8_t>(mode==3?1:mode==2?0:mode)).Invoke();
+    return CopyTags(source,component)&&AttachFinish(owner,component,parent,socket,s.relative)?component:nullptr;
+}
+// WeaponUtils.GetWeaponActorsByDisplayIndex(avatar, Weapon.Slot.Main, display, out actors): the hero weapon actors
+// a weapon-held bullet or effect of that display index uses. Parameters by position, checked by size.
+std::vector<Object*> SlotWeaponActors(Object* pawn,int32_t display) {
+    std::vector<Object*> result;Object* utils=ue::Default("/Script/SGameCombatSystem.Default__WeaponUtils");
+    Object* function=utils?ue::FindFunction(ue::ClassOf(utils),"GetWeaponActorsByDisplayIndex"):nullptr;if(!function)return result;
+    std::vector<std::pair<std::string,int32_t>> params;
+    for(uintptr_t f=ue::At<uintptr_t>(function,ue::layout::kChildProperties);f&&params.size()<8;f=ue::At<uintptr_t>(reinterpret_cast<void*>(f),ue::layout::kPropNext))
+        params.push_back({Text(ue::At<Name>(reinterpret_cast<void*>(f),ue::layout::kPropName)),ue::At<int32_t>(reinterpret_cast<void*>(f),ue::layout::kPropElementSize)});
+    if(params.size()!=4||params[0].second!=8||params[1].second!=8||params[2].second!=4||params[3].second!=16)return result;
+    const Name main=ue::MakeName(L"Weapon.Slot.Main");if(main.None())return result;
+    Call get(utils,function);
+    if(!get.Set(params[0].first.c_str(),pawn).Set(params[1].first.c_str(),main).Set(params[2].first.c_str(),display).Invoke())return result;
+    const Array list=get.Get<Array>(params[3].first.c_str());
+    if(list.num>0&&list.num<=16&&list.data)for(int32_t i=0;i<list.num;++i){Object* actor=static_cast<Object**>(list.data)[i];if(ue::Alive(actor))result.push_back(actor);}
+    ue::Free(list.data);return result;
+}
+void AddSkillColliders(const Context& context) {
+    if(selected_<0||static_cast<size_t>(selected_)>=std::size(kNpcColliderTagSets)||!Same(display_))return;
+    const NpcColliderTags& want=kNpcColliderTagSets[selected_];const NpcSkillSet& set=kNpcSkillSets[selected_];
+    if(!want.count)return;
+    size_t weapon=0,body=0,owners=0;std::string tags;
+    for(size_t k=0;k<set.weapon_count;++k){
+        const std::string path=set.weapons[k].actor_class;const size_t dot=path.find('.');Object* cls=dot==std::string::npos?nullptr:Class(path.c_str());if(!cls)continue;
+        Object* mesh=Property<Object*>(Class((path.substr(0,dot+1)+"Default__"+path.substr(dot+1)).c_str()),"WeaponMesh");
+        const std::vector<ShapeTemplate> shapes=ShapeTemplates(cls,want,ue::Alive(mesh)?ue::NameOf(mesh):Name{},tags);if(shapes.empty())continue;
+        // The hero weapons of the same display index stand for this boss weapon (its effects go to it too);
+        // with none there, the first ones (or every hero weapon) also take its colliders.
+        std::vector<Object*> actors=SlotWeaponActors(context.pawn,static_cast<int32_t>(k));const bool exact=!actors.empty();
+        if(actors.empty()&&k)actors=SlotWeaponActors(context.pawn,0);
+        if(actors.empty())for(const HiddenWeapon& w:hidden_weapons_)if(Same(w.actor))actors.push_back(w.actor.object);
+        const Name root=DisplaySocket(display_.object,set.weapons[k].socket);
+        Object* shown=k<boss_weapon_rows_.size()&&Same(boss_weapon_rows_[k])?boss_weapon_rows_[k].object:nullptr;
+        for(Object* actor:actors){
+            if(exact)for(HiddenWeapon& w:hidden_weapons_)if(w.actor.object==actor)w.boss=k;
+            ++owners;
+            for(const ShapeTemplate& s:shapes){
+                Object* parent=s.on_mesh?shown:display_.object;const Name socket=s.on_mesh?s.socket:root;
+                if(parent&&(s.on_mesh||!root.None())&&CopyShape(actor,s,parent,socket))++weapon;}
+        }
+    }
+    Object* monster=set.monster&&*set.monster?LoadClassPackage(set.monster):nullptr,*root=Property<Object*>(context.pawn,"RootComponent");
+    if(monster)for(const ShapeTemplate& s:ShapeTemplates(monster,want,ue::MakeName(L"CharacterMesh0"),tags)){
+        Object* parent=s.on_mesh?display_.object:root;const Name socket=s.on_mesh?s.socket:Name{};
+        if(s.on_mesh&&!socket.None()){Call exists(display_.object,"DoesSocketExist");if(!exists.Set("InSocketName",socket).Invoke()||!exists.Get<bool>("ReturnValue"))continue;}
+        if(ue::Alive(parent)&&CopyShape(context.pawn,s,parent,socket))++body;
+    }
+    Logf("NPC_SKILL boss colliders weapon=%zu (hero weapon actors %zu) body=%zu tags=%s tracked=%zu",weapon,owners,body,tags.empty()?"-":tags.c_str(),skill_colliders_.size());
+}
+// ---- Boss skill effects ---------------------------------------------------------------------------
+// The weapon effect actions (GAAction_WeaponTrail / WeaponParticle / WeaponParticleFrame, GAA_PBZWeaponTrail ...)
+// spawn on WeaponUtils.GetWeaponActorsByDisplayIndex(avatar, slot, index)'s SocketComponentHolder component at the
+// action's socket: on a skin that is the hero's weapon mesh, so they stayed with the hero's hidden weapon (and,
+// while the whole actor was hidden, never rendered). Avatar-held effects and the montage's notify effects attach
+// to the hero's own mesh at the boss skeleton's sockets. Every frame of a skill a Niagara / Cascade component that
+// appears under a hero weapon moves onto the boss weapon it stands for (same socket, same relative transform), and
+// one under the hero's mesh moves onto the display at its socket unless only the hero's skeleton has that socket.
+std::vector<Object*> Children(Object* component) {
+    std::vector<Object*> out;Call get(component,"GetChildrenComponents");if(!get.Set("bIncludeAllDescendants",false).Invoke())return out;
+    const Array list=get.Get<Array>("Children");
+    if(list.num>0&&list.num<=512&&list.data)for(int32_t i=0;i<list.num;++i){Object* c=static_cast<Object**>(list.data)[i];if(ue::Alive(c))out.push_back(c);}
+    ue::Free(list.data);return out;
+}
+// Handled already and still where it was put or left: a pooled effect the game re-attached under a hero part is new.
+bool Seen(Object* effect,Object* holder) {
+    return std::any_of(seen_effects_.begin(),seen_effects_.end(),[&](const SeenEffect& s){return s.effect.object==effect&&s.parent==holder&&Same(s.effect);});
+}
+void MoveEffect(Object* effect,Object* holder,Object* parent,bool keep_hero_socket) {
+    if(seen_effects_.size()>=512)seen_effects_.erase(seen_effects_.begin(),seen_effects_.begin()+256);
+    Call get(effect,"GetAttachSocketName");const Name socket=get.Invoke()?get.Get<Name>("ReturnValue"):Name{};
+    Call exists(parent,"DoesSocketExist");const bool has=!socket.None()&&exists.Set("InSocketName",socket).Invoke()&&exists.Get<bool>("ReturnValue");
+    if(keep_hero_socket&&!socket.None()&&!has){seen_effects_.push_back({Id(effect),holder});return;}
+    seen_effects_.push_back({Id(effect),parent});
+    Call attach(effect,"K2_AttachToComponent");
+    const bool ok=attach.Set("Parent",parent).Set("SocketName",has?socket:Name{}).Set("LocationRule",uint8_t{0}).Set("RotationRule",uint8_t{0}).Set("ScaleRule",uint8_t{0})
+        .Set("bWeldSimulatedBodies",false).Invoke()&&attach.Get<bool>("ReturnValue");
+    if(++moved_effects_<=12)Logf("NPC_SKILL effect %s %s socket=%s -> %s%s",ok?"moved":"not moved",Text(effect).c_str(),Text(socket).c_str(),Text(parent).c_str(),
+        has||socket.None()?"":" (no such socket there: its origin)");
+}
+void MoveSkillEffects() {
+    if(!active_||skill_.handle<=0||!Same(display_))return;
+    for(const HiddenWeapon& w:hidden_weapons_){
+        if(!Same(w.actor))continue;
+        Object* target=w.boss<boss_weapon_rows_.size()&&Same(boss_weapon_rows_[w.boss])?boss_weapon_rows_[w.boss].object:nullptr;
+        if(!target)for(const Identity& row:boss_weapon_rows_)if(Same(row)){target=row.object;break;}
+        if(!target)continue; // an unarmed boss: the effect stays at the hero's hand, now visible
+        std::vector<Object*> holders;if(Object* root=Property<Object*>(w.actor.object,"RootComponent");ue::Alive(root))holders.push_back(root);
+        for(const HiddenPart& p:w.parts)if(Same(p.component)&&!IsEffect(p.component.object))holders.push_back(p.component.object);
+        for(Object* holder:holders)for(Object* c:Children(holder)){
+            if(!IsEffect(c)||Seen(c,holder)||std::any_of(w.parts.begin(),w.parts.end(),[&](const HiddenPart& p){return p.component.object==c;}))continue;
+            MoveEffect(c,holder,target,false);}
+    }
+    if(source_driver_mode_&&Same(primary_))for(Object* c:Children(primary_.object))if(IsEffect(c)&&!Seen(c,primary_.object))MoveEffect(c,primary_.object,display_.object,true);
+}
 void ShowSkillWeapons(const Context& context) {
-    if(!skill_weapons_.empty()||selected_<0||static_cast<size_t>(selected_)>=std::size(kNpcSkillSets)||!Same(display_))return;
+    if(!skill_weapons_.empty()||!skill_colliders_.empty()||selected_<0||static_cast<size_t>(selected_)>=std::size(kNpcSkillSets)||!Same(display_))return;
     const NpcSkillSet& set=kNpcSkillSets[selected_];
     HideHeroWeapons(); // also for an unarmed boss: its moves have no sword in the hand
-    size_t shown=0;for(size_t i=0;i<set.weapon_count;++i)shown+=ShowSkillWeapon(context,display_.object,set.weapons[i])?1:0;
+    seen_effects_.clear();moved_effects_=0; // effects already on the hero's mesh are not the skill's
+    if(source_driver_mode_&&Same(primary_))for(Object* c:Children(primary_.object))if(IsEffect(c))seen_effects_.push_back({Id(c),primary_.object});
+    boss_weapon_rows_.assign(set.weapon_count,Identity{});
+    size_t shown=0;for(size_t i=0;i<set.weapon_count;++i)if(ShowSkillWeapon(context,display_.object,set.weapons[i])){++shown;boss_weapon_rows_[i]=skill_weapons_.back();}
     Logf("NPC_SKILL boss weapons shown=%zu/%zu heroWeaponsHidden=%zu",shown,set.weapon_count,hidden_weapons_.size());
+    AddSkillColliders(context);
 }
 void RemoveSkillWeapons(const char* why) {
     if(skill_route_until_.load(std::memory_order_relaxed)==~0ull)skill_route_until_.store(GetTickCount64()+kSkillRouteTailMs,std::memory_order_relaxed);
-    if(skill_weapons_.empty()&&hidden_weapons_.empty())return;
+    seen_effects_.clear();boss_weapon_rows_.clear();
+    if(skill_weapons_.empty()&&hidden_weapons_.empty()&&skill_colliders_.empty())return;
+    const size_t colliders=skill_colliders_.size();
+    skill_colliders_.erase(std::remove_if(skill_colliders_.begin(),skill_colliders_.end(),[](const Identity& c){return !Same(c)||Destroy(c.object);}),skill_colliders_.end());
+    if(colliders)Logf("NPC_SKILL boss colliders removed=%zu/%zu effectsMoved=%zu",colliders-skill_colliders_.size(),colliders,moved_effects_);
     const size_t count=skill_weapons_.size();
     skill_weapons_.erase(std::remove_if(skill_weapons_.begin(),skill_weapons_.end(),[](const Identity& w){return !Same(w)||Destroy(w.object);}),skill_weapons_.end());
     Logf("NPC_SKILL boss weapons removed=%zu/%zu reason=%s",count-skill_weapons_.size(),count,why);RestoreHeroWeapons();
@@ -2581,7 +2788,7 @@ void DriveCounterFlash() {
     *counter_.tag=Name{}; // the next counter sets it again
     ShowCounterFlash(*row);
 }
-void DriveBossCalls() { DriveDragonPillar();RedirectWeaponTrace();DriveSkillPillar();PlacePillarGroup();DriveCounterFlash(); }
+void DriveBossCalls() { DriveDragonPillar();RedirectWeaponTrace();DriveSkillPillar();PlacePillarGroup();DriveCounterFlash();MoveSkillEffects(); }
 // The skin is coming off: what the replays hold goes now, not a frame later.
 void EndBossCalls(const char* why) {
     if(pillar_.prepared&&!pillar_.thrown)CancelPillar(why);pillar_={};
@@ -2994,11 +3201,10 @@ void EnforceHiddenFlags() {
         if(Call(saved.component.object,"SetHiddenInGame").Set("NewHidden",true).Set("bPropagateToChildren",false).Invoke())LogDrift("original part",1);}
     if(face_visibility_.empty())for(const Visibility& part:authored_)if(Same(part.component)&&visible(part.component.object)&&!hidden(part.component.object)&&
         SetVisible(part.component.object,part.visible,part.hidden))LogDrift("donor-hidden NPC part",32);
-    // During a boss skill: a skill action (ForceWeaponVisibility) that shows a hero weapon is undone the same frame.
-    static const BitRef actor_hidden_bit=ResolveBit("/Script/Engine.Actor","bHidden");
-    if(actor_hidden_bit.offset>=0&&actor_hidden_bit.mask)for(const HiddenWeapon& weapon:hidden_weapons_)
-        if(Same(weapon.actor)&&!(ue::At<uint8_t>(weapon.actor.object,actor_hidden_bit.offset)&actor_hidden_bit.mask)&&
-            Call(weapon.actor.object,"SetActorHiddenInGame").Set("bNewHidden",true).Invoke())LogDrift("hero weapon during a boss skill",1);
+    // During a boss skill: a skill action (ForceWeaponVisibility) that shows a hero weapon part is undone the same frame.
+    for(const HiddenWeapon& weapon:hidden_weapons_)for(const HiddenPart& part:weapon.parts)
+        if(Same(part.component)&&!hidden(part.component.object)&&
+            Call(part.component.object,"SetHiddenInGame").Set("NewHidden",true).Set("bPropagateToChildren",false).Invoke())LogDrift("hero weapon during a boss skill",1);
 }
 bool Apply(const Context& context,int32_t entry) {
     const Profile& profile=kProfiles[entry];stage_="load donor";

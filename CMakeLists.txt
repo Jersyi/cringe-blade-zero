@@ -61,6 +61,14 @@ target_link_libraries(input_focus_test PRIVATE user32 gdi32 comctl32)
 add_executable(game_thread_test tests/game_thread_test.cpp src/core/game_thread.cpp src/core/ue_runtime.cpp)
 pbz_settings(game_thread_test)
 
+# NPC skin boss skills: attack-collider tags copied onto the hero per skin.
+add_executable(npc_skill_colliders_test tests/npc_skill_colliders_test.cpp)
+pbz_settings(npc_skill_colliders_test)
+
+# Grab damage per damage event: multiplier / percent extra of each native hit, presets.
+add_executable(grab_damage_test tests/grab_damage_test.cpp)
+pbz_settings(grab_damage_test)
+
 # NPC retarget two-handed grip: left-arm contact IK on a synthetic hero/NPC skeleton pair.
 add_executable(npc_pose_transfer_test tests/npc_pose_transfer_test.cpp)
 pbz_settings(npc_pose_transfer_test)

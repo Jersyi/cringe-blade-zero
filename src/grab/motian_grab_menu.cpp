@@ -7,7 +7,9 @@
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cwchar>
+#include <iterator>
 #include <string>
 
 namespace MotianGrabMenu {
@@ -15,12 +17,15 @@ namespace {
 constexpr wchar_t kClass[]=L"PBZMotianGrabWindow";
 constexpr int kEnable=101,kVariant=102,kRange=103,kApply=104,kTrigger=105,kCancel=106,kBoss=107,kPosition=108,kSourceBoss=109,kRecommended=110;
 constexpr int kHideWeapon=111,kDamageMode=112,kDamageValue=113,kInvulnerable=114,kTangExecution=115;
+constexpr int kPresetFirst=120; // one per GrabExtras::kMultiplierPresets
+constexpr size_t kPresetCount=std::size(GrabExtras::kMultiplierPresets);
 HWND window_=nullptr,enabled_=nullptr,boss_=nullptr,position_=nullptr,tang_=nullptr,variant_=nullptr,range_=nullptr,range_label_=nullptr,status_=nullptr,detail_=nullptr;
 HWND variant_label_=nullptr,apply_=nullptr,trigger_=nullptr,cancel_=nullptr,status_section_=nullptr,detail_section_=nullptr;
 HWND source_label_=nullptr,source_boss_=nullptr,source_status_=nullptr;
 HWND range_hint_=nullptr,recommended_=nullptr;
 // Grab add-ons (GrabExtras): weapon hiding and damage, saved with the other settings.
 HWND extras_section_=nullptr,hide_weapon_=nullptr,damage_label_=nullptr,damage_mode_=nullptr,damage_value_=nullptr,damage_unit_=nullptr,invulnerable_=nullptr,extras_result_=nullptr;
+HWND preset_label_=nullptr,presets_[kPresetCount]{};
 std::wstring source_filter_,catalog_signature_;
 HFONT font_=nullptr;
 MotianGrab::Logger logger_=nullptr;
@@ -83,6 +88,22 @@ void RebuildCatalog(const MotianGrab::Snapshot& state,bool force) {
     if (selected==0) source_filter_.clear();
     RebuildMoves(state,preferred);
 }
+// The option controls follow the live settings: the gear pill (and the ini) change them
+// too, and Apply writes every control back, so a stale control undid those changes (gear
+// 10's ×4.5 grab damage went back to native). A live change the page did not make itself
+// is shown again; a value the player is still editing stays until the live one changes.
+std::wstring GrabSignature(const MotianGrab::Options& o) {
+    wchar_t text[64]{};
+    _snwprintf_s(text, _countof(text), _TRUNCATE,L"%d%d%d%d|%.0f",o.enabled?1:0,o.allow_bosses?1:0,o.position_correction?1:0,o.tang_execution?1:0,static_cast<double>(o.range));
+    return text;
+}
+std::wstring ExtrasSignature(const GrabExtras::Options& o) {
+    wchar_t text[64]{};
+    _snwprintf_s(text, _countof(text), _TRUNCATE,L"%d%d%d|%.3f|%.3f",o.hide_weapon?1:0,o.ignore_invulnerable?1:0,static_cast<int>(o.damage),
+        static_cast<double>(o.multiplier),static_cast<double>(o.percent));
+    return text;
+}
+std::wstring live_grab_,shown_grab_,live_extras_,shown_extras_;
 void Apply() {
     if (rendering_) return;
     MotianGrab::Options options=MotianGrab::GetSnapshot().options;
@@ -114,35 +135,60 @@ void Apply() {
     if (extras.damage!=GrabExtras::Damage::Native) {
         wchar_t amount_text[64]{}; GetWindowTextW(damage_value_,amount_text,64); wchar_t* amount_end=nullptr; const double amount=std::wcstod(amount_text,&amount_end);
         const bool percent=extras.damage==GrabExtras::Damage::Percent;
-        if (amount_end==amount_text||*amount_end||!std::isfinite(amount)||amount<(percent?1:.1)||amount>(percent?100:10)) {
-            UiI18n::SetText(status_,percent?L"伤害百分比需为 1–100；尚未提交设置":L"伤害倍率需为 0.1–10；尚未提交设置"); return;
+        if (amount_end==amount_text||*amount_end||!std::isfinite(amount)||amount<(percent?1:.1)||amount>(percent?100:GrabExtras::kMaxMultiplier)) {
+            UiI18n::SetText(status_,percent?L"伤害百分比需为 1–100；尚未提交设置":L"伤害倍率需为 0.1–30；尚未提交设置"); return;
         }
         (percent?extras.percent:extras.multiplier)=static_cast<float>(amount);
     }
     GrabExtras::SetOptions(extras);
+    // The controls now show what was applied; the grab options reach the snapshot a tick later.
+    shown_extras_=ExtrasSignature(GrabExtras::GetOptions());
     if (!MotianGrab::RequestOptions(options)) UiI18n::SetText(status_,L"投技设置未接受；请等待当前动作清理后重试");
+    else shown_grab_=GrabSignature(options);
 }
 void ShowDamageValue(const GrabExtras::Options& extras,int mode) {
     wchar_t value[32]{};
-    if (mode==2) _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",static_cast<double>(extras.percent)); else _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.2g",static_cast<double>(extras.multiplier));
+    if (mode==2) _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",static_cast<double>(extras.percent)); else _snwprintf_s(value, _countof(value), _TRUNCATE,L"%g",static_cast<double>(extras.multiplier));
     SetWindowTextW(damage_value_,value);
     UiI18n::SetText(damage_unit_,mode==2?L"% 最大生命":mode==1?L"× 原生伤害":L"");
     EnableWindow(damage_value_,mode!=0);
 }
+void ShowGrabOptions(const MotianGrab::Options& o) {
+    SendMessageW(enabled_,BM_SETCHECK,o.enabled?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(boss_,BM_SETCHECK,o.allow_bosses?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(position_,BM_SETCHECK,o.position_correction?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(tang_,BM_SETCHECK,o.tang_execution?BST_CHECKED:BST_UNCHECKED,0);
+    wchar_t value[32]{}; _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",o.range); SetWindowTextW(range_,value);
+}
+void ShowExtrasOptions(const GrabExtras::Options& extras) {
+    SendMessageW(hide_weapon_,BM_SETCHECK,extras.hide_weapon?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(invulnerable_,BM_SETCHECK,extras.ignore_invulnerable?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(damage_mode_,CB_SETCURSEL,static_cast<int>(extras.damage),0);
+    ShowDamageValue(extras,static_cast<int>(extras.damage));
+    // The preset in use is drawn as the primary button.
+    for (size_t i=0;i<kPresetCount;++i) {
+        const bool on=extras.damage==GrabExtras::Damage::Multiplier&&std::fabs(extras.multiplier-GrabExtras::kMultiplierPresets[i])<.01f;
+        if ((UiTheme::GetRole(presets_[i])==UiTheme::Role::Primary)!=on) UiTheme::SetRole(presets_[i],on?UiTheme::Role::Primary:UiTheme::Role::None);
+    }
+}
+void Layout();
+// A preset button sets the multiplier mode and value at once; the other settings stay as applied.
+void ApplyPreset(size_t index) {
+    GrabExtras::Options extras=GrabExtras::GetOptions();
+    extras.damage=GrabExtras::Damage::Multiplier; extras.multiplier=GrabExtras::kMultiplierPresets[index];
+    GrabExtras::SetOptions(extras);
+    const GrabExtras::Options now=GrabExtras::GetOptions();
+    rendering_=true; ShowExtrasOptions(now); rendering_=false;
+    shown_extras_=ExtrasSignature(now); Layout();
+    if (logger_) { char line[96]{}; _snprintf_s(line,sizeof(line),_TRUNCATE,"MOTIAN_GRAB_MENU damage preset x%g",static_cast<double>(now.multiplier)); logger_(line); }
+}
 void Refresh(bool options) {
     if (!window_) return; const MotianGrab::Snapshot state=MotianGrab::GetSnapshot(); rendering_=true;
-    if (options) {
-        SendMessageW(enabled_,BM_SETCHECK,state.options.enabled?BST_CHECKED:BST_UNCHECKED,0);
-        SendMessageW(boss_,BM_SETCHECK,state.options.allow_bosses?BST_CHECKED:BST_UNCHECKED,0);
-        SendMessageW(position_,BM_SETCHECK,state.options.position_correction?BST_CHECKED:BST_UNCHECKED,0);
-        SendMessageW(tang_,BM_SETCHECK,state.options.tang_execution?BST_CHECKED:BST_UNCHECKED,0);
-        wchar_t value[32]{}; _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",state.options.range); SetWindowTextW(range_,value);
-        const GrabExtras::Options extras=GrabExtras::GetOptions();
-        SendMessageW(hide_weapon_,BM_SETCHECK,extras.hide_weapon?BST_CHECKED:BST_UNCHECKED,0);
-        SendMessageW(invulnerable_,BM_SETCHECK,extras.ignore_invulnerable?BST_CHECKED:BST_UNCHECKED,0);
-        SendMessageW(damage_mode_,CB_SETCURSEL,static_cast<int>(extras.damage),0);
-        ShowDamageValue(extras,static_cast<int>(extras.damage));
-    }
+    const GrabExtras::Options extras=GrabExtras::GetOptions();
+    const std::wstring grab=GrabSignature(state.options),extra=ExtrasSignature(extras);
+    if (options||(grab!=live_grab_&&grab!=shown_grab_)) { ShowGrabOptions(state.options); shown_grab_=grab; }
+    if (options||(extra!=live_extras_&&extra!=shown_extras_)) { ShowExtrasOptions(extras); shown_extras_=extra; }
+    live_grab_=grab; live_extras_=extra;
     UiI18n::SetText(extras_result_,GrabExtras::LastResult().c_str());
     RebuildCatalog(state,options);
     std::wstring source_status=L"选择来源 Boss，再选择它的投技；先应用设置，等待预载完成后触发。";
@@ -184,7 +230,7 @@ void Refresh(bool options) {
     std::wstring detail=L"投技快捷键默认为键盘 G、Xbox Y + B、PlayStation 三角 + 圈，可在快捷键页修改；手柄两键须在 220 毫秒内按下，每次触发后须松开。\r\n"
         L"开启或更换招式后先等待资源显示“已预载”，再回到游戏按组合键。资源准备耗时会单独显示。\r\n"
         L"以原生成对能力 / Timeline 负责受投、伤害和位移；关闭或取消走双方原能力结束清理。\r\n"
-        L"投技附加：可在投技期间隐藏主角武器（结束后恢复原显示），并在原投技结束后按倍率或最大生命百分比补足伤害；伤害经游戏属性接口写入。未开启“无视无敌”时，只在目标本次确实受到原生伤害时追加。\r\n"
+        L"投技附加：可在投技期间隐藏主角武器（结束后恢复原显示）；投技自身的每段伤害按倍率放大，或至少扣最大生命的设定百分比，经游戏属性接口写入。只有开启“无视无敌”时，目标没有受到任何伤害事件才在结束时直接扣血一次。\r\n"
         L"位置修正：先验证地面。直线对位招式只在安全距离内修正主角一次；其他招式保留原生参考系和完整位移曲线。不移动目标，可关闭对比。\r\n"
         L"每招的搜索距离和推荐距离不同；使用推荐距离只填写编辑框，应用设置后生效。\r\n"
         L"支持范围：地面近处敌对、存活且可受投的人形敌人；人形小怪在受击硬直或特殊动作中也可投。\r\n"
@@ -236,6 +282,10 @@ void Layout() {
     damage_row.Add(damage_value_,m.S(90));
     damage_row.Add(damage_unit_,(std::max)(m.S(110),UiLayout::TextWidth(damage_unit_)),m.Line());
     y=damage_row.Bottom()+gap/2;
+    UiLayout::Flow preset_row(x,y,width,m.Button(),gap,gap);
+    preset_row.Add(preset_label_,UiLayout::TextWidth(preset_label_),m.Line());
+    for (HWND preset:presets_) preset_row.Add(preset,(std::max)(m.S(64),UiLayout::ButtonWidth(preset,m)));
+    y=preset_row.Bottom()+gap/2;
     const int result_height=UiLayout::TextHeight(extras_result_,width,2);
     UiLayout::Place(extras_result_,x,y,width,result_height); y+=result_height+gap;
     y=UiLayout::ButtonRow({apply_,trigger_,cancel_},x,y,width,m,m.S(150))+gap*2;
@@ -270,6 +320,8 @@ LRESULT CALLBACK WindowProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam
             RebuildMoves(state,SelectedVariant());Refresh(false);Layout();
         }
         else if (LOWORD(wparam)==kVariant && HIWORD(wparam)==CBN_SELCHANGE) Refresh(false);
+        else if (LOWORD(wparam)>=kPresetFirst&&LOWORD(wparam)<kPresetFirst+static_cast<int>(kPresetCount)&&HIWORD(wparam)==BN_CLICKED)
+            ApplyPreset(static_cast<size_t>(LOWORD(wparam)-kPresetFirst));
         else if (LOWORD(wparam)==kDamageMode && HIWORD(wparam)==CBN_SELCHANGE) {
             ShowDamageValue(GrabExtras::GetOptions(),static_cast<int>(SendMessageW(damage_mode_,CB_GETCURSEL,0,0))); Layout();
         }
@@ -315,6 +367,11 @@ bool Create() {
     UiI18n::AddString(damage_mode_,CB_ADDSTRING,0,L"最大生命百分比");
     damage_value_=Control(L"EDIT",L"2",ES_AUTOHSCROLL|WS_TABSTOP,0,0,10,10,kDamageValue);
     damage_unit_=Control(L"STATIC",L"",0,0,0,10,10,0);
+    preset_label_=Control(L"STATIC",L"倍率预设",0,0,0,10,10,0);
+    for (size_t i=0;i<kPresetCount;++i) {
+        wchar_t caption[16]{}; _snwprintf_s(caption, _countof(caption), _TRUNCATE,L"×%g",static_cast<double>(GrabExtras::kMultiplierPresets[i]));
+        presets_[i]=Control(L"BUTTON",caption,BS_PUSHBUTTON|WS_TABSTOP,0,0,10,10,kPresetFirst+static_cast<int>(i));
+    }
     extras_result_=Control(L"STATIC",L"",SS_LEFT,0,0,10,10,0);
     UiTheme::SetRole(extras_section_,UiTheme::Role::Section); UiTheme::SetRole(extras_result_,UiTheme::Role::Hint);
     apply_=Control(L"BUTTON",L"应用设置",BS_PUSHBUTTON|WS_TABSTOP,0,0,10,10,kApply);
