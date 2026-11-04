@@ -246,6 +246,34 @@ void PollCommand(HairControls& controls) {
     Log(line);
 }
 
+// A game build the checks refuse (usually a game update): nothing touches its memory, but once the game window is up
+// the player sees why the tools are missing. The trigger hooks attached before the check keep working.
+// The loops pump this thread's messages: the game's thread sends to the banner (activation, its owner moving or being
+// destroyed) and would block until this thread takes them.
+void PumpMessages() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&message); DispatchMessageW(&message); }
+}
+void NotifyUnsupported(const std::wstring& directory) {
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCWSTR>(&NotifyUnsupported), &pinned)) return;
+    UiI18n::Initialize((directory + L"PBZDebugMenu.ini").c_str());
+    UiHost::GuardActivation(&LogLine);
+    UiLoadBanner::Initialize(&LogLine);
+    const ULONGLONG deadline = GetTickCount64() + 10 * 60 * 1000;
+    while (!InterlockedCompareExchange(&stop_worker, 0, 0) && GetTickCount64() < deadline) {
+        PumpMessages(); UiHost::Tick();
+        if (UiHost::InGame()) { UiLoadBanner::ShowUnsupported(); break; }
+        Sleep(500);
+    }
+    while (!InterlockedCompareExchange(&stop_worker, 0, 0) && (UiLoadBanner::Pending() || UiLoadBanner::Active())) {
+        PumpMessages(); UiLoadBanner::Tick();
+        Sleep(UiLoadBanner::Active() ? 16 : 100);
+    }
+    UiLoadBanner::Shutdown(); UiI18n::Shutdown();
+}
+
 DWORD WINAPI Worker(void*) {
     InterlockedExchange(&worker_status, 1);
     wchar_t module_path[32768]{}, executable[32768]{};
@@ -260,7 +288,12 @@ DWORD WINAPI Worker(void*) {
     // Trigger hooks need no game layout, so they keep working on builds the checks below refuse.
     PadTriggers::Attach(&LogLine, (log_path.substr(0, log_path.find_last_of(L"\\/") + 1) + L"PBZDebugMenu.ini").c_str());
     const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    if (!KnownBuild(base, executable)) { Log("UNSUPPORTED_BUILD; no data writes"); InterlockedExchange(&worker_status, 0x200); return 0; }
+    if (!KnownBuild(base, executable)) {
+        Log("UNSUPPORTED_BUILD; no data writes");
+        InterlockedExchange(&worker_status, 0x200);
+        NotifyUnsupported(log_path.substr(0, log_path.find_last_of(L"\\/") + 1));
+        return 0;
+    }
     // The proxy is installed for the life of this process. Never unload its code
     // beneath a worker thread or an in-flight system-version forwarding call.
     HMODULE pinned = nullptr;

@@ -1081,6 +1081,8 @@ inline constexpr UiTranslation kUiTranslations[] = {
     {L"缺少反射属性 ", L"Missing reflected property "},
     {L"行为冷却 / ", L"Behavior cooldown / "},
     {L"豪之刃 已加载", L"Cringe Blade Zero loaded"},
+    {L"豪之刃 未适配当前游戏", L"Cringe Blade Zero: game updated"},  // title font subset: no 版本
+    {L"游戏已更新，豪之刃更新后恢复全部功能", L"All tools return with the next mod update"},
     {L"远距离进攻概率", L"Long-Range Attack Probability"},
     {L"：对象尚未就绪", L": object is not ready"},
     {L"：尚无奖励读回", L": no reward receipt yet"},

@@ -1,4 +1,5 @@
 #include "hair_controls.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -11,13 +12,16 @@ void Commit(uintptr_t base, uintptr_t rva) {
 }
 }
 int main() {
-    const uintptr_t base = reinterpret_cast<uintptr_t>(VirtualAlloc(nullptr, 0x10000000, MEM_RESERVE, PAGE_NOACCESS));
+    using namespace HairAddresses;
+    // A fake image just large enough for the hair globals (they move with each game update).
+    const uintptr_t span = ((std::max)({kHairWrapper, kAppliedHairMode, kViewModeCache, kShaderPrint}) + 0x20000) & ~uintptr_t{0xffff};
+    const uintptr_t base = reinterpret_cast<uintptr_t>(VirtualAlloc(nullptr, span, MEM_RESERVE, PAGE_NOACCESS));
     if (!base) return 2;
-    Commit(base, 0xdfbc2c8); Commit(base, 0xdfbdf70); Commit(base, 0xdfbbd60); Commit(base, 0xdf12044);
+    Commit(base, kHairWrapper); Commit(base, kViewModeCache); Commit(base, kAppliedHairMode); Commit(base, kShaderPrint);
     alignas(8) uint64_t hair = Pair(1), view = Pair(7), replacement = Pair(1);
-    auto* hair_pointer = reinterpret_cast<uintptr_t*>(base + 0xdfbc2c8 + 16);
-    auto* view_pointer = reinterpret_cast<uintptr_t*>(base + 0xdfbdf70);
-    auto* shader = reinterpret_cast<int32_t*>(base + 0xdf12044);
+    auto* hair_pointer = reinterpret_cast<uintptr_t*>(base + kHairWrapper + 16);
+    auto* view_pointer = reinterpret_cast<uintptr_t*>(base + kViewModeCache);
+    auto* shader = reinterpret_cast<int32_t*>(base + kShaderPrint);
     *hair_pointer = reinterpret_cast<uintptr_t>(&hair); *view_pointer = reinterpret_cast<uintptr_t>(&view); *shader = 0;
     {
         HairControls controls(base, false);
@@ -52,8 +56,8 @@ int main() {
     Check(!HairMemory::Exchange64(1, 0, 1), "Invalid atomic write rejected");
     Check(!HairMemory::Exchange64(reinterpret_cast<uintptr_t>(&hair) + 1, 0, 1), "Misaligned atomic write rejected");
     Check(!HairMemory::Exchange64(reinterpret_cast<uintptr_t>(&hair), Pair(99), 0) && hair == Pair(2), "Concurrent value CAS rejected");
-    DWORD old = 0; VirtualProtect(reinterpret_cast<void*>(base + 0xdf12000), 4096, PAGE_READONLY, &old);
-    Check(!HairMemory::Exchange32(base + 0xdf12044, 1, 0), "Readonly page rejected");
+    DWORD old = 0; VirtualProtect(reinterpret_cast<void*>(base + (kShaderPrint & ~uintptr_t{4095})), 4096, PAGE_READONLY, &old);
+    Check(!HairMemory::Exchange32(base + kShaderPrint, 1, 0), "Readonly page rejected");
     VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
     std::printf("hair_controls_test failures=%d\n", failures); return failures ? 1 : 0;
 }

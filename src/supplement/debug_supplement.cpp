@@ -230,8 +230,8 @@ bool Prepare() {
 // UObject's own (Outer->GetWorld(): the game instance's world); the classes and every other object keep the game's table.
 constexpr size_t kGetWorldSlot = 48;
 constexpr uintptr_t kObjectGetWorldRva = 0x15b5e70, kNullStubRva = 0x125a450;
-constexpr unsigned char kObjectGetWorldCode[] = {0x48,0x8b,0x49,0x20,0x48,0x85,0xc9,0x74,0x0a,0x48,0x8b,0x01,0x48,0xff,0xa0,0x80,0x01,0x00,0x00};
-constexpr unsigned char kNullStubCode[] = {0x33,0xc0,0xc3};
+constexpr unsigned char kObjectGetWorldCode[] = {0x48,0x8b,0x49,0x20,0x48,0x85,0xc9,0x74,0x0a,0x48,0x8b,0x01,0x48,0xff,0xa0,0x80,0x01,0x00,0x00};  // exe-bytes: kObjectGetWorldRva
+constexpr unsigned char kNullStubCode[] = {0x33,0xc0,0xc3};  // exe-bytes: kNullStubRva
 std::map<uintptr_t*, uintptr_t*> world_tables_;  // game vtable -> our copy; never freed (an object may outlive our reset)
 
 bool Code(uintptr_t p) { return p >= ue::Base() && p < ue::Base() + 0x20000000; }
@@ -310,7 +310,7 @@ constexpr double kGroundBelow = 100000, kStandAbove = 10;  // trace depth; clear
 // s.LevelStreamingActorsUpdateTimeLimit 5 ms; the game runs them at 0.2), so the destination streams in within seconds.
 // Each storage is pinned by the console variable's registration (lea r8, storage).
 struct Budget { uintptr_t lea; uintptr_t storage; float teleport; };
-constexpr Budget kBudgets[] = {{0xfa6c13, 0xdae8498, 500.f}, {0xfa6f53, 0xdae84a0, 5.f}};
+constexpr Budget kBudgets[] = {{0xfa6c13, 0xdae8498, 500.f}, {0xfa6f53, 0xdae84a0, 5.f}};  // exe-pins
 float saved_budgets_[std::size(kBudgets)]{};
 bool budgets_raised_ = false;
 float* BudgetStorage(const Budget& budget) {
@@ -1160,7 +1160,7 @@ struct ExecPatch { const char* cls; const char* function; uintptr_t game_exec, s
 // game_exec: the emptied exec; stub_call: the instruction that pins it as the emptied one (its call of the `ret` stub
 // 0x125a3e0 or of the FString{} stub 0x12b2470, or the shared empty exec's jump to 0x16963980).
 constexpr char kHelpCollectClass[] = "/Script/ProjectPBZ.PBZGameplayHelpCollect";
-constexpr ExecPatch kHelpExecs[] = {
+constexpr ExecPatch kHelpExecs[] = {  // exe-pins
     {kHelpObjClass, "TeleportCharacter", 0x6591090, 0x6591109, {0xe8,0xd2,0x92,0xcc,0xfa}, &ExecTeleportCharacter},
     {kHelpObjClass, "AddEventTags", 0x658ea20, 0x658eaa8, {0xe8,0x33,0xb9,0xcc,0xfa}, &ExecAddEventTags},
     {kHelpCollectClass, "SetDebugFlyGuard", 0x6569fb0, 0x656a022, {0xe8,0xb9,0x03,0xcf,0xfa}, &ExecSetDebugFlyGuard},

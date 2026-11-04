@@ -72,7 +72,7 @@ constexpr uintptr_t kSocketInfoRva = 0x03db49c0;
 constexpr uintptr_t kGetMeshReferenceRva=0x044f5ae0;
 constexpr size_t kSocketTransformSlot = 0x518 / sizeof(uintptr_t);
 struct NativeSignature { uintptr_t rva; unsigned char code[16]; };
-constexpr NativeSignature kNativeSignatures[] = {
+constexpr NativeSignature kNativeSignatures[] = {  // exe-pins
     {kArrayAddRva, {0x48,0x8b,0xc4,0x53,0x56,0x41,0x55,0x48,0x83,0xec,0x50,0x4d,0x8b,0xe8,0x48,0x8b}},
     {kArrayRemoveRva, {0x48,0x85,0xc9,0x0f,0x84,0xae,0x01,0x00,0x00,0x48,0x89,0x6c,0x24,0x18,0x48,0x89}},
     {kRebuildSocketMapRva, {0x40,0x55,0x53,0x56,0x57,0x41,0x56,0x48,0x8d,0x6c,0x24,0xc9,0x48,0x81,0xec,0xe0}},
@@ -1971,12 +1971,23 @@ void ProbeCameraLift() {
 // The grab module's counted strong-reference pair (exact bytes checked before every call).
 bool ClassRefsReady() { return ue::ReferenceCodeMatches(); }
 // Only package-root UClasses: never an actor, component or anything whose outer holds a world.
+// The first few refusals per process carry the object's reference state (a skin can refuse 60+ classes at once).
+size_t pin_refusals_logged_=0;
+bool RefusePin(const char* what,Object* object,const char* why) {
+    if(pin_refusals_logged_>=12)return false;++pin_refusals_logged_;
+    char state[640]{};ue::DescribeReference(object,state,sizeof(state));
+    Logf("NPC_PIN %s refused (%s) %s",what,why,state);return false;
+}
 bool PinClass(Object* cls) {
-    if(!ClassRefsReady()||!ue::Alive(cls))return false;
+    if(!cls)return false; // Not loaded: counted by the caller's loaded/pinned totals.
+    if(!ClassRefsReady())return RefusePin("class",cls,"AddRef/ReleaseRef bytes");
+    if(!ue::Alive(cls))return RefusePin("class",cls,"not alive");
     for(const Identity& pin:skill_pins_)if(pin.object==cls&&Same(pin))return true;
     Object* outer=ue::OuterOf(cls);
-    if(skill_pins_.size()>=kMaxSkillPins||!ue::IsA(cls,Class("/Script/CoreUObject.Class"))||!ue::Alive(outer)||!ue::IsA(outer,Class("/Script/CoreUObject.Package"))||ue::OuterOf(outer))return false;
-    const Identity id=Id(cls);if(!Same(id))return false;
+    if(skill_pins_.size()>=kMaxSkillPins)return RefusePin("class",cls,"ledger full");
+    if(!ue::IsA(cls,Class("/Script/CoreUObject.Class")))return RefusePin("class",cls,"not a class");
+    if(!ue::Alive(outer)||!ue::IsA(outer,Class("/Script/CoreUObject.Package"))||ue::OuterOf(outer))return RefusePin("class",cls,"outer is not a root package");
+    const Identity id=Id(cls);if(!Same(id))return RefusePin("class",cls,"weak identity");
     reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1573ff0)(cls);skill_pins_.push_back(id);return true;
 }
 void ReleasePins() {
@@ -3210,9 +3221,11 @@ void QuietAimNodes(Object* display) {
 // Package-root assets only (an AnimSequence, never anything that holds a world), held by the same counted
 // strong reference as the skill classes until the skin comes off.
 bool PinAsset(Object* asset,std::vector<Identity>& pins) {
-    if(!ClassRefsReady()||!ue::Alive(asset))return false;Object* outer=ue::OuterOf(asset);
-    if(!ue::Alive(outer)||!ue::IsA(outer,Class("/Script/CoreUObject.Package"))||ue::OuterOf(outer))return false;
-    const Identity id=Id(asset);if(!Same(id))return false;
+    if(!asset)return false;
+    if(!ClassRefsReady())return RefusePin("asset",asset,"AddRef/ReleaseRef bytes");
+    if(!ue::Alive(asset))return RefusePin("asset",asset,"not alive");Object* outer=ue::OuterOf(asset);
+    if(!ue::Alive(outer)||!ue::IsA(outer,Class("/Script/CoreUObject.Package"))||ue::OuterOf(outer))return RefusePin("asset",asset,"outer is not a root package");
+    const Identity id=Id(asset);if(!Same(id))return RefusePin("asset",asset,"weak identity");
     reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1573ff0)(asset);pins.push_back(id);return true;
 }
 // An asset by object path ("/Pkg/Name.Name"): found if loaded, else loaded blocking.

@@ -40,7 +40,8 @@ $readme = @"
   运行 Install.bat 选 3；或手动删除 platform\steam 下的 version.dll，以及同目录的 PBZDebugMenu.ini、PBZDebugMenu.log。
 
 说明
-  MOD 只在匹配的 PBZ.exe 版本上启用（启动时校验 SHA-256），版本不符时只转发系统 version.dll。
+  MOD 只在匹配的 PBZ.exe 版本上启用（启动时校验 SHA-256）。游戏更新后版本不符时，不读写游戏数据，
+  只保留关闭自适应扳机，并在画面上方提示“豪之刃 未适配当前游戏”。
   设置保存在 DLL 旁的 PBZDebugMenu.ini，日志写在 PBZDebugMenu.log。
   更新内容见同目录的 CHANGELOG.md。
   仅用于单机游戏，与游戏开发商无关。

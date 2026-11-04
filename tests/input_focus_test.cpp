@@ -140,6 +140,8 @@ DWORD WINAPI GameMain(void* ready) {
     return 0;
 }
 const wchar_t* const kTitles[] = {L"Boss 连战", L"Boss AI", L"角色替换", L"NPC 重定向", L"空中技能 / JC", L"投技", L"毛发 / Groom", L"武器预设", L"快捷键"};
+// Every page but the optional supplement one, which the DLL registers only when its container is present.
+static_assert(std::size(kTitles) == static_cast<size_t>(DebugHub::Page::Supplement), "one title per always-present page");
 HWND MockPage(HWND parent) {
     HWND page = CreateWindowExW(0, L"STATIC", L"mock page", WS_POPUP, 0, 0, 640, 420, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     DebugHub::Attach(page, parent, 640, 420);
@@ -179,7 +181,7 @@ DWORD WINAPI WorkerMain(void* ready) {
     UiHotkeys::Bind(UiHotkeys::Action::GearUp, [] { ++pad_fires_; });
     UiLoadBanner::Initialize(&LogLine); EntryFocus::Initialize();
     SettingsStore::Initialize(ini); HubPause::Initialize(&LogLine); GrabExtras::Initialize(&LogLine); MotianGrabMenu::Initialize(&LogLine); GearWidget::Initialize(&LogLine);
-    for (int page = 0; page < static_cast<int>(DebugHub::Page::Count); ++page)
+    for (int page = 0; page < static_cast<int>(DebugHub::Page::Supplement); ++page)
         if (page != static_cast<int>(DebugHub::Page::Hotkeys)) DebugHub::Register(static_cast<DebugHub::Page>(page), kTitles[page], &MockPage);
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
     DebugHub::Register(DebugHub::Page::MotianGrab, L"投技", &MotianGrabMenu::CreatePage);
@@ -440,6 +442,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     Check(Keys(5) == 5, "keys reach the game after Esc");
 
     DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(900);
+    // No supplement container here, so its page is not registered: asking for it must leave the hub where it is.
+    DebugHub::ShowPage(DebugHub::Page::Supplement); Sleep(400);
+    Check(Visible(L"PBZHotkeyBind_v1") != nullptr, "the absent supplement page is never shown (the hotkey page stays)");
     DebugHub::Toggle(); Sleep(900);
     Report("hotkey page closed");
     Check(Keys(5) == 5, "keys reach the game after visiting the hotkey page");
@@ -487,6 +492,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     // Grab page vs the gear: a damage mode set outside the page (gear 4+ picks a multiplier)
     // must survive the page's own Apply, which writes every control back.
     {
+        Sleep(800);  // the gear drag above applies its level after the release; let it land before the outside change
         GrabExtras::Options outside = GrabExtras::GetOptions();
         outside.damage = GrabExtras::Damage::Multiplier; outside.multiplier = 4.5f; GrabExtras::SetOptions(outside);
         Sleep(700);

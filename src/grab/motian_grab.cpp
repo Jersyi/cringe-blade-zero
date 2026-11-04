@@ -275,6 +275,11 @@ Object* Resolve(Weak weak) {
     if (!item || ue::At<int32_t>(const_cast<Object*>(item),16)!=weak.serial) return nullptr;
     Object* object=ue::At<Object*>(const_cast<Object*>(item),8); return ue::Alive(object)?object:nullptr;
 }
+bool WeakAssignMatches() {
+    static constexpr unsigned char code[]={0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x12,0x48,0x8b,0xd9,0x48,0x85,0xd2,0x74};
+    const uintptr_t entry=ue::Base()+0x166e900;
+    return ue::Base()&&Readable(reinterpret_cast<void*>(entry),sizeof(code))&&!std::memcmp(reinterpret_cast<void*>(entry),code,sizeof(code));
+}
 Identity Id(Object* object) {
     Identity id; if (!ue::Alive(object)) return id;
     // A freshly loaded Class/CDO/ability may not yet have a GUObjectItem
@@ -969,18 +974,27 @@ bool ReleasePrepared() {
     }
     Logf("MOTIAN_GRAB_PREPARE asset refs released independently of session refs"); prepared_={}; return true;
 }
+// Every refusal is logged with the object's reference state: a refused pin stops preparation at this step.
+bool RefusePin(Object* object,const char* why) {
+    char state[640]{}; ue::DescribeReference(object,state,sizeof(state));
+    Logf("MOTIAN_GRAB_PREPARE pin refused (%s) weakAssign=%s %s",why,WeakAssignMatches()?"ok":"MISMATCH",state);
+    return false;
+}
 bool PinPrepared(Object* object,bool is_class) {
-    if (!ClassRefHelpersMatch()||!ue::Alive(object)) return false;
+    if (!object) return RefusePin(object,"asset not loaded");
+    if (!ClassRefHelpersMatch()) return RefusePin(object,"AddRef/ReleaseRef bytes");
+    if (!ue::Alive(object)) return RefusePin(object,"asset not alive");
     for(const ClassLease& lease:prepared_.assets)if(lease.identity.object==object&&RawIdentity(lease.identity))return lease.phase==RefPhase::Owned;
     constexpr size_t kMaxPreparedAssets=64;
-    if(prepared_.assets.size()>=kMaxPreparedAssets)return false;
+    if(prepared_.assets.size()>=kMaxPreparedAssets)return RefusePin(object,"ledger full");
     Object* outer=ue::OuterOf(object),*package=Type("/Script/CoreUObject.Package");
-    if (!package||!ue::Alive(outer)||!ue::IsA(outer,package)||ue::OuterOf(outer)) return false;
-    if (is_class&&!ue::IsA(object,Type("/Script/CoreUObject.Class"))) return false;
+    if (!package) return RefusePin(object,"Package type missing");
+    if (!ue::Alive(outer)||!ue::IsA(outer,package)||ue::OuterOf(outer)) return RefusePin(object,"outer is not a root package");
+    if (is_class&&!ue::IsA(object,Type("/Script/CoreUObject.Class"))) return RefusePin(object,"not a class");
     // The caller passes only the fixed package-root class/BulletData paths.
     // A world or live Actor is never a valid prepared asset.
-    if (ue::IsA(object,Type("/Script/Engine.Actor"))||ue::IsA(object,Type("/Script/Engine.World"))) return false;
-    const Identity id=Id(object); if (!Same(id)) return false;
+    if (ue::IsA(object,Type("/Script/Engine.Actor"))||ue::IsA(object,Type("/Script/Engine.World"))) return RefusePin(object,"actor or world");
+    const Identity id=Id(object); if (!Same(id)) return RefusePin(object,"weak identity");
     prepared_.assets.push_back({id,RefPhase::Acquiring});
     reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1573ff0)(object);
     prepared_.assets.back().phase=RefPhase::Owned; return true;
@@ -1224,6 +1238,7 @@ void AdvancePreparation(bool wanted) {
     QueryPerformanceCounter(&end);
     prepared_.last_ms=frequency.QuadPart?static_cast<float>(1000.*static_cast<double>(end.QuadPart-begin.QuadPart)/frequency.QuadPart):0;
     prepared_.total_ms+=prepared_.last_ms; prepared_.max_ms=(std::max)(prepared_.max_ms,static_cast<double>(prepared_.last_ms));
+    if (!ok&&specific.empty()&&step>count&&step<count+4) specific=L"投技资产未能加载或保留；日志里的 pin refused 一行写明原因。";
     if (!ok) {
         prepared_.failed=true;
         prepared_.status=specific.empty()?L"资源准备失败；本步骤未通过。请关闭后重开查看日志；未进入战斗触发。":specific;

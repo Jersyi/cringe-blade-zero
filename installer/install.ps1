@@ -207,7 +207,7 @@ function Get-InstallState([string]$Target) {
 }
 function Get-GameVersion([string]$Exe) {
     if ($ExeSha256.StartsWith('__')) { return @((T '未校验（开发版安装脚本）' 'Not checked (development installer)'), $Muted, $true) }
-    $mismatch = @((T '与本 MOD 不匹配：完整版不会启用，精简版仍可用' 'Does not match: the full version stays off, triggers-only works'), $Red, $false)
+    $mismatch = @((T '与本 MOD 不匹配：只有关闭自适应扳机可用' 'Does not match: only the adaptive-trigger switch works'), $Red, $false)
     if ((Get-Item -LiteralPath $Exe).Length -ne [long]$ExeBytes) { return $mismatch }
     if ((Get-Sha $Exe) -ne $ExeSha256) { return $mismatch }
     return @((T '与本 MOD 匹配' 'Matches this build'), $Green, $true)
@@ -341,6 +341,6 @@ while ($true) {
         default { exit 0 }
     }
     Write-Host ''
-    Write-Host ("   $Muted" + (T '按任意键返回菜单，Esc 退出。' 'Press any key for the menu, Esc to quit.') + $R)
+    Write-Host ("   $Muted" + (T '按任意键返回，Esc 退出。' 'Press any key to go back, Esc to quit.') + $R)
     if ([Console]::ReadKey($true).Key -eq 'Escape') { exit 0 }
 }

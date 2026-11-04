@@ -53,7 +53,7 @@
 
 3. 可选：把补充包 `PBZDebugSupplement.pak`、`.utoc`、`.ucas` 放进 `<PBZ 安装目录>\ProjectPBZ\Content\Paks\~mods\`，面板会多出“调试补充”页。补充包由更新前的游戏文件生成，不随发布包提供；没有它时 DLL 照常工作。
 
-> MOD 只在匹配的 `PBZ.exe` 版本上启用（启动时校验 SHA-256），版本不符时只转发系统 `version.dll` 调用，不写入任何游戏数据。当前版本对应 2026-11-04 更新后的游戏。日志写在 DLL 旁的 `PBZDebugMenu.log`。
+> MOD 只在匹配的 `PBZ.exe` 版本上启用（启动时校验 SHA-256）。版本不符时（通常是游戏更新后）不读写任何游戏数据，只保留关闭 DualSense 自适应扳机，并在画面上方提示“豪之刃 未适配当前游戏”。当前版本对应 2026-11-04 更新后的游戏。日志写在 DLL 旁的 `PBZDebugMenu.log`。
 
 ## 构建
 

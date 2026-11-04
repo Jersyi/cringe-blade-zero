@@ -11,10 +11,7 @@
 #include <cwchar>
 
 namespace {
-constexpr uintptr_t kHairWrapper = 0x0dfbc2c8;
-constexpr uintptr_t kAppliedHairMode = 0x0dfbbd60;
-constexpr uintptr_t kViewModeCache = 0x0dfbdf70;
-constexpr uintptr_t kShaderPrint = 0x0df12044;
+using namespace HairAddresses;
 constexpr uint64_t PairOf(int32_t value) { return static_cast<uint32_t>(value) | (static_cast<uint64_t>(static_cast<uint32_t>(value)) << 32); }
 constexpr uint64_t kBoundsMode = PairOf(32);
 constexpr int kHairButton = 101, kBoundsButton = 102, kRestoreButton = 103, kForceButton = 104, kOutfitButton = 105, kTriggersButton = 107, kBossButton = 108;

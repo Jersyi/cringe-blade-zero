@@ -57,6 +57,9 @@ bool AddReference(Object* object);
 // directly check this one pin.
 bool ReferenceCodeMatches();
 bool ReleaseReference(Object* object);  // only for an object this caller referenced (its memory is still valid)
+// One log line on why a counted reference may be refused: helper bytes, the object's array item (flags, refcount,
+// serial) and its outer package. Read-only; never calls engine code.
+void DescribeReference(Object* object, char* out, size_t out_size);
 
 Object* FindObject(const char* path);   // "/Script/Engine.Actor"; results cached
 Object* FindFunction(Object* cls, const char* name);

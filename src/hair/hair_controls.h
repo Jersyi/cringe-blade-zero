@@ -2,6 +2,14 @@
 #include <windows.h>
 #include <cstdint>
 
+// PBZ.exe globals the hair switches read and write (RVAs); tests/hair_controls_test.cpp maps the same pages.
+namespace HairAddresses {
+constexpr uintptr_t kHairWrapper = 0x0dfbc2c8;
+constexpr uintptr_t kAppliedHairMode = 0x0dfbbd60;
+constexpr uintptr_t kViewModeCache = 0x0dfbdf70;
+constexpr uintptr_t kShaderPrint = 0x0df12044;
+}
+
 // Only the version-verified worker constructs this. UI callbacks and CVar writes
 // stay on that worker; Force Groom (F6) only posts a request to the game-thread
 // hook in groom_force.cpp, which is the one place engine functions are called.

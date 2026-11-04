@@ -59,7 +59,7 @@ HFONT title_font_=nullptr,subtitle_font_=nullptr;
 DWORD worker_=0;
 Logger logger_=nullptr;
 std::atomic<bool> active_{false};
-bool shown_=false,class_ready_=false,reduced_=false;
+bool shown_=false,class_ready_=false,reduced_=false,unsupported_=false;
 ULONGLONG started_=0,last_frame_=0,pending_since_=0;
 int x_=0,y_=0;
 double scale_=1,shown_ms_=0;
@@ -187,7 +187,7 @@ bool Draw(const Frame& frame,double milliseconds) {
             const double inside=UiMotion::Unit(.5+(kFaceR-radius)*scale_);
             if (inside>0) {
                 // Smoothstep over the frames with a cross-fade, as in the source player.
-                const double t=UiMotion::Unit((milliseconds-kFaceStart)/kFaceUp),amount=t*t*(3-2*t);
+                const double t=unsupported_?0.0:UiMotion::Unit((milliseconds-kFaceStart)/kFaceUp),amount=t*t*(3-2*t);
                 const double f=amount*(kFaceFrames-1); const int i=static_cast<int>(f),j=(std::min)(i+1,kFaceFrames-1); const double a=f-i;
                 const double u=(dx+kFaceR)/(2*kFaceR)*kFaceSize,v=(dy+kFaceR)/(2*kFaceR)*kFaceSize;
                 double first[3],second[3]; SampleFace(i,u,v,first);
@@ -209,8 +209,9 @@ bool Draw(const Frame& frame,double milliseconds) {
         }
         surface_.pixels[static_cast<size_t>(y)*surface_.width+x]=pixel;
     }
-    Text(UiI18n::Translate(L"豪之刃 已加载"),title_font_,25,51,247,242,231);
-    const std::wstring subtitle=UiHotkeys::Plain(UiHotkeys::Get(UiHotkeys::Action::ToggleHub))+L"  "+UiI18n::Translate(L"打开豪之刃");
+    Text(UiI18n::Translate(unsupported_?L"豪之刃 未适配当前游戏":L"豪之刃 已加载"),title_font_,25,51,247,242,231);
+    const std::wstring subtitle=unsupported_?UiI18n::Translate(L"游戏已更新，豪之刃更新后恢复全部功能"):
+        UiHotkeys::Plain(UiHotkeys::Get(UiHotkeys::Action::ToggleHub))+L"  "+UiI18n::Translate(L"打开豪之刃");
     Text(subtitle,subtitle_font_,55,76,160,153,141);
     const int top=(std::max)(0,y_+static_cast<int>(std::lround(frame.slide*scale_)));
     if ((GetWindowLongPtrW(window_,GWL_STYLE)&WS_CHILD)==0) return false;
@@ -246,6 +247,10 @@ void ShowSuccess() {
     if (!worker_||worker_!=GetCurrentThreadId()||shown_||pending_since_) return;
     pending_since_=GetTickCount64(); reduced_=UiMotion::ReducedMotion();
 }
+void ShowUnsupported() {
+    if (!worker_||worker_!=GetCurrentThreadId()||shown_||pending_since_) return;
+    unsupported_=true; ShowSuccess();
+}
 void Tick() {
     if (!worker_||worker_!=GetCurrentThreadId()) return;
     const ULONGLONG now=GetTickCount64();
@@ -263,8 +268,9 @@ void Tick() {
     Advance(now);
 }
 bool Active() { return active_.load(std::memory_order_relaxed); }
+bool Pending() { return pending_since_!=0; }
 void Shutdown() {
     if (worker_&&worker_!=GetCurrentThreadId()) return;
-    ReleaseVisuals(); worker_=0; logger_=nullptr; shown_=false; pending_since_=0; started_=last_frame_=0;
+    ReleaseVisuals(); worker_=0; logger_=nullptr; shown_=false; unsupported_=false; pending_since_=0; started_=last_frame_=0;
 }
 }

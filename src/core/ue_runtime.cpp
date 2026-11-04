@@ -140,6 +140,51 @@ bool ReleaseReference(Object* object) {
     reinterpret_cast<void(__fastcall*)(Object*)>(base_ + kReleaseRefRva)(object);
     return true;
 }
+void DescribeReference(Object* object, char* out, size_t out_size) {
+    if (!out || !out_size) return;
+    out[0] = 0;
+    const auto hex = [](uintptr_t at, char* text, size_t size) {
+        size_t n = 0;
+        for (size_t i = 0; i < 16 && n + 3 < size; ++i) n += _snprintf_s(text + n, size - n, _TRUNCATE, "%02x", Read<unsigned char>(at + i));
+    };
+    char add[40]{}, release[40]{};
+    if (base_ && !ReferenceCodeMatches()) { hex(base_ + kAddRefRva, add, sizeof(add)); hex(base_ + kReleaseRefRva, release, sizeof(release)); }
+    char name[96] = "none", outer_name[160] = "none", outer_class[96] = "none";
+    int32_t index = -1, serial = -1, refs = -1; uint32_t flags = 0, internal = 0, outer_flags = 0, outer_internal = 0;
+    bool alive = false, outer_alive = false, outer_outer = false, item_ok = false;
+    __try {
+        if (object) {
+            NameText(NameOf(object), name, sizeof(name));
+            alive = Alive(object);
+            index = Read<int32_t>(Addr(object) + layout::kObjIndex);
+            flags = Read<uint32_t>(Addr(object) + layout::kObjFlags);
+            if (index >= 0 && index < detail::ObjectCount()) {
+                const uintptr_t chunks = Read<uintptr_t>(base_ + layout::kObjectArray + 0x18);
+                const uintptr_t item = Read<uintptr_t>(chunks + (static_cast<uint32_t>(index) >> 16) * 8ull) + (index & 0xffff) * 24ull;
+                const uint64_t packed = Read<uint64_t>(item);
+                internal = static_cast<uint32_t>(packed >> 32); refs = static_cast<int32_t>(packed & 0xffffffffu);
+                serial = Read<int32_t>(item + 16); item_ok = Read<Object*>(item + 8) == object;
+            }
+            if (Object* outer = OuterOf(object)) {
+                NameText(NameOf(outer), outer_name, sizeof(outer_name));
+                NameText(NameOf(ClassOf(outer)), outer_class, sizeof(outer_class));
+                outer_alive = Alive(outer); outer_outer = OuterOf(outer) != nullptr;
+                outer_flags = Read<uint32_t>(Addr(outer) + layout::kObjFlags);
+                const int32_t outer_index = Read<int32_t>(Addr(outer) + layout::kObjIndex);
+                if (outer_index >= 0 && outer_index < detail::ObjectCount()) {
+                    const uintptr_t chunks = Read<uintptr_t>(base_ + layout::kObjectArray + 0x18);
+                    outer_internal = static_cast<uint32_t>(Read<uint64_t>(Read<uintptr_t>(chunks + (static_cast<uint32_t>(outer_index) >> 16) * 8ull) +
+                        (outer_index & 0xffff) * 24ull) >> 32);
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { strncpy_s(name, "unreadable", _TRUNCATE); }
+    _snprintf_s(out, out_size, _TRUNCATE,
+        "refCode=%s%s%s%s%s object=%s alive=%d index=%d flags=0x%x itemFlags=0x%x refs=%d serial=%d itemMatches=%d "
+        "outer=%s outerClass=%s outerAlive=%d outerHasOuter=%d outerFlags=0x%x outerItemFlags=0x%x",
+        add[0] ? "MISMATCH" : "ok", add[0] ? " addRef=" : "", add, add[0] ? " releaseRef=" : "", release, name, alive ? 1 : 0, index, flags,
+        internal, refs, serial, item_ok ? 1 : 0, outer_name, outer_class, outer_alive ? 1 : 0, outer_outer ? 1 : 0, outer_flags, outer_internal);
+}
 
 Object* FindObject(const char* path) {
     if (auto it = object_cache.find(path); it != object_cache.end()) {
