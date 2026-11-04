@@ -13,6 +13,8 @@
 ![Engine](https://img.shields.io/badge/Unreal%20Engine-5-0e1128?style=flat-square)
 ![Build](https://img.shields.io/badge/build-CMake%20%2B%20MSVC-d8c292?style=flat-square)
 
+**[⬇ 下载最新版（CringeBladeZero.zip）](https://github.com/Jersyi/cringe-blade-zero/releases/latest/download/CringeBladeZero.zip)** · [全部版本](https://github.com/Jersyi/cringe-blade-zero/releases)
+
 </div>
 
 ---
@@ -37,7 +39,7 @@
 
 ## 安装
 
-1. 先退出游戏。解压发布包，双击 `Install.bat`：
+1. 先退出游戏。下载[发布包](https://github.com/Jersyi/cringe-blade-zero/releases/latest/download/CringeBladeZero.zip)并解压，双击 `Install.bat`：
    - 安装器从注册表找到游戏目录（Steam 卸载项或 Steam 库列表；找不到时可手动输入），并校验游戏版本。
    - 按 **1** 安装完整版，**2** 安装精简版（只关闭 DualSense 自适应扳机），**3** 卸载。
    - 复制后校验 SHA-256。目录里已有其他 MOD 的 `version.dll` 时先备份，卸载时还原。
