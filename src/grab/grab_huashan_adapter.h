@@ -127,6 +127,7 @@ constexpr const char* kVictim="/PBZCombatAsset/ActorData/Mobs/035_HuaShan/Abilit
 struct Metadata {uintptr_t base=0;Object* source=nullptr,*victim=nullptr,*location=nullptr,*world=nullptr,*level=nullptr,*blackboard=nullptr,*warping=nullptr,*holder=nullptr,*execution_interface=nullptr,*ai_library=nullptr,*bb_library=nullptr,*ability_library=nullptr,*task=nullptr,*time=nullptr,*timeline=nullptr;Name domain_tag,domain_key,troop,execution;int source_location=-1,time_offset=-1,timeline_offset=-1;};
 inline Metadata metadata;
 inline bool Prepare(std::wstring& reason){
+    GrabStateLeases::Detail::function_failure[0]=0;
     Metadata m;m.base=ue::Base();m.source=ue::FindObject(kSource);m.victim=ue::FindObject(kVictim);
     m.world=ue::FindObject("/Script/Engine.World");m.level=ue::FindObject("/Script/Engine.Level");m.blackboard=ue::FindObject("/Script/AIModule.BlackboardComponent");m.warping=ue::FindObject("/Script/MotionWarping.MotionWarpingComponent");
     m.ai_library=ue::Default("/Script/SGameAI.Default__SGameAIFunctionLibrary");m.bb_library=ue::Default("/Script/AIModule.Default__AIBlueprintHelperLibrary");m.ability_library=ue::Default("/Script/SGameUtils.Default__AbilityUtils");
@@ -144,7 +145,7 @@ inline bool Prepare(std::wstring& reason){
     if(m.source_location<0x28||m.source_location>ue::StructSize(m.source)-24||m.time_offset<0x28||m.time_offset>ue::StructSize(m.task)-4||m.timeline_offset<0x28||m.timeline_offset>ue::StructSize(m.task)-8||!Function(ue::ClassOf(m.bb_library),"GetBlackboard",16,{{"Target",obj,8,0},{"ReturnValue",obj,8,8}})||
        !Function(ue::ClassOf(m.ai_library),"GetValueAsVectorByTag",40,{{"BlackboardComponent",obj,8,0},{"Tag",st,8,8},{"ReturnValue",st,24,16}})||
        !Function(ue::ClassOf(m.ai_library),"GetBlackboardKeyNameFromTag",16,{{"Tag",st,8,0},{"ReturnValue",na,8,8}})||
-       !Function(m.blackboard,"IsVectorValueSet",12,{{"KeyName",na,8,0},{"ReturnValue",bo,1,8}})||
+       !Function(m.blackboard,"IsVectorValueSet",9,{{"KeyName",na,8,0},{"ReturnValue",bo,1,8}})|| // ParmsSize is unpadded: FName 8 + bool 1
        !Function(m.warping,"AddOrUpdateWarpTargetFromLocation",32,{{"WarpTargetName",na,8,0},{"TargetLocation",st,24,8}})||
        !Function(m.warping,"RemoveWarpTarget",12,{{"WarpTargetName",na,8,0},{"ReturnValue",0x80,4,8}})||
        !Function(m.holder,"GetMotionWarpingComponent",8,{{"ReturnValue",obj,8,0}})||
@@ -153,7 +154,7 @@ inline bool Prepare(std::wstring& reason){
        !Function(m.execution_interface,"GetCurrentExecutionInfo",32,{{"Info",st,32,0}})||
        !Function(m.victim,"GetPlayTimelineTask",8,{{"ReturnValue",obj,8,0}})||
        !Function(m.victim,"GetTimelineByName",16,{{"TimelineName",na,8,0},{"ReturnValue",obj,8,8}})||
-       !Function(ue::ClassOf(m.ability_library),"GetWarpTarget",128,{{"MotionWarpingComponent",obj,8,0},{"WarpTarget",na,8,8},{"Transform",st,96,16},{"ReturnValue",bo,1,112}}))return Reject(reason,L"场地投摔原生函数参数布局不符");
+       !Function(ue::ClassOf(m.ability_library),"GetWarpTarget",113,{{"MotionWarpingComponent",obj,8,0},{"WarpTarget",na,8,8},{"Transform",st,96,16},{"ReturnValue",bo,1,112}}))return Reject(reason,L"场地投摔原生函数参数布局不符");
     m.domain_tag=ue::MakeName(L"AI.BlackboardKey.Vector.DomainCenter");m.troop=ue::MakeName(L"TroopThrow");m.execution=ue::MakeName(L"ExecutionTimeline");
     if(m.domain_tag.None()||m.troop.None()||m.execution.None())return Reject(reason,L"场地投摔原生标签未就绪");
     ue::Call key(m.ai_library,"GetBlackboardKeyNameFromTag");if(!key.Set("Tag",m.domain_tag).Invoke()||(m.domain_key=key.Get<Name>("ReturnValue"),m.domain_key.None()))return Reject(reason,L"场地投摔黑板键未就绪");

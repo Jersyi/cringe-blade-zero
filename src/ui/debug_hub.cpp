@@ -41,10 +41,13 @@ constexpr const wchar_t* kSubtitles[kPages]={
     L"头发表示切换、强制 Groom 与调试开关",
     L"快捷键或触控板滑动切换两套装备，切换前自动记忆",
     L"键盘、Xbox、PlayStation 各一套，自动识别",
+    L"补充包中的原版调试功能：战斗、移动、画面、进度与剧情",
 };
-constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE805,0xE7AD,0xE771,0xE8AB,0xE144};
+constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A};
 struct Entry { const wchar_t* title=L""; Factory factory; HWND window=nullptr; int width=0,height=0; double x=0,y=0; int target_x=0,target_y=0; };
 std::array<Entry,kPages> entries;
+// Sidebar pages: optional trailing pages (the debug supplement) only once registered.
+int NavCount() { int count=static_cast<int>(kPages); while (count>1&&!entries[static_cast<size_t>(count-1)].factory) --count; return count; }
 HWND window_=nullptr,nav_=nullptr,viewport_=nullptr,segment_=nullptr,close_=nullptr,pause_=nullptr,rails_[2]{};
 HWND game_window_=nullptr;
 bool enabled_=false,appearance_dirty_=false,reduced_=false;
@@ -55,9 +58,6 @@ ULONGLONG last_motion_=0;
 UiMotion::Tween opacity_,rise_,page_,title_,pill_,knob_,close_hover_,pause_knob_,pause_hover_;
 std::array<UiMotion::Tween,kPages> nav_hover_;
 bool hide_pending_=false,restore_game_=false,layout_dirty_=false,held_open_=false,parked_=false;
-volatile LONG native_menu_forward_=0;
-volatile LONG64 native_menu_deadline_=0;
-SHORT native_o_down_=0;
 int applied_alpha_=-1;
 int nav_hot_=-1,segment_hot_=-1;
 bool close_hot_=false,close_down_=false,pause_hot_=false;
@@ -129,8 +129,13 @@ bool KeyboardCues(HWND window) { return !(SendMessageW(window,WM_QUERYUISTATE,0,
 // ---- geometry -------------------------------------------------------------
 int SidebarWidth() { return S(224); }
 int NavTop() { return S(86); }
-int NavItem() { return S(42); }
-int NavStep() { return S(46); }
+// Rows shrink (down to S(30)) when the window is too short for every page above the shortcut legend.
+int NavStep() {
+    RECT client{}; if (window_) GetClientRect(window_,&client);
+    const int room=static_cast<int>(client.bottom)-NavTop()-S(96);
+    return room>0?std::clamp(room/NavCount(),S(30),S(46)):S(46);
+}
+int NavItem() { return NavStep()-S(4); }
 RECT NavItemRect(int index) {
     RECT client{}; if (nav_) GetClientRect(nav_,&client);
     return {0,index*NavStep(),client.right,index*NavStep()+NavItem()};
@@ -393,7 +398,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam
 // ---- sidebar navigation -------------------------------------------------------
 int NavHit(LPARAM lparam) {
     const POINT point{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)};
-    for (int i=0;i<static_cast<int>(kPages);++i) { const RECT rect=NavItemRect(i); if (PtInRect(&rect,point)) return i; }
+    for (int i=0;i<NavCount();++i) { const RECT rect=NavItemRect(i); if (PtInRect(&rect,point)) return i; }
     return -1;
 }
 void NavHover(int index) {
@@ -415,7 +420,7 @@ void PaintNav(HWND hwnd) {
         UiAssets::DrawBar(graphics,UiAssets::Id::SelectedBar,Gdiplus::RectF(static_cast<float>(rect.left),static_cast<float>(rect.top+S(3)),
             static_cast<float>(rect.right-rect.left),static_cast<float>(rect.bottom-rect.top-S(6))),opacity);
     };
-    for (int i=0;i<static_cast<int>(kPages);++i) {
+    for (int i=0;i<NavCount();++i) {
         const double hover=nav_hover_[static_cast<size_t>(i)].At(now);
         if (hover>.01&&i!=selected_) { if (art) brush(NavItemRect(i),static_cast<float>(.14*hover)); else Shape(dc,NavItemRect(i),static_cast<float>(S(9)),UiTheme::Panel(),static_cast<BYTE>(150*hover)); }
     }
@@ -427,7 +432,7 @@ void PaintNav(HWND hwnd) {
         RECT focus=NavItemRect(selected_); InflateRect(&focus,-S(1),-S(1));
         Shape(dc,focus,static_cast<float>(S(8)),0,0,UiTheme::Accent(),150);
     }
-    for (int i=0;i<static_cast<int>(kPages);++i) {
+    for (int i=0;i<NavCount();++i) {
         const RECT rect=NavItemRect(i);
         const double hover=nav_hover_[static_cast<size_t>(i)].At(now);
         const double closeness=(std::max)(0.0,1.0-std::fabs(pill-i));
@@ -464,9 +469,9 @@ LRESULT CALLBACK NavProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
     case WM_KEYDOWN: {
         int next=selected_;
         if (wparam==VK_UP) --next; else if (wparam==VK_DOWN) ++next;
-        else if (wparam==VK_HOME) next=0; else if (wparam==VK_END) next=static_cast<int>(kPages)-1;
+        else if (wparam==VK_HOME) next=0; else if (wparam==VK_END) next=NavCount()-1;
         else break;
-        next=(next+static_cast<int>(kPages))%static_cast<int>(kPages);
+        next=(next+NavCount())%NavCount();
         SendMessageW(hwnd,WM_CHANGEUISTATE,MAKEWPARAM(UIS_CLEAR,UISF_HIDEFOCUS),0);
         Select(next); SetFocus(hwnd); return 0;
     }
@@ -645,9 +650,9 @@ void PaintHub(HWND hwnd) {
     UiHotkeys::Draw(dc,tile.right+S(12),tile.top+S(25),S(18),UiHotkeys::Get(UiHotkeys::Action::ToggleHub),SidebarWidth()-S(8));
     // Shortcut legend at the bottom of the sidebar, drawn as key caps.
     struct Hint { const wchar_t* keys[2]; const wchar_t* label; };
-    const Hint hints[]={{{L"Esc"},L"隐藏面板"},{{L"Ctrl",L"Tab"},L"切换页面"},{{L"O",nullptr},L"游戏内原生菜单"}};
+    const Hint hints[]={{{L"Esc"},L"隐藏面板"},{{L"Ctrl",L"Tab"},L"切换页面"}};
     int y=client.bottom-S(22)-static_cast<int>(std::size(hints))*S(30);
-    const int legend_top=NavTop()+static_cast<int>(kPages)*NavStep()+S(8);
+    const int legend_top=NavTop()+NavCount()*NavStep()+S(8);
     if (y<legend_top) y=legend_top;
     RECT divider{S(22),y-S(14),SidebarWidth()-S(18),y-S(13)}; Fill(dc,divider,Mix(UiTheme::Border(),UiTheme::Base(),45));
     for (size_t hint_index=0;hint_index<std::size(hints);++hint_index) {
@@ -698,7 +703,7 @@ LRESULT HitTest(HWND hwnd,LPARAM lparam) {
 void Layout() {
     if (!window_||!viewport_) return;
     RECT client{}; GetClientRect(window_,&client);
-    if (nav_) SetWindowPos(nav_,nullptr,S(12),NavTop(),SidebarWidth()-S(24),static_cast<int>(kPages)*NavStep(),SWP_NOZORDER|SWP_NOACTIVATE);
+    if (nav_) SetWindowPos(nav_,nullptr,S(12),NavTop(),SidebarWidth()-S(24),NavCount()*NavStep(),SWP_NOZORDER|SWP_NOACTIVATE);
     if (close_) SetWindowPos(close_,nullptr,client.right-S(14)-S(40),S(14),S(40),S(32),SWP_NOZORDER|SWP_NOACTIVATE);
     if (segment_) SetWindowPos(segment_,nullptr,client.right-S(14)-S(40)-S(12)-S(108),S(15),S(108),S(30),SWP_NOZORDER|SWP_NOACTIVATE);
     if (pause_) SetWindowPos(pause_,nullptr,client.right-S(14)-S(40)-S(12)-S(108)-S(10)-S(136),S(15),S(136),S(30),SWP_NOZORDER|SWP_NOACTIVATE);
@@ -779,7 +784,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) 
     return DefWindowProcW(hwnd,message,wparam,lparam);
 }
 void Select(int index) {
-    if (!window_||index<0||index>=static_cast<int>(kPages)) return;
+    if (!window_||index<0||index>=NavCount()) return;
     const bool changed=index!=selected_; const ULONGLONG now=GetTickCount64();
     selected_=index;
     const bool animate=changed&&IsWindowVisible(window_);
@@ -926,28 +931,8 @@ bool TextEntryFocused() {
     if (!focus||GetClassNameW(focus,name,64)<=0) return false;
     return !_wcsicmp(name,L"Edit")||!_wcsnicmp(name,L"RichEdit",8)||!_wcsicmp(name,L"ComboBox")||!_wcsicmp(name,L"ComboBoxEx32");
 }
-void RequestNativeMenu() {
-    InterlockedExchange64(&native_menu_deadline_,static_cast<LONG64>(GetTickCount64()+3000));
-    InterlockedExchange(&native_menu_forward_,1);
-}
 void ReleaseTopmost() {
     if (window_) SetWindowPos(window_,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-}
-// The worker pump does not see UnrealWindow keys. Poll O only while this
-// process's hub or game window is foreground, so a key typed elsewhere is ignored.
-void PollNativeMenuKey() {
-    const SHORT down=GetAsyncKeyState('O');
-    const bool edge=(down&0x8000)&&!(native_o_down_&0x8000);
-    native_o_down_=down;
-    if (!edge||!window_||hide_pending_||!IsWindowVisible(window_)||ModifierDown()||TextEntryFocused()||UiHotkeys::Capturing()) return;
-    const HWND foreground=GetForegroundWindow();
-    const bool hub=HubFocused();
-    const HWND root=foreground?GetAncestor(foreground,GA_ROOT):nullptr;
-    const bool game=GameWindow(foreground)||GameWindow(root)||UiHost::InGame();
-    if (!hub&&!game) return;
-    // The game already received this O when focus is on its viewport. Hiding is enough.
-    if (hub) RequestNativeMenu();
-    ReleaseTopmost(); Hide();
 }
 void Tick() {
     if (!enabled_) return;
@@ -976,13 +961,9 @@ void Tick() {
         if (window_&&(message.hwnd==window_||IsChild(window_,message.hwnd))) {
             if (UiHotkeys::Capturing()&&(message.message==WM_KEYDOWN||message.message==WM_KEYUP||message.message==WM_SYSKEYDOWN||message.message==WM_SYSKEYUP||message.message==WM_CHAR)) continue;
             if (message.message==WM_KEYDOWN&&message.wParam==VK_ESCAPE) { if (!UiTheme::DismissPopup()) Hide(); continue; }
-            if (message.message==WM_KEYDOWN&&(message.wParam=='O'||message.wParam=='o')&&!ModifierDown()&&!TextEntryFocused()) {
-                if (!hide_pending_) { RequestNativeMenu(); ReleaseTopmost(); Hide(); }
-                continue;
-            }
             if (message.message==WM_KEYDOWN&&message.wParam==VK_TAB&&(GetKeyState(VK_CONTROL)&0x8000)) {
                 const int direction=(GetKeyState(VK_SHIFT)&0x8000)?-1:1;
-                Select((selected_+direction+static_cast<int>(entries.size()))%static_cast<int>(entries.size())); continue;
+                Select((selected_+direction+NavCount())%NavCount()); continue;
             }
             const HWND active=entries[static_cast<size_t>(selected_)].window;
             if (active&&(message.hwnd==active||IsChild(active,message.hwnd))&&IsDialogMessageW(active,&message)) continue;
@@ -999,7 +980,6 @@ void Tick() {
     if (layout_dirty_&&window_) { layout_dirty_=false; ActiveLayout(); }
     MotionTick(); ToastTick(GetTickCount64()); RevealFocus();
     if (!window_||!IsWindowVisible(window_)||hide_pending_||parked_) ReturnFocus();
-    PollNativeMenuKey();
     UiHost::Tick();
     KeepInside();
     UiCursor::Sync(ObscuresGameplay());
@@ -1051,14 +1031,6 @@ bool ObscuresGameplay() { return window_&&IsWindowVisible(window_)&&!IsIconic(wi
 void RefreshChrome() {
     if (window_) InvalidateRect(window_,nullptr,FALSE);
     if (nav_) InvalidateRect(nav_,nullptr,FALSE);
-}
-bool TakeNativeMenuKey() {
-    if (!InterlockedCompareExchange(&native_menu_forward_,0,0)) return false;
-    const ULONGLONG now=GetTickCount64();
-    const ULONGLONG deadline=static_cast<ULONGLONG>(InterlockedCompareExchange64(&native_menu_deadline_,0,0));
-    if (now>deadline) { InterlockedExchange(&native_menu_forward_,0); return false; }
-    if (!EntryFocus::GameplayFocused()) return false;
-    return InterlockedExchange(&native_menu_forward_,0)!=0;
 }
 bool Animating() {
     const ULONGLONG now=GetTickCount64();

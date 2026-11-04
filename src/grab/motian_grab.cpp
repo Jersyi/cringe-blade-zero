@@ -184,7 +184,8 @@ void Logf(const char* format,...) {
 void LogPrepareReason(const char* label,const std::wstring& reason) {
     char utf8[512]{};
     if(!reason.empty())WideCharToMultiByte(CP_UTF8,0,reason.c_str(),-1,utf8,static_cast<int>(sizeof(utf8)),nullptr,nullptr);
-    Logf("MOTIAN_GRAB_PREPARE %s failed: %s",label,utf8[0]?utf8:"(no reason)");
+    const char* signature=GrabStateLeases::LastFunctionFailure();
+    Logf("MOTIAN_GRAB_PREPARE %s failed: %s%s%s",label,utf8[0]?utf8:"(no reason)",signature[0]?" signature=":"",signature);
 }
 struct PhaseTimer {
     int phase=0; LARGE_INTEGER begin{};
@@ -234,16 +235,28 @@ void Status(const wchar_t* format,...) {
 std::string Text(Object* object) {
     if (!object) return "-"; char value[192]{}; ue::NameText(ue::NameOf(object),value,sizeof(value)); return value;
 }
+std::string Text(Name name) { char value[192]{}; ue::NameText(name,value,sizeof(value)); return value; }
 std::wstring Wide(const std::string& text) {
     const int count=MultiByteToWideChar(CP_UTF8,0,text.c_str(),-1,nullptr,0);
     if (count<=1) return {}; std::wstring value(static_cast<size_t>(count),L'\0');
     MultiByteToWideChar(CP_UTF8,0,text.c_str(),-1,value.data(),count); value.pop_back(); return value;
 }
+// Regions VirtualQuery found committed and readable during this game-thread pass, forgotten at the next one
+// (Tick runs under SEH as before): a grab's start checked ~4,400 pointers in the object array, its chunks and a
+// few allocator pages, one VirtualQuery each, and stalled the game thread ~150 ms.
+struct ReadableRegion { uintptr_t start=0,end=0; };
+// Only the game thread uses the cache.
+ReadableRegion readable_cache_[32]{};size_t readable_next_=0;DWORD readable_thread_=0;
+void ForgetReadable() { for (ReadableRegion& r:readable_cache_) r={}; readable_next_=0; readable_thread_=GetCurrentThreadId(); }
 bool Readable(const void* pointer,size_t bytes) {
-    if (!pointer) return false; MEMORY_BASIC_INFORMATION page{};
+    if (!pointer) return false;
+    const auto at=reinterpret_cast<uintptr_t>(pointer);const bool cached=GetCurrentThreadId()==readable_thread_;
+    if (cached && bytes<=~at) for (const ReadableRegion& r:readable_cache_) if (r.end && at>=r.start && at+bytes<=r.end) return true;
+    MEMORY_BASIC_INFORMATION page{};
     ++virtual_query_calls_;
     if (!VirtualQuery(pointer,&page,sizeof(page)) || page.State!=MEM_COMMIT || (page.Protect&(PAGE_NOACCESS|PAGE_GUARD))) return false;
-    const auto at=reinterpret_cast<uintptr_t>(pointer),start=reinterpret_cast<uintptr_t>(page.BaseAddress);
+    const uintptr_t start=reinterpret_cast<uintptr_t>(page.BaseAddress);
+    if (cached) readable_cache_[readable_next_++%std::size(readable_cache_)]={start,start+page.RegionSize};
     return at>=start && bytes<=page.RegionSize && at-start<=page.RegionSize-bytes;
 }
 bool ArrayOk(const Array& array,size_t stride,int32_t limit=2048) {
@@ -268,7 +281,7 @@ Identity Id(Object* object) {
     // serial. Reading zero is not a weak identity. Use the exact native
     // FWeakObjectPtr assignment to allocate its serial before recording it.
     static constexpr unsigned char code[]={0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x12,0x48,0x8b,0xd9,0x48,0x85,0xd2,0x74};
-    const uintptr_t entry=ue::Base()+0x166f2a0;
+    const uintptr_t entry=ue::Base()+0x166e900;
     if (!ue::Base() || !Readable(reinterpret_cast<void*>(entry),sizeof(code)) || std::memcmp(reinterpret_cast<void*>(entry),code,sizeof(code))) return id;
     ++weak_assign_calls_;
     reinterpret_cast<void(__fastcall*)(Weak*,Object* const*)>(entry)(&id.weak,&object);
@@ -280,12 +293,7 @@ bool RawIdentity(const Identity& id) {
     const Object* item=id.object&&id.weak.serial>0?Item(id.weak.index):nullptr;
     return item && ue::At<Object*>(const_cast<Object*>(item),8)==id.object && ue::At<int32_t>(const_cast<Object*>(item),16)==id.weak.serial;
 }
-bool ClassRefHelpersMatch() {
-    static constexpr unsigned char add[]={0x40,0x53,0x48,0x83,0xec,0x20,0x8b,0x41,0x0c,0x3b,0x05,0x51,0xef,0x83,0x0c,0x7d};
-    static constexpr unsigned char release[]={0x8b,0x41,0x0c,0x3b,0x05,0x17,0x35,0x82,0x0c,0x7d,0x1e,0x8b,0xc8,0x0f,0xb7,0xc0};
-    return ue::Base() && !std::memcmp(reinterpret_cast<void*>(ue::Base()+0x1574d00),add,sizeof(add)) &&
-        !std::memcmp(reinterpret_cast<void*>(ue::Base()+0x1590740),release,sizeof(release));
-}
+bool ClassRefHelpersMatch() { return ue::ReferenceCodeMatches(); }
 bool AcquireClass(Object* cls) {
     if (!ClassRefHelpersMatch() || !ue::Alive(cls)) return false;
     Object* meta=Type("/Script/CoreUObject.Class"),*package=Type("/Script/CoreUObject.Package"),*outer=ue::OuterOf(cls);
@@ -298,7 +306,7 @@ bool AcquireClass(Object* cls) {
     class_leases_.push_back({id,RefPhase::Acquiring}); cleanup_pending_=true;
     // Record uncertainty before the native transition. An exception cannot be
     // retried/decremented speculatively; the retained ledger blocks new work.
-    reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1574d00)(cls);
+    reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1573ff0)(cls);
     class_leases_.back().phase=RefPhase::Owned;
     Logf("MOTIAN_GRAB_CLASS acquired class=%s serial=%d count=%zu world-independent=1",Text(cls).c_str(),id.weak.serial,class_leases_.size());
     return true;
@@ -315,7 +323,7 @@ bool ReleaseClasses() {
         Object* cls=lease.identity.object;
         Logf("MOTIAN_GRAB_CLASS release class=%s serial=%d",Text(cls).c_str(),lease.identity.weak.serial);
         lease.phase=RefPhase::Releasing;
-        reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1590740)(cls);
+        reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x158fa30)(cls);
         class_leases_.pop_back();
     }
     return true;
@@ -383,7 +391,8 @@ bool KnownMontagePath(Object* mesh) {
     const uintptr_t method=table[0x2f8/8],base=ue::Base();
     static constexpr unsigned char native[]={0x48,0x8b,0xc4,0x48,0x89,0x58,0x18,0x48,0x89,0x78,0x20,0x48,0x89,0x50,0x10,0x55};
     static constexpr unsigned char game[]={0x48,0x89,0x5c,0x24,0x08,0x57,0x48,0x83,0xec,0x50,0x0f,0xb6,0x84,0x24,0x90,0x00};
-    const unsigned char* expected=method==base+0x3b21580?native:method==base+0x6751970?game:nullptr;
+    // Written as ue::Base()+ so update_port.py relocates them (11-04: 0x3b21580 / 0x6751970 were missed as base+).
+    const unsigned char* expected=method==ue::Base()+0x3b28d80?native:method==ue::Base()+0x67935f0?game:nullptr;
     return base&&expected&&Readable(reinterpret_cast<const void*>(method),16)&&!std::memcmp(reinterpret_cast<const void*>(method),expected,16);
 }
 bool InWorld(Object* object,Object* world) {
@@ -883,19 +892,23 @@ Object* GrabEvent(Object* bullet,Object* victim_class,Name success_timeline,uint
     const int32_t pre_offset=ue::At<int32_t>(pre,0x44);
     if (pre_offset!=0x1a8||!Readable(bullet+pre_offset,48)) return nullptr;
     const Array list=ue::At<Array>(bullet,pre_offset+32); if (!ArrayOk(list,8,128)) return nullptr;
-    Object* result=nullptr;
+    Object* result=nullptr;std::string seen; // why each listed event was passed over, logged when none fits
     for (int32_t i=0;i<list.num;++i) {
         Object* event=static_cast<Object**>(list.data)[i];
-        if (!ue::Alive(event)||ue::OuterOf(event)!=bullet||!ue::IsA(event,cls)||Property<Object*>(event,"Executed Ability")!=victim_class) continue;
-        if(expected_event&&!ue::NameIs(ue::NameOf(event),expected_event))continue;
+        const auto skip=[&](const char* why){if(seen.size()<600)seen+=" "+(ue::Alive(event)?Text(event):std::string("dead"))+":"+why;};
+        if (!ue::Alive(event)||ue::OuterOf(event)!=bullet||!ue::IsA(event,cls)){skip("class/outer");continue;}
+        if (Property<Object*>(event,"Executed Ability")!=victim_class){skip(("executed="+Text(Property<Object*>(event,"Executed Ability"))).c_str());continue;}
+        if(expected_event&&!ue::NameIs(ue::NameOf(event),expected_event)){skip("name");continue;}
         if(!kind){Object* success=Field(ue::ClassOf(event),"Success Timeline");
-            if(!success||ue::At<int32_t>(success,0x34)!=static_cast<int32_t>(sizeof(Name))||success_timeline.None()||!(Property<Name>(event,"Success Timeline")==success_timeline))continue;
+            if(!success||ue::At<int32_t>(success,0x34)!=static_cast<int32_t>(sizeof(Name))||success_timeline.None()||!(Property<Name>(event,"Success Timeline")==success_timeline)){
+                skip(("timeline="+(success?Text(Property<Name>(event,"Success Timeline")):std::string("no-field"))).c_str());continue;}
         }else{
             Object* source=Field(ue::ClassOf(event),"Execution Ability");
-            if(!source||ue::At<int32_t>(source,0x34)!=8||Property<Object*>(event,"Execution Ability"))continue;
+            if(!source||ue::At<int32_t>(source,0x34)!=8||Property<Object*>(event,"Execution Ability")){skip("execution-ability");continue;}
         }
-        if (result) return nullptr; result=event;
+        if (result){Logf("MOTIAN_GRAB_PREPARE grab event ambiguous: %s and %s",Text(result).c_str(),Text(event).c_str());return nullptr;} result=event;
     }
+    if(!result)Logf("MOTIAN_GRAB_PREPARE grab event not found in %s (%d listed):%s",Text(bullet).c_str(),list.num,seen.empty()?" -":seen.c_str());
     return result;
 }
 constexpr const char* kPreparationMetadata[]={
@@ -951,7 +964,7 @@ bool ReleasePrepared() {
             prepared_.uncertain=true; prepared_.ready=false; return false;
         }
         Object* object=lease.identity.object; lease.phase=RefPhase::Releasing;
-        reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1590740)(object);
+        reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x158fa30)(object);
         prepared_.assets.pop_back();
     }
     Logf("MOTIAN_GRAB_PREPARE asset refs released independently of session refs"); prepared_={}; return true;
@@ -969,7 +982,7 @@ bool PinPrepared(Object* object,bool is_class) {
     if (ue::IsA(object,Type("/Script/Engine.Actor"))||ue::IsA(object,Type("/Script/Engine.World"))) return false;
     const Identity id=Id(object); if (!Same(id)) return false;
     prepared_.assets.push_back({id,RefPhase::Acquiring});
-    reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1574d00)(object);
+    reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1573ff0)(object);
     prepared_.assets.back().phase=RefPhase::Owned; return true;
 }
 std::vector<const GrabWeaponData*> WeaponRows(const char* variant_id) {
@@ -1078,6 +1091,14 @@ bool SourceSuccessTimeline(Object* source,Name success) {
         Object* item=static_cast<Object**>(list.data)[i];
         if(ue::Alive(item)&&ue::NameOf(item)==success)return true;
     }
+    // An empty list on the CDO (count 0: MengHua GEx_01): instances fill Timelines when they are made, so
+    // the authored timeline is looked up as a live subobject of the CDO or of its class instead.
+    Object* cls=ue::ClassOf(source);Object* found=nullptr;
+    ue::ForEachObject([&](Object* o){
+        if(!(ue::NameOf(o)==success)||!ue::Alive(o))return true;
+        for(Object* outer=ue::OuterOf(o);outer;outer=ue::OuterOf(outer))if(outer==source||outer==cls){found=o;return false;}
+        return true;});
+    if(found){Logf("MOTIAN_GRAB_PREPARE success timeline found as subobject %s (CDO list count=%d)",Text(found).c_str(),list.num);return true;}
     Logf("MOTIAN_GRAB_PREPARE success timeline missing on CDO called=%d count=%d",called?1:0,list.num);
     return false;
 }
@@ -1171,7 +1192,10 @@ void AdvancePreparation(bool wanted) {
             const bool contract=identities&&ExecutionContract(prepared_.source_cdo.object,prepared_.victim_cdo.object,true);
             const bool warm=contract&&WarmTransitions(variant);
             ok=warm;
-            if(!identities){specific=L"投技事件或能力默认对象未对齐";Logf("MOTIAN_GRAB_PREPARE owned events identity failed");}
+            if(!identities){specific=L"投技事件或能力默认对象未对齐";
+                Logf("MOTIAN_GRAB_PREPARE owned events identity failed event=%d(%s) sourceCdo=%d victimCdo=%d sourceInstanced=%d victimInstanced=%d timeline=%ls",
+                    Same(prepared_.event)?1:0,event?Text(event).c_str():"none",Same(prepared_.source_cdo)?1:0,Same(prepared_.victim_cdo)?1:0,
+                    InstancedClass(prepared_.source.object,variant.source)?1:0,InstancedClass(prepared_.victim.object,variant.victim)?1:0,variant.success_timeline);}
             else if(!contract){specific=L"处决时间轴接口布局不匹配";Logf("MOTIAN_GRAB_PREPARE execution contract slots failed");}
             else if(!warm){specific=L"阶段切换预热未通过";Logf("MOTIAN_GRAB_PREPARE warm transitions failed");}
             if(ok&&variant.event_kind==1){
@@ -2396,7 +2420,7 @@ void Initialize(Logger logger,InputFocus focus) {
     for(size_t i=0;i<std::size(kVariants);++i){
         const VariantData& v=kVariants[i];Variant move;move.id=Wide(v.id);move.name=v.name;move.index=static_cast<int32_t>(i);
         move.boss_id=Wide(v.boss_id);move.boss_name=v.boss_name;move.supported=MoveSupported(move.index);move.reason=v.reason;
-        move.max_range=v.max_range;move.recommended_range=v.recommended_range;
+        move.max_range=v.max_range;move.recommended_range=v.recommended_range;move.authored_distance=static_cast<float>(v.authored_distance);
         move.detail=move.reason;state_.variants.push_back(std::move(move));
     }
     for(const BossData& data:kBosses){
@@ -2440,6 +2464,7 @@ bool RequestTrigger(int32_t expected_global_index) {
 void RequestCancel() { AcquireSRWLockExclusive(&request_lock); cancel_=true; ReleaseSRWLockExclusive(&request_lock); }
 Snapshot GetSnapshot() { AcquireSRWLockShared(&state_lock); Snapshot copy=state_; ReleaseSRWLockShared(&state_lock); return copy; }
 void OnGameThreadGuarded() {
+    ForgetReadable();
     __try { Tick(); }
     __except(FaultFilter(GetExceptionInformation())) {
         ++faults_; trigger_lookup_=preparing_lookup_=false; forced_target_=nullptr; redirect_attempt_=false; redirect_={};
@@ -2453,7 +2478,7 @@ void OnGameThreadGuarded() {
     }
 }
 bool BeforeTravel() {
-    bool result=false;
+    bool result=false;ForgetReadable();
     __try {
         ResetKeys(); manual_deadline_=0;manual_variant_=-1; redirect_={}; ignored_execution_={};
         result=Cleanup(true);

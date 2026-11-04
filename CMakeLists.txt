@@ -5,7 +5,7 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Every source folder is an include root, so headers are included by bare name.
-include_directories(src/core src/ui src/boss src/grab src/air src/weapons src/character src/hair src/pad src/generated)
+include_directories(src/core src/ui src/boss src/grab src/air src/weapons src/character src/hair src/pad src/supplement src/generated)
 
 function(pbz_settings target)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -25,6 +25,7 @@ add_library(version SHARED
     src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp src/ui/skill_toast.cpp
     src/weapons/weapon_presets.cpp src/weapons/weapon_icons.cpp src/weapons/weapon_presets_menu.cpp
     src/pad/pad_triggers.cpp src/core/ue_runtime.cpp src/core/game_thread.cpp src/hair/groom_force.cpp
+    src/supplement/debug_supplement.cpp src/supplement/supplement_menu.cpp
     src/core/forwarders.asm src/core/version.def)
 pbz_settings(version)
 target_link_libraries(version PRIVATE bcrypt user32 gdi32 comctl32)
@@ -72,6 +73,10 @@ pbz_settings(grab_damage_test)
 # NPC retarget two-handed grip: left-arm contact IK on a synthetic hero/NPC skeleton pair.
 add_executable(npc_pose_transfer_test tests/npc_pose_transfer_test.cpp)
 pbz_settings(npc_pose_transfer_test)
+
+# Debug supplement page: every catalog item on exactly one card.
+add_executable(supplement_layout_test tests/supplement_layout_test.cpp)
+pbz_settings(supplement_layout_test)
 
 # DualSense adaptive-trigger rewrite (pad_triggers.h): report layouts, Steam vtable hook, import-table path.
 add_executable(pad_triggers_test tests/pad_triggers_test.cpp src/pad/pad_triggers.cpp)

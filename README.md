@@ -32,20 +32,28 @@
 | **角色 / NPC** | 主角兼容装束替换；以 NPC / 人形 Boss 外观操作主角（75 个，实验）：保留主角的动作与能力，手臂、武器、碰撞半径和相机按 NPC 体型适配 |
 | **NPC 技能** | 套用 NPC 外观后按 NPC 技能快捷键（默认键盘 X、手柄 L3 + R3）施放该 Boss 的技能（随机轮换、自动锁定、右下角提示），技能期间换成 Boss 自己的武器；伤害倍率可调（默认 3 倍，NPC 页选择）；Boss 蓝图里专有的特效和动作在主角身上重放（龙柱、魔渊柱、武器追踪、反击闪光）；技能期间 Boss 武器和身体的攻击判定复制到主角身上，武器拖尾 / 粒子特效显示在 Boss 武器上；长鸿·雷电枪骑的马播放 Boss 自己的动作 |
 | **毛发 / Groom** | 头发表示切换、强制 Groom、GPU 包围盒调试 |
+| **调试补充（可选）** | 装有补充包时出现：游戏原版的 169 项调试功能重新整理为 9 个分区的卡片（无敌、不死、飞行、移速、传送、DLSS、音频、物品、天赋、剧情推进、过场、性能采集等），可搜索、按分区筛选；会改写存档的项目须在三秒内再点一次确认 |
 | **其他** | DualSense 自适应扳机可关闭；全部设置写入 `PBZDebugMenu.ini` |
 
 ## 安装
 
-1. 构建或取得 `version.dll`（见下文）。
-2. 复制到游戏目录：
+1. 先退出游戏。解压发布包，双击 `Install.bat`：
+   - 安装器从注册表找到游戏目录（Steam 卸载项或 Steam 库列表；找不到时可手动输入），并校验游戏版本。
+   - 按 **1** 安装完整版，**2** 安装精简版（只关闭 DualSense 自适应扳机），**3** 卸载。
+   - 复制后校验 SHA-256。目录里已有其他 MOD 的 `version.dll` 时先备份，卸载时还原。
+   - 界面语言随 Windows 显示语言：中文系统显示中文，其他系统显示英文。
+
+   也可以手动安装：把 `version.dll` 复制到
 
    ```text
    <PBZ 安装目录>\platform\steam\version.dll
    ```
 
-3. 启动游戏。进入游戏时屏幕上方出现“豪之刃”横幅，按 **F10** 打开面板。
+2. 启动游戏。进入游戏时屏幕上方出现“豪之刃”横幅，按 **F10** 打开面板。
 
-> MOD 只在匹配的 `PBZ.exe` 版本上启用（启动时校验 SHA-256），版本不符时只转发系统 `version.dll` 调用，不写入任何游戏数据。日志写在 DLL 旁的 `PBZDebugMenu.log`。
+3. 可选：把补充包 `PBZDebugSupplement.pak`、`.utoc`、`.ucas` 放进 `<PBZ 安装目录>\ProjectPBZ\Content\Paks\~mods\`，面板会多出“调试补充”页。补充包由更新前的游戏文件生成，不随发布包提供；没有它时 DLL 照常工作。
+
+> MOD 只在匹配的 `PBZ.exe` 版本上启用（启动时校验 SHA-256），版本不符时只转发系统 `version.dll` 调用，不写入任何游戏数据。当前版本对应 2026-11-04 更新后的游戏。日志写在 DLL 旁的 `PBZDebugMenu.log`。
 
 ## 构建
 
@@ -63,7 +71,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --target version
 ```
 
-发布包内含完整版与精简版 `version.dll`、安装说明 `README.txt`（含默认快捷键）和更新日志 `CHANGELOG.md`。
+发布包内含完整版与精简版 `version.dll`、一键安装 `Install.bat` 与 `install.ps1`、安装说明 `README.txt`（含默认快捷键）和更新日志 `CHANGELOG.md`。
 
 | 目标 | 产物 |
 |---|---|
@@ -129,10 +137,12 @@ src/
 ├─ weapons/       武器预设与游戏内武器图标
 ├─ character/     角色替换、NPC 外观重定向（姿势传递、武器适配、碰撞体、技能、坐骑代理）
 ├─ hair/          毛发显示与 Groom
+├─ supplement/    可选补充包：运行时挂载、调用原版调试蓝图、调试补充页
 ├─ pad/           DualSense 自适应扳机
 ├─ generated/     从游戏数据生成的表（投技目录、武器、骨骼、NPC 档案 / 技能 / 坐骑、UI 资源、导出表）
 └─ triggers_only/ 精简版 version.dll
-tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点 / NPC 姿势测试
+tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点 / NPC 姿势 / 补充页目录测试
+installer/        一键安装（Install.bat 启动 install.ps1；打包时填入匹配的 PBZ.exe 大小与 SHA-256）
 docs/             README 图片
 ```
 

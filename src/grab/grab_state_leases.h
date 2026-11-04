@@ -2,6 +2,7 @@
 #include "ue_runtime.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -243,7 +244,7 @@ inline bool Same(const Identity& id) {
 inline Identity Identify(Object* object) {
     Identity id;if(!ue::Alive(object))return id;
     static constexpr unsigned char signature[]={0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x12,0x48,0x8b,0xd9,0x48,0x85,0xd2,0x74};
-    const uintptr_t fn=ue::Base()+0x166f2a0;
+    const uintptr_t fn=ue::Base()+0x166e900;
     if(!ue::Base()||!Readable(reinterpret_cast<void*>(fn),sizeof(signature))||std::memcmp(reinterpret_cast<void*>(fn),signature,sizeof(signature)))return id;
     reinterpret_cast<void(__fastcall*)(Weak*,Object* const*)>(fn)(&id.weak,&object);
     id.object=object;id.name=ue::NameOf(object);return Same(id)?id:Identity{};
@@ -253,12 +254,26 @@ struct Metadata {
     Object* primitive=nullptr,*attribute=nullptr;Object* runtime=nullptr;int offset=-1,stride=0,value_offset=0;Name main;
 };
 inline Metadata metadata;
+// The first signature check that failed since the last Prepare, with what the game has (for the prepare log).
+inline char function_failure[256]{};
 inline bool Function(Object* type,const char* name,int bytes,std::initializer_list<std::tuple<const char*,uint64_t,int,int>> fields) {
-    Object* f=ue::FindFunction(type,name);if(!f||ue::At<uint16_t>(f,ue::layout::kFuncParmsSize)!=bytes)return false;
-    for(const auto& field:fields)if(!Shape(Field(f,std::get<0>(field)),std::get<1>(field),std::get<2>(field),std::get<3>(field)))return false;
+    Object* f=ue::FindFunction(type,name);
+    if(!f||ue::At<uint16_t>(f,ue::layout::kFuncParmsSize)!=bytes){
+        if(!function_failure[0])_snprintf_s(function_failure,sizeof(function_failure),_TRUNCATE,"%s parms=%d want=%d",name,f?int(ue::At<uint16_t>(f,ue::layout::kFuncParmsSize)):-1,bytes);
+        return false;}
+    for(const auto& field:fields){Object* p=Field(f,std::get<0>(field));
+        if(Shape(p,std::get<1>(field),std::get<2>(field),std::get<3>(field)))continue;
+        if(!function_failure[0])_snprintf_s(function_failure,sizeof(function_failure),_TRUNCATE,"%s.%s kind=0x%llx size=%d offset=%d want=0x%llx/%d/%d",name,std::get<0>(field),
+            static_cast<unsigned long long>(Kind(p)),p?ue::At<int32_t>(p,0x34):-1,p?ue::At<int32_t>(p,0x44):-1,static_cast<unsigned long long>(std::get<1>(field)),std::get<2>(field),std::get<3>(field));
+        return false;}
     return true;
 }
+inline bool ByteParam(Object* function,const char* name) {
+    Object* p=function?Field(function,name):nullptr;const uint64_t kind=Kind(p);
+    return (kind==0x40||kind==0x1000000000000ull)&&ue::At<int32_t>(p,0x34)==1&&ue::At<int32_t>(p,0x44)==0;
+}
 inline bool Prepare(std::wstring& reason) {
+    function_failure[0]=0;
     if(metadata.base==ue::Base()&&metadata.base&&ue::Alive(metadata.weapons)&&!metadata.main.None())return true;
     Metadata m;m.base=ue::Base();
     m.weapons=ue::FindObject("/Script/SGameCombatSystem.CharacterWeaponsComponent");
@@ -278,7 +293,7 @@ inline bool Prepare(std::wstring& reason) {
        !Shape(inner,0x100000,288)||ue::At<Object*>(inner,0x70)!=m.single)return Reject(reason,L"原生主武器槽位或配置反射类型不匹配");
     m.offset=ue::At<int32_t>(m.runtime,0x44);m.stride=ue::At<int32_t>(m.runtime,0x8c);m.value_offset=ue::At<int32_t>(m.runtime,0x80);
     if(m.offset<0||m.stride!=48||m.value_offset!=8)return Reject(reason,L"原生主武器稀疏表布局不匹配");
-    constexpr uint64_t st=0x100000,bo=0x20000,in=0x80,by=0x1;
+    constexpr uint64_t st=0x100000,bo=0x20000,in=0x80;
     // IsDead's UFunction::ParmsSize at +0x106 is 9 (Pawn@0/8, bool@8/1).
     // properties_size at +0xA8 is the aligned 16 and must not be used here.
     if(!Function(m.weapons,"GetCurrentWeaponIndex",16,{{"SlotTag",st,8,0},{"WithPending",bo,1,8},{"ReturnValue",in,4,12}}))return Reject(reason,L"GetCurrentWeaponIndex 参数布局不匹配");
@@ -286,8 +301,10 @@ inline bool Prepare(std::wstring& reason) {
     if(!Function(m.weapons,"IsArmed",9,{{"SlotTag",st,8,0},{"ReturnValue",bo,1,8}}))return Reject(reason,L"IsArmed 参数布局不匹配");
     if(!Function(m.weapons,"SetArmed",9,{{"SlotTag",st,8,0},{"Armed",bo,1,8}}))return Reject(reason,L"SetArmed 参数布局不匹配");
     if(!Function(m.weapons,"IsInWeaponTransition",1,{{"ReturnValue",bo,1,0}}))return Reject(reason,L"IsInWeaponTransition 参数布局不匹配");
-    if(!Function(primitive,"GetCollisionEnabled",1,{{"ReturnValue",by,1,0}}))return Reject(reason,L"GetCollisionEnabled 参数布局不匹配");
-    if(!Function(primitive,"SetCollisionEnabled",1,{{"NewType",by,1,0}}))return Reject(reason,L"SetCollisionEnabled 参数布局不匹配");
+    // ECollisionEnabled::Type is a TEnumAsByte (ByteProperty 0x40); an EnumProperty (1<<48) of one byte reads the same.
+    // The old constant 0x1 is UField's cast flag, so no property ever matched and every leased grab stayed unprepared.
+    if(!Function(primitive,"GetCollisionEnabled",1,{})||!ByteParam(ue::FindFunction(primitive,"GetCollisionEnabled"),"ReturnValue"))return Reject(reason,L"GetCollisionEnabled 参数布局不匹配");
+    if(!Function(primitive,"SetCollisionEnabled",1,{})||!ByteParam(ue::FindFunction(primitive,"SetCollisionEnabled"),"NewType"))return Reject(reason,L"SetCollisionEnabled 参数布局不匹配");
     if(!Function(ue::ClassOf(m.dead),"IsDead",9,{{"Pawn",0x10000,8,0},{"ReturnValue",bo,1,8}}))return Reject(reason,L"IsDead 参数布局不匹配");
     if(!Function(holder,"GetCharacterWeaponsComponent",8,{{"ReturnValue",0x10000,8,0}}))return Reject(reason,L"GetCharacterWeaponsComponent 参数布局不匹配");
     m.main=ue::MakeName(L"Weapon.Slot.Main");if(m.main.None())return Reject(reason,L"原生主武器槽位标签不可用");
@@ -360,6 +377,7 @@ struct NativeIO {
 };
 } // Detail
 inline bool Prepare(std::wstring& reason){return Detail::Prepare(reason);}
+inline const char* LastFunctionFailure(){return Detail::function_failure;}
 inline bool Capture(Object* source,Object* victim,const Policy& sp,const Policy& vp,Ledger& ledger,std::wstring& reason) {
     if(!sp.Any()&&!vp.Any()){Detail::NativeIO io;return CaptureWith(io,source,victim,sp,vp,ledger,reason);}
     if(Detail::metadata.base!=ue::Base()||!Detail::metadata.base)return Reject(reason,L"原生状态恢复接口尚未预载；请等待预载完成");

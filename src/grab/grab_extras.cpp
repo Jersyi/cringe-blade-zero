@@ -742,6 +742,16 @@ void SetSkinDisplay(SkinDisplay provider) { skin_display_ = provider; }
 bool ChangeHealth(unsigned char* character, float delta) {
     return ue::Alive(character) && std::isfinite(delta) && AttributeLayout() && AddHealth(character, delta);
 }
+bool ChangeMaxHealth(unsigned char* character, float delta) {
+    if (!ue::Alive(character) || !std::isfinite(delta) || !AttributeLayout()) return false;
+    for (const wchar_t* name : {L"Health_Max", L"MaxHealth"}) {
+        Attribute attribute; if (!MakeAttribute(name, attribute)) { FreeAttribute(attribute); continue; }
+        Call add(ue::Default("/Script/SGameAttributes.Default__AttributeUtils"), "ModifyCharacterAttributeValue");
+        const bool ok = add.Set("Character", character).Set("Attribute", attribute).Set("ModiferOp", uint8_t{0}).Set("Value", delta).Invoke();
+        FreeAttribute(attribute); if (ok) return true;
+    }
+    return false;
+}
 void SourceEnded() {
     if (!session_.active || session_.damage_done) return;
     session_.damage_done = true; ApplyDamage();

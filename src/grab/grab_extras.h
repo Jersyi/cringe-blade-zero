@@ -84,4 +84,6 @@ void SourceEnded();
 // damage uses (AttributeUtils.ModifyCharacterAttributeValue; negative removes health), so death and
 // hit callbacks stay the game's own. False when the call or the attribute layout is unavailable.
 bool ChangeHealth(unsigned char* character, float delta);
+// Game thread. delta added to the maximum health attribute (Health_Max, else MaxHealth); the runtime audit's dummy.
+bool ChangeMaxHealth(unsigned char* character, float delta);
 }

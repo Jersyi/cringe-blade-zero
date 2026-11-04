@@ -81,6 +81,15 @@ void NameText(Name name, char* out, size_t size) {
     out[n] = 0;
     if (name.number) { char suffix[16]{}; _snprintf_s(suffix, sizeof(suffix), _TRUNCATE, "_%u", name.number - 1); strncat_s(out, size, suffix, _TRUNCATE); }
 }
+void NameWide(Name name, wchar_t* out, size_t size) {
+    const unsigned char* text = nullptr; size_t length = 0; bool wide = false;
+    if (!size) return;
+    if (!Entry(name, text, length, wide)) { wcsncpy_s(out, size, L"?", _TRUNCATE); return; }
+    size_t n = 0;
+    for (; n < length && n + 1 < size; ++n) out[n] = static_cast<wchar_t>(wide ? (text[n * 2] | text[n * 2 + 1] << 8) : text[n]);
+    out[n] = 0;
+    if (name.number) { wchar_t suffix[16]{}; _snwprintf_s(suffix, _countof(suffix), _TRUNCATE, L"_%u", name.number - 1); wcsncat_s(out, size, suffix, _TRUNCATE); }
+}
 bool NameContains(Name name, const char* const* needles, size_t count) {
     char text[256]{}; NameText(name, text, sizeof(text));
     for (char& c : text) c = Lower(c);
@@ -108,6 +117,28 @@ bool Alive(Object* object) {
         // EInternalObjectFlags Garbage|Unreachable; RF_BeginDestroyed|RF_FinishDestroyed|RF_MirroredGarbage.
         return !(internal & ((1u << 21) | (1u << 28))) && !(flags & (0x8000u | 0x10000u | 0x40000000u));
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// UObjectBase::AddRef / ReleaseRef of the pinned 11-04 build (FUObjectItem reference count). 5.8 GC keeps its roots in
+// a separate set (GRoots) that these functions update; setting the RootSet bit by hand is invisible to GC.
+namespace {
+constexpr uintptr_t kAddRefRva = 0x1573ff0, kReleaseRefRva = 0x158fa30;
+constexpr unsigned char kAddRefCode[] = {0x40,0x53,0x48,0x83,0xec,0x20,0x8b,0x41,0x0c,0x3b,0x05,0x71,0x4c,0x8b,0x0c,0x7d};
+constexpr unsigned char kReleaseRefCode[] = {0x8b,0x41,0x0c,0x3b,0x05,0x37,0x92,0x89,0x0c,0x7d,0x1e,0x8b,0xc8,0x0f,0xb7,0xc0};
+}
+bool ReferenceCodeMatches() {
+    return base_ && !std::memcmp(reinterpret_cast<const void*>(base_ + kAddRefRva), kAddRefCode, sizeof(kAddRefCode)) &&
+        !std::memcmp(reinterpret_cast<const void*>(base_ + kReleaseRefRva), kReleaseRefCode, sizeof(kReleaseRefCode));
+}
+bool AddReference(Object* object) {
+    if (!Alive(object) || !ReferenceCodeMatches()) return false;
+    reinterpret_cast<void(__fastcall*)(Object*)>(base_ + kAddRefRva)(object);
+    return true;
+}
+bool ReleaseReference(Object* object) {
+    if (!object || !ReferenceCodeMatches()) return false;
+    reinterpret_cast<void(__fastcall*)(Object*)>(base_ + kReleaseRefRva)(object);
+    return true;
 }
 
 Object* FindObject(const char* path) {

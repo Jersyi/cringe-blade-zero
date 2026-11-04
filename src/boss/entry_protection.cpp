@@ -45,8 +45,8 @@ bool HelpersMatch() {
         0x12, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xd2, 0x74};
     static constexpr unsigned char damage[] = {0x80, 0x49, 0x5a, 0x04, 0xc3};
     return ue::Base() &&
-        !std::memcmp(reinterpret_cast<const void*>(ue::Base() + 0x0166f2a0), weak, sizeof(weak)) &&
-        !std::memcmp(reinterpret_cast<const void*>(ue::Base() + 0x03a9cbf0), damage, sizeof(damage));
+        !std::memcmp(reinterpret_cast<const void*>(ue::Base() + 0x0166e900), weak, sizeof(weak)) &&
+        !std::memcmp(reinterpret_cast<const void*>(ue::Base() + 0x03a9f960), damage, sizeof(damage));
 }
 const unsigned char* Item(int32_t index) {
     auto* array = reinterpret_cast<unsigned char*>(ue::Base() + ue::layout::kObjectArray);
@@ -69,7 +69,7 @@ bool Same(const Identity& id) {
 bool Capture(Object* object, Identity& result) {
     if (!object || !ue::Alive(object) || ue::IsTemplate(object) || !HelpersMatch()) return false;
     struct Weak { int32_t index = 0, serial = 0; } weak;
-    reinterpret_cast<void(__fastcall*)(Weak*, Object* const*)>(ue::Base() + 0x0166f2a0)(&weak, &object);
+    reinterpret_cast<void(__fastcall*)(Weak*, Object* const*)>(ue::Base() + 0x0166e900)(&weak, &object);
     Identity candidate{object, ue::NameOf(object), weak.index, weak.serial};
     if (!Same(candidate)) return false;
     result = candidate; return true;

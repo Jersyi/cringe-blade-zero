@@ -23,6 +23,7 @@ struct Variant {
     bool supported = false;
     std::wstring reason;
     float max_range = 400.0f, recommended_range = 280.0f;
+    float authored_distance = 0.0f; // the boss move's own first-frame pair distance (cm)
 };
 struct BossInfo {
     std::wstring id, name, status;

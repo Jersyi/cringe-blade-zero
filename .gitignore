@@ -11,6 +11,8 @@
 !*.asm
 !*.def
 !docs/title.jpg
+!installer/install.ps1
+!installer/Install.bat
 
 # Build output, release ZIPs and local notes / scripts / archives stay out of the repository.
 build/

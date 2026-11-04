@@ -20,12 +20,12 @@ struct Array { void* data = nullptr; int32_t num = 0, max = 0; };
 struct String { const wchar_t* data = nullptr; int32_t num = 0, max = 0; };
 
 namespace layout {
-constexpr uintptr_t kNamePool = 0x0dd11ac0, kObjectArray = 0x0ddb3c40;
-constexpr uintptr_t kFree = 0x012e1930;                 // FMemory::Free
-constexpr uintptr_t kProcessEvent = 0x01631410;         // UObject::ProcessEvent
-constexpr uintptr_t kGameEngineTick = 0x03f3e670;       // UGameEngine::Tick
-constexpr uintptr_t kApplySkinnedHairMode = 0x03db4460; // MainHairMode visibility of one USkinnedMeshComponent
-constexpr uintptr_t kApplyGroomHairMode = 0x050dc010;   // MainHairMode state of one UGroomComponent
+constexpr uintptr_t kNamePool = 0x0dd86ac0, kObjectArray = 0x0de28c50;
+constexpr uintptr_t kFree = 0x012e0af0;                 // FMemory::Free
+constexpr uintptr_t kProcessEvent = 0x01630720;         // UObject::ProcessEvent
+constexpr uintptr_t kGameEngineTick = 0x03f51090;       // UGameEngine::Tick
+constexpr uintptr_t kApplySkinnedHairMode = 0x03dc1540; // MainHairMode visibility of one USkinnedMeshComponent
+constexpr uintptr_t kApplyGroomHairMode = 0x0510e660;   // MainHairMode state of one UGroomComponent
 constexpr size_t kProcessEventSlot = 76, kTickSlot = 94;
 constexpr size_t kObjFlags = 0x08, kObjIndex = 0x0c, kObjClass = 0x10, kObjName = 0x18, kObjOuter = 0x20;
 constexpr size_t kFieldNext = 0x28, kSuper = 0x40, kChildren = 0x48, kChildProperties = 0x50;
@@ -42,6 +42,7 @@ bool ValidateLayout(char* why, size_t why_size);
 bool NameIs(Name name, const char* text);
 bool NameContains(Name name, const char* const* needles, size_t count);  // case-insensitive
 void NameText(Name name, char* out, size_t out_size);
+void NameWide(Name name, wchar_t* out, size_t out_size);  // full UTF-16 text (NameText maps non-ASCII to '?')
 Name NameOf(Object* object);
 Object* ClassOf(Object* object);
 Object* OuterOf(Object* object);
@@ -49,6 +50,13 @@ bool IsA(Object* object, Object* cls);
 bool IsDefault(Object* object);
 bool IsTemplate(Object* object);       // class default object or archetype (Blueprint component template)
 bool Alive(Object* object);             // still in GUObjectArray and not garbage
+// Counted strong reference (engine AddRef/ReleaseRef, game thread only): keeps the object and its class from garbage
+// collection until released. False when the engine code differs from the pinned build.
+bool AddReference(Object* object);
+// The engine AddRef (RVA 0x1573ff0) / ReleaseRef (0x158fa30) code matches the pinned build; modules that call them
+// directly check this one pin.
+bool ReferenceCodeMatches();
+bool ReleaseReference(Object* object);  // only for an object this caller referenced (its memory is still valid)
 
 Object* FindObject(const char* path);   // "/Script/Engine.Actor"; results cached
 Object* FindFunction(Object* cls, const char* name);

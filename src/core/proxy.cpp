@@ -38,6 +38,8 @@
 #include "motian_grab_menu.h"
 #include "weapon_presets.h"
 #include "weapon_presets_menu.h"
+#include "debug_supplement.h"
+#include "supplement_menu.h"
 #include "character_swap.h"
 #include "ue_runtime.h"
 
@@ -47,15 +49,11 @@ INIT_ONCE system_once = INIT_ONCE_STATIC_INIT;
 std::array<FARPROC, kExportCount> system_functions{};
 volatile LONG stop_worker = 0;
 volatile LONG worker_status = 0;
-constexpr uintptr_t kNamePoolRva = 0x0dd11ac0;
-constexpr uintptr_t kObjectArrayRva = 0x0ddb3c40;
-constexpr uintptr_t kConsoleRva = 0x0e0247c0;
-constexpr size_t kDebugBoolOffset = 0x7c1;
-constexpr DWORD kTimestamp = 0x6ae19d7a;
-constexpr DWORD kImageSize = 0x1ec54000;
-constexpr DWORD kEntrypoint = 0x1b9e0a60;
-constexpr uint64_t kExeBytes = 511072344;
-constexpr const char* kSha256 = "7b4fcd286a350780faf0824d73aa150b21cbf1bccde883e6a96386cbe09973b4";
+constexpr DWORD kTimestamp = 0x6ae7ae3f;
+constexpr DWORD kImageSize = 0x1e0bb000;
+constexpr DWORD kEntrypoint = 0x18db0d40;
+constexpr uint64_t kExeBytes = 498913272;
+constexpr const char* kSha256 = "4415933ce33476f14c837abb61a1b60af8b78cd81783896501913a7aac69e423";
 std::wstring log_path;
 std::wstring command_path;
 
@@ -63,10 +61,12 @@ void Log(const char* message) {
     if (log_path.empty()) return;
     SYSTEMTIME t{}; GetLocalTime(&t);
     char line[1024]{};
-    const int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
         "%04u-%02u-%02u %02u:%02u:%02u pid=%lu %s\r\n",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
         GetCurrentProcessId(), message);
+    // _TRUNCATE returns -1 on a cut line: keep the cut text with its line end instead of dropping the line.
+    if (n < 0) { n = static_cast<int>(sizeof(line)) - 1; line[n - 2] = '\r'; line[n - 1] = '\n'; }
     if (n <= 0) return;
     HANDLE file = CreateFileW(log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -112,26 +112,6 @@ bool Read(uintptr_t address, void* dest, size_t bytes) {
 }
 template<class T> bool ReadValue(uintptr_t p, T& out) { return Read(p, &out, sizeof(out)); }
 
-bool IsWritable(uintptr_t address, size_t bytes) {
-    if (address > UINTPTR_MAX - bytes) return false;
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info))) return false;
-    const DWORD p = info.Protect & 0xff;
-    if (info.State != MEM_COMMIT || info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-    if (p != PAGE_READWRITE && p != PAGE_WRITECOPY) return false; // Never write executable pages.
-    const uintptr_t end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
-    return address + bytes <= end;
-}
-
-bool WriteData(uintptr_t address, const void* source, size_t size) {
-    if (!IsWritable(address, size)) return false;
-    SIZE_T n = 0;
-    if (!WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), source, size, &n) || n != size)
-        return false;
-    std::array<unsigned char, 8> verify{};
-    return size <= verify.size() && Read(address, verify.data(), size) && std::memcmp(source, verify.data(), size) == 0;
-}
-
 bool HashExecutable(const wchar_t* path) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -172,96 +152,6 @@ bool KnownBuild(uintptr_t base, const wchar_t* executable) {
     return HashExecutable(executable);
 }
 
-bool FNameEquals(uintptr_t base, uint32_t id, const char* wanted) {
-    uint32_t block_count = 0, cursor = 0;
-    if (!ReadValue(base + kNamePoolRva + 8, block_count) || !ReadValue(base + kNamePoolRva + 12, cursor) ||
-        block_count >= 8192 || cursor > 131072) return false;
-    const uint32_t block = id >> 16, offset = (id & 65535u) * 2;
-    if (block > block_count || offset + 2 > (block == block_count ? cursor : 131072u)) return false;
-    uintptr_t pointer = 0; uint16_t header = 0;
-    if (!ReadValue(base + kNamePoolRva + 16 + block * 8ull, pointer) || !ReadValue(pointer + offset, header)) return false;
-    const size_t length = header >> 6;
-    if (!length || length != std::strlen(wanted) || length >= 128) return false;
-    const size_t byte_count = length * ((header & 1) ? 2 : 1);
-    if (offset + 2 + byte_count > (block == block_count ? cursor : 131072u)) return false;
-    std::array<unsigned char, 256> text{};
-    if (!Read(pointer + offset + 2, text.data(), byte_count)) return false;
-    if (!(header & 1)) return std::memcmp(text.data(), wanted, length) == 0;
-    for (size_t i = 0; i < length; ++i)
-        if (text[i * 2] != static_cast<unsigned char>(wanted[i]) || text[i * 2 + 1]) return false;
-    return true;
-}
-
-struct ObjectHeader {
-    uintptr_t vtable; uint32_t flags; int32_t index; uintptr_t cls;
-    uint32_t name; uint32_t number; uintptr_t outer;
-};
-static_assert(sizeof(ObjectHeader) == 40);
-struct Objects {
-    uint32_t max_chunks; uint32_t num_chunks; uintptr_t chunks;
-    uint32_t count; uint32_t maximum; uintptr_t preallocated;
-};
-static_assert(sizeof(Objects) == 32);
-
-bool ValidCdo(uintptr_t base, uintptr_t obj, uint32_t index) {
-    ObjectHeader head{}, cls{}, outer{};
-    return ReadValue(obj, head) && head.index == static_cast<int32_t>(index) && (head.flags & 0x10) &&
-        head.number == 0 && FNameEquals(base, head.name, "Default__PBZGameSettings") &&
-        ReadValue(head.cls, cls) && cls.number == 0 && FNameEquals(base, cls.name, "PBZGameSettings") &&
-        ReadValue(head.outer, outer) && FNameEquals(base, outer.name, "/Script/ProjectPBZ");
-}
-
-bool GetObjects(uintptr_t base, Objects& objects) {
-    if (!ReadValue(base + kObjectArrayRva + 16, objects)) return false;
-    return objects.num_chunks > 0 && objects.num_chunks <= objects.max_chunks && objects.max_chunks <= 8192 &&
-        objects.count <= objects.maximum && objects.maximum <= objects.max_chunks * 65536ull &&
-        objects.count <= objects.num_chunks * 65536ull;
-}
-
-bool ObjectAt(const Objects& objects, uint32_t i, uintptr_t& result) {
-    uintptr_t chunk = 0;
-    return i < objects.count && ReadValue(objects.chunks + (i / 65536ull) * 8, chunk) &&
-        ReadValue(chunk + (i % 65536ull) * 24 + 8, result) && result != 0;
-}
-
-bool FindCdo(uintptr_t base, uintptr_t& result, uint32_t& index) {
-    Objects objects{};
-    if (!GetObjects(base, objects)) return false;
-    // Stable native registration slots in the two independently inspected runs.
-    // Both are still validated by exact name, class, package and InternalIndex.
-    for (uint32_t candidate : {46646u, 46636u}) {
-        uintptr_t obj = 0;
-        if (ObjectAt(objects, candidate, obj) && ValidCdo(base, obj, candidate)) { result = obj; index = candidate; return true; }
-    }
-    std::vector<uintptr_t> chunks(objects.num_chunks);
-    if (!Read(objects.chunks, chunks.data(), chunks.size() * sizeof(uintptr_t))) return false;
-    std::vector<unsigned char> items(65536 * 24);
-    for (uint32_t c = 0; c < objects.num_chunks; ++c) {
-        const uint32_t begin = c * 65536;
-        if (begin >= objects.count) break;
-        const uint32_t n = (objects.count - begin < 65536 ? objects.count - begin : 65536);
-        if (!n || !Read(chunks[c], items.data(), n * 24ull)) continue;
-        for (uint32_t j = 0; j < n; ++j) {
-            uintptr_t obj = 0; std::memcpy(&obj, items.data() + j * 24ull + 8, sizeof(obj));
-            if (!obj) continue;
-            ObjectHeader head{};
-            if (!ReadValue(obj, head) || head.index != static_cast<int32_t>(begin + j) || !(head.flags & 0x10)) continue;
-            if (ValidCdo(base, obj, begin + j)) { result = obj; index = begin + j; return true; }
-        }
-    }
-    return false;
-}
-
-bool ConsoleData(uintptr_t base, uintptr_t& data) {
-    std::array<uintptr_t, 3> wrapper{};
-    if (!Read(base + kConsoleRva, wrapper.data(), sizeof(wrapper))) return false;
-    if (!wrapper[1] || !wrapper[2]) return false;
-    std::array<int32_t, 2> values{};
-    if (!Read(wrapper[2], values.data(), sizeof(values)) ||
-        values[0] < 0 || values[0] > 1 || values[1] < 0 || values[1] > 1 || !IsWritable(wrapper[2], sizeof(values))) return false;
-    data = wrapper[2]; return true;
-}
-
 void LogLine(const char* message) { Log(message); }
 
 DWORD groom_faults = 0, groom_fault_code = 0;
@@ -294,14 +184,8 @@ void DispatchGameThread() {
     AirSkills::OnGameThreadGuarded();
     if (!BossRush::IsTransitioning()) WeaponPresets::OnGameThreadGuarded();
     BossRush::OnGameThreadGuarded();
-    if (DebugHub::TakeNativeMenuKey()) {
-        INPUT chord[2]{};
-        chord[0].type=INPUT_KEYBOARD; chord[0].ki.wVk='O';
-        chord[1].type=INPUT_KEYBOARD; chord[1].ki.wVk='O'; chord[1].ki.dwFlags=KEYEVENTF_KEYUP;
-        SendInput(2, chord, sizeof(INPUT));
-        Log("DEBUG_MENU keyboard O forwarded after gameplay focus");
-    }
     BossAI::OnGameThreadGuarded();
+    DebugSupplement::OnGameThreadGuarded();
     HubPause::OnGameThread(BossRush::IsTransitioning());
     if (!BossRush::IsTransitioning() && groom_faults < GameThread::kMaxFaults && !GuardedGroomTick()) { ++groom_faults; ReportGroomFault(); }
 }
@@ -353,6 +237,8 @@ void PollCommand(HairControls& controls) {
     else if (!std::strcmp(text, "grab")) ok = MotianGrab::HandleCommand(text, argument);
     else if (!std::strcmp(text, "weapons") && !std::strcmp(argument, "menu")) WeaponPresetsMenu::Show();
     else if (!std::strcmp(text, "weapons")) ok = WeaponPresets::HandleCommand(text, argument);
+    else if (!std::strcmp(text, "supplement") && !std::strcmp(argument, "menu")) ok = DebugSupplement::Present() && (DebugHub::ShowPage(DebugHub::Page::Supplement), true);
+    else if (!std::strcmp(text, "supplement")) ok = DebugSupplement::HandleCommand(text, argument);
     else if (!std::strcmp(text, "boss") || !std::strcmp(text, "rush")) ok = BossRush::HandleCommand(text, argument);
     else if (strcmp(text, "status")) ok = false;
     wchar_t status[320]{}, outfit[200]{}; GroomForce::Status(status, 320); GroomForce::OutfitStatus(outfit, 200);
@@ -380,7 +266,7 @@ DWORD WINAPI Worker(void*) {
     HMODULE pinned = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         reinterpret_cast<LPCWSTR>(&Worker), &pinned)) { Log("PIN_FAILED; no data writes"); InterlockedExchange(&worker_status, 0x400); return 0; }
-    Log("KNOWN_BUILD sha256 verified; waiting for native settings and console data");
+    Log("KNOWN_BUILD sha256 verified");
     InterlockedExchange(&worker_status, 3);
     ue::Attach(base);
     GroomForce::Initialize(&LogLine, &NpcRetarget::OwnsAppearance);
@@ -402,6 +288,8 @@ DWORD WINAPI Worker(void*) {
     MotianGrab::Initialize(&LogLine, &EntryFocus::GameplayFocused);
     MotianGrabMenu::Initialize(&LogLine);
     WeaponPresets::Initialize(&LogLine, &EntryFocus::GameplayFocused);
+    // Optional: only acts when the supplement container sits under the game's Paks folder.
+    DebugSupplement::Initialize(&LogLine, std::wstring(executable, static_cast<size_t>(filename - executable)).c_str());
     UiHost::GuardActivation(&LogLine);
     UiCursor::SetLogger(&LogLine);
     DebugHub::Initialize();
@@ -450,9 +338,13 @@ DWORD WINAPI Worker(void*) {
         WeaponPresets::RequestSwap();
     });
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
-    Log("DEBUG_HUB registered 9 embedded pages; hotkeys toggle the host; native O retained");
-    bool hook_attempted = false,success_banner_shown=false;
-    uintptr_t cdo = 0; uint32_t index = 0; bool announced = false;
+    // The supplement page exists only with the supplement container; the hub hides an unregistered last page.
+    if (DebugSupplement::Present()) DebugHub::Register(DebugHub::Page::Supplement, L"调试补充", &SupplementMenu::CreatePage);
+    Log(DebugSupplement::Present() ? "DEBUG_HUB registered 10 embedded pages (supplement present); hotkeys toggle the host"
+                                   : "DEBUG_HUB registered 9 embedded pages; hotkeys toggle the host");
+    bool hook_attempted = false,ready = false,timeout_logged = false;
+    // The 11-04 game update removed the native debug menu (DebugObj.js, BP_CollectHelp, PBZ.DebugMenu.Enable,
+    // GM_* bodies), so the two debug switches are no longer written; the tools need only the game-thread hook.
     const ULONGLONG deadline = GetTickCount64() + 10 * 60 * 1000;
     ULONGLONG next_settings = 0;
     while (!InterlockedCompareExchange(&stop_worker, 0, 0)) {
@@ -468,46 +360,25 @@ DWORD WINAPI Worker(void*) {
         MotianGrabMenu::Tick();
         WeaponPresets::WorkerTick();
         WeaponPresetsMenu::Tick();
+        SupplementMenu::Tick();
         EntryFocus::Poll();
         controls.Tick();
         if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25); continue; }
         next_settings = GetTickCount64() + 1000;
         if (!hook_attempted) if (ue::Object* engine = ue::FindEngine()) { InstallGameThread(base, engine); hook_attempted = true; }
         PollCommand(controls);
-        if (!cdo || !ValidCdo(base, cdo, index)) { cdo = 0; FindCdo(base, cdo, index); }
-        uintptr_t console = 0;
-        if (cdo && ConsoleData(base, console)) {
-            unsigned char enabled = 0; std::array<int32_t, 2> values{};
-            if (!ReadValue(cdo + kDebugBoolOffset, enabled) || enabled > 1 || !Read(console, values.data(), sizeof(values))) {
-                Log("LAYOUT_MISMATCH; worker stopped without further writes"); InterlockedExchange(&worker_status, 0x800); return 0;
-            }
-            bool wrote = false;
-            const std::array<int32_t, 2> ones{1, 1};
-            if (values != ones) { if (!WriteData(console, ones.data(), sizeof(ones))) { Log("CONSOLE_WRITE_FAILED; worker stopped"); InterlockedExchange(&worker_status, 0x1000); return 0; } wrote = true; }
-            if (!enabled) {
-                const unsigned char one = 1;
-                if (!WriteData(cdo + kDebugBoolOffset, &one, 1)) {
-                    // Restore the console values if this two-switch update was incomplete.
-                    if (wrote) WriteData(console, values.data(), sizeof(values));
-                    Log("SETTINGS_WRITE_FAILED; worker stopped"); InterlockedExchange(&worker_status, 0x2000); return 0;
-                }
-                wrote = true;
-            }
-            InterlockedExchange(&worker_status, 31);
-            if (!success_banner_shown&&GameThread::Installed()) {
-                UiLoadBanner::ShowSuccess(); success_banner_shown=true;
-                Log("UI_LOAD_BANNER success; main tool window remains hidden until user request");
-            }
-            if (!announced || wrote) {
-                char line[256]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "ENABLED cdo=%p slot=%u bool=%p console=%p values=1/1", reinterpret_cast<void*>(cdo), index,
-                    reinterpret_cast<void*>(cdo + kDebugBoolOffset), reinterpret_cast<void*>(console)); Log(line); announced = true;
-            }
-        } else if (!announced && GetTickCount64() > deadline) {
-            Log("INITIALIZATION_TIMEOUT; no further attempts"); InterlockedExchange(&worker_status, 0x4000); return 0;
+        if (!ready && GameThread::Installed()) {
+            ready = true; InterlockedExchange(&worker_status, 31);
+            // Air skills, grabs and NPC skills fail quietly without these (11-04 port missed them once).
+            if (!ue::ReferenceCodeMatches()) Log("UE_RUNTIME reference helpers mismatch: engine AddRef/ReleaseRef differ from the pinned build; air skills, grabs and NPC skills cannot keep objects");
+            UiLoadBanner::ShowSuccess();
+            Log("UI_LOAD_BANNER success; main tool window remains hidden until user request");
+        } else if (!ready && !timeout_logged && GetTickCount64() > deadline) {
+            timeout_logged = true; Log("GAME_THREAD_HOOK not installed after 10 minutes; still waiting");
         }
         Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25);
     }
-    WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown();
+    WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown();
     SkillToast::Shutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
     UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
     return 0;

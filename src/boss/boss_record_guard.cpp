@@ -18,8 +18,8 @@ struct JsonWrapper {
     void* controller = nullptr;
 };
 static_assert(sizeof(JsonWrapper) == 32);
-constexpr uintptr_t kReleaseSharedReference = 0x0126fc00;
-constexpr uintptr_t kSyncAdvancedToMaster = 0x06b2a4d0;
+constexpr uintptr_t kReleaseSharedReference = 0x0126ec80;
+constexpr uintptr_t kSyncAdvancedToMaster = 0x06b710b0;
 constexpr int32_t kMaxTextCharacters = 4 * 1024 * 1024;
 Logger logger_ = nullptr;
 Object* captured_save_ = nullptr;

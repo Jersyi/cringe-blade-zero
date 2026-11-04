@@ -13,11 +13,11 @@ void Commit(uintptr_t base, uintptr_t rva) {
 int main() {
     const uintptr_t base = reinterpret_cast<uintptr_t>(VirtualAlloc(nullptr, 0x10000000, MEM_RESERVE, PAGE_NOACCESS));
     if (!base) return 2;
-    Commit(base, 0xdf47258); Commit(base, 0xdf48f00); Commit(base, 0xdf46cf0); Commit(base, 0xde9d004);
+    Commit(base, 0xdfbc2c8); Commit(base, 0xdfbdf70); Commit(base, 0xdfbbd60); Commit(base, 0xdf12044);
     alignas(8) uint64_t hair = Pair(1), view = Pair(7), replacement = Pair(1);
-    auto* hair_pointer = reinterpret_cast<uintptr_t*>(base + 0xdf47258 + 16);
-    auto* view_pointer = reinterpret_cast<uintptr_t*>(base + 0xdf48f00);
-    auto* shader = reinterpret_cast<int32_t*>(base + 0xde9d004);
+    auto* hair_pointer = reinterpret_cast<uintptr_t*>(base + 0xdfbc2c8 + 16);
+    auto* view_pointer = reinterpret_cast<uintptr_t*>(base + 0xdfbdf70);
+    auto* shader = reinterpret_cast<int32_t*>(base + 0xdf12044);
     *hair_pointer = reinterpret_cast<uintptr_t>(&hair); *view_pointer = reinterpret_cast<uintptr_t>(&view); *shader = 0;
     {
         HairControls controls(base, false);
@@ -52,8 +52,8 @@ int main() {
     Check(!HairMemory::Exchange64(1, 0, 1), "Invalid atomic write rejected");
     Check(!HairMemory::Exchange64(reinterpret_cast<uintptr_t>(&hair) + 1, 0, 1), "Misaligned atomic write rejected");
     Check(!HairMemory::Exchange64(reinterpret_cast<uintptr_t>(&hair), Pair(99), 0) && hair == Pair(2), "Concurrent value CAS rejected");
-    DWORD old = 0; VirtualProtect(reinterpret_cast<void*>(base + 0xde9d000), 4096, PAGE_READONLY, &old);
-    Check(!HairMemory::Exchange32(base + 0xde9d004, 1, 0), "Readonly page rejected");
+    DWORD old = 0; VirtualProtect(reinterpret_cast<void*>(base + 0xdf12000), 4096, PAGE_READONLY, &old);
+    Check(!HairMemory::Exchange32(base + 0xdf12044, 1, 0), "Readonly page rejected");
     VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
     std::printf("hair_controls_test failures=%d\n", failures); return failures ? 1 : 0;
 }

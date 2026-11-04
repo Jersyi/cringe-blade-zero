@@ -4,7 +4,7 @@
 
 // Worker-thread UI only. Pages keep their existing request/snapshot boundary.
 namespace DebugHub {
-enum class Page { BossRush, BossAI, Character, Npc, AirSkills, MotianGrab, Groom, WeaponPresets, Hotkeys, Count };
+enum class Page { BossRush, BossAI, Character, Npc, AirSkills, MotianGrab, Groom, WeaponPresets, Hotkeys, Supplement, Count };  // Supplement: only with the debug supplement container
 using Factory = std::function<HWND(HWND)>;
 void Initialize();
 void Register(Page page, const wchar_t* title, Factory factory);
@@ -26,7 +26,4 @@ bool Visible();
 bool ObscuresGameplay();
 void RefreshChrome();
 bool Animating();
-// Game thread. One native debug-menu O, after the worker hid the hub and
-// gameplay focus is back. Stays pending while the world is still paused.
-bool TakeNativeMenuKey();
 }

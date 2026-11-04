@@ -148,16 +148,12 @@ bool Same(const Identity& value) {
 }
 bool GCHelpersMatch() {
     static constexpr unsigned char weak[] = {0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0x12,0x48,0x8b,0xd9,0x48,0x85,0xd2,0x74};
-    static constexpr unsigned char add[] = {0x40,0x53,0x48,0x83,0xec,0x20,0x8b,0x41,0x0c,0x3b,0x05,0x51,0xef,0x83,0x0c,0x7d};
-    static constexpr unsigned char release[] = {0x8b,0x41,0x0c,0x3b,0x05,0x17,0x35,0x82,0x0c,0x7d,0x1e,0x8b,0xc8,0x0f,0xb7,0xc0};
-    return ue::Base() && !std::memcmp(reinterpret_cast<void*>(ue::Base()+0x166f2a0),weak,sizeof(weak)) &&
-        !std::memcmp(reinterpret_cast<void*>(ue::Base()+0x1574d00),add,sizeof(add)) &&
-        !std::memcmp(reinterpret_cast<void*>(ue::Base()+0x1590740),release,sizeof(release));
+    return ue::Base() && !std::memcmp(reinterpret_cast<void*>(ue::Base()+0x166e900),weak,sizeof(weak)) && ue::ReferenceCodeMatches();
 }
 Identity Identify(Object* object) {
     if (!ue::Alive(object) || !GCHelpersMatch()) return {};
     struct Weak { int32_t index = 0, serial = 0; } weak;
-    reinterpret_cast<void(__fastcall*)(Weak*,Object* const*)>(ue::Base()+0x166f2a0)(&weak,&object);
+    reinterpret_cast<void(__fastcall*)(Weak*,Object* const*)>(ue::Base()+0x166e900)(&weak,&object);
     Identity result{object,ue::NameOf(object),weak.index,weak.serial};
     return Same(result) ? result : Identity{};
 }
@@ -169,7 +165,7 @@ bool Keep(Object* object) {
     // Reserve the ownership record before engine code. An exception during a
     // native refcount transition is uncertain: never decrement speculatively.
     strong_.push_back({id,RefState::Acquiring});
-    reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1574d00)(object);
+    reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1573ff0)(object);
     strong_.back().state = RefState::Owned;
     return true;
 }
@@ -181,7 +177,7 @@ bool ReleaseStrongTail(size_t retain) {
         // Release pending-destroy objects too, but only while their exact
         // serial/index still exists. Do not let Alive() hide our own GC hold.
         value.state = RefState::Releasing;
-        reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x1590740)(value.identity.object);
+        reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x158fa30)(value.identity.object);
         strong_.pop_back();
     }
     return true;
@@ -446,9 +442,9 @@ template<class Visitor> bool VisitBindings(Object* input, Visitor&& visitor) {
 }
 bool CacheHelpers() {
     static constexpr unsigned char add[] = {0x48, 0x85, 0xd2, 0x0f, 0x84, 0xbf, 0x03, 0, 0, 0x55, 0x57, 0x41, 0x54, 0x48, 0x8b, 0xec};
-    static constexpr unsigned char remove[] = {0xe9, 0x9b, 0xd4, 0x59, 0x12};
-    return !std::memcmp(reinterpret_cast<void*>(ue::Base() + 0x5ddbbf0), add, sizeof(add)) &&
-        !std::memcmp(reinterpret_cast<void*>(ue::Base() + 0x5ddfbd0), remove, sizeof(remove)) &&
+    static constexpr unsigned char remove[] = {0xe9, 0x4b, 0xf3, 0xde, 0x11};
+    return !std::memcmp(reinterpret_cast<void*>(ue::Base() + 0x5e24bb0), add, sizeof(add)) &&
+        !std::memcmp(reinterpret_cast<void*>(ue::Base() + 0x5e28b90), remove, sizeof(remove)) &&
         ue::StructSize(Type("/Script/SGameInputSystem.ActionAbilityBindingItem")) == 152;
 }
 int32_t References(void* list, Object* asset) {
@@ -487,7 +483,7 @@ bool ReplaceInList(void* list,Object* original,Object* copy) {
         // caches and GC references, using UE allocations. The surrounding
         // InputAction entry and SGameInput delegates stay in place.
         using Native = void(__fastcall*)(void*, Object*);
-        const auto remove = reinterpret_cast<Native>(ue::Base() + 0x5ddfbd0), add = reinterpret_cast<Native>(ue::Base() + 0x5ddbbf0);
+        const auto remove = reinterpret_cast<Native>(ue::Base() + 0x5e28b90), add = reinterpret_cast<Native>(ue::Base() + 0x5e24bb0);
         for (int32_t i = 0; i < references; ++i) remove(list, original);
         if (References(list,original)!=0||CachedItems(list,original)!=0) return false;
         for (int32_t i = 0; i < references; ++i) add(list, copy);
@@ -577,10 +573,10 @@ bool EnsureUnregisterHook() {
     if (!Same(input_)) return false;
     Object* function=ue::FindFunction(ue::ClassOf(input_.object),"UnregisterActionInputBindings"),*property=Field(function,"Bindings");
     if (!function||ue::At<uint16_t>(function,ue::layout::kFuncParmsSize)!=80||
-        ue::At<uintptr_t>(function,0x128)!=ue::Base()+0x5de6870||!property||Kind(property)!=0x400000000000ull||
+        ue::At<uintptr_t>(function,0x128)!=ue::Base()+0x5e2f940||!property||Kind(property)!=0x400000000000ull||
         ue::At<int32_t>(property,0x44)!=0||ue::At<int32_t>(property,0x34)!=80||
         ue::At<int32_t>(property,0x80)!=8||ue::At<int32_t>(property,0x8c)!=24) return false;
-    auto* entry=reinterpret_cast<unsigned char*>(ue::Base()+0x5de2840);
+    auto* entry=reinterpret_cast<unsigned char*>(ue::Base()+0x5e2b800);
     unsigned char patch[15]{}; JumpPatch(patch,reinterpret_cast<const void*>(&UnregisterHook));
     if (unregister_installed_) return unregister_verified_&&!std::memcmp(entry,patch,sizeof(patch));
     if (std::memcmp(entry,kUnregisterPrologue,sizeof(kUnregisterPrologue))) return false;
@@ -607,7 +603,7 @@ bool EnsureUnregisterHook() {
 bool RemoveUnregisterHook() {
     if (!unregister_installed_) return true;
     if (GetCurrentThreadId()!=game_thread_) return false;
-    auto* entry=reinterpret_cast<unsigned char*>(ue::Base()+0x5de2840);
+    auto* entry=reinterpret_cast<unsigned char*>(ue::Base()+0x5e2b800);
     unsigned char patch[15]{}; JumpPatch(patch,reinterpret_cast<const void*>(&UnregisterHook));
     if (std::memcmp(entry,patch,sizeof(patch))) return false;
     DWORD old=0; if (!VirtualProtect(entry,15,PAGE_EXECUTE_READWRITE,&old)) return false;
@@ -1584,9 +1580,9 @@ bool QuietCancelSetter(const Context& context,Object* ability) {
     auto* ability_table=ue::At<unsigned char*>(ability,0),*asc_table=ue::At<unsigned char*>(context.asc,0);
     if (!ability_table||!asc_table) return false;
     return Readable(ability_table+0x330,8)&&Readable(asc_table+0x798,8)&&
-        ue::At<uintptr_t>(ability_table,0x330)==ue::Base()+0x4c2b900&&
-        ue::At<uintptr_t>(asc_table,0x798)==ue::Base()+0x125b360&&
-        !std::memcmp(reinterpret_cast<const void*>(ue::Base()+0x125b360),"\xc2\x00\x00",3);
+        ue::At<uintptr_t>(ability_table,0x330)==ue::Base()+0x4c58170&&
+        ue::At<uintptr_t>(asc_table,0x798)==ue::Base()+0x125a3e0&&
+        !std::memcmp(reinterpret_cast<const void*>(ue::Base()+0x125a3e0),"\xc2\x00\x00",3);
 }
 CancelResult ForceCancelOne(const Context& context,const CancelStamp& stamp) {
     Object* ability=stamp.ability.object; bool original=false,changed=false,restored=true,cancel_invoked=false;

@@ -28,7 +28,7 @@ constexpr KnownFloat kKnown[] = {
 };
 // Verified const getter: uses instance ParameterCollection, or rebuilds and
 // returns MergedParameterCollection when its instance override flag is true.
-constexpr uintptr_t kGetParameters = 0x05d00760;
+constexpr uintptr_t kGetParameters = 0x05d46d10;
 constexpr unsigned char kGetParametersCode[] = {
     0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x81,
     0xec, 0x80, 0x0a, 0x00, 0x00, 0x48, 0x8b, 0x05

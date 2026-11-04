@@ -73,8 +73,8 @@ Name advanced_function_name_, session_save_name_;
 Name force_save_function_name_;
 volatile LONG advanced_protected_ = 0, advanced_rejected_ = 0, force_save_rejected_ = 0;
 constexpr size_t kNativeExecOffset = 0x128;
-constexpr uintptr_t kAdvancedExecRva = 0x065ff3b0;
-constexpr uintptr_t kForceSaveExecRva = 0x065fc860;
+constexpr uintptr_t kAdvancedExecRva = 0x066481d0;
+constexpr uintptr_t kForceSaveExecRva = 0x06645720;
 constexpr size_t kSaveBusyOffset = 0x279;
 constexpr int32_t kLegacySaveGuardOffset = 0x3d4;
 
@@ -406,7 +406,7 @@ bool PrimePlayerSaveForTravel(const Context& context, std::wstring& options) {
         modes.num >= 0 && modes.num <= 16384 && (!modes.num || modes.data);
     if (valid) options = modes.num > 0 ? std::wstring(modes.data, static_cast<size_t>(modes.num - 1)) : std::wstring{};
     ue::Free(const_cast<wchar_t*>(level.data)); ue::Free(const_cast<wchar_t*>(modes.data));
-    if (controller) reinterpret_cast<void(__fastcall*)(void*)>(ue::Base() + 0x0126fc00)(controller);
+    if (controller) reinterpret_cast<void(__fastcall*)(void*)>(ue::Base() + 0x0126ec80)(controller);
     ue::Free(const_cast<wchar_t*>(json_text.data)); std::memset(output, 0, 80);
     if (!valid) { Logf("BOSS_LOAD_PRIME failed result=%u; travel cancelled", result); return false; }
     // LoadGame primes the normal character deserialization path. OpenLevel alone
@@ -475,7 +475,7 @@ bool ReturnOriginal(const Context& context) {
     ue::String loaded_text{}; void* loaded_controller = nullptr;
     std::memcpy(&loaded_text, output + 48, sizeof(loaded_text));
     std::memcpy(&loaded_controller, output + 48 + 24, sizeof(loaded_controller));
-    if (loaded_controller) reinterpret_cast<void(__fastcall*)(void*)>(ue::Base() + 0x0126fc00)(loaded_controller);
+    if (loaded_controller) reinterpret_cast<void(__fastcall*)(void*)>(ue::Base() + 0x0126ec80)(loaded_controller);
     ue::Free(const_cast<wchar_t*>(loaded_text.data));
     std::memset(output + 48, 0, 32);
     if (result_type != 0 || !valid_level || !valid_options || !EnsurePracticeVeto(save)) return false; // ESaveLoadResultType::Success=0
