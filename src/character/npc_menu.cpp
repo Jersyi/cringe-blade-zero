@@ -18,14 +18,14 @@ namespace {
 constexpr wchar_t kClass[] = L"PBZ_NpcRetarget_Window_v1";
 constexpr int kSearch = 4601, kList = 4602, kInspect = 4603;
 constexpr int kApply = 4610, kRestore = 4611, kClose = 4612;
-constexpr int kExperimental = 4613, kSkillDamage = 4614;
+constexpr int kSkillDamage = 4614;
 // NPC skill damage multiplier choices; an ini value that is none of them gets a row of its own.
 constexpr float kDamageChoices[] = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f, 8.0f, 10.0f};
 HWND window_ = nullptr, return_window_ = nullptr;
 HWND title_ = nullptr, introduction_ = nullptr, search_label_ = nullptr, search_ = nullptr, list_ = nullptr;
 HWND detail_ = nullptr, gates_ = nullptr, active_ = nullptr, status_ = nullptr;
 HWND inspect_ = nullptr, apply_ = nullptr, restore_ = nullptr, close_ = nullptr;
-HWND experimental_ = nullptr, skill_damage_label_ = nullptr, skill_damage_ = nullptr;
+HWND skill_damage_label_ = nullptr, skill_damage_ = nullptr;
 std::vector<float> damage_values_; // skill_damage_ rows
 HFONT font_ = nullptr;
 Logger logger_ = nullptr;
@@ -89,11 +89,11 @@ void SelectionChanged() {
     const NpcRetarget::Entry* entry = Selected();
     if (entry) {
         const std::wstring id(entry->id.begin(), entry->id.end()), evidence = BoneEvidence(entry->id);
-        SetText(detail_, entry->name + L" · 原 NPC 模型 / 实验适配\r\n标识：" + id + L"\r\n\r\n" +
+        SetText(detail_, entry->name + L" · 原 NPC 模型\r\n标识：" + id + L"\r\n\r\n" +
             (evidence.empty() ? L"" : evidence + L"\r\n\r\n") + entry->detail);
     } else SetText(detail_, L"选择一个 NPC 查看来源、骨架差异与适配范围。\r\n这些项目属于原 NPC 模型，不属于主角的同名套装。");
     const bool can_request = snapshot_.ready && !snapshot_.busy && entry;
-    EnableWindow(inspect_, can_request); EnableWindow(apply_, can_request && snapshot_.experimental && snapshot_.appearance_gate && !snapshot_.cleanup_pending && !snapshot_.disabled);
+    EnableWindow(inspect_, can_request); EnableWindow(apply_, can_request && snapshot_.appearance_gate && !snapshot_.cleanup_pending && !snapshot_.disabled);
     EnableWindow(restore_, snapshot_.active || snapshot_.busy || snapshot_.cleanup_pending);
 }
 bool CatalogChanged(const std::vector<NpcRetarget::Entry>& entries) {
@@ -111,7 +111,7 @@ void Filter() {
     for (const NpcRetarget::Entry& entry : entries_) {
         const std::wstring id(entry.id.begin(), entry.id.end());
         if (!search.empty() && Lower(entry.name + L" " + UiI18n::Translate(entry.name) + L" " + id).find(search) == std::wstring::npos) continue;
-        const std::wstring title = entry.name + L"   ·   原 NPC / 实验适配";
+        const std::wstring title = entry.name + L"   ·   原 NPC";
         const LRESULT row = UiI18n::AddString(list_,LB_ADDSTRING,0,title.c_str());
         if (row == LB_ERR || row == LB_ERRSPACE) continue;
         SendMessageW(list_, LB_SETITEMDATA, static_cast<WPARAM>(row), entry.index);
@@ -141,8 +141,6 @@ void Update() {
     if (!window_) return;
     updating_ = true;
     snapshot_ = NpcRetarget::GetSnapshot();
-    SendMessageW(experimental_, BM_SETCHECK, snapshot_.experimental ? BST_CHECKED : BST_UNCHECKED, 0);
-    EnableWindow(experimental_, !snapshot_.disabled);
     ShowSkillDamage();
     if (CatalogChanged(snapshot_.entries)) { entries_ = snapshot_.entries; Filter(); }
     const CharacterSwap::Snapshot outfit = CharacterSwap::GetSnapshot();
@@ -155,7 +153,7 @@ void Update() {
     else if (snapshot_.disabled) state += L"\r\nNPC 模块已达到独立故障上限；可提交恢复，新的应用已关闭。";
     else if (!snapshot_.appearance_gate) state += L"\r\n主角外观互斥适配器尚未接入；当前只允许检查模板。";
     if (outfit.active) state += L"\r\n主角同骨架套装：" + outfit.selected + L"。切换到 NPC 前必须通过原生会话释放校验。";
-    else if (snapshot_.busy) state += L"\r\n游戏线程正在等待空闲或处理请求；恢复按钮可取消待应用操作。";
+    else if (snapshot_.busy) state += L"\r\n游戏线程正在处理请求（过场中会等过场结束）；恢复按钮可取消待应用操作。";
     else if (!snapshot_.ready) state += L"\r\n请进入可操作场景；可用后再检查模板或应用模型。";
     SetText(active_, state);
     std::wstring status = snapshot_.entries.empty() ? L"NPC 适配模块尚未初始化；菜单仅等待后端快照。" : snapshot_.status;
@@ -167,7 +165,7 @@ void Submit(NpcRetarget::Action action) {
     if (NpcRetarget::Request(action, entry)) {
         if (action == NpcRetarget::Action::Restore) Notice(L"恢复请求已排队；只由游戏线程恢复原模型、材质和临时适配。");
         else if (action == NpcRetarget::Action::Inspect) Notice(L"模板检查请求已排队；检查结果会写入调试日志。");
-        else Notice(L"实验适配请求已排队；将等待主角空闲后更换。");
+        else Notice(L"NPC 外观请求已排队；立即更换，不等当前动作结束（过场中会等过场结束）。");
     } else Notice(L"后端未接受此请求，请检查状态和所选模型。");
     Update();
 }
@@ -224,9 +222,7 @@ void Layout() {
     const int label_width = (std::min)(UiLayout::TextWidth(search_label_) + gap, left / 2);
     MoveWindow(search_label_, margin, search_top + (edit_height - line) / 2, label_width, line, TRUE);
     MoveWindow(search_, margin + label_width + gap, search_top, (std::max)(1, left - label_width - gap), edit_height, TRUE);
-    const int check_width = (std::min)(right_width, UiLayout::CheckWidth(experimental_, m));
-    MoveWindow(experimental_, right, search_top, check_width, edit_height, TRUE);
-    const int damage_left = right + check_width + 2 * gap, damage_label = UiLayout::TextWidth(skill_damage_label_) + gap / 2;
+    const int damage_left = right, damage_label = UiLayout::TextWidth(skill_damage_label_) + gap / 2;
     const int damage_width = (std::max)(1, (std::min)(S(180), margin + content - damage_left - damage_label - gap / 2));
     MoveWindow(skill_damage_label_, damage_left, search_top + (edit_height - line) / 2, damage_label, line, TRUE);
     MoveWindow(skill_damage_, damage_left + damage_label + gap / 2, search_top, damage_width, edit_height + S(240), TRUE);
@@ -271,11 +267,6 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         else if (id == kInspect) Submit(NpcRetarget::Action::Inspect);
         else if (id == kApply || id == IDOK) { if (IsWindowEnabled(apply_)) Submit(NpcRetarget::Action::Apply); }
         else if (id == kRestore) Submit(NpcRetarget::Action::Restore);
-        else if (id == kExperimental) {
-            const bool enabled = SendMessageW(experimental_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            if (!NpcRetarget::SetExperimental(enabled)) Notice(L"实验开关未接受请求；故障停用时仍可恢复原模型。");
-            Update();
-        }
         else if (id == kSkillDamage && notification == CBN_SELCHANGE) {
             const LRESULT row = SendMessageW(skill_damage_, CB_GETCURSEL, 0, 0);
             if (row >= 0 && static_cast<size_t>(row) < damage_values_.size() && NpcRetarget::SetSkillDamageMultiplier(damage_values_[static_cast<size_t>(row)]))
@@ -294,24 +285,23 @@ bool Create() {
     type.hInstance = GetModuleHandleW(nullptr); type.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     type.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1); type.lpszClassName = kClass;
     if (!RegisterClassExW(&type) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) { Log("NPC_MENU window class registration failed"); return false; }
-    window_ = CreateWindowExW(WS_EX_CONTROLPARENT, kClass, L"PBZ · NPC 原模型实验适配", WS_OVERLAPPEDWINDOW,
+    window_ = CreateWindowExW(WS_EX_CONTROLPARENT, kClass, L"PBZ · NPC 原模型", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, S(1040), S(820), nullptr, nullptr, type.hInstance, nullptr);
     if (!window_) { Log("NPC_MENU window creation failed"); return false; }
-    UiI18n::Bind(window_,L"PBZ · NPC 原模型实验适配");
+    UiI18n::Bind(window_,L"PBZ · NPC 原模型");
     dpi_ = static_cast<int>(GetDpiForWindow(window_)); if (dpi_ <= 0) dpi_ = 96; Font();
-    title_ = Control(L"STATIC", L"NPC 原模型 · 实验重定向", SS_LEFT, 0);
+    title_ = Control(L"STATIC", L"NPC 原模型 · 重定向", SS_LEFT, 0);
     UiTheme::SetRole(title_, UiTheme::Role::Section);
-    introduction_ = Control(L"EDIT", L"保留主角操作与能力，使用沐小葵、魔渊、左殇、虚空等原 NPC 与全部人形 Boss 的外观（可搜索）。\r\n更换会等待空闲；可随时提交恢复请求。这里的模型仍需完成实机动作与部件验收。", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0);
+    introduction_ = Control(L"EDIT", L"保留主角操作与能力，使用沐小葵、魔渊、左殇、虚空等原 NPC 与全部人形 Boss 的外观（可搜索）。\r\n更换立即生效，不等当前动作结束；可随时提交恢复请求。套用后按 NPC 技能键施放该 Boss 的技能，招式派生页可以编排连招。", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0);
     search_label_ = Control(L"STATIC", L"搜索", SS_LEFT, 0);
     search_ = Control(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, kSearch, WS_EX_CLIENTEDGE);
     SendMessageW(search_, EM_SETLIMITTEXT, 128, 0);
     list_ = Control(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP, kList, WS_EX_CLIENTEDGE);
-    experimental_ = Control(L"BUTTON", L"启用实验模型切换", BS_AUTOCHECKBOX | WS_TABSTOP, kExperimental);
     skill_damage_label_ = Control(L"STATIC", L"NPC 技能伤害", SS_LEFT, 0);
     skill_damage_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kSkillDamage);
     for (const float value : kDamageChoices) AddDamageChoice(value);
     detail_ = Control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 0, WS_EX_CLIENTEDGE);
-    gates_ = Control(L"EDIT", L"待验收：完整身体 / 头部 / 发丝 / 衣料；走跑、攻击、受击与武器位置；恢复与跨图清理。\r\n"
+    gates_ = Control(L"EDIT", L"适配范围：完整身体 / 头部 / 发丝 / 衣料；走跑、攻击、受击与武器位置；恢复与跨图清理。\r\n"
         L"主角保留原生动画、技能与武器骨骼，NPC 外观独立适配。\r\n"
         L"武器按当前动画与手部比例修正，保留技能中的独立运动。\r\n"
         L"与主角同骨架套装互斥，必须先完整恢复上一种覆盖，再装配下一种。", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0);

@@ -4,7 +4,7 @@
 
 // Worker-thread UI only. Pages keep their existing request/snapshot boundary.
 namespace DebugHub {
-enum class Page { BossRush, BossAI, Character, Npc, AirSkills, MotianGrab, Groom, WeaponPresets, Hotkeys, Supplement, Count };  // Supplement: only with the debug supplement container
+enum class Page { BossRush, BossAI, Character, Npc, Combo, AirSkills, MotianGrab, Groom, WeaponPresets, Hotkeys, Supplement, Donate, Count };  // Supplement: only with the debug supplement container
 using Factory = std::function<HWND(HWND)>;
 void Initialize();
 void Register(Page page, const wchar_t* title, Factory factory);

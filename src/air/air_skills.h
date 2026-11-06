@@ -70,4 +70,11 @@ void OnGameThreadGuarded();
 // state or counted strong references have not been restored; do not travel.
 bool BeforeTravel();
 bool HandleCommand(const char* verb, const char* arguments);
+// 招式派生 pre-input, game thread only, read-only: the pawn's SGameInput component and the InputActions its
+// AbilityInputComponent binds, each with the trigger tags of its bindings ("Ability.Action.Hun.Light"...). False
+// when the pawn's input is not there.
+struct HeroAction { void* action = nullptr; std::vector<std::string> tags; };
+bool HeroActions(void* pawn, void*& sinput, std::vector<HeroAction>& actions);
+// SGameInput.IsHolding(action): the action's input held now. False when it cannot be asked.
+bool HeroHolding(void* sinput, void* action, bool& down);
 }

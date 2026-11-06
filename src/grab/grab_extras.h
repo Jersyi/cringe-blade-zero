@@ -80,6 +80,16 @@ void SetSkinDisplay(SkinDisplay provider);
 // The executor's own grab ended: hits stop being scaled (hits landed while the
 // target is still getting up never are) and the outcome is reported.
 void SourceEnded();
+// The move chain (招式派生) cut the grab in the middle (允许中断): a clone of the executing boss's body, left on the
+// spot, plays the rest of it. HandOff copies the boss weapons shown now onto `body` (that clone's skeletal mesh, on the
+// boss's own skeleton; components of `owner`, at the boss's own sockets) and takes over what is left of the grab's
+// damage: the session no longer deals it when the grab is cancelled. Game thread, while Active().
+struct HandOffInfo { unsigned char* target = nullptr; size_t weapons = 0; int32_t damage = -1; };
+bool HandOff(unsigned char* owner, unsigned char* body, HandOffInfo& out);
+// The clone's grab is over: completed (it played to its end) deals the move's damage the target had not taken yet
+// (its recorded native damage minus what landed before the cut, scaled as the grab page sets; with 无视无敌 and no
+// record, 6 % of max health as for a grab that dealt no event); false drops it.
+void HandOffEnd(int32_t damage, bool completed);
 // Game thread: an additive change of a character's Health through the same game attribute call the grab
 // damage uses (AttributeUtils.ModifyCharacterAttributeValue; negative removes health), so death and
 // hit callbacks stay the game's own. False when the call or the attribute layout is unavailable.

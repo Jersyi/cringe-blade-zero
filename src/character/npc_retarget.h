@@ -9,7 +9,9 @@ using Logger = void (*)(const char*);
 // Game-thread adapter: cancel queued/reapply outfit intent and synchronously
 // release its owned temporary session. True must mean verified release, rather
 // than an inactive UI snapshot. The adapter must not apply another appearance.
-using ReleaseAppearance = bool (*)();
+// chain: a 招式派生 look change (the game's dead flag alone does not hold it); why: the gate that holds it, or on
+// success a note (nullptr: none).
+using ReleaseAppearance = bool (*)(bool chain, const char** why);
 struct Entry { int32_t index; std::string id; std::wstring name, detail; };
 struct Snapshot {
     std::vector<Entry> entries;
@@ -18,6 +20,8 @@ struct Snapshot {
     bool ready = false, active = false, busy = false;
     bool cleanup_pending = false, disabled = false, appearance_gate = false, experimental = false;
     int32_t parts = 0, sockets = 0, retargeted_bones = 0;
+    int32_t skin = -1; // the applied skin's row (kProfiles), -1 without one
+    int32_t chain = -1; // whose 招式派生 chain runs: the skin, or while a BOSS 技能 look is borrowed the look before (-1 the hero)
 };
 enum class Action { Apply, Restore, Inspect };
 void Initialize(Logger logger, ReleaseAppearance release_appearance = nullptr);
@@ -39,6 +43,16 @@ unsigned char* GrabDisplay(double& size);
 // Any thread, no engine calls. Off queues a normal guarded Restore.
 bool SetExperimental(bool enabled);
 Snapshot GetSnapshot();
+// Any thread, no engine calls: a skin's moves for the move-chain page (招式派生), as GA names: its AI skills and its
+// own dodges (directions F / B / L / R, 0 when the name does not say), each once; and a move's notice label.
+// skin -1: the hero's own chain (profile NpcCombo::kHeroProfile): its abilities named GA_*, as last read in game.
+struct SkinMoves { std::string profile; std::wstring name; std::vector<std::string> skills, dodges; std::vector<char> directions; };
+bool GetSkinMoves(int32_t skin, SkinMoves& moves);
+std::wstring MoveLabel(const std::string& ability);
+// Any thread, no engine calls: the skin row (kProfiles) that plays a grab move's boss (MotianGrab::Variant boss_id and
+// source): of that boss's skins (GrabBoss::Key), the one whose blueprint or moves share the longest folder with the
+// grab ability (a P2 grab gets the P2 look), then the one named like the boss; -1 when no skin plays it.
+int32_t SkinForGrab(const std::wstring& boss_id, const std::wstring& source);
 void OnGameThreadGuarded();
 // Game thread only. False means cleanup must be retried before travel/outfit changes.
 bool BeforeTravel();

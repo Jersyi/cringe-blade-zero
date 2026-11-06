@@ -4,6 +4,7 @@
 // right palm, keep bone lengths and the hand's rotation, and fade out between 60 and 90 cm.
 #include "npc_pose_transfer.h"
 #include "npc_body_collision.h"
+#include "npc_grip_routes.h"
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -697,6 +698,32 @@ void TestBodyCollision() {
 }
 }  // namespace
 
+// Weapon routes: only another actor's weapon on a named socket becomes one; effects (a pooled footstep burst on
+// foot_r_Socket owned by WorldSettings, a weapon's own trail) never do; discovered routes go when the weapon goes.
+void TestWeaponRoutes() {
+    using NpcGripRoutes::Attached;
+    constexpr uint64_t kFoot = 0x1111, kBack = 0x2222, kHand = 0x3333;
+    Attached pooled; pooled.socket = kFoot; pooled.owner_alive = true; pooled.owner_is_world = true; pooled.effect = true;
+    Attached pooled_mesh = pooled; pooled_mesh.effect = false;  // anything the pools own, even not an effect class
+    Attached trail; trail.socket = kHand; trail.owner_alive = true; trail.effect = true;  // a weapon actor's Niagara
+    Attached knife; knife.socket = kBack; knife.owner_alive = true;                       // a Shaqi weapon's mesh
+    Attached own = knife; own.owner_is_pawn = true;                                       // the hero's own part
+    Attached dead = knife; dead.owner_alive = false;
+    Attached bare = knife; bare.socket = 0;
+    Check(!NpcGripRoutes::Weapon(pooled) && !NpcGripRoutes::TakesRoute(pooled, true, false), "a pooled effect on foot_r_Socket (owner WorldSettings) is no route");
+    Check(!NpcGripRoutes::TakesRoute(pooled_mesh, true, false), "nothing the effect pools own becomes a route");
+    Check(!NpcGripRoutes::TakesRoute(trail, true, false), "a weapon actor's effect component is no route");
+    Check(NpcGripRoutes::TakesRoute(knife, true, false), "another actor's weapon on a socket the mesh has becomes a route");
+    Check(!NpcGripRoutes::TakesRoute(knife, true, true) && !NpcGripRoutes::TakesRoute(knife, false, false), "not twice, not on a socket the mesh lacks");
+    Check(!NpcGripRoutes::TakesRoute(own, true, false) && !NpcGripRoutes::TakesRoute(dead, true, false) && !NpcGripRoutes::TakesRoute(bare, true, false),
+          "the hero's own parts, a dead owner and an unnamed socket are no routes");
+    const std::vector<NpcGripRoutes::Route> routes = {{kHand, false}, {kBack, true}, {kFoot, true}};
+    const std::vector<size_t> with_knife = NpcGripRoutes::StaleRoutes(routes, {knife, pooled});
+    Check(with_knife.size() == 1 && with_knife[0] == 2, "a discovered route with only an effect on its socket goes; the knife's stays; generated ones stay");
+    const std::vector<size_t> nothing = NpcGripRoutes::StaleRoutes(routes, {});
+    Check(nothing.size() == 2 && nothing[0] == 2 && nothing[1] == 1, "with nothing attached every discovered route goes, highest index first");
+}
+
 int main() {
     TestContact();
     TestWeaponFrame();
@@ -711,6 +738,7 @@ int main() {
     TestOwnMontageBuiltOffSkeleton();
     TestOwnMontageNativeArms();
     TestMountPuppet();
+    TestWeaponRoutes();
     std::printf("npc_pose_transfer_test failures=%d\n", failures);
     return failures ? 1 : 0;
 }

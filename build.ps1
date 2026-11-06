@@ -19,11 +19,21 @@ $readme = @"
 
 安装
   一键安装：先退出游戏，双击 Install.bat，按 1 安装完整版、2 安装精简版、3 卸载。
-    安装器从注册表找到游戏目录（找不到时可手动输入），校验游戏版本，复制后再校验 DLL；
+    安装器从注册表找到游戏目录（找不到时可手动输入 PBZ.exe 所在文件夹），校验游戏版本，复制后再校验 DLL；
     目录里已有其他 MOD 的 version.dll 时先备份，卸载时还原。界面语言随系统显示语言（中文 / 英文）。
-  手动安装：把 version.dll 复制到游戏目录的 platform\steam 文件夹：
-    <PBZ 安装目录>\platform\steam\version.dll
+  手动安装：把 version.dll 复制到 PBZ.exe 所在的文件夹：
+    Steam 版   <PBZ 安装目录>\platform\steam\version.dll
+    WeGame 版  WeGame 游戏目录里 PBZ.exe 的旁边
   启动游戏，进入游戏后按 F10 打开面板。
+
+环境检查与修复
+  Install.bat 选 4，或直接双击 EnvCheck.exe（也可以把 PBZ.exe 拖到它上面）。检查 Windows、VC++ 运行库、Direct3D 12、
+  MOD 用到的全部系统组件、手柄与字体；会拦下 MOD 的 Windows 设置（智能应用控制、Exploit protection 等）、安全软件和
+  系统里的拦截记录；每个游戏安装：游戏版本、已装的 DLL、放错位置的副本、其他 MOD 加载器、写入权限、只读文件、
+  派生文件和上次运行的日志；最后判断游戏到底有没有加载 MOD。发现问题时按编号修复：安装或更新 MOD、停用放错位置的
+  副本、去掉下载标记、从微软官方下载并安装 VC++ 运行库（校验签名）、让 Steam 验证游戏文件、取消只读、移走损坏的
+  派生文件、授予游戏目录写入权限、运行系统文件修复。需要管理员权限的修复会弹出确认。结果保存在 EnvCheck_report.txt。
+  一切正常但 MOD 没有加载时：启动游戏停在标题画面，再运行 EnvCheck.exe，它会读出游戏实际加载的 version.dll。
 
 默认快捷键（键盘 / Xbox / PlayStation；按最近使用的设备自动识别）
   释放投技          G       Y + B      三角 + 圈
@@ -37,10 +47,14 @@ $readme = @"
   两个文件同名，只装其中一个。
 
 卸载
-  运行 Install.bat 选 3；或手动删除 platform\steam 下的 version.dll，以及同目录的 PBZDebugMenu.ini、PBZDebugMenu.log。
+  运行 Install.bat 选 3；或手动删除 PBZ.exe 旁边的 version.dll，以及同目录的 PBZDebugMenu.ini、PBZDebugMenu.log。
+
+Donate（自愿）
+  MOD 完全免费，不打赏也可以使用全部功能。喜欢的话可以在爱发电支持作者：https://afdian.com/a/Jersyi1
+  游戏里面板最底部的 Donate 页有二维码，也能直接在浏览器中打开链接。
 
 说明
-  MOD 只在匹配的 PBZ.exe 版本上启用（启动时校验 SHA-256）。游戏更新后版本不符时，不读写游戏数据，
+  MOD 只在匹配的 PBZ.exe 版本上启用（Steam 版和 WeGame 版，启动时校验 SHA-256）。游戏更新后版本不符时，不读写游戏数据，
   只保留关闭自适应扳机，并在画面上方提示“豪之刃 未适配当前游戏”。
   设置保存在 DLL 旁的 PBZDebugMenu.ini，日志写在 PBZDebugMenu.log。
   更新内容见同目录的 CHANGELOG.md。
@@ -51,15 +65,19 @@ $readme = @"
 $files = [ordered]@{
     "$name/version.dll"               = Join-Path $buildRoot 'Release\version.dll'
     "$name/triggers_only/version.dll" = Join-Path $buildRoot 'triggers_only\version.dll'
+    "$name/EnvCheck.exe"              = Join-Path $buildRoot 'Release\EnvCheck.exe'
     "$name/CHANGELOG.md"              = Join-Path $projectRoot 'CHANGELOG.md'
     "$name/Install.bat"               = Join-Path $projectRoot 'installer\Install.bat'
 }
-# The installer checks the game against the build proxy.cpp accepts.
+# The installer checks the game against the builds proxy.cpp accepts: Steam (kExeBytes, kSha256), WeGame (kWeGame...).
 $proxy = Get-Content -LiteralPath (Join-Path $projectRoot 'src\core\proxy.cpp') -Raw
-$exeBytes = [regex]::Match($proxy, 'kExeBytes = (\d+);').Groups[1].Value
-$exeSha256 = [regex]::Match($proxy, 'kSha256 = "([0-9a-f]{64})"').Groups[1].Value
-if (-not $exeBytes -or -not $exeSha256) { throw 'kExeBytes / kSha256 not found in proxy.cpp' }
-$installer = [IO.File]::ReadAllText((Join-Path $projectRoot 'installer\install.ps1')).Replace('__EXE_BYTES__', $exeBytes).Replace('__EXE_SHA256__', $exeSha256)
+$exeBuilds = foreach ($build in @(@('Steam', ''), @('WeGame', 'WeGame'))) {
+    $exeBytes = [regex]::Match($proxy, '\bk' + $build[1] + 'ExeBytes = (\d+);').Groups[1].Value
+    $exeSha256 = [regex]::Match($proxy, '\bk' + $build[1] + 'Sha256 = "([0-9a-f]{64})"').Groups[1].Value
+    if (-not $exeBytes -or -not $exeSha256) { throw "k$($build[1])ExeBytes / k$($build[1])Sha256 not found in proxy.cpp" }
+    $build[0] + '|' + $exeBytes + '|' + $exeSha256
+}
+$installer = [IO.File]::ReadAllText((Join-Path $projectRoot 'installer\install.ps1')).Replace('__EXE_BUILDS__', ($exeBuilds -join ';'))
 $distRoot = Join-Path $projectRoot 'dist'
 New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 $zipPath = Join-Path $distRoot "$name.zip"

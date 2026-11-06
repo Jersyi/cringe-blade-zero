@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 // PBZDebugMenu.ini persistence shared by the worker and the game thread.
 // Values are cached; Put writes the file only when a value actually changes,
@@ -14,4 +15,6 @@ void Put(const wchar_t* section, const wchar_t* key, const std::wstring& value);
 void PutBool(const wchar_t* section, const wchar_t* key, bool value);
 void PutFloat(const wchar_t* section, const wchar_t* key, float value);
 void PutInt(const wchar_t* section, const wchar_t* key, int value);
+// The keys of one section as the file has them (no cache), in file order.
+std::vector<std::wstring> Keys(const wchar_t* section);
 }

@@ -35,19 +35,27 @@ constexpr const wchar_t* kSubtitles[kPages]={
     L"传送、直接触战与连战流程，附难度 / 周目设置",
     L"读取并调整当前 Boss 实例的原生 AI 参数",
     L"主角兼容装束的完整装配替换",
-    L"以原 NPC 外观操作主角（实验）",
+    L"以原 NPC / 人形 Boss 外观操作主角，施放 Boss 技能",
+    L"按节点编排 Boss 招式、间隔慢放，并把主角闪避替换为 Boss 闪避",
     L"空中施放、跳跃取消与近敌 JC 奖励",
     L"选择各 Boss 的原生投技，按投技快捷键触发",
     L"头发表示切换、强制 Groom 与调试开关",
     L"快捷键或触控板滑动切换两套装备，切换前自动记忆",
     L"键盘、Xbox、PlayStation 各一套，自动识别",
     L"补充包中的原版调试功能：战斗、移动、画面、进度与剧情",
+    L"MOD 完全免费，不打赏也可以使用全部功能",
 };
-constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A};
+constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE8AB,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A,0xEB51};
 struct Entry { const wchar_t* title=L""; Factory factory; HWND window=nullptr; int width=0,height=0; double x=0,y=0; int target_x=0,target_y=0; };
 std::array<Entry,kPages> entries;
-// Sidebar pages: optional trailing pages (the debug supplement) only once registered.
-int NavCount() { int count=static_cast<int>(kPages); while (count>1&&!entries[static_cast<size_t>(count-1)].factory) --count; return count; }
+// Sidebar rows: registered pages only, in page order (the debug supplement may be missing before Donate).
+// selected_ is a page; the nav pill, hover and hit testing work in rows.
+int NavCount() { int count=0; for (const Entry& entry:entries) count+=entry.factory?1:0; return (std::max)(1,count); }
+int NavPage(int row) {
+    for (size_t page=0;page<entries.size();++page) if (entries[page].factory&&row--==0) return static_cast<int>(page);
+    return 0;
+}
+int NavRow(int page) { int row=0; for (int i=0;i<page&&i<static_cast<int>(kPages);++i) row+=entries[static_cast<size_t>(i)].factory?1:0; return row; }
 HWND window_=nullptr,nav_=nullptr,viewport_=nullptr,segment_=nullptr,close_=nullptr,pause_=nullptr,rails_[2]{};
 HWND game_window_=nullptr;
 bool enabled_=false,appearance_dirty_=false,reduced_=false;
@@ -422,14 +430,14 @@ void PaintNav(HWND hwnd) {
     };
     for (int i=0;i<NavCount();++i) {
         const double hover=nav_hover_[static_cast<size_t>(i)].At(now);
-        if (hover>.01&&i!=selected_) { if (art) brush(NavItemRect(i),static_cast<float>(.14*hover)); else Shape(dc,NavItemRect(i),static_cast<float>(S(9)),UiTheme::Panel(),static_cast<BYTE>(150*hover)); }
+        if (hover>.01&&i!=NavRow(selected_)) { if (art) brush(NavItemRect(i),static_cast<float>(.14*hover)); else Shape(dc,NavItemRect(i),static_cast<float>(S(9)),UiTheme::Panel(),static_cast<BYTE>(150*hover)); }
     }
     RECT active=NavItemRect(0); OffsetRect(&active,0,static_cast<int>(std::lround(pill*NavStep())));
     // The game's selected-row brush stroke rides along with the slide.
     if (art) brush(active,1.f);
     else Shape(dc,active,static_cast<float>(S(9)),Mix(UiTheme::Panel(),UiTheme::Selection(),55),255,Mix(UiTheme::Border(),UiTheme::Base(),35));
     if (!art&&GetFocus()==hwnd&&KeyboardCues(hwnd)) {
-        RECT focus=NavItemRect(selected_); InflateRect(&focus,-S(1),-S(1));
+        RECT focus=NavItemRect(NavRow(selected_)); InflateRect(&focus,-S(1),-S(1));
         Shape(dc,focus,static_cast<float>(S(8)),0,0,UiTheme::Accent(),150);
     }
     for (int i=0;i<NavCount();++i) {
@@ -442,9 +450,9 @@ void PaintNav(HWND hwnd) {
         COLORREF icon=Mix(Mix(UiTheme::MutedText(),UiTheme::Text(),static_cast<int>(60*hover)),UiTheme::Accent(),static_cast<int>(100*closeness));
         if (art) { label=Mix(label,ink,static_cast<int>(100*closeness)); icon=Mix(icon,ink,static_cast<int>(100*closeness)); }
         RECT glyph{rect.left+S(14),rect.top,rect.left+S(14)+S(22),rect.bottom};
-        Text(dc,std::wstring(1,kGlyphs[i]),glyph,Font(UiTheme::Font::Icon),icon,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+        Text(dc,std::wstring(1,kGlyphs[NavPage(i)]),glyph,Font(UiTheme::Font::Icon),icon,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
         RECT caption{rect.left+S(48),rect.top,rect.right-S(10),rect.bottom};
-        const std::wstring title=Tr(entries[static_cast<size_t>(i)].title);
+        const std::wstring title=Tr(entries[static_cast<size_t>(NavPage(i))].title);
         Text(dc,title,caption,Display(UiTheme::Font::Heading,title),label,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
     }
 }
@@ -465,15 +473,15 @@ LRESULT CALLBACK NavProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
         if (LOWORD(lparam)==HTCLIENT) { POINT point{}; GetCursorPos(&point); ScreenToClient(hwnd,&point);
             if (NavHit(MAKELPARAM(point.x,point.y))>=0) { SetCursor(LoadCursorW(nullptr,IDC_HAND)); return TRUE; } }
         break;
-    case WM_LBUTTONDOWN: { const int hit=NavHit(lparam); SetFocus(hwnd); if (hit>=0) Select(hit); return 0; }
+    case WM_LBUTTONDOWN: { const int hit=NavHit(lparam); SetFocus(hwnd); if (hit>=0) Select(NavPage(hit)); return 0; }
     case WM_KEYDOWN: {
-        int next=selected_;
+        int next=NavRow(selected_);
         if (wparam==VK_UP) --next; else if (wparam==VK_DOWN) ++next;
         else if (wparam==VK_HOME) next=0; else if (wparam==VK_END) next=NavCount()-1;
         else break;
         next=(next+NavCount())%NavCount();
         SendMessageW(hwnd,WM_CHANGEUISTATE,MAKEWPARAM(UIS_CLEAR,UISF_HIDEFOCUS),0);
-        Select(next); SetFocus(hwnd); return 0;
+        Select(NavPage(next)); SetFocus(hwnd); return 0;
     }
     default: break;
     }
@@ -784,11 +792,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) 
     return DefWindowProcW(hwnd,message,wparam,lparam);
 }
 void Select(int index) {
-    if (!window_||index<0||index>=NavCount()) return;
+    if (!window_||index<0||index>=static_cast<int>(kPages)||!entries[static_cast<size_t>(index)].factory) return;
     const bool changed=index!=selected_; const ULONGLONG now=GetTickCount64();
     selected_=index;
     const bool animate=changed&&IsWindowVisible(window_);
-    pill_.ease=UiMotion::EaseOutCubic; pill_.Set(index,animate?360:0,now,reduced_);
+    pill_.ease=UiMotion::EaseOutCubic; pill_.Set(NavRow(index),animate?360:0,now,reduced_);
     if (animate) {
         page_.ease=UiMotion::EaseOutCubic; page_.from=S(20); page_.to=0; page_.start=now; page_.duration=reduced_?0:320;
         title_.ease=UiMotion::EaseOutCubic; title_.from=0; title_.to=1; title_.start=now; title_.duration=reduced_?0:260;
@@ -848,7 +856,7 @@ bool Create() {
     pause_=CreateWindowExW(0,kPause,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP,0,0,1,1,window_,nullptr,instance,nullptr);
     for (HWND& rail:rails_) rail=CreateWindowExW(0,kRail,L"",WS_CHILD,0,0,1,1,window_,nullptr,instance,nullptr);
     if (!nav_||!viewport_||!segment_||!close_||!pause_||!rails_[0]||!rails_[1]) { DestroyWindow(window_); return false; }
-    knob_.Jump(UiI18n::GetLanguage()==UiI18n::Language::English?1:0); pause_knob_.Jump(HubPause::Enabled()?1:0); pause_hover_.Jump(0); pill_.Jump(selected_); title_.Jump(1); page_.Jump(0);
+    knob_.Jump(UiI18n::GetLanguage()==UiI18n::Language::English?1:0); pause_knob_.Jump(HubPause::Enabled()?1:0); pause_hover_.Jump(0); pill_.Jump(NavRow(selected_)); title_.Jump(1); page_.Jump(0);
     opacity_.Jump(0); rise_.Jump(S(12));
     UiGlass::Apply(window_); UiGlass::SetOpacity(window_,0); applied_alpha_=0;
     const COLORREF edge=Mix(UiTheme::Border(),UiTheme::Base(),20); DwmSetWindowAttribute(window_,34 /*DWMWA_BORDER_COLOR*/,&edge,sizeof(edge));
@@ -956,14 +964,22 @@ void Tick() {
             UiGlass::Sync(window_);
         }
     }
+    if (window_&&IsWindowVisible(window_)) UiCursor::ProbeClicks(window_);  // HUB_CLICK diagnostics
     MSG message{};
     while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+        // Each message's time on this thread (HUB_CLICK reports the slowest), also when it is taken without a dispatch.
+        struct Timed {
+            const MSG& m; HWND hub; LARGE_INTEGER t0{};
+            Timed(const MSG& msg,HWND h):m(msg),hub(h) { QueryPerformanceCounter(&t0); }
+            ~Timed() { LARGE_INTEGER t1{},f{}; QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
+                       UiCursor::NoteDispatch(hub,m,f.QuadPart?static_cast<double>(t1.QuadPart-t0.QuadPart)*1000.0/static_cast<double>(f.QuadPart):0.0); }
+        } timed(message,window_);
         if (window_&&(message.hwnd==window_||IsChild(window_,message.hwnd))) {
             if (UiHotkeys::Capturing()&&(message.message==WM_KEYDOWN||message.message==WM_KEYUP||message.message==WM_SYSKEYDOWN||message.message==WM_SYSKEYUP||message.message==WM_CHAR)) continue;
             if (message.message==WM_KEYDOWN&&message.wParam==VK_ESCAPE) { if (!UiTheme::DismissPopup()) Hide(); continue; }
             if (message.message==WM_KEYDOWN&&message.wParam==VK_TAB&&(GetKeyState(VK_CONTROL)&0x8000)) {
                 const int direction=(GetKeyState(VK_SHIFT)&0x8000)?-1:1;
-                Select((selected_+direction+NavCount())%NavCount()); continue;
+                Select(NavPage((NavRow(selected_)+direction+NavCount())%NavCount())); continue;
             }
             const HWND active=entries[static_cast<size_t>(selected_)].window;
             if (active&&(message.hwnd==active||IsChild(active,message.hwnd))&&IsDialogMessageW(active,&message)) continue;

@@ -1,5 +1,6 @@
 #include "air_skills.h"
 #include "ue_runtime.h"
+#include "game_build.h"
 #include "settings_store.h"
 #include <algorithm>
 #include <cmath>
@@ -444,7 +445,7 @@ bool CacheHelpers() {
     static constexpr unsigned char add[] = {0x48, 0x85, 0xd2, 0x0f, 0x84, 0xbf, 0x03, 0, 0, 0x55, 0x57, 0x41, 0x54, 0x48, 0x8b, 0xec};
     static constexpr unsigned char remove[] = {0xe9, 0x4b, 0xf3, 0xde, 0x11};
     return !std::memcmp(reinterpret_cast<void*>(ue::Base() + 0x5e24bb0), add, sizeof(add)) &&
-        !std::memcmp(reinterpret_cast<void*>(ue::Base() + 0x5e28b90), remove, sizeof(remove)) &&
+        GameBuild::CodeMatches(ue::Base() + 0x5e28b90, remove, sizeof(remove)) &&  // protector stub: jump differs per build
         ue::StructSize(Type("/Script/SGameInputSystem.ActionAbilityBindingItem")) == 152;
 }
 int32_t References(void* list, Object* asset) {
@@ -2085,6 +2086,36 @@ bool BeforeTravel() {
         Recover(); options_ = {}; Publish(false,0);
         Logf("AIR_SKILLS pretravel restore fault=%lu; travel refused",fault_code_); return false;
     }
+}
+bool HeroActions(void* pawn_pointer, void*& sinput_out, std::vector<HeroAction>& actions) {
+    actions.clear(); sinput_out = nullptr;
+    Object* pawn = static_cast<Object*>(pawn_pointer);
+    if (!ue::Alive(pawn)) return false;
+    Object* input = Component(pawn, "/Script/SGameInputSystem.AbilityInputComponent");
+    if (!ue::Alive(input)) return false;
+    Object* sinput = Property(input, "SGameInput");
+    if (!ue::Alive(sinput)) return false;
+    Object* binding_class = Type("/Script/SGameInputSystem.InputActionBinding");
+    const bool visited = VisitBindings(input, [&](Object*& binding, Object* action) {
+        if (!ue::Alive(binding) || !ue::Alive(action) || (binding_class && !ue::IsA(binding, binding_class))) return;
+        std::vector<Name> triggers;
+        WalkStruct(binding, ue::ClassOf(binding), [](Tags*, Gate) {}, 0, &triggers);
+        auto entry = std::find_if(actions.begin(), actions.end(), [&](const HeroAction& a) { return a.action == action; });
+        if (entry == actions.end()) { actions.push_back({action, {}}); entry = actions.end() - 1; }
+        for (const Name tag : triggers) {
+            char text[192]{}; ue::NameText(tag, text, sizeof(text));
+            if (text[0] && std::find(entry->tags.begin(), entry->tags.end(), text) == entry->tags.end()) entry->tags.push_back(text);
+        }
+    });
+    if (!visited) { actions.clear(); return false; }
+    sinput_out = sinput; return true;
+}
+bool HeroHolding(void* sinput, void* action, bool& down) {
+    Object* input = static_cast<Object*>(sinput); Object* act = static_cast<Object*>(action);
+    if (!ue::Alive(input) || !ue::Alive(act)) return false;
+    Call holding(input, "IsHolding");
+    if (!holding.Set("InputAction", act).Invoke()) return false;
+    down = holding.Get<bool>("ReturnValue"); return true;
 }
 bool HandleCommand(const char* verb, const char* arguments) {
     if (std::strcmp(verb, "air")) return false;

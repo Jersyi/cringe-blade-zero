@@ -1,6 +1,7 @@
 #include "debug_supplement.h"
 #include "debug_supplement_catalog.generated.h"
 #include "ue_runtime.h"
+#include "game_build.h"
 #include <windows.h>
 #include <algorithm>
 #include <cstdarg>
@@ -136,7 +137,7 @@ Object* GameInstance() {
 
 bool EngineCodeMatches() {
     for (const EngineCode& check : kEngineCode)
-        if (std::memcmp(reinterpret_cast<const void*>(ue::Base() + check.rva), check.code, sizeof(check.code))) return false;
+        if (!GameBuild::CodeMatches(ue::Base() + check.rva, check.code, sizeof(check.code))) return false;
     return true;
 }
 void CopyText(const wchar_t* text, char* out, size_t size) {
@@ -1158,7 +1159,8 @@ void ExecAddEventTags(Object*, unsigned char* stack, void*) {
 }
 struct ExecPatch { const char* cls; const char* function; uintptr_t game_exec, stub_call; unsigned char call[5]; NativeExec ours; };
 // game_exec: the emptied exec; stub_call: the instruction that pins it as the emptied one (its call of the `ret` stub
-// 0x125a3e0 or of the FString{} stub 0x12b2470, or the shared empty exec's jump to 0x16963980).
+// 0x125a3e0 or of the FString{} stub 0x12b2470, or the shared empty exec's jump into the protector, 0x16963980 on Steam;
+// the jump differs per build, game_build.h).
 constexpr char kHelpCollectClass[] = "/Script/ProjectPBZ.PBZGameplayHelpCollect";
 constexpr ExecPatch kHelpExecs[] = {  // exe-pins
     {kHelpObjClass, "TeleportCharacter", 0x6591090, 0x6591109, {0xe8,0xd2,0x92,0xcc,0xfa}, &ExecTeleportCharacter},
@@ -1173,7 +1175,7 @@ constexpr ExecPatch kHelpExecs[] = {  // exe-pins
 bool PatchExec(const ExecPatch& patch) {
     Object* cls = ue::FindObject(patch.cls);
     Object* function = cls ? ue::FindFunction(cls, patch.function) : nullptr;
-    if (!function || std::memcmp(reinterpret_cast<const void*>(ue::Base() + patch.stub_call), patch.call, sizeof(patch.call))) return false;
+    if (!function || !GameBuild::CodeMatches(ue::Base() + patch.stub_call, patch.call, sizeof(patch.call))) return false;
     const uintptr_t game = ue::Base() + patch.game_exec, ours = reinterpret_cast<uintptr_t>(patch.ours);
     for (int32_t offset = 0xb0; offset < 0x140; offset += 8) {
         uintptr_t& slot = ue::At<uintptr_t>(function, offset);

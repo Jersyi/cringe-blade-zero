@@ -61,10 +61,21 @@ bool ReleaseReference(Object* object);  // only for an object this caller refere
 // serial) and its outer package. Read-only; never calls engine code.
 void DescribeReference(Object* object, char* out, size_t out_size);
 
-Object* FindObject(const char* path);   // "/Script/Engine.Actor"; results cached
+// "/Script/Engine.Actor"; results cached. On the game thread a "/Package/Path.Asset" path not cached yet is asked of
+// the engine's own object hash (a soft reference's resolve, never a load); other paths, other threads and an answer
+// that is not live scan the object array as before.
+Object* FindObject(const char* path);
+// The thread FindObject may ask the engine on (the game thread's tick callback marks itself every frame).
+void MarkGameThread();
+// FindObject so far (callers take differences): cache hits, engine answers (found / not loaded), object-array scans.
+struct LookupStats { uint64_t hits = 0, engine_found = 0, engine_missed = 0, scans = 0; double scan_ms = 0; };
+LookupStats LookupTotals();
 Object* FindFunction(Object* cls, const char* name);
 int32_t Offset(Object* strukt, const char* property);  // -1 when missing
 int32_t StructSize(Object* strukt);                    // UStruct::PropertiesSize, 0 when missing
+// A struct's or function's own properties in declaration order (a function's: its parameters); how many were read.
+struct Field { char name[64]; int32_t offset, size; };
+size_t Fields(Object* strukt, Field* out, size_t max);
 template<class T> T& At(void* base, int32_t offset) { return *reinterpret_cast<T*>(static_cast<unsigned char*>(base) + offset); }
 
 namespace detail { Object* ObjectAt(int32_t index); int32_t ObjectCount(); }

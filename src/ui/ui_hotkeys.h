@@ -59,6 +59,13 @@ Chord Get(Action action, Device device);
 bool Bound(Action action);
 // Any thread: Get(action) as text in the UI language ("G", "Y + B", "三角 + 圈").
 std::wstring Hint(Action action);
+// Any thread: the pad buttons held as of the worker's latest poll (Xbox and PlayStation presses on one layout: bits
+// 0..15 = Up, Down, Left, Right, Menu, View, L3, R3, LB, RB, A, B, X, Y, LT, RT), whether the game window has the focus
+// with no text box or capture up, and whether the pad in use is a PlayStation one.
+// `stick`: the left stick pushed one way (one bit at a time, by its main axis: 1 up / forward, 2 down / back, 4 left,
+// 8 right; 0 near the middle), on either pad.
+struct PadLevel { unsigned buttons = 0; bool in_game = false; bool ps = false; ULONGLONG at = 0; unsigned stick = 0; };
+PadLevel CurrentPad();
 // The pad set that fires now (Xbox or PlayStation).
 Device ActivePad();
 // The device prompts follow: Keyboard, or the active pad.
@@ -68,6 +75,13 @@ std::wstring Plain(const Chord& chord);
 int Draw(HDC dc, int x, int y, int height, const Chord& chord, int limit_x);
 // One keycap in the game's keyboard-prompt style. Returns the right edge.
 int DrawKey(HDC dc, int x, int y, int height, const wchar_t* caption);
+// How far Draw / DrawKey / DrawStick would go from x (Draw: including its gap after the last glyph).
+int Width(HDC dc, int height, const Chord& chord);
+int KeyWidth(HDC dc, int height, const wchar_t* caption);
+int StickWidth(int height, bool ps);
+// The left stick pushed one way (0 up, 1 down, 2 left, 3 right): the pad's L3 prompt icon and an arrow. Returns the
+// right edge.
+int DrawStick(HDC dc, int x, int y, int height, int way, bool ps);
 // Game thread. kind 1 = DualSense / Edge, 2 = DualShock 4. The report includes its id byte.
 void NoteSonyReport(int kind, const unsigned char* data, int size);
 // Weapon HID thread. Ordered DualSense reports, preferred while that reader is live.

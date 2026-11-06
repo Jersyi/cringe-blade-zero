@@ -29,7 +29,15 @@ struct Rotator { double pitch = 0, yaw = 0, roll = 0; };
 struct Display {
     Object* component = nullptr; ue::Name name; bool visible = true;
     Object* parent = nullptr; ue::Name parent_name, socket, hand; double base[3]{}, moved[3]{}; bool follow_refused = false;
+    // As the boss's own weapon actor hangs: its socket on the boss skeleton, the mesh template's relative transform.
+    std::string boss_socket; Transform own_relative; Object* asset = nullptr; bool skeletal = false;
 };
+// What a grab cut by the move chain still owes its target (HandOff / HandOffEnd).
+struct Owed {
+    int32_t id = 0; Object* target = nullptr; ue::Name target_name; std::wstring move; float native = 0, hp_max = -1; uint32_t hits = 0; Options options;
+};
+std::vector<Owed> owed_;
+int32_t owed_serial_ = 0;
 struct Session {
     bool active = false;
     Object* pawn = nullptr; ue::Name pawn_name;
@@ -416,6 +424,7 @@ bool ShowWeapon(Object* pawn, const Weapon& weapon) {
     Quaternion(rotation, relative.rotation);
     relative.translation[0] = location.x; relative.translation[1] = location.y; relative.translation[2] = location.z;
     relative.scale[0] = scale.x; relative.scale[1] = scale.y; relative.scale[2] = scale.z;
+    const Transform own_relative = relative;
     const char* mode = "socket";
     Object* parent = mesh;
     ue::Name attach_to = socket;
@@ -452,6 +461,7 @@ bool ShowWeapon(Object* pawn, const Weapon& weapon) {
     display.parent = parent; display.parent_name = ue::NameOf(parent); display.socket = attach_to;
     for (int i = 0; i < 3; ++i) display.base[i] = relative.translation[i];
     display.hand = HandBone(parent, attach_to);
+    display.boss_socket = weapon.socket ? weapon.socket : ""; display.own_relative = own_relative; display.asset = asset; display.skeletal = is_skeletal;
     session_.displays.push_back(display);
     char socket_text[96]{}, attach_text[96]{}; ue::NameText(socket, socket_text, sizeof(socket_text)); ue::NameText(attach_to, attach_text, sizeof(attach_text));
     Logf("GRAB_EXTRAS boss weapon shown %s socket=%s attached=%s mode=%s %s scale=%.3f", weapon.class_path, socket_text, attach_text, mode, is_skeletal ? "skeletal" : "static", session_.scale);
@@ -755,5 +765,77 @@ bool ChangeMaxHealth(unsigned char* character, float delta) {
 void SourceEnded() {
     if (!session_.active || session_.damage_done) return;
     session_.damage_done = true; ApplyDamage();
+}
+bool HandOff(unsigned char* owner, unsigned char* body, HandOffInfo& out) {
+    out = {};
+    if (!session_.active || !ue::Alive(owner) || !ue::Alive(body)) return false;
+    out.target = Same(session_.target, session_.target_name) ? session_.target : nullptr;
+    // The boss weapons in the boss's hands: copies on the clone's own sockets (it plays the grab on the boss skeleton).
+    Object* skeletal = ue::FindObject("/Script/Engine.SkeletalMeshComponent"), *static_type = ue::FindObject("/Script/Engine.StaticMeshComponent");
+    for (const Display& display : session_.displays) {
+        if (!Same(display.component, display.name) || !display.visible || !ue::Alive(display.asset) || display.boss_socket.empty()) continue;
+        const ue::Name socket = Socket(body, display.boss_socket.c_str());
+        if (socket.None()) { Logf("GRAB_EXTRAS hand-off weapon: no socket %s on the boss body", display.boss_socket.c_str()); continue; }
+        Call add(owner, "AddComponentByClass");
+        if (!add.Set("Class", display.skeletal ? skeletal : static_type).Set("bManualAttachment", true).Set("RelativeTransform", display.own_relative)
+                 .Set("bDeferredFinish", true).Invoke()) continue;
+        Object* component = add.Get<Object*>("ReturnValue");
+        if (!ue::Alive(component)) continue;
+        const bool mesh_set = display.skeletal ? Call(component, "SetSkeletalMeshAsset").Set("NewMesh", display.asset).Invoke()
+                                               : Call(component, "SetStaticMesh").Set("NewMesh", display.asset).Invoke();
+        Call(component, "SetCollisionEnabled").Set("NewType", uint8_t{0}).Invoke();
+        Call attach(component, "K2_AttachToComponent");
+        const bool attached = attach.Set("Parent", body).Set("SocketName", socket).Set("LocationRule", uint8_t{0}).Set("RotationRule", uint8_t{0})
+            .Set("ScaleRule", uint8_t{0}).Set("bWeldSimulatedBodies", false).Invoke() && attach.Get<bool>("ReturnValue");
+        Call(owner, "FinishAddComponent").Set("Component", component).Set("bManualAttachment", true).Set("RelativeTransform", display.own_relative).Invoke();
+        if (!mesh_set || !attached) { Call(component, "K2_DestroyComponent").Set("Object", component).Invoke(); continue; }
+        Call count(display.component, "GetNumMaterials");
+        const int32_t materials = count.Invoke() ? count.Get<int32_t>("ReturnValue") : 0;
+        for (int32_t i = 0; i < materials && i < 64; ++i) {
+            Call get(display.component, "GetMaterial");
+            if (get.Set("ElementIndex", i).Invoke()) if (Object* material = get.Get<Object*>("ReturnValue")) Call(component, "SetMaterial").Set("ElementIndex", i).Set("Material", material).Invoke();
+        }
+        ++out.weapons;
+    }
+    // What is left of the damage: the hits so far are counted, the rest goes with the clone.
+    if (!session_.damage_done && Same(session_.target, session_.target_name)) ScaleHits();
+    session_.damage_done = true;
+    Owed owed; owed.id = ++owed_serial_; owed.target = session_.target; owed.target_name = session_.target_name; owed.move = session_.move;
+    owed.native = session_.native; owed.hp_max = session_.hp_max; owed.hits = session_.hits; owed.options = session_.options;
+    owed_.push_back(owed); out.damage = owed.id;
+    if (owed_.size() > 8) owed_.erase(owed_.begin());
+    Logf("GRAB_EXTRAS hand-off to the boss body: weapons=%zu/%zu damage so far native=%.1f hits=%u (the rest when the body's grab ends)",
+        out.weapons, session_.displays.size(), session_.native, session_.hits);
+    return true;
+}
+void HandOffEnd(int32_t damage, bool completed) {
+    const auto found = std::find_if(owed_.begin(), owed_.end(), [&](const Owed& o) { return o.id == damage; });
+    if (found == owed_.end()) return;
+    const Owed o = *found; owed_.erase(found);
+    if (!completed) { Logf("GRAB_EXTRAS hand-off %d dropped: the boss body was removed before its grab ended; nothing added", o.id); return; }
+    if (!Same(o.target, o.target_name)) { Result(L"投技分身：目标已不存在，未追加伤害"); return; }
+    float hp = 0, maximum = 0;
+    if (!ReadHealth(o.target, hp, maximum)) { Result(L"投技分身：无法读取目标生命，未追加伤害"); return; }
+    if (hp <= 0) { Result(L"投技分身：目标已倒下"); return; }
+    if (maximum <= 0) maximum = o.hp_max;
+    const float recorded = o.move.empty() ? -1.f : SettingsStore::GetFloat(kDamageSection, o.move.c_str(), -1.f);
+    float base = 0; const char* from = "none";
+    if (std::isfinite(recorded) && recorded > .01f) { base = (std::max)(0.f, recorded - o.native); from = "recorded"; }
+    else if (o.native < .01f && o.options.ignore_invulnerable && maximum > 0) { base = maximum * kFallbackShare; from = "fallback"; }
+    if (base < .01f) {
+        Result(L"投技分身：这招没有剩余伤害的记录，未追加");
+        Logf("GRAB_EXTRAS hand-off %d damage: none left (recorded=%.1f native before the cut=%.1f ignore_invulnerable=%d)", o.id, recorded, o.native, o.options.ignore_invulnerable ? 1 : 0);
+        return;
+    }
+    const float wanted = (std::min)(hp, base + HitExtra(o.options.damage, base, o.options.multiplier, o.options.percent, maximum));
+    if (!AddHealth(o.target, -wanted)) { Result(L"投技分身：游戏属性接口调用失败，未修改"); return; }
+    float after = 0, ignored = 0; bool read = ReadHealth(o.target, after, ignored);
+    if (read && std::fabs(after - hp) < .5f && o.options.ignore_invulnerable) {
+        const float forced = (std::max)(1.f, hp - wanted);
+        ForceHealth(o.target, forced); read = ReadHealth(o.target, after, ignored);
+    }
+    Result(L"投技分身：补上这招剩下的伤害 %.0f（生命 %.0f → %.0f）", read ? hp - after : wanted, hp, read ? after : hp - wanted);
+    Logf("GRAB_EXTRAS hand-off %d damage base=%.1f (%s) wanted=%.1f hp=%.1f->%.1f max=%.1f mode=%d", o.id, base, from, wanted, hp, read ? after : -1.f, maximum,
+        static_cast<int>(o.options.damage));
 }
 }

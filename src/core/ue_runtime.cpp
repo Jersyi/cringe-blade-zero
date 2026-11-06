@@ -1,14 +1,22 @@
 #include "ue_runtime.h"
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ue {
 namespace {
 uintptr_t base_ = 0;
-std::map<std::string, Object*> object_cache;
+// A cached object is the same live object while it keeps its name and outer (a collected one's memory is reused).
+struct CachedObject { Object* object = nullptr; Name name; Object* outer = nullptr; };
+std::map<std::string, CachedObject, std::less<>> object_cache;
+DWORD game_thread_id = 0;
+bool engine_asking = false;
+LookupStats lookup_stats;
+LONGLONG lookup_frequency = 0;
 std::map<std::pair<Object*, std::string>, Object*> function_cache;
 std::map<std::pair<Object*, std::string>, int32_t> offset_cache;
 
@@ -186,12 +194,50 @@ void DescribeReference(Object* object, char* out, size_t out_size) {
         internal, refs, serial, item_ok ? 1 : 0, outer_name, outer_class, outer_alive ? 1 : 0, outer_outer ? 1 : 0, outer_flags, outer_internal);
 }
 
+void MarkGameThread() { game_thread_id = GetCurrentThreadId(); }
+LookupStats LookupTotals() { return lookup_stats; }
+namespace {
+// "/Package/Path.Asset" (ASCII, one dot after the last slash, no subobject) asked of the engine: KismetSystemLibrary's
+// Conv_SoftObjectReferenceToObject on a soft reference to it resolves it in the engine's object hash (StaticFindObject)
+// and never loads. `asked` is false when it could not be asked (another thread, a nested lookup, another path form).
+Object* EngineFind(const char* path, bool& asked) {
+    asked = false;
+    if (engine_asking || !game_thread_id || GetCurrentThreadId() != game_thread_id) return nullptr;
+    const char* slash = std::strrchr(path, '/');
+    const char* dot = slash ? std::strchr(slash, '.') : nullptr;
+    if (!dot || dot == slash + 1 || !dot[1] || std::strchr(dot + 1, '.') || std::strchr(path, ':')) return nullptr;
+    for (const char* c = path; *c; ++c) if (static_cast<unsigned char>(*c) >= 0x80) return nullptr;
+    struct SoftPath { int32_t index = 0, serial = 0; Name package, asset; String sub; };
+    static_assert(sizeof(SoftPath) == 40, "TSoftObjectPtr");
+    engine_asking = true;  // the names and the library default below are looked up the old way
+    const std::wstring package(path, dot), asset(dot + 1, dot + std::strlen(dot));
+    SoftPath soft; soft.package = MakeName(package.c_str()); soft.asset = MakeName(asset.c_str());
+    Object* found = nullptr;
+    if (!soft.package.None() && !soft.asset.None()) {
+        Call resolve(Default("/Script/Engine.Default__KismetSystemLibrary"), "Conv_SoftObjectReferenceToObject");
+        if (resolve.Set("SoftObject", soft).Invoke()) { asked = true; found = resolve.Get<Object*>("ReturnValue"); }
+    }
+    engine_asking = false;
+    return found;
+}
+void Remember(const char* path, Object* object) { object_cache[path] = CachedObject{object, NameOf(object), OuterOf(object)}; }
+}
 Object* FindObject(const char* path) {
-    if (auto it = object_cache.find(path); it != object_cache.end()) {
+    if (auto it = object_cache.find(std::string_view(path)); it != object_cache.end()) {
         // Loaded (blueprint) objects are garbage-collected once unused and their memory reused.
-        if (Alive(it->second) && MatchPath(it->second, path)) return it->second;
+        const CachedObject& cached = it->second;
+        if (Alive(cached.object) && NameOf(cached.object) == cached.name && OuterOf(cached.object) == cached.outer) { ++lookup_stats.hits; return cached.object; }
         object_cache.erase(it);
     }
+    bool asked = false;
+    if (Object* engine = EngineFind(path, asked); asked) {
+        if (!engine) { ++lookup_stats.engine_missed; return nullptr; }
+        if (Alive(engine) && MatchPath(engine, path)) { ++lookup_stats.engine_found; Remember(path, engine); return engine; }
+        // A copy the collector has marked: the scan looks for a live one.
+    }
+    LARGE_INTEGER t0{}, t1{};
+    if (!lookup_frequency) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); lookup_frequency = f.QuadPart > 0 ? f.QuadPart : 1; }
+    QueryPerformanceCounter(&t0);
     const char* leaf = path + std::strlen(path);
     while (leaf > path && leaf[-1] != '.' && leaf[-1] != ':' ) --leaf;
     // Only a live object: one the collector has already marked unreachable (a blueprint class nothing
@@ -201,7 +247,10 @@ Object* FindObject(const char* path) {
         if (NameIs(NameOf(o), leaf) && MatchPath(o, path) && Alive(o)) { found = o; return false; }
         return true;
     });
-    if (found) object_cache[path] = found;
+    QueryPerformanceCounter(&t1);
+    const double ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(lookup_frequency);
+    ++lookup_stats.scans; lookup_stats.scan_ms += ms;
+    if (found) Remember(path, found);
     return found;
 }
 Object* FindFunction(Object* cls, const char* name) {
@@ -226,6 +275,17 @@ int32_t Offset(Object* strukt, const char* property) {
 }
 
 int32_t StructSize(Object* strukt) { return strukt ? Read<int32_t>(Addr(strukt) + layout::kPropertiesSize) : 0; }
+size_t Fields(Object* strukt, Field* out, size_t max) {
+    size_t n = 0;
+    if (!strukt || !out) return 0;
+    __try {
+        for (uintptr_t f = Read<uintptr_t>(Addr(strukt) + layout::kChildProperties); f && n < max; f = Read<uintptr_t>(f + layout::kPropNext)) {
+            NameText(Read<Name>(f + layout::kPropName), out[n].name, sizeof(out[n].name));
+            out[n].offset = Read<int32_t>(f + layout::kPropOffset); out[n].size = Read<int32_t>(f + layout::kPropElementSize); ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
 
 Object* FindEngine() {
     Object* engine = nullptr;

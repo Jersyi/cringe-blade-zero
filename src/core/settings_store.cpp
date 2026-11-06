@@ -64,4 +64,13 @@ void PutFloat(const wchar_t* section, const wchar_t* key, float value) {
     wchar_t text[64]{}; _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.3f", value); Put(section, key, text);
 }
 void PutInt(const wchar_t* section, const wchar_t* key, int value) { Put(section, key, std::to_wstring(value)); }
+std::vector<std::wstring> Keys(const wchar_t* section) {
+    std::vector<std::wstring> out;
+    AcquireSRWLockShared(&lock_); const std::wstring path = path_; ReleaseSRWLockShared(&lock_);
+    if (path.empty()) return out;
+    std::vector<wchar_t> buffer(1u << 16);
+    const DWORD used = GetPrivateProfileStringW(section, nullptr, L"", buffer.data(), static_cast<DWORD>(buffer.size()), path.c_str());
+    for (DWORD at = 0; at < used && buffer[at];) { const std::wstring key(buffer.data() + at); out.push_back(key); at += static_cast<DWORD>(key.size()) + 1; }
+    return out;
+}
 }

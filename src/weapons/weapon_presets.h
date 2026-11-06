@@ -42,6 +42,17 @@ bool BeforeTravel(); // No UObject references held; retire stale world identity.
 // Game thread: the equipped main weapon's native ID (e.g. "Tang"), read from the
 // backpack's own cache. Works while presets are off; the backpack is found once per world.
 bool CurrentMainWeaponId(std::string& id);
+// Game thread: this world's PBZBackPackSubsystem (a ue::Object*, cached per world; nullptr when not ready).
+unsigned char* CurrentBackpack();
+// A weapon held for a while (招式派生 武器派生), presets on or off; the saved sets are not touched. Take: the weapon
+// (backpack id; shaqi: a 杀器) is selected when it is equipped, else it goes into the slot not in hand and is
+// selected. Restore: the equipment from before the first take comes back. Both run as the presets' own verified
+// native transaction (replace, wait for the configs, select, read back; restored on failure).
+enum class TemporaryPhase : int { Off, Going, On, Returning, Failed };
+struct TemporaryView { TemporaryPhase phase = TemporaryPhase::Off; std::string weapon; bool changed = false; std::wstring status; uint32_t serial = 0; };
+bool RequestTemporaryWeapon(const std::string& id, bool shaqi);
+bool RequestTemporaryRestore();
+TemporaryView GetTemporary();
 void Shutdown();    // Worker thread: stops only this module's own HID reader.
 bool HandleCommand(const char* verb, const char* arguments);
 }

@@ -26,12 +26,15 @@
 #include "gear_widget.h"
 #include "skill_toast.h"
 #include "hub_pause.h"
+#include "title_control.h"
 #include "boss_rush.h"
 #include "boss_ai.h"
 #include "boss_ai_menu.h"
+#include "test_dummy.h"
 #include "entry_focus.h"
 #include "npc_retarget.h"
 #include "npc_menu.h"
+#include "combo_menu.h"
 #include "air_skills.h"
 #include "air_skills_menu.h"
 #include "motian_grab.h"
@@ -40,8 +43,10 @@
 #include "weapon_presets_menu.h"
 #include "debug_supplement.h"
 #include "supplement_menu.h"
+#include "donate_page.h"
 #include "character_swap.h"
 #include "ue_runtime.h"
+#include "game_build.h"
 
 namespace {
 HMODULE self_module = nullptr;
@@ -54,6 +59,17 @@ constexpr DWORD kImageSize = 0x1e0bb000;
 constexpr DWORD kEntrypoint = 0x18db0d40;
 constexpr uint64_t kExeBytes = 498913272;
 constexpr const char* kSha256 = "4415933ce33476f14c837abb61a1b60af8b78cd81783896501913a7aac69e423";
+// WeGame: the same changelist without Denuvo (game_build.h); update_port.py build wegame rewrites these.
+constexpr DWORD kWeGameTimestamp = 0x6ae7ae5b;
+constexpr DWORD kWeGameImageSize = 0x1b948000;
+constexpr DWORD kWeGameEntrypoint = 0x120f71e0;
+constexpr uint64_t kWeGameExeBytes = 457545208;
+constexpr const char* kWeGameSha256 = "32f8ffaf347c7f458e1607d6655135e5f400a81a3c656934ec5121619c1f9017";
+struct KnownExe { GameBuild::Id id; DWORD timestamp, image_size, entrypoint; uint64_t bytes; const char* sha256; };
+constexpr KnownExe kKnownExes[] = {
+    {GameBuild::Id::Steam, kTimestamp, kImageSize, kEntrypoint, kExeBytes, kSha256},
+    {GameBuild::Id::WeGame, kWeGameTimestamp, kWeGameImageSize, kWeGameEntrypoint, kWeGameExeBytes, kWeGameSha256},
+};
 std::wstring log_path;
 std::wstring command_path;
 
@@ -112,12 +128,12 @@ bool Read(uintptr_t address, void* dest, size_t bytes) {
 }
 template<class T> bool ReadValue(uintptr_t p, T& out) { return Read(p, &out, sizeof(out)); }
 
-bool HashExecutable(const wchar_t* path) {
+bool HashExecutable(const wchar_t* path, const KnownExe& exe) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file, &size) || static_cast<uint64_t>(size.QuadPart) != kExeBytes) { CloseHandle(file); return false; }
+    if (!GetFileSizeEx(file, &size) || static_cast<uint64_t>(size.QuadPart) != exe.bytes) { CloseHandle(file); return false; }
     BCRYPT_ALG_HANDLE algorithm = nullptr; BCRYPT_HASH_HANDLE hash = nullptr;
     bool valid = false;
     if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0 &&
@@ -133,7 +149,7 @@ bool HashExecutable(const wchar_t* path) {
         if (ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0) {
             char hex[65]{};
             for (size_t i = 0; i < digest.size(); ++i) _snprintf_s(hex + i * 2, 3, _TRUNCATE, "%02x", digest[i]);
-            valid = std::strcmp(hex, kSha256) == 0;
+            valid = std::strcmp(hex, exe.sha256) == 0;
         }
     }
     if (hash) BCryptDestroyHash(hash);
@@ -142,14 +158,16 @@ bool HashExecutable(const wchar_t* path) {
     return valid;
 }
 
-bool KnownBuild(uintptr_t base, const wchar_t* executable) {
+// The build whose header facts the running image has, once the file's size and SHA-256 confirm it; else nullptr.
+const KnownExe* KnownBuild(uintptr_t base, const wchar_t* executable) {
     IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
     if (!ReadValue(base, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 || dos.e_lfanew > 1024 * 1024 ||
-        !ReadValue(base + static_cast<uintptr_t>(dos.e_lfanew), nt)) return false;
-    if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-        nt.FileHeader.TimeDateStamp != kTimestamp || nt.OptionalHeader.SizeOfImage != kImageSize ||
-        nt.OptionalHeader.AddressOfEntryPoint != kEntrypoint) return false;
-    return HashExecutable(executable);
+        !ReadValue(base + static_cast<uintptr_t>(dos.e_lfanew), nt)) return nullptr;
+    if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return nullptr;
+    for (const KnownExe& exe : kKnownExes)
+        if (nt.FileHeader.TimeDateStamp == exe.timestamp && nt.OptionalHeader.SizeOfImage == exe.image_size &&
+            nt.OptionalHeader.AddressOfEntryPoint == exe.entrypoint) return HashExecutable(executable, exe) ? &exe : nullptr;
+    return nullptr;
 }
 
 void LogLine(const char* message) { Log(message); }
@@ -169,15 +187,25 @@ void ReportGroomFault() {
     __try { GroomForce::OnFault(groom_fault_code, groom_fault_address, groom_faults, groom_faults >= GameThread::kMaxFaults); }
     __except (EXCEPTION_EXECUTE_HANDLER) { Log("GROOM fault handler failed; other game-thread tasks remain enabled"); }
 }
-bool ReleasePlayerAppearanceForNpc() {
+bool ReleasePlayerAppearanceForNpc(bool chain, const char** why) {
     const auto grab = MotianGrab::GetSnapshot();
-    return !grab.active && !grab.cleanup_pending && BossRush::AllowsAppearanceChanges() && CharacterSwap::ReleaseForExternal() && GroomForce::ReleasePlayerForExternal();
+    const char* gate = nullptr;
+    auto fail = [&](const char* reason) { if (why) *why = reason; return false; };
+    // A grab whose hero side is over (a cut, or its target still getting up / returning to its baseline) leaves the
+    // hero free (the chain's next look).
+    if ((grab.active || grab.cleanup_pending) && !grab.holding && !grab.hero_free) return fail(grab.active ? "grab-active" : "grab-cleanup");
+    if (chain ? !BossRush::AllowsChainLook(&gate) : !BossRush::AllowsAppearanceChanges()) return fail(gate ? gate : "boss-rush (loading / transition / player dead)");
+    if (!CharacterSwap::ReleaseForExternal()) return fail("character-swap (another outfit preview holds the look)");
+    if (!GroomForce::ReleasePlayerForExternal()) return fail("force-groom");
+    if (why) *why = gate;  // a note on success ("dead-flag-ignored") or nullptr
+    return true;
 }
 bool ReleaseNpcForOutfit() {
     const auto grab = MotianGrab::GetSnapshot();
     return !grab.active && !grab.cleanup_pending && BossRush::AllowsAppearanceChanges() && NpcRetarget::ReleaseForExternal();
 }
 void DispatchGameThread() {
+    ue::MarkGameThread();
     MotianGrab::OnGameThreadGuarded();
     CharacterSwap::OnGameThreadGuarded();
     NpcRetarget::OnGameThreadGuarded();
@@ -185,8 +213,10 @@ void DispatchGameThread() {
     if (!BossRush::IsTransitioning()) WeaponPresets::OnGameThreadGuarded();
     BossRush::OnGameThreadGuarded();
     BossAI::OnGameThreadGuarded();
+    if (!BossRush::IsTransitioning()) TestDummy::OnGameThreadGuarded();  // 测试木桩 (招式派生 page)
     DebugSupplement::OnGameThreadGuarded();
     HubPause::OnGameThread(BossRush::IsTransitioning());
+    TitleControl::OnGameThread();
     if (!BossRush::IsTransitioning() && groom_faults < GameThread::kMaxFaults && !GuardedGroomTick()) { ++groom_faults; ReportGroomFault(); }
 }
 void DispatchFault(DWORD code, uintptr_t address, DWORD faults, bool disabled) {
@@ -240,6 +270,7 @@ void PollCommand(HairControls& controls) {
     else if (!std::strcmp(text, "supplement") && !std::strcmp(argument, "menu")) ok = DebugSupplement::Present() && (DebugHub::ShowPage(DebugHub::Page::Supplement), true);
     else if (!std::strcmp(text, "supplement")) ok = DebugSupplement::HandleCommand(text, argument);
     else if (!std::strcmp(text, "boss") || !std::strcmp(text, "rush")) ok = BossRush::HandleCommand(text, argument);
+    else if (!std::strcmp(text, "title")) ok = TitleControl::HandleCommand(text, argument);
     else if (strcmp(text, "status")) ok = false;
     wchar_t status[320]{}, outfit[200]{}; GroomForce::Status(status, 320); GroomForce::OutfitStatus(outfit, 200);
     char line[768]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "COMMAND %s ok=%d hair=0x%lx force=%ls outfit=%ls", text, ok ? 1 : 0, controls.Status(), status, outfit);
@@ -288,7 +319,8 @@ DWORD WINAPI Worker(void*) {
     // Trigger hooks need no game layout, so they keep working on builds the checks below refuse.
     PadTriggers::Attach(&LogLine, (log_path.substr(0, log_path.find_last_of(L"\\/") + 1) + L"PBZDebugMenu.ini").c_str());
     const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    if (!KnownBuild(base, executable)) {
+    const KnownExe* build = KnownBuild(base, executable);
+    if (!build) {
         Log("UNSUPPORTED_BUILD; no data writes");
         InterlockedExchange(&worker_status, 0x200);
         NotifyUnsupported(log_path.substr(0, log_path.find_last_of(L"\\/") + 1));
@@ -299,7 +331,9 @@ DWORD WINAPI Worker(void*) {
     HMODULE pinned = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         reinterpret_cast<LPCWSTR>(&Worker), &pinned)) { Log("PIN_FAILED; no data writes"); InterlockedExchange(&worker_status, 0x400); return 0; }
-    Log("KNOWN_BUILD sha256 verified");
+    // Before any feature reads the game: self-checks of protector-wrapped entries take this build's bytes.
+    GameBuild::Set(build->id);
+    Log(build->id == GameBuild::Id::Steam ? "KNOWN_BUILD sha256 verified" : "KNOWN_BUILD sha256 verified build=WeGame");
     InterlockedExchange(&worker_status, 3);
     ue::Attach(base);
     GroomForce::Initialize(&LogLine, &NpcRetarget::OwnsAppearance);
@@ -308,10 +342,12 @@ DWORD WINAPI Worker(void*) {
     UiHotkeys::Initialize((directory+L"PBZDebugMenu.ini").c_str());
     SettingsStore::Initialize((directory+L"PBZDebugMenu.ini").c_str());
     HubPause::Initialize(&LogLine);
+    TitleControl::Initialize(&LogLine);
     GrabExtras::Initialize(&LogLine);
     // With an NPC skin on, a grab's boss weapon follows the NPC display's hands.
     GrabExtras::SetSkinDisplay(&NpcRetarget::GrabDisplay);
     BossAI::Initialize(&LogLine);
+    TestDummy::Initialize(&LogLine);
     BossRush::Initialize(&LogLine, directory.c_str());
     CharacterSwap::Initialize(&LogLine, &ReleaseNpcForOutfit);
     NpcRetarget::Initialize(&LogLine, &ReleasePlayerAppearanceForNpc);
@@ -335,6 +371,7 @@ DWORD WINAPI Worker(void*) {
     DebugHub::Register(DebugHub::Page::BossAI,L"Boss AI",&BossAIMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::Character,L"角色替换",&BossMenu::CreateCharacterPage);
     DebugHub::Register(DebugHub::Page::Npc,L"NPC 重定向",&NpcMenu::CreatePage);
+    DebugHub::Register(DebugHub::Page::Combo,L"招式派生",&ComboMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::AirSkills,L"空中技能 / JC",&AirSkillsMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::MotianGrab,L"投技",&MotianGrabMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::Groom,L"毛发 / Groom",[&controls](HWND parent) { return controls.CreatePage(parent); });
@@ -371,10 +408,11 @@ DWORD WINAPI Worker(void*) {
         WeaponPresets::RequestSwap();
     });
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
-    // The supplement page exists only with the supplement container; the hub hides an unregistered last page.
+    // The supplement page exists only with the supplement container; the hub lists registered pages only.
     if (DebugSupplement::Present()) DebugHub::Register(DebugHub::Page::Supplement, L"调试补充", &SupplementMenu::CreatePage);
-    Log(DebugSupplement::Present() ? "DEBUG_HUB registered 10 embedded pages (supplement present); hotkeys toggle the host"
-                                   : "DEBUG_HUB registered 9 embedded pages; hotkeys toggle the host");
+    DebugHub::Register(DebugHub::Page::Donate, L"Donate", &DonatePage::CreatePage);
+    Log(DebugSupplement::Present() ? "DEBUG_HUB registered 12 embedded pages (supplement present); hotkeys toggle the host"
+                                   : "DEBUG_HUB registered 11 embedded pages; hotkeys toggle the host");
     bool hook_attempted = false,ready = false,timeout_logged = false;
     // The 11-04 game update removed the native debug menu (DebugObj.js, BP_CollectHelp, PBZ.DebugMenu.Enable,
     // GM_* bodies), so the two debug switches are no longer written; the tools need only the game-thread hook.
@@ -389,11 +427,13 @@ DWORD WINAPI Worker(void*) {
         BossMenu::Tick();
         BossAIMenu::Tick();
         NpcMenu::Tick();
+        ComboMenu::Tick();
         AirSkillsMenu::Tick();
         MotianGrabMenu::Tick();
         WeaponPresets::WorkerTick();
         WeaponPresetsMenu::Tick();
         SupplementMenu::Tick();
+        DonatePage::Tick();
         EntryFocus::Poll();
         controls.Tick();
         if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25); continue; }
@@ -411,7 +451,7 @@ DWORD WINAPI Worker(void*) {
         }
         Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25);
     }
-    WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown();
+    WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown(); DonatePage::Shutdown(); ComboMenu::Shutdown();
     SkillToast::Shutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
     UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
     return 0;

@@ -21,6 +21,7 @@
 #include "hub_pause.h"
 #include "weapon_presets.h"
 #include "weapon_presets_menu.h"
+#include "donate_page.h"
 #include <windows.h>
 #include <windowsx.h>
 #include <atomic>
@@ -139,7 +140,7 @@ DWORD WINAPI GameMain(void* ready) {
     DestroyWindow(game_);
     return 0;
 }
-const wchar_t* const kTitles[] = {L"Boss 连战", L"Boss AI", L"角色替换", L"NPC 重定向", L"空中技能 / JC", L"投技", L"毛发 / Groom", L"武器预设", L"快捷键"};
+const wchar_t* const kTitles[] = {L"Boss 连战", L"Boss AI", L"角色替换", L"NPC 重定向", L"招式派生", L"空中技能 / JC", L"投技", L"毛发 / Groom", L"武器预设", L"快捷键"};
 // Every page but the optional supplement one, which the DLL registers only when its container is present.
 static_assert(std::size(kTitles) == static_cast<size_t>(DebugHub::Page::Supplement), "one title per always-present page");
 HWND MockPage(HWND parent) {
@@ -186,13 +187,15 @@ DWORD WINAPI WorkerMain(void* ready) {
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
     DebugHub::Register(DebugHub::Page::MotianGrab, L"投技", &MotianGrabMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::WeaponPresets, L"武器预设", &WeaponPresetsMenu::CreatePage);
+    // Supplement stays unregistered, so the Donate row follows the hotkey row directly.
+    DebugHub::Register(DebugHub::Page::Donate, L"Donate", &DonatePage::CreatePage);
     UiLoadBanner::ShowSuccess();
     SetEvent(static_cast<HANDLE>(ready));
     while (!stop_.load()) {
-        UiHotkeys::Tick(); DebugHub::Tick(); UiLoadBanner::Tick(); EntryFocus::Poll(); MotianGrabMenu::Tick(); WeaponPresetsMenu::Tick(); GearWidget::Tick();
+        UiHotkeys::Tick(); DebugHub::Tick(); UiLoadBanner::Tick(); EntryFocus::Poll(); MotianGrabMenu::Tick(); WeaponPresetsMenu::Tick(); DonatePage::Tick(); GearWidget::Tick();
         Sleep(DebugHub::Visible() || DebugHub::Animating() || UiLoadBanner::Active() ? 16 : 25);
     }
-    WeaponPresetsMenu::Shutdown(); DebugHub::Shutdown(); UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
+    WeaponPresetsMenu::Shutdown(); DonatePage::Shutdown(); DebugHub::Shutdown(); UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
     return 0;
 }
 void Foreground(HWND window);
@@ -445,6 +448,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     // No supplement container here, so its page is not registered: asking for it must leave the hub where it is.
     DebugHub::ShowPage(DebugHub::Page::Supplement); Sleep(400);
     Check(Visible(L"PBZHotkeyBind_v1") != nullptr, "the absent supplement page is never shown (the hotkey page stays)");
+    // The page after the missing one still opens (rows skip unregistered pages).
+    DebugHub::ShowPage(DebugHub::Page::Donate); Sleep(600);
+    Check(Visible(L"PBZDonatePage_v1") != nullptr, "the Donate page opens after the absent supplement page");
+    DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(600);
     DebugHub::Toggle(); Sleep(900);
     Report("hotkey page closed");
     Check(Keys(5) == 5, "keys reach the game after visiting the hotkey page");

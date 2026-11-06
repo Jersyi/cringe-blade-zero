@@ -1100,6 +1100,25 @@ Snapshot GetSnapshot() {
 bool IsTransitioning() {
     AcquireSRWLockShared(&snapshot_lock); const bool busy = snapshot_.busy; ReleaseSRWLockShared(&snapshot_lock); return busy;
 }
+bool AllowsChainLook(const char** why) {
+    auto fail = [&](const char* reason) { if (why) *why = reason; return false; };
+    if (phase_ != Phase::Idle && phase_ != Phase::WaitingBoss && phase_ != Phase::Fighting && phase_ != Phase::Won) return fail("boss-rush-transition");
+    Context context;
+    if (!ContextNow(context) || !context.pawn || !context.controller) return fail("no-player");
+    const int32_t loading = Offset(context.instance, "IsLoadingLevel");
+    if (loading < 0 || ue::At<uint8_t>(context.instance, loading)) return fail("loading");
+    float health = 0, maximum = 0;
+    if (!PlayerVitals(context, health, maximum)) {
+        float hp = 0;
+        Call get(context.pawn, "GetHealth");
+        const bool read = get.Invoke() ? (hp = get.Get<float>("ReturnValue"), true) : ReadAttributeValue(context.pawn, "Health", hp);
+        if (!read || !std::isfinite(hp) || hp <= 0) return fail("health-0");
+        if (why) *why = "dead-flag-ignored";
+    }
+    if (phase_ == Phase::Idle) return true;
+    if (!entry_armed_ || (phase_ == Phase::WaitingBoss && !BossInitialized())) return fail("boss-rush-entry");
+    return true;
+}
 bool AllowsAppearanceChanges() {
     if (phase_ != Phase::Idle && phase_ != Phase::WaitingBoss && phase_ != Phase::Fighting && phase_ != Phase::Won) return false;
     Context context;

@@ -16,10 +16,10 @@ namespace MotianGrabMenu {
 namespace {
 constexpr wchar_t kClass[]=L"PBZMotianGrabWindow";
 constexpr int kEnable=101,kVariant=102,kRange=103,kApply=104,kTrigger=105,kCancel=106,kBoss=107,kPosition=108,kSourceBoss=109,kRecommended=110;
-constexpr int kHideWeapon=111,kDamageMode=112,kDamageValue=113,kInvulnerable=114,kTangExecution=115;
+constexpr int kHideWeapon=111,kDamageMode=112,kDamageValue=113,kInvulnerable=114,kTangExecution=115,kTransform=116;
 constexpr int kPresetFirst=120; // one per GrabExtras::kMultiplierPresets
 constexpr size_t kPresetCount=std::size(GrabExtras::kMultiplierPresets);
-HWND window_=nullptr,enabled_=nullptr,boss_=nullptr,position_=nullptr,tang_=nullptr,variant_=nullptr,range_=nullptr,range_label_=nullptr,status_=nullptr,detail_=nullptr;
+HWND window_=nullptr,enabled_=nullptr,boss_=nullptr,position_=nullptr,tang_=nullptr,transform_=nullptr,variant_=nullptr,range_=nullptr,range_label_=nullptr,status_=nullptr,detail_=nullptr;
 HWND variant_label_=nullptr,apply_=nullptr,trigger_=nullptr,cancel_=nullptr,status_section_=nullptr,detail_section_=nullptr;
 HWND source_label_=nullptr,source_boss_=nullptr,source_status_=nullptr;
 HWND range_hint_=nullptr,recommended_=nullptr;
@@ -94,7 +94,7 @@ void RebuildCatalog(const MotianGrab::Snapshot& state,bool force) {
 // is shown again; a value the player is still editing stays until the live one changes.
 std::wstring GrabSignature(const MotianGrab::Options& o) {
     wchar_t text[64]{};
-    _snwprintf_s(text, _countof(text), _TRUNCATE,L"%d%d%d%d|%.0f",o.enabled?1:0,o.allow_bosses?1:0,o.position_correction?1:0,o.tang_execution?1:0,static_cast<double>(o.range));
+    _snwprintf_s(text, _countof(text), _TRUNCATE,L"%d%d%d%d%d|%.0f",o.enabled?1:0,o.allow_bosses?1:0,o.position_correction?1:0,o.tang_execution?1:0,o.transform?1:0,static_cast<double>(o.range));
     return text;
 }
 std::wstring ExtrasSignature(const GrabExtras::Options& o) {
@@ -111,6 +111,7 @@ void Apply() {
     options.allow_bosses=SendMessageW(boss_,BM_GETCHECK,0,0)==BST_CHECKED;
     options.position_correction=SendMessageW(position_,BM_GETCHECK,0,0)==BST_CHECKED;
     options.tang_execution=SendMessageW(tang_,BM_GETCHECK,0,0)==BST_CHECKED;
+    options.transform=SendMessageW(transform_,BM_GETCHECK,0,0)==BST_CHECKED;
     const auto state=MotianGrab::GetSnapshot();
     const auto* selected=FindVariant(state,SelectedVariant());
     if (options.enabled) {
@@ -158,6 +159,7 @@ void ShowGrabOptions(const MotianGrab::Options& o) {
     SendMessageW(boss_,BM_SETCHECK,o.allow_bosses?BST_CHECKED:BST_UNCHECKED,0);
     SendMessageW(position_,BM_SETCHECK,o.position_correction?BST_CHECKED:BST_UNCHECKED,0);
     SendMessageW(tang_,BM_SETCHECK,o.tang_execution?BST_CHECKED:BST_UNCHECKED,0);
+    SendMessageW(transform_,BM_SETCHECK,o.transform?BST_CHECKED:BST_UNCHECKED,0);
     wchar_t value[32]{}; _snwprintf_s(value, _countof(value), _TRUNCATE,L"%.0f",o.range); SetWindowTextW(range_,value);
 }
 void ShowExtrasOptions(const GrabExtras::Options& extras) {
@@ -213,6 +215,7 @@ void Refresh(bool options) {
     status+=L"\r\n请求 / 双能力激活："+std::to_wstring(state.attempts)+L" / "+std::to_wstring(state.activations);
     status+=L"　会话类引用："+std::to_wstring(state.retained_classes);
     if (!state.alignment_status.empty()) status+=L"\r\n位置："+state.alignment_status;
+    if (state.options.transform) status+=L"\r\n投技时变身：按投技键时先换成这招的 Boss 外观，投完换回原来的外观（派生链里的投技不变身）";
     if (state.options.tang_execution) {
         status+=std::wstring(L"\r\n")+(state.execution_prepared?L"黑伤处决：魔渊 · 完整擒拿已预载":L"黑伤处决：魔渊 · 完整擒拿准备中")+
             L"；已替换处决次数："+std::to_wstring(state.executions_redirected);
@@ -252,7 +255,7 @@ void Layout() {
     UiLayout::Flow flow(x,y,width,m.Check(),gap*3,gap/2);
     flow.Add(enabled_,UiLayout::CheckWidth(enabled_,m)); flow.Add(boss_,UiLayout::CheckWidth(boss_,m));
     flow.Break(); flow.Add(position_,UiLayout::CheckWidth(position_,m));
-    flow.Break(); flow.Add(tang_,UiLayout::CheckWidth(tang_,m));
+    flow.Break(); flow.Add(tang_,UiLayout::CheckWidth(tang_,m)); flow.Add(transform_,UiLayout::CheckWidth(transform_,m));
     y=flow.Bottom()+gap;
     UiLayout::Flow source_row(x,y,width,m.Row(),gap,gap);
     source_row.Add(source_label_,UiLayout::TextWidth(source_label_),m.Line());
@@ -347,6 +350,7 @@ bool Create() {
     boss_=Control(L"BUTTON",L"目标允许人形 Boss（实验）",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kBoss);
     position_=Control(L"BUTTON",L"按原投技距离修正位置（一次；地面 / 碰撞验证）",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kPosition);
     tang_=Control(L"BUTTON",L"黑伤处决改为魔渊 · 完整擒拿",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kTangExecution);
+    transform_=Control(L"BUTTON",L"投技时变身为该 Boss",BS_AUTOCHECKBOX|WS_TABSTOP,0,0,10,10,kTransform);
     source_label_=Control(L"STATIC",L"来源 Boss",SS_LEFT,0,0,10,10,0);
     source_boss_=Control(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,0,0,10,10,kSourceBoss);
     source_status_=Control(L"STATIC",L"",SS_LEFT,0,0,10,10,0);

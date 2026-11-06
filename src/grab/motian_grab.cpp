@@ -9,6 +9,8 @@
 #include "grab_state_leases.h"
 #include "grab_huashan_adapter.h"
 #include "grab_effect_guard.h"
+#include "grab_boss.h"
+#include "npc_retarget.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -105,6 +107,7 @@ constexpr const wchar_t* kCleanupTags[]={L"CharacterState.Stand.Invulnerable.Exe
 struct CleanupProof { Identity actor,asc,capsule; bool tags[std::size(kCleanupTags)]{}; uint8_t pawn_response=0; bool check_collision=true; };
 struct Session {
     bool redirect=false; // started by a redirected 黑伤 execution, not the grab chord
+    bool chain=false;    // started by the move chain (招式派生 投技 node), not the grab chord
     Identity pawn,target,world,source_class,victim_class,source_asc,target_asc,execution;
     std::vector<int32_t> source_before,target_before;
     std::vector<Grant> grants;
@@ -126,6 +129,13 @@ struct Session {
     GrabEffectGuard::Ledger effect_guard;
     uint32_t deferred_grace_ms=0;
     Identity source_movement;bool verify_source_end_walking=false;uint8_t source_mode_before=0;
+    // RequestCut: the executor's side cancelled for the chain's next move (hero_released once it ended and settled),
+    // the target's side holding the target until RequestRelease(cut_token) / its own end (releasing).
+    bool cut=false,hero_released=false,releasing=false;uint32_t cut_token=0;ULONGLONG cut_at=0;
+    // HoldAfterSource: the executor's side ended by itself first (its target still getting up); refusals logged once.
+    bool hold_refusal_logged=false;
+    // Cleanup: since when only the tags / capsule baseline is awaited (all native abilities ended).
+    ULONGLONG baseline_since=0;
 };
 static_assert(sizeof(Vector)==24 && sizeof(Rotation)==24 && sizeof(Hit)==256 && sizeof(Floor)==272 && sizeof(TraceColor)==16 &&
     sizeof(Tags)==32 && sizeof(Key)==24 && sizeof(CurrentInfo)==32 && sizeof(AnimData)==24 && sizeof(SoftPath)==40);
@@ -141,6 +151,13 @@ Prepared prepared_;
 Prepared spare_;
 int32_t run_variant_=0,execution_variant_=-1;
 bool slot_swapped_=false; // prepared_ holds the execution move until its session ends
+// Third slot: the move chain's own grab (招式派生 投技 nodes), loaded beside the menu move whatever the 投技 page says.
+Prepared chain_;
+int32_t chain_variant_=-1;     // the move the chain keeps loaded (-1: none)
+bool chain_swapped_=false;     // prepared_ holds the chain's move until its session ends
+bool chain_attempt_=false;     // Start runs for the chain
+ULONGLONG chain_deadline_=0;   // a chain grab asked for, tried until then
+constexpr ULONGLONG kChainTriggerMs=1200;
 // A 黑伤 execution that was cancelled and waits for both sides to finish ending.
 struct Redirect {
     bool pending=false; ULONGLONG deadline=0;
@@ -157,7 +174,16 @@ std::unordered_map<std::wstring,Name> names_;
 bool preparing_lookup_=false,trigger_lookup_=false;
 uint64_t weak_assign_calls_=0,virtual_query_calls_=0;
 bool initialized_=false,has_options_=false,trigger_=false,cancel_=false,cleanup_pending_=false;
-int32_t trigger_variant_=-1;
+uint32_t cut_request_=0,release_request_=0;  // RequestCut / RequestRelease tokens (0: none)
+// A cut's executor side must end and settle within kCutHeroSettleMs (else the whole grab is cancelled); a target is
+// held at most kCutHoldMaxMs.
+constexpr ULONGLONG kCutHeroSettleMs=1500,kCutHoldMaxMs=20000;
+// Once every native ability of a grab has ended, its target's tags / capsule baseline is awaited this long; then the
+// session retires its handles anyway (the target's state is the game's own: lying, getting up, its AI).
+constexpr ULONGLONG kTargetBaselineWaitMs=3000;
+uint32_t own_hold_serial_=0;  // tokens of HoldAfterSource holds (high bit set: never one of the chain's cut tokens)
+int32_t trigger_variant_=-1;bool trigger_transform_=true,manual_transform_=false;
+int32_t chain_request_=-2,chain_trigger_variant_=-1;bool chain_trigger_=false; // posted by RequestChainMove / RequestChainTrigger (-2: no change)
 bool key_baseline_=false,armed_=false,last_top_=false,last_right_=false;
 ULONGLONG top_time_=0,right_time_=0,last_attempt_=0,next_poll_=0,next_cleanup_=0,manual_deadline_=0;
 int32_t manual_variant_=-1;
@@ -653,7 +679,10 @@ bool VerifyCleanupProof(const CleanupProof& original) {
     CleanupProof actual;
     if(Same(original.asc)){
         if (!ReadCleanupProof(original.actor.object,original.asc.object,actual)) return false;
-        for (size_t i=0;i<std::size(kCleanupTags);++i) if (actual.tags[i]!=original.tags[i]) return false;
+        // Only an execution tag the grab left on blocks. One that was on before the grab (another execution's, e.g.
+        // the hero's own execution starting as the chain's grab began) and is gone now is a cleaner state, not a leak:
+        // waiting for it to come back kept the hero holding the boss weapon with its own weapons hidden for good.
+        for (size_t i=0;i<std::size(kCleanupTags);++i) if (actual.tags[i]&&!original.tags[i]) return false;
     }else{
         // Tags belonged to the retired ASC. Still prove the live capsule's
         // physical baseline without calling into that obsolete component.
@@ -666,6 +695,21 @@ bool VerifyCleanupProof(const CleanupProof& original) {
         if (!dead.Set("Pawn",original.actor.object).Invoke()||!dead.Get<bool>("ReturnValue")) return false;
     }
     return true;
+}
+// What of a cleanup proof is not back yet, for the log ("" when all of it is, or the actor is gone).
+std::string ProofDiff(const char* side,const CleanupProof& original){
+    if(!Same(original.actor)||!Same(original.asc)||!Same(original.capsule))return "";
+    CleanupProof actual;
+    if(!ReadCleanupProof(original.actor.object,original.asc.object,actual))return std::string(" ")+side+"=unreadable";
+    std::string out;
+    for(size_t i=0;i<std::size(kCleanupTags);++i)if(actual.tags[i]&&!original.tags[i]){
+        char name[96]{};WideCharToMultiByte(CP_UTF8,0,kCleanupTags[i],-1,name,static_cast<int>(sizeof(name)),nullptr,nullptr);
+        out+=std::string(" ")+name+"(still on)";
+    }
+    if(original.check_collision&&actual.pawn_response!=original.pawn_response){
+        char text[64]{};_snprintf_s(text,sizeof(text),_TRUNCATE," PawnResponse %u->%u",original.pawn_response,actual.pawn_response);out+=text;
+    }
+    return out.empty()?"":std::string(" ")+side+":"+out;
 }
 bool Family(Name name,const char* prefix) {
     char text[256]{}; ue::NameText(name,text,sizeof(text)); const size_t n=std::strlen(prefix);
@@ -809,7 +853,7 @@ bool Enemy(Object* actor,const Context& c,Object*& asc,Object*& execution,bool& 
     if (!ue::Alive(actor) || ue::IsTemplate(actor) || actor==c.pawn || !InWorld(actor,c.world)) return Reject("not_in_world");
     boss=ClassListed(actor,kDeniedBossClasses,std::size(kDeniedBossClasses)); bool flag=false;
     if (Bool(actor,"bIsBoss",flag) && flag) boss=true;
-    if ((boss && !options_.allow_bosses) || (!boss && !ClassListed(actor,kOrdinaryEnemyClasses,std::size(kOrdinaryEnemyClasses)))) return Reject("class_not_listed");
+    if ((boss && !options_.allow_bosses && !chain_attempt_) || (!boss && !ClassListed(actor,kOrdinaryEnemyClasses,std::size(kOrdinaryEnemyClasses)))) return Reject("class_not_listed");
     if (ClassListed(actor,kRigMismatchClasses,std::size(kRigMismatchClasses))) return Reject("rig_mismatch");
     Object* controller=Property<Object*>(actor,"Controller"),*ai=Type("/Script/SGameAI.SGameAIController");
     if (!ai || !ue::Alive(controller) || !ue::IsA(controller,ai)) return Reject("no_ai_controller");
@@ -1020,15 +1064,20 @@ bool DefinitionSupported(const VariantData& v) {
     if(v.translate_player_requirement&&(std::strcmp(v.id,"MengHua:GA_MengHua_GEx_02:BD_MengHua_GEx_02:BP_BulletEvent_Grab_C_0")||
         std::strcmp(v.source,"/PBZCombatAsset/ActorData/Mobs/078_MengHua/Ability/GA_MengHua_GEx_02.GA_MengHua_GEx_02_C")||
         std::strcmp(v.victim,"/PBZCombatAsset/ActorData/Mobs/078_MengHua/Ability/GA_MengHua_GEd_02.GA_MengHua_GEd_02_C")))return false;
-    if(v.huashan_domain_bridge&&std::strcmp(v.id,"HuaShan:GA_HuaShan_Troop_GEx_01:BD_HuaShan_Troop_GEx_01:BP_BulletEvent_Grab_C_0"))return false;
-    if(v.event_kind&&(std::strcmp(v.id,"MengHua:GA_MengHua_GEx_01:BD_MengHua_GEx_01:BP_BulletEvent_PlayExecution_C_0")||
-        std::wcscmp(v.success_timeline,L"GrabSuccess")||v.alignment_mode!=1||
-        std::strcmp(v.source,"/PBZCombatAsset/ActorData/Mobs/078_MengHua/Ability/GA_MengHua_GEx_01.GA_MengHua_GEx_01_C")||
-        std::strcmp(v.victim,"/PBZCombatAsset/ActorData/Mobs/078_MengHua/Ability/GA_MengHua_GEd_01.GA_MengHua_GEd_01_C")))return false;
+    if(v.huashan_domain_bridge&&std::strcmp(v.id,"HuaShan:GA_HuaShan_Troop_GEx_01:BD_HuaShan_Troop_GEx_01:BP_BulletEvent_Grab_C_0")&&
+        std::strcmp(v.id,"ZuoShang:GA_ZuoShang_CA_GEx_01:BD_ZuoShang_CA_03:BP_BulletEvent_Grab_C_0"))return false;
+    if(v.event_kind&&(std::strcmp(v.id,"MengHua:GA_MengHua_GEx_01:BD_MengHua_GEx_01:BP_BulletEvent_PlayExecution_C_0")&&
+        (std::strcmp(v.id,"ZuoShang:GA_ZuoShang_CA_GEx_01:BD_ZuoShang_CA_03:BP_BulletEvent_Grab_C_0")||
+         std::wcscmp(v.success_timeline,L"GrabSuccess")||v.alignment_mode!=1||
+         std::strcmp(v.source,"/PBZCombatAsset/ActorData/Mobs/054_ZuoShang/Ability/Abilities/GA_ZuoShang_CA_GEx_01.GA_ZuoShang_CA_GEx_01_C")||
+         std::strcmp(v.victim,"/PBZCombatAsset/ActorData/Mobs/054_ZuoShang/Ability/Abilities/GA_ZuoShang_CA_GEd_01.GA_ZuoShang_CA_GEd_01_C"))))return false;
     if(v.guard_effect){
-        if(std::strcmp(v.id,"XuKong:GA_XuKong_GEx_01:GA_XuKong_CA_Grab:BP_BulletEvent_Grab_C_1")||
+        const bool zuo_gex01=!std::strcmp(v.id,"ZuoShang:GA_ZuoShang_CA_GEx_01:BD_ZuoShang_CA_03:BP_BulletEvent_Grab_C_0")&&
+            !std::strcmp(v.guard_effect,"/PBZCombatAsset/ActorData/Mobs/054_ZuoShang/AIConfig/GE_ZuoShang_MinHealth_40.GE_ZuoShang_MinHealth_40_C");
+        if(!zuo_gex01&&(std::strcmp(v.id,"XuKong:GA_XuKong_GEx_01:GA_XuKong_CA_Grab:BP_BulletEvent_Grab_C_1")||
             std::strcmp(v.guard_effect,"/PBZCombatAsset/ActorData/Mobs/078_MengHua/GameplayEffects/GE_MengHua_XuKong_LockHealth.GE_MengHua_XuKong_LockHealth_C")||
-            v.deferred_grace_ms<100||v.deferred_grace_ms>3000)return false;
+            v.deferred_grace_ms<100||v.deferred_grace_ms>3000))return false;
+        if(zuo_gex01&&(v.deferred_grace_ms<100||v.deferred_grace_ms>3000))return false;
     }else if(v.deferred_grace_ms)return false;
     if(v.verify_source_end_walking&&std::strcmp(v.id,"MadDoctor:GA_MadDoctor_CA_01_Gex:BD_GA_MadDoctor_CA_01_Gex:BP_BulletEvent_Grab_C_0"))return false;
     if(v.transition_count){const auto& t=v.transitions[0];
@@ -1255,12 +1304,36 @@ void AdvancePreparation(bool wanted) {
 bool ExecutionShared() { return execution_variant_>=0&&execution_variant_==options_.variant; }
 // Both slots advance one step per tick: the menu move while grabs are on, and
 // MoTian's full grab while 黑伤 executions are redirected.
+bool MenuWanted() { return options_.enabled||(options_.tang_execution&&execution_variant_>=0&&ExecutionShared()); }
+bool SpareWanted() { return options_.tang_execution&&execution_variant_>=0&&!ExecutionShared(); }
+// The chain's move needs its own slot unless the menu or the execution slot already keeps that move loaded.
+bool ChainOwnSlot() {
+    if (chain_variant_<0) return false;
+    if (MenuWanted()&&options_.variant==chain_variant_) return false;
+    if (SpareWanted()&&execution_variant_==chain_variant_) return false;
+    return true;
+}
 void PrepareSlots() {
-    const bool redirect=options_.tang_execution&&execution_variant_>=0;
-    run_variant_=options_.variant; AdvancePreparation(options_.enabled||(redirect&&ExecutionShared()));
+    run_variant_=options_.variant; AdvancePreparation(MenuWanted());
     std::swap(prepared_,spare_); run_variant_=execution_variant_>=0?execution_variant_:options_.variant;
-    AdvancePreparation(redirect&&!ExecutionShared());
-    std::swap(prepared_,spare_); run_variant_=options_.variant;
+    AdvancePreparation(SpareWanted());
+    std::swap(prepared_,spare_);
+    std::swap(prepared_,chain_); run_variant_=chain_variant_>=0?chain_variant_:options_.variant;
+    AdvancePreparation(ChainOwnSlot());
+    std::swap(prepared_,chain_); run_variant_=options_.variant;
+}
+// Run the chain's move: from the slot holding it (the menu slot, the execution slot or its own), until its session ends.
+void UseChainSlot() {
+    if (prepared_.variant==chain_variant_) {}
+    else if (spare_.variant==chain_variant_&&!slot_swapped_) { std::swap(prepared_,spare_); slot_swapped_=true; }
+    else if (!chain_swapped_) { std::swap(prepared_,chain_); chain_swapped_=true; }
+    run_variant_=chain_variant_;
+}
+// The slot that holds the chain's move (null: none yet).
+const Prepared* ChainHolder() {
+    if (chain_variant_<0) return nullptr;
+    for (const Prepared* slot:{&prepared_,&spare_,&chain_}) if (slot->variant==chain_variant_) return slot;
+    return nullptr;
 }
 // Run with prepared_ holding the execution move (swapped in until its session ends).
 void UseExecutionSlot() {
@@ -1270,12 +1343,14 @@ void UseExecutionSlot() {
 void RestoreSlot() {
     if (HasResources()) return;
     if (slot_swapped_) { std::swap(prepared_,spare_); slot_swapped_=false; }
+    if (chain_swapped_) { std::swap(prepared_,chain_); chain_swapped_=false; }
     run_variant_=options_.variant;
 }
 bool SlotReady(int32_t variant) {
     const int32_t saved=run_variant_; bool ready=false; run_variant_=variant;
     if (prepared_.variant==variant) ready=PreparedReady();
     else if (spare_.variant==variant) { std::swap(prepared_,spare_); ready=PreparedReady(); std::swap(prepared_,spare_); }
+    else if (chain_.variant==variant) { std::swap(prepared_,chain_); ready=PreparedReady(); std::swap(prepared_,chain_); }
     run_variant_=saved; return ready;
 }
 bool PointDistance(const Context& c,Object* target,double& distance,const Vector* known_player=nullptr) {
@@ -1751,9 +1826,27 @@ bool Cleanup(bool cancel) {
     }
     if(!GrabEffectGuard::Verify(session_.effect_guard,adapter_reason,true,true)){Status(L"%s",adapter_reason.c_str());return false;}
     if(!VerifySourceWalkingEnd())return false;
-    if (!VerifyCleanupProof(session_.source_proof)||!VerifyCleanupProof(session_.target_proof)) {
-        if (session_.cleanup_state!=3) Logf("MOTIAN_GRAB_END native End completed but tags/capsule baseline pending; no raw writes");
-        session_.cleanup_state=3; return false;
+    const bool hero_back=VerifyCleanupProof(session_.source_proof);
+    if (!hero_back||!VerifyCleanupProof(session_.target_proof)) {
+        const ULONGLONG now=GetTickCount64();
+        if (session_.cleanup_state!=3) {
+            session_.baseline_since=now;
+            Logf("MOTIAN_GRAB_END native End completed but tags/capsule baseline pending;%s%s no raw writes",
+                 ProofDiff("hero",session_.source_proof).c_str(),ProofDiff("target",session_.target_proof).c_str());
+        }
+        session_.cleanup_state=3;
+        // The hero is back: the grab no longer holds it (its displays go, the chain moves on) while the target's
+        // state comes back; that used to keep the hero standing with the boss weapon until the target got up.
+        if (hero_back&&!session_.hero_released) {
+            session_.hero_released=true; GrabExtras::Finish(session_.paired&&(!cancel||session_.source_completed));
+            Logf("MOTIAN_GRAB_END the hero's side is back; the hero is free while the target's baseline is awaited");
+        }
+        if (now<session_.baseline_since+kTargetBaselineWaitMs) return false;
+        // Every native ability ended kTargetBaselineWaitMs ago: what is still on is the game's own state (no raw
+        // writes); the grab lets go of the hero and its target anyway.
+        if (!session_.hero_released) { session_.hero_released=true; GrabExtras::Finish(session_.paired&&(!cancel||session_.source_completed)); }
+        Logf("MOTIAN_GRAB_END baseline not back after %llu ms (%s%s); every native ability ended, that state is left to the game; handles retired",
+             now-session_.baseline_since,ProofDiff("hero",session_.source_proof).c_str(),ProofDiff("target",session_.target_proof).c_str());
     }
     for (size_t i=session_.grants.size();i-- >0;) {
         Grant& grant=session_.grants[i];
@@ -1769,14 +1862,122 @@ bool Cleanup(bool cancel) {
     GrabExtras::Finish(session_.paired&&(!cancel||session_.source_completed));
     session_={}; cleanup_pending_=false; ResetKeys(); stage_="idle"; return true;
 }
+// RequestCut on the game thread: the executor's side of the paired chain grab is cancelled, the target's side kept
+// (DriveCut). The hero's weapons and the grab's displays go back now: the boss body took its copies and the damage.
+void StartCut(uint32_t token,bool& cancel) {
+    if (!session_.began) { Logf("MOTIAN_GRAB cut token=%u: no grab running, nothing held",token); return; }
+    if (session_.cut) { Logf("MOTIAN_GRAB cut token=%u: already cut (token=%u)",token,session_.cut_token); return; }
+    if (!session_.paired||!session_.chain||!session_.transitions.empty()||!session_.receipts_bound||session_.uncertain||!Same(session_.source_asc)||!Same(session_.target_asc)) {
+        Logf("MOTIAN_GRAB cut token=%u: not held (paired=%d chain=%d transitions=%zu receipts=%d uncertain=%d) -> cancelled",token,session_.paired?1:0,session_.chain?1:0,
+             session_.transitions.size(),session_.receipts_bound?1:0,session_.uncertain?1:0);
+        cancel=true; return;
+    }
+    session_.cut=true; session_.cut_token=token; session_.cut_at=GetTickCount64(); session_.verify_source_end_walking=false;
+    GrabExtras::Finish(false);
+    size_t cancelled=0;
+    for (Grant& grant:session_.grants) {
+        if (grant.asc.object!=session_.source_asc.object) continue;
+        for (const Identity& instance:grant.instances) {
+            bool active=false;
+            if (Same(instance)&&IsActive(instance.object,active)&&active&&Call(instance.object,"K2_CancelAbility").Invoke()) ++cancelled;
+        }
+        grant.next_cancel=session_.cut_at+250;
+    }
+    Logf("MOTIAN_GRAB cut token=%u: executor side cancelled=%zu; the target's side keeps holding the target",token,cancelled);
+}
+// The executor's side of a cut grab once its abilities ended: its cleanup proof (tags, capsule) and state lease
+// checked / restored as at a grab's end, its temporary grants cleared, so the final cleanup no longer checks the hero.
+bool SettleHeroSide(std::wstring& reason) {
+    if (!VerifyCleanupProof(session_.source_proof)) { reason=L"executor tags / capsule not back yet"; return false; }
+    GrabStateLeases::Ledger hero; hero.source=session_.state_lease.source;
+    if (!GrabStateLeases::VerifyOrRestore(hero,reason,true)) return false;
+    session_.state_lease.source=hero.source; session_.state_lease.preserved|=hero.preserved;
+    for (size_t i=session_.grants.size();i-- >0;) {
+        Grant& grant=session_.grants[i];
+        if (grant.asc.object!=session_.source_asc.object) continue;
+        Spec spec; bool present=false;
+        if (!OwnedSpec(grant,spec,present)) { reason=L"executor grant changed"; return false; }
+        if (present) {
+            if (spec.active||(spec.pending&&!ASCQuiescent(grant.asc.object))||!Call(grant.asc.object,"ClearAbility").Set("Handle",grant.handle).Invoke()) { reason=L"executor grant still active"; return false; }
+            Spec after; bool remains=false; if (!OwnedSpec(grant,after,remains)||remains) { reason=L"executor grant remains"; return false; }
+        }
+        session_.grants.erase(session_.grants.begin()+static_cast<std::ptrdiff_t>(i));
+    }
+    session_.source_proof={};
+    return true;
+}
+// The executor's side ended by itself while the target's side still plays (its get-up): the normal end of a grab.
+// The hero is handed back now (its side settled as for a cut, the grab's displays gone) and the target's side plays on
+// to its own end, held as a cut's (DriveCut, RequestRelease); it used to be cancelled after 300 ms, which cut the
+// target's get-up short and left its execution state for its AI to clear (a target without AI stayed down).
+bool HoldAfterSource() {
+    if (!session_.paired||session_.cut||!session_.receipts_bound||session_.uncertain||!session_.transitions.empty()||
+        !Same(session_.source_asc)||!Same(session_.target_asc)) return false;
+    std::wstring reason=L"executor not on its feet yet";
+    if (!VerifySourceWalkingEnd()||!SettleHeroSide(reason)) {
+        if (!session_.hold_refusal_logged) { session_.hold_refusal_logged=true; Logf("MOTIAN_GRAB executor side ended; not settled yet (%ls)",reason.c_str()); }
+        return false;
+    }
+    const ULONGLONG now=GetTickCount64();
+    session_.cut=true; session_.hero_released=true; session_.verify_source_end_walking=false; session_.cut_at=now;
+    session_.cut_token=0x80000000u|(++own_hold_serial_&0x7fffffffu);
+    GrabExtras::Finish(true);
+    Logf("MOTIAN_GRAB executor side ended by itself after %llu ms and settled; the hero is free, the target's side plays on to its own end (token=%u)",
+         now-session_.began,session_.cut_token);
+    return true;
+}
+// A cut grab every tick: the executor's side cancelled again until it ended, then settled (within kCutHeroSettleMs,
+// else the whole grab is cancelled); the target stays held while its side runs. True: held this tick; false with
+// cancel set: the grab ends now (its target's side ended, the hold's time ran out, or the hero's side did not settle).
+bool DriveCut(bool& cancel) {
+    const ULONGLONG now=GetTickCount64();
+    if (now>=session_.cut_at+kCutHoldMaxMs) {
+        Logf("MOTIAN_GRAB cut token=%u: target held %llu ms, released",session_.cut_token,now-session_.cut_at); session_.releasing=true; cancel=true; return false;
+    }
+    if (!session_.hero_released) {
+        bool ended=true;
+        for (Grant& grant:session_.grants) {
+            if (grant.asc.object!=session_.source_asc.object) continue;
+            for (const Identity& instance:grant.instances) {
+                if (!Same(instance)) continue;
+                bool active=false;
+                if (!IsActive(instance.object,active)) { ended=false; continue; }
+                if (active&&now>=grant.next_cancel&&grant.cancel_rounds<4) { ++grant.cancel_rounds; grant.next_cancel=now+250; Call(instance.object,"K2_CancelAbility").Invoke(); }
+                ended=Ended(instance)&&ended;
+            }
+        }
+        std::wstring reason=L"executor abilities still running";
+        if (ended) ended=SettleHeroSide(reason);
+        if (!ended) {
+            if (now<session_.cut_at+kCutHeroSettleMs) return true;
+            Logf("MOTIAN_GRAB cut token=%u: executor side not settled after %llu ms (%ls); the whole grab is cancelled",session_.cut_token,now-session_.cut_at,reason.c_str());
+            session_.releasing=true; cancel=true; return false;
+        }
+        session_.hero_released=true;
+        Logf("MOTIAN_GRAB cut token=%u: executor side ended and settled after %llu ms; the target stays held",session_.cut_token,now-session_.cut_at);
+    }
+    bool running=false,read=true;
+    for (const Grant& grant:session_.grants) for (const Identity& instance:grant.instances) if (Same(instance)) {
+        bool active=false; if (!IsActive(instance.object,active)) read=false; else running=running||active;
+    }
+    if (read&&!running) {
+        Logf("MOTIAN_GRAB cut token=%u: the target's side ended by itself after %llu ms",session_.cut_token,now-session_.cut_at); session_.releasing=true; cancel=true; return false;
+    }
+    return true;
+}
 void Publish(bool ready=false) {
     AcquireSRWLockExclusive(&state_lock); state_.options=options_; state_.ready=ready&&PreparedReady();
     state_.prepared=options_.enabled&&PreparedReady(); state_.preparing=options_.enabled&&!prepared_.ready&&!prepared_.failed&&!prepared_.uncertain;
     state_.prepared_asset_refs=static_cast<uint32_t>(prepared_.assets.size()); state_.preparation_last_ms=prepared_.last_ms; state_.preparation_status=prepared_.status;
     state_.active=HasResources(); state_.paired=session_.paired; state_.cleanup_pending=cleanup_pending_||prepared_.uncertain;
+    state_.holding=session_.began&&session_.cut&&session_.hero_released&&!session_.releasing; state_.holding_token=state_.holding?session_.cut_token:0;
+    state_.hero_free=session_.began&&session_.hero_released;
     state_.retained_classes=static_cast<uint32_t>(class_leases_.size());
     state_.disabled=InterlockedCompareExchange(&disabled_,0,0)!=0;
     state_.execution_prepared=options_.tang_execution&&SlotReady(execution_variant_);
+    state_.chain_variant=chain_variant_; state_.chain_prepared=chain_variant_>=0&&SlotReady(chain_variant_);
+    { const Prepared* holder=ChainHolder(); state_.chain_preparing=chain_variant_>=0&&!state_.chain_prepared&&(!holder||(!holder->failed&&!holder->uncertain));
+      state_.chain_status=holder?holder->status:std::wstring(); }
     state_.target=Same(session_.target)?Wide(Text(session_.target.object)):L"";
     state_.ability=Same(session_.source_class)?Wide(Text(session_.source_class.object)):L"";
     ReleaseSRWLockExclusive(&state_lock);
@@ -1885,7 +2086,7 @@ bool StartAttempt(const Context& c) {
     timing.Next(1);
     // A redirected execution names its target; the move's own range then applies.
     Object* target=nullptr,*target_asc=nullptr,*target_execution=nullptr,*near_boss=nullptr;
-    double best=forced_target_?static_cast<double>(variant.max_range):options_.range;
+    double best=forced_target_||chain_attempt_?static_cast<double>(variant.max_range):options_.range;  // the chain: the move's own full range
     const char* near_reason=""; char near_detail[200]{};
     // The closest listed enemy that was refused, so a failed grab says why.
     Object* refused=nullptr; double refused_distance=1e30; const char* refused_reason=""; char refused_detail[200]{};
@@ -1979,7 +2180,7 @@ bool StartAttempt(const Context& c) {
     session_.source_class=Id(source); session_.victim_class=Id(victim); session_.source_asc=Id(c.asc); session_.target_asc=Id(target_asc);
     session_.execution=Id(c.execution);
     if(variant.transition_count)session_.target_execution=Id(target_execution);
-    session_.variant=run_variant_;session_.redirect=redirect_attempt_;session_.max_duration_ms=variant.max_duration_ms;
+    session_.variant=run_variant_;session_.redirect=redirect_attempt_;session_.chain=chain_attempt_;session_.max_duration_ms=variant.max_duration_ms;
     session_.deferred_grace_ms=variant.deferred_grace_ms;
     session_.verify_source_end_walking=variant.verify_source_end_walking;
     if(variant.verify_source_end_walking){session_.source_movement=Id(c.movement);session_.source_mode_before=Property<uint8_t>(c.movement,"MovementMode");}
@@ -2304,7 +2505,61 @@ void SaveOptions(const Options& o) {
     SettingsStore::PutBool(L"Grab",L"Position",o.position_correction);
     SettingsStore::PutFloat(L"Grab",L"Range",o.range);
     SettingsStore::PutBool(L"Grab",L"TangExecution",o.tang_execution);
+    SettingsStore::PutBool(L"Grab",L"Transform",o.transform);
     if(o.variant>=0&&o.variant<static_cast<int32_t>(std::size(kVariants)))SettingsStore::Put(L"Grab",L"Move",Wide(kVariants[o.variant].id));
+}
+// 投技时变身 (Options::transform): a grab the hero starts first takes the look of the move's boss, then grabs,
+// and the look from before comes back once the grab has ended (or was not cast). 1: waiting for the look;
+// 2: the grab is queued or running in it.
+struct Transform { int stage=0; int32_t skin=-1,previous=-1; ULONGLONG deadline=0; bool started=false; };
+Transform transform_;
+constexpr ULONGLONG kTransformWaitMs=10000,kTransformGrabMs=5000;
+std::string SkinId(const NpcRetarget::Snapshot& skin,int32_t row) {
+    for (const NpcRetarget::Entry& e:skin.entries) if (e.index==row) return e.id;
+    return {};
+}
+void EndTransform(const char* why) {
+    // Only while the boss look is still on (or still being put on): a look picked meanwhile stays.
+    const NpcRetarget::Snapshot skin=NpcRetarget::GetSnapshot();
+    const bool ours=skin.skin==transform_.skin||skin.busy;
+    bool asked=false;
+    if (ours) asked=transform_.previous>=0?NpcRetarget::Request(NpcRetarget::Action::Apply,transform_.previous):NpcRetarget::Request(NpcRetarget::Action::Restore);
+    Logf("MOTIAN_GRAB transform end reason=%s skin=%d previous=%d restore=%s",why,transform_.skin,transform_.previous,!ours?"skipped (look changed)":asked?"queued":"refused");
+    transform_={};
+}
+// Before a grab the hero started: true when the boss's look was asked for and the grab now waits for it.
+bool BeginTransform() {
+    const VariantData& v=kVariants[options_.variant];
+    const int32_t row=NpcRetarget::SkinForGrab(Wide(v.boss_id),Wide(v.source));
+    const NpcRetarget::Snapshot skin=NpcRetarget::GetSnapshot();
+    if (row<0) { Logf("MOTIAN_GRAB transform skipped: no NPC look plays boss=%s",v.boss_id); return false; }
+    if (skin.skin>=0&&GrabBoss::Same(SkinId(skin,skin.skin),std::string(v.boss_id))) { Logf("MOTIAN_GRAB transform skipped: already that boss (skin=%d)",skin.skin); return false; }
+    if (skin.busy) { Logf("MOTIAN_GRAB transform skipped: the look is changing"); return false; }
+    if (!NpcRetarget::Request(NpcRetarget::Action::Apply,row)) { Logf("MOTIAN_GRAB transform skipped: NPC look refused (off or disabled) skin=%d",row); return false; }
+    transform_={}; transform_.stage=1; transform_.skin=row; transform_.previous=skin.skin; transform_.deadline=GetTickCount64()+kTransformWaitMs;
+    Logf("MOTIAN_GRAB transform boss=%s skin=%d previous=%d",v.boss_id,row,skin.skin);
+    Status(L"投技前变身为该 Boss，换好外观后施放");
+    return true;
+}
+void DriveTransform(bool cancelled) {
+    if (!transform_.stage) return;
+    const ULONGLONG now=GetTickCount64();
+    if (transform_.stage==1) {
+        if (cancelled) { Status(L"投技已取消；外观换回"); EndTransform("cancelled"); return; }
+        const NpcRetarget::Snapshot skin=NpcRetarget::GetSnapshot();
+        if (skin.skin==transform_.skin&&!skin.busy) {
+            transform_.stage=2; manual_deadline_=now+kTransformGrabMs; manual_variant_=options_.variant; manual_transform_=false;
+            Logf("MOTIAN_GRAB transform skin=%d on; grab queued",transform_.skin);
+            Status(L"已变身为该 Boss；投技已排队（5 秒内仍需通过焦点、生命与目标门控）");
+        } else if (now>transform_.deadline||!options_.enabled) {
+            Status(L"变身为该 Boss 没有完成；本次投技未施放");
+            EndTransform(options_.enabled?"look-timeout":"grabs-off");
+        }
+        return;
+    }
+    if (session_.began) transform_.started=true;
+    if (session_.began||HasResources()||manual_deadline_||!class_leases_.empty()) return;
+    EndTransform(transform_.started?"grab-ended":"grab-not-cast");
 }
 void Tick() {
     if (!initialized_) return;
@@ -2314,22 +2569,43 @@ void Tick() {
         if(options_.variant!=pending_.variant){manual_deadline_=0;manual_variant_=-1;}
         options_=pending_; has_options_=false; ResetKeys(); input_gate_="options_changed";
         SaveOptions(options_);
-        Logf("MOTIAN_GRAB_OPTIONS enabled=%d humanoid_bosses=%d positionCorrection=%d variant=%s range=%.1f tangExecution=%d",options_.enabled?1:0,options_.allow_bosses?1:0,options_.position_correction?1:0,kVariants[options_.variant].id,options_.range,options_.tang_execution?1:0);
+        Logf("MOTIAN_GRAB_OPTIONS enabled=%d humanoid_bosses=%d positionCorrection=%d variant=%s range=%.1f tangExecution=%d transform=%d",options_.enabled?1:0,options_.allow_bosses?1:0,options_.position_correction?1:0,kVariants[options_.variant].id,options_.range,options_.tang_execution?1:0,options_.transform?1:0);
     }
-    manual=trigger_;expected_variant=trigger_variant_;trigger_=false;trigger_variant_=-1;cancel=cancel_; cancel_=false; ReleaseSRWLockExclusive(&request_lock);
+    manual=trigger_;expected_variant=trigger_variant_;const bool may_transform=trigger_transform_;trigger_=false;trigger_variant_=-1;trigger_transform_=true;cancel=cancel_; cancel_=false;
+    const int32_t chain_move=chain_request_;const bool chain_manual=chain_trigger_;const int32_t chain_manual_variant=chain_trigger_variant_;
+    chain_request_=-2;chain_trigger_=false;chain_trigger_variant_=-1;
+    const uint32_t cut_token=cut_request_,release_token=release_request_;cut_request_=release_request_=0;
+    ReleaseSRWLockExclusive(&request_lock);
+    if (cut_token&&!cancel) StartCut(cut_token,cancel);
+    if (release_token&&session_.began&&session_.cut&&session_.cut_token==release_token&&!session_.releasing) {
+        session_.releasing=true; cancel=true;
+        Logf("MOTIAN_GRAB cut token=%u: released (the boss body ended) after %llu ms",release_token,GetTickCount64()-session_.cut_at);
+    }
+    if (chain_move!=-2&&chain_move!=chain_variant_) {
+        Logf("MOTIAN_GRAB chain move %s -> %s",chain_variant_>=0?kVariants[chain_variant_].id:"none",chain_move>=0?kVariants[chain_move].id:"none");
+        chain_variant_=chain_move; if (chain_deadline_&&chain_variant_<0) chain_deadline_=0;
+    }
+    if (chain_manual) {
+        if (chain_manual_variant!=chain_variant_) Logf("MOTIAN_GRAB chain move %s -> %s (trigger)",chain_variant_>=0?kVariants[chain_variant_].id:"none",kVariants[chain_manual_variant].id);
+        chain_variant_=chain_manual_variant; chain_deadline_=GetTickCount64()+kChainTriggerMs;
+        Logf("MOTIAN_GRAB chain trigger queued variant=%s",kVariants[chain_variant_].id);
+    }
     const bool explicit_cancel=cancel;
     if(manual&&expected_variant>=0&&expected_variant!=options_.variant){manual=false;manual_deadline_=0;manual_variant_=-1;Status(L"所选投技尚未应用；本次请求已拒绝，请先应用设置");}
     if(manual&&HasResources()){manual=false;Status(L"当前投技尚未完整结束；未排队下一招");}
-    if (manual) { manual_deadline_=GetTickCount64()+10000;manual_variant_=options_.variant;Status(L"已排队一次投技：10 秒内回到游戏；仍需通过焦点、生命与目标门控"); }
-    if (cancel) {manual_deadline_=0;manual_variant_=-1;}
-    // Grabs and the 黑伤 execution redirect share this module; a chord grab still
-    // ends when grabs are switched off.
-    const bool module_on=options_.enabled||options_.tang_execution;
+    if(manual&&transform_.stage){manual=false;Status(L"正在为上一次投技变身；本次请求已忽略");}
+    if (manual) { manual_deadline_=GetTickCount64()+10000;manual_variant_=options_.variant;manual_transform_=may_transform;Status(L"已排队一次投技：10 秒内回到游戏；仍需通过焦点、生命与目标门控"); }
+    if (cancel) {manual_deadline_=0;manual_variant_=-1;chain_deadline_=0;}
+    // Grabs, the 黑伤 execution redirect and the move chain's grab share this module; a chord grab still ends when
+    // grabs are switched off (a chain grab and a redirect do not).
+    const bool module_on=options_.enabled||options_.tang_execution||chain_variant_>=0;
     if (!module_on || InterlockedCompareExchange(&disabled_,0,0)) cancel=true;
-    if (!options_.enabled&&session_.began&&!session_.redirect) cancel=true;
+    if (!options_.enabled&&session_.began&&!session_.redirect&&!session_.chain) cancel=true;
     if (!options_.enabled) { if (manual) Status(L"请先开启投技并应用设置"); manual_deadline_=0;manual_variant_=-1; }
+    DriveTransform(cancel);
     // Default-off does no context enumeration or native calls.
-    if (!module_on&&!HasResources()&&prepared_.assets.empty()&&prepared_.variant<0&&spare_.assets.empty()&&spare_.variant<0&&!slot_swapped_&&!manual) { Publish(); return; }
+    if (!module_on&&!HasResources()&&prepared_.assets.empty()&&prepared_.variant<0&&spare_.assets.empty()&&spare_.variant<0&&!slot_swapped_&&
+        chain_.assets.empty()&&chain_.variant<0&&!chain_swapped_&&!manual) { Publish(); return; }
     if (!session_.began && !class_leases_.empty()) {
         if (GetTickCount64()>=next_cleanup_) { next_cleanup_=GetTickCount64()+500; Cleanup(true); }
         Publish(); return;
@@ -2339,6 +2615,7 @@ void Tick() {
         GrabExtras::Tick();
         if (InterlockedCompareExchange(&disabled_,0,0) && !explicit_cancel) { Publish(); return; }
         const bool old_world=!Same(session_.world)||!Same(session_.pawn)||!Same(session_.target);
+        if (session_.cut&&!session_.releasing&&!cancel&&!old_world&&DriveCut(cancel)) { Publish(); return; }
         if(!PollTransitions())cleanup_pending_=true;
         if(session_.deferred_grace_ms){bool advancing=false;if(!BrokerTime(advancing))cleanup_pending_=true;}
         const bool expired=session_.transitions.empty()&&!session_.deferred_grace_ms?GetTickCount64()-session_.began>session_.max_duration_ms:session_.broker_clock>session_.max_duration_ms;
@@ -2381,9 +2658,14 @@ void Tick() {
                 if (!running && Cleanup(false)) Status(L"原投技结束，临时能力句柄已清理");
                 else if (running && source_running!=victim_running) {
                     if (!session_.asymmetric_since) session_.asymmetric_since=GetTickCount64();
-                    if (GetTickCount64()-session_.asymmetric_since>300) {
-                        // Executor done while the victim still plays its get-up: the normal end of a grab.
-                        if (!source_running && victim_running) session_.source_completed=true;
+                    const ULONGLONG since=GetTickCount64()-session_.asymmetric_since;
+                    if (!source_running && victim_running && session_.paired) {
+                        // Executor done while the victim still plays its get-up: the normal end of a grab. The hero
+                        // goes free now; the victim's side ends by itself (HoldAfterSource, then DriveCut).
+                        session_.source_completed=true;
+                        if (HoldAfterSource()) Status(L"投技结束：主角已恢复，目标的起身照常播放");
+                        else if (since>kCutHeroSettleMs && Cleanup(true)) Status(L"投技一侧提前结束，已正常取消另一侧并核对清理");
+                    } else if (since>300) {
                         if (Cleanup(true)) Status(L"投技一侧提前结束，已正常取消另一侧并核对清理");
                     }
                 } else session_.asymmetric_since=0;
@@ -2396,6 +2678,26 @@ void Tick() {
     if (cancel) { redirect_={}; Publish(); return; }
     Context c; const bool ready=ContextNow(c);
     if (ready&&RedirectExecution(c)) { ResetKeys(); Publish(ready); return; }
+    if (chain_deadline_&&chain_variant_>=0) {
+        // A 招式派生 投技 node: its own move from the slot holding it; no 开启, no 投技时变身, the page's move untouched.
+        const ULONGLONG now=GetTickCount64();
+        const bool slot=SlotReady(chain_variant_);
+        if (now>chain_deadline_) {
+            chain_deadline_=0;
+            AcquireSRWLockExclusive(&state_lock); ++state_.attempts; ReleaseSRWLockExclusive(&state_lock);
+            Logf("MOTIAN_GRAB chain grab not started variant=%s ready=%d prepared=%d gate=%s",kVariants[chain_variant_].id,ready?1:0,slot?1:0,input_gate_);
+            Status(L"派生链投技未施放：投技未就绪，或焦点 / 生命 / 地面门控未通过");
+        } else if (ready&&slot&&InputBaseAllowed(c)&&InputAllowed(c)) {
+            chain_deadline_=0; last_attempt_=now;
+            AcquireSRWLockExclusive(&state_lock); ++state_.attempts; ReleaseSRWLockExclusive(&state_lock);
+            UseChainSlot(); chain_attempt_=true;
+            const bool ok=Start(c);
+            chain_attempt_=false;
+            if (!session_.began) RestoreSlot();
+            Logf("MOTIAN_GRAB chain grab %s variant=%s stage=%s",ok?"started":"not started",kVariants[chain_variant_].id,stage_);
+            ResetKeys(); Publish(ready); return;
+        }
+    }
     if (!options_.enabled||!PreparedReady()) {
         ResetKeys(); Publish(ready);
         if (manual) { manual_deadline_=0;manual_variant_=-1;Status(L"资源准备中 / 未就绪；请等已预载后重新请求投技"); }
@@ -2417,6 +2719,10 @@ void Tick() {
     manual=manual_deadline_!=0;
     const bool combo=combo_deadline_!=0;
     if ((combo||manual) && GetTickCount64()-last_attempt_>800) {
+        // 投技时变身: the hero's own grab (chord, grab key, 投技 page) first takes the boss's look.
+        const bool transform=options_.transform&&!transform_.stage&&(combo||manual_transform_);
+        manual_transform_=false;
+        if (transform&&BeginTransform()) { manual_deadline_=0;manual_variant_=-1;combo_deadline_=0;combo_owner_={};ResetKeys();Publish(ready);return; }
         manual_deadline_=0;manual_variant_=-1;combo_deadline_=0; combo_owner_={}; last_attempt_=GetTickCount64();
         AcquireSRWLockExclusive(&state_lock); ++state_.attempts; ReleaseSRWLockExclusive(&state_lock);
         Logf("MOTIAN_GRAB request combo=%d manual=%d",combo?1:0,manual?1:0);
@@ -2434,7 +2740,7 @@ void Initialize(Logger logger,InputFocus focus) {
     AcquireSRWLockExclusive(&state_lock); state_.variants.clear();state_.bosses.clear();
     for(size_t i=0;i<std::size(kVariants);++i){
         const VariantData& v=kVariants[i];Variant move;move.id=Wide(v.id);move.name=v.name;move.index=static_cast<int32_t>(i);
-        move.boss_id=Wide(v.boss_id);move.boss_name=v.boss_name;move.supported=MoveSupported(move.index);move.reason=v.reason;
+        move.boss_id=Wide(v.boss_id);move.boss_name=v.boss_name;move.source=Wide(v.source);move.supported=MoveSupported(move.index);move.reason=v.reason;
         move.max_range=v.max_range;move.recommended_range=v.recommended_range;move.authored_distance=static_cast<float>(v.authored_distance);
         move.detail=move.reason;state_.variants.push_back(std::move(move));
     }
@@ -2459,6 +2765,7 @@ void Initialize(Logger logger,InputFocus focus) {
         o.position_correction=SettingsStore::GetBool(L"Grab",L"Position",true);
         o.range=std::clamp(SettingsStore::GetFloat(L"Grab",L"Range",kVariants[i].recommended_range),80.f,kVariants[i].max_range);
         o.tang_execution=SettingsStore::GetBool(L"Grab",L"TangExecution",true);
+        o.transform=SettingsStore::GetBool(L"Grab",L"Transform",false);
         if(RequestOptions(o)){
             AcquireSRWLockExclusive(&state_lock);state_.options=o;ReleaseSRWLockExclusive(&state_lock);
             Logf("MOTIAN_GRAB restored saved options enabled=%d move=%s range=%.1f",o.enabled?1:0,kVariants[i].id,o.range);
@@ -2471,20 +2778,32 @@ bool RequestOptions(const Options& options) {
     if (options.variant<0 || options.variant>=static_cast<int32_t>(std::size(kVariants)) || !std::isfinite(options.range)) return false;
     AcquireSRWLockExclusive(&request_lock); pending_=options; pending_.range=std::clamp(pending_.range,80.f,kVariants[options.variant].max_range); has_options_=true; ReleaseSRWLockExclusive(&request_lock); return true;
 }
-bool RequestTrigger() { return RequestTrigger(-1); }
-bool RequestTrigger(int32_t expected_global_index) {
+bool RequestTrigger() { return RequestTrigger(-1,true); }
+bool RequestTrigger(int32_t expected_global_index) { return RequestTrigger(expected_global_index,true); }
+bool RequestTrigger(int32_t expected_global_index,bool transform) {
     if(expected_global_index< -1||expected_global_index>=static_cast<int32_t>(std::size(kVariants)))return false;
-    AcquireSRWLockExclusive(&request_lock);trigger_=true;trigger_variant_=expected_global_index;ReleaseSRWLockExclusive(&request_lock);return true;
+    AcquireSRWLockExclusive(&request_lock);trigger_=true;trigger_variant_=expected_global_index;trigger_transform_=transform;ReleaseSRWLockExclusive(&request_lock);return true;
+}
+bool RequestChainMove(int32_t variant) {
+    if (variant< -1||variant>=static_cast<int32_t>(std::size(kVariants))||(variant>=0&&!MoveSupported(variant))) return false;
+    AcquireSRWLockExclusive(&request_lock); chain_request_=variant; ReleaseSRWLockExclusive(&request_lock); return true;
+}
+bool RequestChainTrigger(int32_t variant) {
+    if (variant<0||variant>=static_cast<int32_t>(std::size(kVariants))||!MoveSupported(variant)) return false;
+    AcquireSRWLockExclusive(&request_lock); chain_trigger_=true; chain_trigger_variant_=variant; ReleaseSRWLockExclusive(&request_lock); return true;
 }
 void RequestCancel() { AcquireSRWLockExclusive(&request_lock); cancel_=true; ReleaseSRWLockExclusive(&request_lock); }
+void RequestCut(uint32_t token) { if (!token) return; AcquireSRWLockExclusive(&request_lock); cut_request_=token; ReleaseSRWLockExclusive(&request_lock); }
+void RequestRelease(uint32_t token) { if (!token) return; AcquireSRWLockExclusive(&request_lock); release_request_=token; ReleaseSRWLockExclusive(&request_lock); }
 Snapshot GetSnapshot() { AcquireSRWLockShared(&state_lock); Snapshot copy=state_; ReleaseSRWLockShared(&state_lock); return copy; }
 void OnGameThreadGuarded() {
     ForgetReadable();
     __try { Tick(); }
     __except(FaultFilter(GetExceptionInformation())) {
-        ++faults_; trigger_lookup_=preparing_lookup_=false; forced_target_=nullptr; redirect_attempt_=false; redirect_={};
+        ++faults_; trigger_lookup_=preparing_lookup_=false; forced_target_=nullptr; redirect_attempt_=false; redirect_={}; chain_attempt_=false; chain_deadline_=0;
         if (!prepared_.assets.empty()) prepared_.uncertain=true;
         if (!spare_.assets.empty()) spare_.uncertain=true;
+        if (!chain_.assets.empty()) chain_.uncertain=true;
         cleanup_pending_=HasResources()||prepared_.uncertain; ResetKeys();
         if (faults_>=3) InterlockedExchange(&disabled_,1);
         SafeFinishExtras();
@@ -2495,10 +2814,11 @@ void OnGameThreadGuarded() {
 bool BeforeTravel() {
     bool result=false;ForgetReadable();
     __try {
-        ResetKeys(); manual_deadline_=0;manual_variant_=-1; redirect_={}; ignored_execution_={};
+        ResetKeys(); manual_deadline_=0;manual_variant_=-1; redirect_={}; ignored_execution_={}; chain_deadline_=0;
         result=Cleanup(true);
         if (result) { RestoreSlot(); result=ReleasePrepared(); }
         if (result) { std::swap(prepared_,spare_); result=ReleasePrepared(); std::swap(prepared_,spare_); }
+        if (result) { std::swap(prepared_,chain_); result=ReleasePrepared(); std::swap(prepared_,chain_); }
         Publish();
     }
     __except(FaultFilter(GetExceptionInformation())) { cleanup_pending_=HasResources(); result=false; }

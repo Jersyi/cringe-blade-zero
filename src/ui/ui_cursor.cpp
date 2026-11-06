@@ -17,6 +17,16 @@ WNDPROC old_proc_ = nullptr;
 void (*log_)(const char*) = nullptr;
 std::atomic<DWORD> worker_{0};
 int focus_logs_ = 0;
+// Click diagnostics: the game frames' gaps (game thread) and the hub pump's slowest message (UI worker), in us.
+std::atomic<long long> frame_last_us_{0}, frame_gap_max_us_{0};
+long long dispatch_max_us_ = 0; UINT dispatch_max_msg_ = 0; wchar_t dispatch_max_class_[64]{};
+unsigned hub_downs_ = 0, click_logs_ = 0; bool button_was_ = false; ULONGLONG follow_at_ = 0; unsigned follow_n_ = 0;
+long long NowUs() {
+    static LARGE_INTEGER frequency{};
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    return frequency.QuadPart ? now.QuadPart * 1000000 / frequency.QuadPart : 0;
+}
 
 using ShowFn = int (WINAPI*)(BOOL);
 using CursorFn = HCURSOR (WINAPI*)(HCURSOR);
@@ -25,6 +35,7 @@ using GetFn = BOOL (WINAPI*)(LPPOINT);
 using ClipFn = BOOL (WINAPI*)(const RECT*);
 using CaptureFn = HWND (WINAPI*)(HWND);
 using ReleaseFn = BOOL (WINAPI*)();
+using SendFn = LRESULT (WINAPI*)(HWND, UINT, WPARAM, LPARAM);
 ShowFn real_show_ = nullptr;
 CursorFn real_cursor_ = nullptr;
 PosFn real_pos_ = nullptr;
@@ -32,8 +43,95 @@ GetFn real_get_ = nullptr;
 ClipFn real_clip_ = nullptr;
 CaptureFn real_capture_ = nullptr;
 ReleaseFn real_release_ = nullptr;
+SendFn real_send_ = nullptr;
 
 bool Captured() { return open_.load(std::memory_order_relaxed) || hold_.load(std::memory_order_relaxed); }
+
+// UE's raw-input worker (WindowsApplication.UseWorkerThreadForRawInput, on in this game): while the game holds
+// the mouse (mouse look) the game thread sends WM_APP + 1 to the worker's message-only "UnrealRawInputWindow",
+// which registers the mouse to itself with RIDEV_NOLEGACY. Then no window of the process gets mouse messages
+// (the hub could not be clicked) and mouse look reads the worker, past GameProc. While the hub is open the
+// worker is told to let go with its own WM_APP + 2; when the hub closes it takes the mouse again (WM_APP + 1)
+// if the game's last request was to take it. The game's requests are watched in its SendMessageW.
+constexpr UINT kRawTake = WM_APP + 1, kRawDrop = WM_APP + 2;
+std::atomic<HWND> raw_worker_{nullptr};
+std::atomic<int> raw_wanted_{-1};      // the game's last request to the worker: 1 take, 0 drop, -1 none seen
+std::atomic<bool> raw_parked_{false};  // the worker let go of the mouse for the hub (or the game's take was held back)
+bool raw_direct_ = false;              // game thread: the worker did not let go, the registration was removed directly
+RAWINPUTDEVICE raw_saved_{};
+int raw_logs_ = 0;
+bool RawWorkerWindow(HWND window) {
+    if (!window || !IsWindow(window)) return false;
+    wchar_t name[64]{};
+    return GetClassNameW(window, name, 64) && !wcscmp(name, L"UnrealRawInputWindow");
+}
+// The process's raw mouse registration (usage page 1, usage 2), if any.
+bool RawMouse(RAWINPUTDEVICE* out) {
+    RAWINPUTDEVICE devices[32]{};
+    UINT count = 32;
+    const UINT got = GetRegisteredRawInputDevices(devices, &count, sizeof(RAWINPUTDEVICE));
+    if (got == static_cast<UINT>(-1)) return false;
+    for (UINT i = 0; i < got && i < 32; ++i)
+        if (devices[i].usUsagePage == 1 && devices[i].usUsage == 2) { if (out) *out = devices[i]; return true; }
+    return false;
+}
+bool NoLegacy(const RAWINPUTDEVICE& device) { return (device.dwFlags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY; }
+void SendWorker(HWND window, UINT message) {
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(window, message, 0, 0, SMTO_NORMAL | SMTO_ABORTIFHUNG, 250, &result);
+}
+void RawLog(const char* text) { if (log_ && raw_logs_ < 24) { ++raw_logs_; log_(text); } }
+// Game thread, every frame while the hub is open.
+void ParkRawMouse() {
+    RAWINPUTDEVICE mouse{};
+    if (!RawMouse(&mouse) || !NoLegacy(mouse)) return;
+    char line[260]{};
+    wchar_t name[64]{}; if (mouse.hwndTarget) GetClassNameW(mouse.hwndTarget, name, 64);
+    if (RawWorkerWindow(mouse.hwndTarget)) {
+        raw_worker_.store(mouse.hwndTarget, std::memory_order_relaxed);
+        raw_wanted_.store(1, std::memory_order_relaxed);  // the worker registers only on the game's take
+        SendWorker(mouse.hwndTarget, kRawDrop);
+        RAWINPUTDEVICE after{};
+        if (!(RawMouse(&after) && NoLegacy(after))) {
+            raw_parked_.store(true, std::memory_order_relaxed);
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "RAW_INPUT hub open: UE raw-input worker held the mouse (flags=0x%lx) -> told to let go; mouse messages back, mouse look stopped", mouse.dwFlags);
+            RawLog(line);
+            return;
+        }
+    }
+    // Not the worker, or it did not let go: remove the mouse registration itself and put it back on close.
+    RAWINPUTDEVICE remove{};
+    remove.usUsagePage = 1; remove.usUsage = 2; remove.dwFlags = RIDEV_REMOVE; remove.hwndTarget = nullptr;
+    const BOOL ok = RegisterRawInputDevices(&remove, 1, sizeof(remove));
+    const DWORD error = ok ? 0 : GetLastError();
+    if (ok && !raw_direct_) { raw_saved_ = mouse; raw_direct_ = true; }
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "RAW_INPUT hub open: mouse registered RIDEV_NOLEGACY (flags=0x%lx target=%ls) -> registration removed ok=%d err=%lu",
+        mouse.dwFlags, name, ok ? 1 : 0, error);
+    RawLog(line);
+}
+// Game thread, the first frame after the hub closed.
+void UnparkRawMouse() {
+    char line[200]{};
+    if (raw_parked_.exchange(false, std::memory_order_relaxed)) {
+        const HWND worker = raw_worker_.load(std::memory_order_relaxed);
+        const int wanted = raw_wanted_.load(std::memory_order_relaxed);
+        const bool take = wanted == 1 && RawWorkerWindow(worker);
+        if (take) SendWorker(worker, kRawTake);
+        RAWINPUTDEVICE mouse{};
+        const bool held = RawMouse(&mouse) && NoLegacy(mouse);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "RAW_INPUT hub closed: worker given the mouse back=%d (game's last request=%d) held=%d", take ? 1 : 0, wanted,
+            held ? 1 : 0);
+        RawLog(line);
+    }
+    if (raw_direct_) {
+        raw_direct_ = false;
+        BOOL ok = TRUE;
+        if (!RawMouse(nullptr) && (!raw_saved_.hwndTarget || IsWindow(raw_saved_.hwndTarget))) ok = RegisterRawInputDevices(&raw_saved_, 1, sizeof(raw_saved_));
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "RAW_INPUT hub closed: mouse registration restored flags=0x%lx ok=%d", raw_saved_.dwFlags, ok ? 1 : 0);
+        RawLog(line);
+    }
+}
 bool ContainsI(const wchar_t* text, const wchar_t* needle) {
     if (!text || !needle) return false;
     const size_t span = wcslen(needle);
@@ -149,6 +247,20 @@ BOOL WINAPI ReleaseHook() {
     if (Captured() && ForeignCapture(GetCapture())) return TRUE;
     return real_release_ ? real_release_() : FALSE;
 }
+// The game's requests to its raw-input worker. A take while the hub is open is only remembered and owed for
+// the close (the worker returns 0 for it and the game does not wait on it); a drop always goes through: the
+// game waits on the worker's event after it.
+LRESULT WINAPI SendHook(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if ((message == kRawTake || message == kRawDrop) && RawWorkerWindow(window)) {
+        raw_worker_.store(window, std::memory_order_relaxed);
+        raw_wanted_.store(message == kRawTake ? 1 : 0, std::memory_order_relaxed);
+        if (message == kRawTake && open_.load(std::memory_order_relaxed)) {
+            raw_parked_.store(true, std::memory_order_relaxed);
+            return 0;
+        }
+    }
+    return real_send_ ? real_send_(window, message, wparam, lparam) : 0;
+}
 void WriteSlot(void** slot, void* hook, void** saved) {
     if (!slot || *slot == hook) return;
     if (saved && !*saved) *saved = *slot;
@@ -157,7 +269,7 @@ void WriteSlot(void** slot, void* hook, void** saved) {
     InterlockedExchangePointer(slot, hook);
     VirtualProtect(slot, sizeof(void*), old, &old);
 }
-void PatchModule(HMODULE module, HMODULE self) {
+void PatchModule(HMODULE module, HMODULE self, bool game) {
     if (!module || module == self) return;
     const auto* base = reinterpret_cast<const unsigned char*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
@@ -184,6 +296,7 @@ void PatchModule(HMODULE module, HMODULE self) {
             else if (!std::strcmp(imported->Name, "ClipCursor")) WriteSlot(target, reinterpret_cast<void*>(&ClipHook), reinterpret_cast<void**>(&real_clip_));
             else if (!std::strcmp(imported->Name, "SetCapture")) WriteSlot(target, reinterpret_cast<void*>(&CaptureHook), reinterpret_cast<void**>(&real_capture_));
             else if (!std::strcmp(imported->Name, "ReleaseCapture")) WriteSlot(target, reinterpret_cast<void*>(&ReleaseHook), reinterpret_cast<void**>(&real_release_));
+            else if (game && !std::strcmp(imported->Name, "SendMessageW")) WriteSlot(target, reinterpret_cast<void*>(&SendHook), reinterpret_cast<void**>(&real_send_));
         }
     }
 }
@@ -198,9 +311,10 @@ void EnsureHooks() {
     // Game and third-party modules only. System DLLs (comctl32, uxtheme, ...) run
     // our own controls and must see the real cursor functions.
     wchar_t windows[MAX_PATH]{}; const UINT windows_length = GetWindowsDirectoryW(windows, MAX_PATH);
+    const HMODULE exe = GetModuleHandleW(nullptr);
     for (BOOL more = Module32FirstW(snap, &entry); more; more = Module32NextW(snap, &entry)) {
         if (windows_length && !_wcsnicmp(entry.szExePath, windows, windows_length)) continue;
-        PatchModule(entry.hModule, self);
+        PatchModule(entry.hModule, self, entry.hModule == exe);  // SendMessageW only in the game's exe (its raw-input worker)
     }
     CloseHandle(snap);
 }
@@ -221,6 +335,10 @@ void Sync(bool open) {
     open_.store(open, std::memory_order_relaxed);
 }
 void AfterTick() {
+    {
+        const long long now = NowUs(), last = frame_last_us_.exchange(now, std::memory_order_relaxed);
+        if (last && now > last && now - last > frame_gap_max_us_.load(std::memory_order_relaxed)) frame_gap_max_us_.store(now - last, std::memory_order_relaxed);
+    }
     EnsureHooks();
     SubclassGame();
     if (open_.load(std::memory_order_relaxed)) {
@@ -241,14 +359,68 @@ void AfterTick() {
             if (real_clip_) real_clip_(&screen);
             else ClipCursor(&screen);
         }
+        ParkRawMouse();
         return;
     }
     if (!hold_.load(std::memory_order_relaxed)) return;
+    UnparkRawMouse();
     while (forced_ > 0) {
         if (real_show_) real_show_(FALSE);
         else ShowCursor(FALSE);
         --forced_;
     }
     hold_.store(false, std::memory_order_relaxed);
+}
+void NoteDispatch(HWND hub, const MSG& message, double ms) {
+    const long long us = static_cast<long long>(ms * 1000.0);
+    if (us > dispatch_max_us_) {
+        dispatch_max_us_ = us; dispatch_max_msg_ = message.message; dispatch_max_class_[0] = 0;
+        if (message.hwnd) GetClassNameW(message.hwnd, dispatch_max_class_, 64);
+    }
+    if (hub && (message.message == WM_LBUTTONDOWN || message.message == WM_NCLBUTTONDOWN || message.message == WM_LBUTTONDBLCLK) &&
+        (message.hwnd == hub || IsChild(hub, message.hwnd))) ++hub_downs_;
+}
+void ProbeClicks(HWND hub) {
+    if (!log_ || !hub) return;
+    const ULONGLONG now = GetTickCount64();
+    char line[900]{};
+    if (follow_at_ && now >= follow_at_) {
+        // What became of the press 400 ms on: did the hub's pump get the button-down, and was anything slow.
+        const long long gap = frame_gap_max_us_.exchange(0, std::memory_order_relaxed), age = NowUs() - frame_last_us_.load(std::memory_order_relaxed);
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "HUB_CLICK n=%u after 400ms: hubButtonDowns=%u pumpSlowest=%.1fms (msg 0x%x %ls) gameFrameGapMax=%.1fms gameFrameAge=%.1fms",
+            follow_n_, hub_downs_, dispatch_max_us_ / 1000.0, dispatch_max_msg_, dispatch_max_class_, gap / 1000.0, age / 1000.0);
+        log_(line); follow_at_ = 0;
+    }
+    const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool pressed = down && !button_was_;
+    button_was_ = down;
+    if (!pressed || click_logs_ >= 40) return;
+    ++click_logs_;
+    POINT at{}; GetCursorPos(&at);
+    const HWND under = WindowFromPoint(at);
+    wchar_t under_class[64]{}; if (under) GetClassNameW(under, under_class, 64);
+    const DWORD under_tid = under ? GetWindowThreadProcessId(under, nullptr) : 0;
+    const HWND game = UiHost::Game();
+    const DWORD game_tid = game ? GetWindowThreadProcessId(game, nullptr) : 0;
+    const char* whose = !under ? "none" : (under == hub || IsChild(hub, under)) ? "hub" : under == game ? "game" :
+                        under_tid == GetCurrentThreadId() ? "worker-other" : under_tid == game_tid ? "game-other" : "foreign";
+    RECT box{}; GetWindowRect(hub, &box);
+    RECT clip{}; GetClipCursor(&clip);
+    CURSORINFO cursor{sizeof(cursor)}; GetCursorInfo(&cursor);
+    GUITHREADINFO gui{sizeof(gui)}; if (game_tid) GetGUIThreadInfo(game_tid, &gui);
+    wchar_t capture_class[64]{}; if (gui.hwndCapture) GetClassNameW(gui.hwndCapture, capture_class, 64);
+    const HWND parent = GetParent(hub);
+    RAWINPUTDEVICE raw{}; const bool raw_on = RawMouse(&raw);
+    wchar_t raw_class[64]{}; if (raw_on && raw.hwndTarget) GetClassNameW(raw.hwndTarget, raw_class, 64);
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "HUB_CLICK n=%u at=%ld,%ld under=%ls (%s tid=%lu) hub=%ld,%ld-%ld,%ld enabled=%d visible=%d ex=0x%llx childOfGame=%d clip=%ld,%ld-%ld,%ld cursorShown=%d "
+        "gameCapture=%p(%ls) gameActive=%p gameFocus=%p gameFlags=0x%lx workerCapture=%p gate=%d hubButtonDownsBefore=%u rawMouse=%d flags=0x%lx(%ls)",
+        click_logs_, at.x, at.y, under_class, whose, under_tid, box.left, box.top, box.right, box.bottom, IsWindowEnabled(hub) ? 1 : 0, IsWindowVisible(hub) ? 1 : 0,
+        static_cast<unsigned long long>(GetWindowLongPtrW(hub, GWL_EXSTYLE)), parent && parent == game ? 1 : 0, clip.left, clip.top, clip.right, clip.bottom,
+        (cursor.flags & CURSOR_SHOWING) ? 1 : 0, static_cast<void*>(gui.hwndCapture), capture_class, static_cast<void*>(gui.hwndActive), static_cast<void*>(gui.hwndFocus),
+        gui.flags, static_cast<void*>(GetCapture()), Captured() ? 1 : 0, hub_downs_, raw_on ? 1 : 0, raw_on ? raw.dwFlags : 0ul, raw_class);
+    log_(line);
+    hub_downs_ = 0; dispatch_max_us_ = 0; dispatch_max_msg_ = 0; dispatch_max_class_[0] = 0; frame_gap_max_us_.store(0, std::memory_order_relaxed);
+    follow_at_ = now + 400; follow_n_ = click_logs_;
 }
 }

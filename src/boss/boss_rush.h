@@ -43,5 +43,8 @@ bool Request(Action action, int32_t entry, const Options& options);
 Snapshot GetSnapshot();
 bool IsTransitioning(); // Atomic snapshot flag only; no engine reads.
 bool AllowsAppearanceChanges(); // Game thread only; blocks incomplete loading/spawn.
+// Game thread only. A 招式派生 look change: as AllowsAppearanceChanges, except the game's dead flag with health above
+// 0 (some boss moves cast on the hero leave it set) does not block; why: the gate that blocks, or that note.
+bool AllowsChainLook(const char** why);
 bool HandleCommand(const char* verb, const char* arguments);
 }

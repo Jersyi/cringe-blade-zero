@@ -11,10 +11,18 @@
 !*.asm
 !*.def
 !docs/title.jpg
+!docs/donate.jpg
 !installer/install.ps1
 !installer/Install.bat
+!src/env_check/known_exes.cmake
+!src/env_check/known_exes.h.in
 
 # Build output, release ZIPs and local notes / scripts / archives stay out of the repository.
 build/
+build_*/
 dist/
 local/
+
+# Players' chain files (combos\*.combo next to version.dll) are personal data: never in the repository or the ZIP.
+combos/
+*.combo

@@ -8,6 +8,7 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -152,6 +153,13 @@ ULONGLONG next_sony_ = 0;
 std::atomic<unsigned> snoop_buttons_{0};
 std::atomic<ULONGLONG> snoop_time_{0};
 std::atomic<unsigned> polled_buttons_{0};
+// The PlayStation pad's left stick (x | y << 8, 0..255, 128 the middle; y down) from its latest report, and when.
+std::atomic<unsigned> sony_stick_{0x8080};
+std::atomic<ULONGLONG> sony_stick_at_{0};
+// The left stick's direction (StickWay): 1 up, 2 down, 4 left, 8 right.
+constexpr unsigned kStickUp = 1u, kStickDown = 2u, kStickLeft = 4u, kStickRight = 8u;
+constexpr float kStickOn = .55f, kStickOff = .35f;
+unsigned stick_way_ = 0;
 std::atomic<bool> yield_sony_{false};
 HANDLE sony_thread_ = nullptr;
 volatile LONG sony_stop_ = 0;
@@ -172,6 +180,7 @@ Stroke stroke_{};
 unsigned PollSony();
 unsigned TakeSwipe();
 void NoteLevel(unsigned level);
+void NoteSonyStick(int kind, const unsigned char* data, int size);
 bool ParseSony(int kind, const unsigned char* data, int size, unsigned& buttons);
 void PublishTouch(int kind, const unsigned char* data, int size, bool ordered);
 bool key_was_[256]{};
@@ -255,14 +264,33 @@ void EnsureXInput() {
     if (!module) module = LoadLibraryW(L"XInput1_3.dll");
     if (module) xinput_ = reinterpret_cast<XInputGetStateFn>(GetProcAddress(module, "XInputGetState"));
 }
+// The left stick as one of four ways, by its main axis: pushed past kStickOn it takes that way, and keeps it while the
+// stick stays past kStickOff along it and is not turned past the diagonal (so a turn from up to down passes the middle
+// or a side, and a stick held one way never flickers).
+unsigned StickWay(float x, float y) {
+    const float ax = std::fabs(x), ay = std::fabs(y);
+    if (stick_way_) {
+        const bool vertical = stick_way_ == kStickUp || stick_way_ == kStickDown;
+        const float along = stick_way_ == kStickUp ? y : stick_way_ == kStickDown ? -y : stick_way_ == kStickLeft ? -x : x;
+        if (along > kStickOff && along >= (vertical ? ax : ay) * .8f) return stick_way_;
+    }
+    stick_way_ = 0;
+    if ((std::max)(ax, ay) < kStickOn) return 0;
+    stick_way_ = ay >= ax ? (y > 0 ? kStickUp : kStickDown) : (x > 0 ? kStickRight : kStickLeft);
+    return stick_way_;
+}
+unsigned stick_now_ = 0;
 unsigned ReadPad() {
     EnsureXInput();
     unsigned xbox = 0;
     bool live = false;
+    float stick_x = 0, stick_y = 0;
+    const auto take = [&](float x, float y) { if (x * x + y * y > stick_x * stick_x + stick_y * stick_y) { stick_x = x; stick_y = y; } };
     if (xinput_) for (DWORD user = 0; user < 4; ++user) {
         XState state{};
         if (xinput_(user, &state) != 0) continue;
         live = true;
+        take((std::max)(-1.f, state.pad.lx / 32767.f), (std::max)(-1.f, state.pad.ly / 32767.f));
         const WORD bits = state.pad.buttons;
         if (bits & 0x0001) xbox |= kUp;
         if (bits & 0x0002) xbox |= kDown;
@@ -282,6 +310,11 @@ unsigned ReadPad() {
         if (state.pad.right > 30) xbox |= kRT;
     }
     xinput_live_ = live;
+    if (GetTickCount64() - sony_stick_at_.load(std::memory_order_relaxed) < 200) {
+        const unsigned packed = sony_stick_.load(std::memory_order_relaxed);
+        take(((static_cast<int>(packed & 0xFFu)) - 128) / 127.f, (128 - static_cast<int>((packed >> 8) & 0xFFu)) / 127.f);
+    }
+    stick_now_ = StickWay((std::clamp)(stick_x, -1.f, 1.f), (std::clamp)(stick_y, -1.f, 1.f));
     unsigned sony = polled_buttons_.load(std::memory_order_relaxed);
     if (GetTickCount64() - snoop_time_.load(std::memory_order_relaxed) < 150)
         sony |= snoop_buttons_.load(std::memory_order_relaxed);
@@ -371,6 +404,14 @@ bool ParseSony(int kind, const unsigned char* data, int size, unsigned& buttons)
     if (b2 & 0x02) mask |= kTouch;
     buttons = mask;
     return true;
+}
+// The left stick of a report ParseSony read: the two bytes that start it on both pads (x, then y; 128 the middle).
+void NoteSonyStick(int kind, const unsigned char* data, int size) {
+    if (!data || size < 10 || (kind != 1 && kind != 2)) return;
+    const int base = data[0] == 0x01 ? 1 : data[0] == 0x31 && kind == 1 ? 2 : data[0] == 0x11 && kind == 2 ? 3 : -1;
+    if (base < 0 || size < base + 2) return;
+    sony_stick_.store(static_cast<unsigned>(data[base]) | (static_cast<unsigned>(data[base + 1]) << 8), std::memory_order_relaxed);
+    sony_stick_at_.store(GetTickCount64(), std::memory_order_relaxed);
 }
 void PublishTouch(int kind, const unsigned char* data, int size, bool ordered) {
     if (kind != 1 || !data || size <= 0) return;
@@ -569,7 +610,7 @@ unsigned PollSony() {
             if (!GetOverlappedResult(dev.handle, &dev.io, &bytes, FALSE)) { CloseDev(dev); continue; }
             unsigned buttons = 0;
             if (ParseSony(dev.kind, dev.report, static_cast<int>(bytes), buttons)) {
-                dev.buttons = buttons; dev.last = GetTickCount64();
+                dev.buttons = buttons; dev.last = GetTickCount64(); NoteSonyStick(dev.kind, dev.report, static_cast<int>(bytes));
                 if (dev.kind == 1) PublishTouch(dev.kind, dev.report, static_cast<int>(bytes), false);
             }
             if (!Issue(dev)) { CloseDev(dev); continue; }
@@ -1160,8 +1201,16 @@ void StepCapture() {
     }
 }
 // The keyboard set always fires; of the pad sets only the active pad's.
+std::atomic<unsigned> level_buttons_{0};
+std::atomic<unsigned> level_flags_{0};  // 1: in game, 2: PlayStation pad
+std::atomic<ULONGLONG> level_at_{0};
+std::atomic<unsigned> level_stick_{0};
 void Snapshot(bool fire) {
     const unsigned mods = Mods(), pad = ReadPad();
+    level_buttons_.store(pad & 0xFFFFu, std::memory_order_relaxed);
+    level_stick_.store(stick_now_, std::memory_order_relaxed);
+    level_flags_.store((fire ? 1u : 0u) | (PadNow() == Device::PlayStation ? 2u : 0u), std::memory_order_relaxed);
+    level_at_.store(GetTickCount64(), std::memory_order_relaxed);
     if (pad & ~pad_seen_) { input_known_ = true; input_pad_ = true; }
     pad_seen_ = pad;
     const size_t active = static_cast<size_t>(PadNow());
@@ -1454,6 +1503,7 @@ void NoteSonyReport(int kind, const unsigned char* data, int size) {
     if (!ParseSony(kind, data, size, buttons)) return;
     snoop_buttons_.store(buttons, std::memory_order_relaxed);
     snoop_time_.store(GetTickCount64(), std::memory_order_relaxed);
+    NoteSonyStick(kind, data, size);
     if (kind == 1) PublishTouch(kind, data, size, false);
 }
 void NoteDualSenseTouch(const unsigned char* data, int size) {
@@ -1462,6 +1512,7 @@ void NoteDualSenseTouch(const unsigned char* data, int size) {
     if (!ParseSony(1, data, size, buttons)) return;
     snoop_buttons_.store(buttons, std::memory_order_relaxed);
     snoop_time_.store(GetTickCount64(), std::memory_order_relaxed);
+    NoteSonyStick(1, data, size);
 }
 void YieldSony(bool yield) { yield_sony_.store(yield, std::memory_order_relaxed); }
 void SetXInputForTest(PadStateReader reader) {
@@ -1579,6 +1630,15 @@ std::wstring Hint(Action action) {
     return text;
 }
 Device ActivePad() { return PadNow(); }
+PadLevel CurrentPad() {
+    PadLevel level;
+    level.buttons = level_buttons_.load(std::memory_order_relaxed);
+    const unsigned flags = level_flags_.load(std::memory_order_relaxed);
+    level.in_game = (flags & 1u) != 0; level.ps = (flags & 2u) != 0;
+    level.at = level_at_.load(std::memory_order_relaxed);
+    level.stick = level_stick_.load(std::memory_order_relaxed);
+    return level;
+}
 Device InputDevice() { return InputNow(); }
 std::wstring Plain(const Chord& chord) {
     if (chord.empty()) return UiI18n::Translate(L"未设置");
@@ -1657,6 +1717,51 @@ int DrawKey(HDC dc, int x, int y, int height, const wchar_t* caption) {
     const int width = KeycapWidth(dc, height, text);
     Keycap(dc, {x, y, x + width, y + height}, text);
     return x + width;
+}
+int Width(HDC dc, int height, const Chord& chord) {
+    if (!dc || height < 8 || chord.empty()) return 0;
+    HFONT created = CreateFontW(-(height * 3 / 5), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HFONT font = created ? created : UiTheme::GetFont(UiTheme::Font::Small, static_cast<UINT>((std::max)(96, height * 96 / 22)));
+    const bool xbox = chord.device == Device::Xbox;
+    int x = 0; bool first = true;
+    for (const Part& part : Parts(chord)) {  // as Draw lays them out
+        const bool art = part.asset >= 0 || part.mark == Mark::Key || (part.mark == Mark::View && xbox && !UiTheme::HighContrast());
+        const int width = art ? PartWidth(dc, part, height)
+            : ShowsText(part.mark) ? (std::max)(height, (part.text.empty() ? 0 : Measure(dc, font, part.text)) + height / 2) : height;
+        const int gap = height / 5;
+        x += (first ? 0 : gap + height / 3) + width + gap;
+        first = false;
+    }
+    if (created) DeleteObject(created);
+    return x;
+}
+int KeyWidth(HDC dc, int height, const wchar_t* caption) { return dc && caption && height >= 8 ? KeycapWidth(dc, height, caption) : 0; }
+int StickWidth(int height, bool ps) {
+    const int icon = UiTheme::HighContrast() ? height : UiAssets::WidthAt(ps ? UiAssets::Id::PsL3 : UiAssets::Id::XbL3, height);
+    return (icon > 0 ? icon : height) + height * 3 / 5;
+}
+int DrawStick(HDC dc, int x, int y, int height, int way, bool ps) {
+    if (!dc || height < 8) return x;
+    const int icon = StickWidth(height, ps) - height * 3 / 5;
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    if (UiTheme::HighContrast()) {
+        Part part{Mark::Stick, L"L", UiTheme::Text(), 0};
+        Glyph(graphics, {x, y, x + icon, y + height}, part, UiTheme::Mix(UiTheme::Base(), UiTheme::Panel(), 70), UiTheme::Text(), UiTheme::Mix(UiTheme::Border(), UiTheme::Base(), 18));
+    } else {
+        UiAssets::Draw(graphics, ps ? UiAssets::Id::PsL3 : UiAssets::Id::XbL3, Gdiplus::RectF(static_cast<float>(x), static_cast<float>(y), static_cast<float>(icon), static_cast<float>(height)));
+    }
+    // The arrow: a filled triangle the way the stick goes, right of the icon.
+    const float s = height * .5f, cx = static_cast<float>(x + icon) + height * .3f, cy = static_cast<float>(y) + height * .5f, r = s * .5f;
+    Gdiplus::PointF points[3] = {{cx, cy - r}, {cx + r, cy + r * .8f}, {cx - r, cy + r * .8f}};                                  // up
+    if (way == 1) { points[0] = {cx, cy + r}; points[1] = {cx - r, cy - r * .8f}; points[2] = {cx + r, cy - r * .8f}; }          // down
+    else if (way == 2) { points[0] = {cx - r, cy}; points[1] = {cx + r * .8f, cy - r}; points[2] = {cx + r * .8f, cy + r}; }     // left
+    else if (way == 3) { points[0] = {cx + r, cy}; points[1] = {cx - r * .8f, cy + r}; points[2] = {cx - r * .8f, cy - r}; }     // right
+    const COLORREF ink = UiTheme::Text();
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(ink), GetGValue(ink), GetBValue(ink)));
+    graphics.FillPolygon(&brush, points, 3);
+    return x + StickWidth(height, ps);
 }
 HWND CreatePage(HWND parent) {
     if (!parent || !RegisterClasses()) return nullptr;

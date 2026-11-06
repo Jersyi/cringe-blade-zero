@@ -2,6 +2,7 @@
 #include "weapon_presets_logic.h"
 #include "ui_hotkeys.h"
 #include "ue_runtime.h"
+#include "game_build.h"
 #include "settings_store.h"
 #include <windows.h>
 #include <setupapi.h>
@@ -28,6 +29,8 @@ volatile LONG hid_allowed = 0, hid_ready = 0, hid_swipes = 0, hid_reports = 0, h
 HANDLE hid_thread = nullptr, hid_stop = nullptr;
 int pending_enable = -1, pending_action = 0;
 bool pending_read = false;
+// Temporary weapon requests (kept apart from pending_action: they wait while a transaction runs): 1 take, 2 restore.
+int pending_temp = 0; std::string pending_temp_weapon; bool pending_temp_shaqi = false;
 bool enabled = false, faulted = false, rollback_pending = false;
 int active_set = 0;
 Object* engine = nullptr;
@@ -195,7 +198,7 @@ bool ConfigHelpersMatch() {
         ,{0x698a270,{0x40,0x53,0x48,0x83,0xec,0x20,0x4c,0x8b,0xd2,0x41,0xb8,0xb9,0x79,0x37,0x9e,0x8b}}
     };
     if(!ue::Base())return Diagnose(L"原生武器数据入口尚未初始化");
-    for(const auto& signature:signatures) if(std::memcmp(reinterpret_cast<void*>(ue::Base()+signature.rva),signature.code,sizeof(signature.code)))
+    for(const auto& signature:signatures) if(!GameBuild::CodeMatches(ue::Base()+signature.rva,signature.code,sizeof(signature.code)))
         return Diagnose(L"原生武器数据入口签名不符（RVA=%llx）",static_cast<unsigned long long>(signature.rva));
     return true;
 }
@@ -640,6 +643,7 @@ struct PendingApply {
     Set goal,submitted;
     Identity pawn,world;
     int target=0;
+    int temporary=0;  // 1 a temporary take, 2 its restore (TemporaryPhase follows the transaction)
     bool selecting=false,restoring=false,restore_needed=false,superseded=false,timed_out=false;
     uint64_t active_wait=0;
     ULONGLONG last_tick=0;
@@ -663,6 +667,73 @@ bool Paused(const Context& c,bool& value) {
 }
 bool TransactionOwner(const Context& c){return Same(rollback_identity)&&Same(transaction.pawn)&&Same(transaction.world)&&
     c.backpack==rollback_backpack&&c.pawn==transaction.pawn.object&&c.world==transaction.world.object&&ue::NameOf(c.backpack)==rollback_name;}
+// ---- temporary weapon ----
+struct Temporary { TemporaryPhase phase=TemporaryPhase::Off; std::string weapon; bool changed=false; Set restore; ULONGLONG since=0; };
+Temporary temp;TemporaryView temp_view;
+void PublishTemporary(const std::wstring& status){
+    AcquireSRWLockExclusive(&snapshot_lock);
+    temp_view.phase=temp.phase;temp_view.weapon=temp.weapon;temp_view.changed=temp.changed;temp_view.status=status;++temp_view.serial;
+    ReleaseSRWLockExclusive(&snapshot_lock);
+}
+void TemporaryFail(const std::wstring& why){
+    temp.phase=TemporaryPhase::Failed;PublishTemporary(why);
+    Logf("WEAPON_TEMP failed weapon=%s reason=%ls",temp.weapon.c_str(),why.c_str());
+}
+// A temporary transaction ended: kind 1 the take, 2 the restore; restored: the presets put the equipment from before
+// it back (the native request failed).
+void TemporaryDone(int kind,bool restored){
+    if(restored){TemporaryFail(L"游戏没有接受换武器，已恢复原装备");if(kind==2){temp.changed=false;temp.restore={};}return;}
+    if(kind==1){temp.phase=TemporaryPhase::On;PublishTemporary(L"");Logf("WEAPON_TEMP on weapon=%s after %llums",temp.weapon.c_str(),GetTickCount64()-temp.since);}
+    else{Logf("WEAPON_TEMP restored after %llums",GetTickCount64()-temp.since);temp=Temporary{};PublishTemporary(L"");}
+}
+bool Capture(Object* backpack, Set& output);
+bool BuildPlan(Object* backpack, const Set& from, const Set& to, std::vector<Step<Name>>& plan, std::vector<OwnedInfo>& main, std::vector<OwnedInfo>& shaqi);
+bool ReadCurrent(const Context& c);
+void AdvanceTransaction(const Context& c,bool& ready);
+// Starts the presets' transaction from `before` to `goal` for a temporary take (1) or restore (2).
+bool BeginTemporary(const Context& c,const Set& before,const Set& goal,int kind){
+    std::vector<Step<Name>> plan; std::vector<OwnedInfo> main, shaqi;
+    if(!BuildPlan(c.backpack,before,goal,plan,main,shaqi))return false;
+    rollback_identity=Identify(c.backpack);
+    if(!Same(rollback_identity))return Diagnose(L"原生背包弱身份校验失败");
+    rollback=before;rollback_backpack=c.backpack;rollback_name=ue::NameOf(c.backpack);rollback_pending=true;
+    rollback_main=main;rollback_sha=shaqi;rollback_attempts=0;next_rollback=0;
+    transaction=PendingApply{};transaction.goal=goal;transaction.target=active_set;transaction.temporary=kind;
+    transaction.pawn=Identify(c.pawn);transaction.world=Identify(c.world);transaction.last_tick=GetTickCount64();
+    next_transaction_poll=transaction.last_tick+100;
+    if(!Same(transaction.pawn)||!Same(transaction.world)){RetireTransaction();return Diagnose(L"当前主角/世界弱身份校验失败");}
+    const bool submitted=SubmitEquip(c.backpack,transaction.goal);ReadLayout(c.backpack,transaction.submitted);
+    if(!submitted){Failed();transaction.restore_needed=true;transaction.error=diagnostic;}
+    bool ready=ReadCurrent(c);AdvanceTransaction(c,ready);Publish(ready);
+    return true;
+}
+void TemporaryTake(const Context& c,const std::string& id,bool shaqi){
+    temp.weapon=id;temp.since=GetTickCount64();temp.phase=TemporaryPhase::Going;
+    Set before;
+    if(Restricted(c)||!Capture(c.backpack,before)){TemporaryFail(L"暂时不能换武器："+diagnostic);return;}
+    if(!before.bankable){TemporaryFail(L"正在使用额外特殊武器槽，不能临时换武器");return;}
+    const std::wstring wide(id.begin(),id.end());const Name name=ue::MakeName(wide.c_str());
+    Set goal=before;std::vector<Name>& list=shaqi?goal.shaqi:goal.main;int32_t& index=shaqi?goal.shaqi_index:goal.main_index;
+    if(list.empty()){TemporaryFail(shaqi?L"没有杀器槽":L"没有武器槽");return;}
+    int32_t slot=-1;for(size_t i=0;i<list.size();++i)if(list[i]==name){slot=static_cast<int32_t>(i);break;}
+    if(slot<0){slot=list.size()>1?(index==0?1:0):0;list[static_cast<size_t>(slot)]=name;}
+    index=slot;
+    if(!temp.changed)temp.restore=before;
+    if(Equal(before,goal)){temp.phase=TemporaryPhase::On;PublishTemporary(L"");Logf("WEAPON_TEMP on weapon=%s (already in hand)",id.c_str());return;}
+    temp.changed=true;
+    Logf("WEAPON_TEMP take weapon=%s shaqi=%d slot=%d (%s)",id.c_str(),shaqi?1:0,slot,list.size()>1&&!(before.main==goal.main&&before.shaqi==goal.shaqi)?"replaced":"selected");
+    if(!BeginTemporary(c,before,goal,1))TemporaryFail(L"换武器失败："+diagnostic);
+    else PublishTemporary(L"");
+}
+void TemporaryRestore(const Context& c){
+    if(!temp.changed){temp=Temporary{};PublishTemporary(L"");Logf("WEAPON_TEMP restore: nothing changed");return;}
+    temp.phase=TemporaryPhase::Returning;temp.since=GetTickCount64();
+    Set before;
+    if(Restricted(c)||!Capture(c.backpack,before)){TemporaryFail(L"暂时不能换回原武器："+diagnostic);return;}
+    if(Equal(before,temp.restore)){Logf("WEAPON_TEMP restored (already)");temp=Temporary{};PublishTemporary(L"");return;}
+    if(!BeginTemporary(c,before,temp.restore,2))TemporaryFail(L"换回原武器失败："+diagnostic);
+    else PublishTemporary(L"");
+}
 void AdvanceTransaction(const Context& c,bool& ready) {
     if(!rollback_pending)return;
     const ULONGLONG now=GetTickCount64();bool paused=false;
@@ -701,9 +772,10 @@ void AdvanceTransaction(const Context& c,bool& ready) {
         ready=ReadCurrent(c);
     }
     if(!transaction.restore_needed&&ready&&Equal(current_equipment,transaction.goal)){
-        const int completed=transaction.target;const bool restored=transaction.restoring;
+        const int completed=transaction.target;const bool restored=transaction.restoring;const int temporary=transaction.temporary;
         RetireTransaction();faulted=false;
-        if(restored){enabled=false;Status(L"原生请求已退休，已核对恢复离开前的实际装备和选择");}
+        if(temporary)TemporaryDone(temporary,restored);
+        else if(restored){enabled=false;Status(L"原生请求已退休，已核对恢复离开前的实际装备和选择");}
         else {active_set=completed;AcquireSRWLockExclusive(&snapshot_lock);++snapshot.swaps;ReleaseSRWLockExclusive(&snapshot_lock);
             Status(active_set?L"已应用第二套；原生配置和实际已提交选择均已核对":L"已应用原始套；原生配置和实际已提交选择均已核对");
             Logf("WEAPON_PRESETS switched set=%d full runtime config identity and committed indices verified; asynchronous jobs retired",active_set+1);}
@@ -804,10 +876,11 @@ void Tick() {
         }
     }
     const ULONGLONG now=GetTickCount64();
-    if (!enabled && !read_requested && !action && !rollback_pending && enable_request<0) return;
+    bool temp_waiting=false;AcquireSRWLockShared(&request_lock);temp_waiting=pending_temp!=0;ReleaseSRWLockShared(&request_lock);
+    if (!enabled && !read_requested && !action && !rollback_pending && enable_request<0 && !temp_waiting) return;
     if(rollback_pending&&!action&&!read_requested&&enable_request<0&&now<next_transaction_poll)return;
     if(rollback_pending)next_transaction_poll=now+100;
-    if (!action && !read_requested && !rollback_pending && enable_request<0 && now<next_read) return;
+    if (!action && !read_requested && !rollback_pending && enable_request<0 && !temp_waiting && now<next_read) return;
     next_read=now+250;
     Context c;
     diagnostic.clear(); const bool context_ready = ContextNow(c);
@@ -819,7 +892,20 @@ void Tick() {
     }
     if (rollback_pending) {
         if(context_ready)AdvanceTransaction(c,ready);
+        // A temporary transaction retired without reaching its goal (another path gave up on it).
+        if(!rollback_pending&&(temp.phase==TemporaryPhase::Going||temp.phase==TemporaryPhase::Returning))
+            TemporaryFail(L"换武器没有完成："+diagnostic);
         Publish(ready); return;
+    }
+    int temp_request=0;std::string temp_weapon;bool temp_shaqi=false;
+    AcquireSRWLockExclusive(&request_lock);temp_request=pending_temp;temp_weapon=pending_temp_weapon;temp_shaqi=pending_temp_shaqi;pending_temp=0;ReleaseSRWLockExclusive(&request_lock);
+    if(temp_request){
+        // No player yet (a level loading): the request waits for one.
+        if(!context_ready){AcquireSRWLockExclusive(&request_lock);if(!pending_temp)pending_temp=temp_request;ReleaseSRWLockExclusive(&request_lock);Publish(false);return;}
+        if(!ready)TemporaryFail(L"读不到当前装备："+diagnostic);
+        else if(temp_request==1)TemporaryTake(c,temp_weapon,temp_shaqi);
+        else TemporaryRestore(c);
+        Publish(ready);return;
     }
     if (!ready) { if (action || enable_request>=0) DetailedStatus(L"操作未执行"); Publish(false); return; }
     if (faulted && (action==1 || action==20 || action==21)) { Status(L"之前的原生装备调用出现异常，请重载游戏后再应用预设；仍可读取和保存当前"); Publish(true); return; }
@@ -932,6 +1018,18 @@ bool RequestSwitchToSet(int32_t set_index) {
     AcquireSRWLockExclusive(&request_lock); const bool accepted=pending_action==0; if(accepted)pending_action=20+set_index; ReleaseSRWLockExclusive(&request_lock); return accepted;
 }
 Snapshot GetSnapshot() { AcquireSRWLockShared(&snapshot_lock); Snapshot result = snapshot; ReleaseSRWLockShared(&snapshot_lock); return result; }
+bool RequestTemporaryWeapon(const std::string& id, bool shaqi) {
+    if (id.empty() || id.size() > 120) return false;
+    AcquireSRWLockExclusive(&request_lock); pending_temp = 1; pending_temp_weapon = id; pending_temp_shaqi = shaqi; ReleaseSRWLockExclusive(&request_lock);
+    AcquireSRWLockExclusive(&snapshot_lock); temp_view.phase = TemporaryPhase::Going; temp_view.weapon = id; ++temp_view.serial; ReleaseSRWLockExclusive(&snapshot_lock);
+    return true;
+}
+bool RequestTemporaryRestore() {
+    AcquireSRWLockExclusive(&request_lock); pending_temp = 2; ReleaseSRWLockExclusive(&request_lock);
+    AcquireSRWLockExclusive(&snapshot_lock); if (temp_view.changed) temp_view.phase = TemporaryPhase::Returning; ++temp_view.serial; ReleaseSRWLockExclusive(&snapshot_lock);
+    return true;
+}
+TemporaryView GetTemporary() { AcquireSRWLockShared(&snapshot_lock); TemporaryView result = temp_view; ReleaseSRWLockShared(&snapshot_lock); return result; }
 void WorkerTick() {
     const Snapshot state = GetSnapshot();
     const bool allowed = state.enabled && state.ready && state.can_save && !state.busy && input_focus && input_focus();
@@ -972,6 +1070,7 @@ bool CurrentMainWeaponId(std::string& id) {
     if (!ContextNow(c) || !Read(c.backpack, "CurrentMainWeaponID", 0x2000, current)) return false;
     char text[128]{}; ue::NameText(current, text, sizeof(text)); id = text; return !id.empty();
 }
+Object* CurrentBackpack() { Context c; return ContextNow(c) ? c.backpack : nullptr; }
 void Shutdown() {
     InterlockedExchange(&hid_allowed, 0);
     if (hid_stop) SetEvent(hid_stop);

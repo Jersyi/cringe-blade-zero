@@ -1,6 +1,7 @@
 ﻿# Cringe Blade Zero one-click setup (Windows PowerShell 5.1+), started by Install.bat.
-# The game folder comes from the registry: the Steam uninstall entry's InstallLocation, then the libraries listed in
-# Steam's libraryfolders.vdf; otherwise the player types it. The DLL goes to <game>\platform\steam\version.dll.
+# The game comes from the registry: the Steam uninstall entry's InstallLocation, the libraries listed in Steam's
+# libraryfolders.vdf, then any uninstall entry named after the game (another store, such as WeGame); otherwise the
+# player types the folder. The DLL goes next to PBZ.exe: <game>\platform\steam on Steam, the PBZ.exe folder elsewhere.
 # Text follows the Windows display language: Chinese on a Chinese system, English everywhere else.
 param([string]$Choice = '')
 $ErrorActionPreference = 'Stop'
@@ -18,9 +19,8 @@ trap {
 }
 
 $AppId = '4115450'
-# build.ps1 -Package fills in the size and SHA-256 of the PBZ.exe (platform\steam) this build supports.
-$ExeBytes = '__EXE_BYTES__'
-$ExeSha256 = '__EXE_SHA256__'
+# build.ps1 -Package fills in the PBZ.exe builds this DLL supports: name|size|SHA-256 per build (Steam, WeGame), ';' between.
+$ExeBuilds = '__EXE_BUILDS__'
 $Here = $PSScriptRoot
 $FullDll = Join-Path $Here 'version.dll'
 $TriggersDll = Join-Path $Here 'triggers_only\version.dll'
@@ -140,16 +140,33 @@ function Show-Box([object[]]$Rows) {
 }
 
 # ---- Game folder ----------------------------------------------------------------------
-function Test-GameRoot([string]$Root) { return $Root -and (Test-Path -LiteralPath (Join-Path $Root 'platform\steam\PBZ.exe')) }
+# PBZ.exe of a game folder: platform\steam (Steam), another platform\<store> folder, or the folder itself (the PBZ.exe
+# folder of another store's install, or typed by hand); a path to PBZ.exe is taken as it is.
+function Find-GameExe([string]$Root) {
+    if (-not $Root) { return $null }
+    $Root = $Root.Trim().Trim('"').TrimEnd('\')
+    if (-not $Root) { return $null }
+    if ($Root -match '\\PBZ\.exe$') { if (Test-Path -LiteralPath $Root -PathType Leaf) { return $Root } else { return $null } }
+    $candidates = @((Join-Path $Root 'platform\steam\PBZ.exe'))
+    $platform = Join-Path $Root 'platform'
+    if (Test-Path -LiteralPath $platform -PathType Container) {
+        $candidates += @(Get-ChildItem -LiteralPath $platform -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { Join-Path $_.FullName 'PBZ.exe' })
+    }
+    $candidates += @((Join-Path $Root 'PBZ.exe'))
+    foreach ($candidate in $candidates) { if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate } }
+    return $null
+}
 function Read-RegistryValue([string]$Key, [string]$Name) {
     try { return (Get-ItemProperty -LiteralPath $Key -Name $Name -ErrorAction Stop).$Name } catch { return $null }
 }
-function Find-GameRoot {
+# Every install found: @(PBZ.exe, where it was found), one per PBZ.exe.
+function Find-Games {
+    $games = @()
     foreach ($key in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App $AppId",
                        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App $AppId",
                        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App $AppId")) {
-        $location = Read-RegistryValue $key 'InstallLocation'
-        if (Test-GameRoot $location) { return @($location, (T 'Steam 卸载项' 'Steam uninstall entry')) }
+        $exe = Find-GameExe (Read-RegistryValue $key 'InstallLocation')
+        if ($exe) { $games += ,@($exe, (T 'Steam 卸载项' 'Steam uninstall entry')) }
     }
     $steams = @((Read-RegistryValue 'HKCU:\Software\Valve\Steam' 'SteamPath'),
                 (Read-RegistryValue 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam' 'InstallPath'),
@@ -166,24 +183,55 @@ function Find-GameRoot {
             $manifest = Join-Path $library "steamapps\appmanifest_$AppId.acf"
             if (-not (Test-Path -LiteralPath $manifest)) { continue }
             $dir = [regex]::Match((Get-Content -LiteralPath $manifest -Raw -Encoding UTF8), '"installdir"\s+"([^"]+)"').Groups[1].Value
-            $root = Join-Path $library "steamapps\common\$dir"
-            if (Test-GameRoot $root) { return @($root, (T 'Steam 库' 'Steam library')) }
+            $exe = Find-GameExe (Join-Path $library "steamapps\common\$dir")
+            if ($exe) { $games += ,@($exe, (T 'Steam 库' 'Steam library')) }
         }
     }
-    return $null
+    # Other stores (WeGame): an uninstall entry named after the game, if the store writes one.
+    foreach ($hive in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+                        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        foreach ($entry in @(Get-ChildItem -LiteralPath $hive -ErrorAction SilentlyContinue)) {
+            $name = Read-RegistryValue $entry.PSPath 'DisplayName'
+            if (-not $name -or $name -notmatch '影之刃零|Phantom Blade Zero') { continue }
+            $exe = Find-GameExe (Read-RegistryValue $entry.PSPath 'InstallLocation')
+            if ($exe) { $games += ,@($exe, ((T '卸载项 ' 'uninstall entry ') + $name)) }
+        }
+    }
+    $seen = @{}; $unique = @()
+    foreach ($game in $games) {
+        $key = $game[0].ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $unique += ,$game }
+    }
+    return ,$unique
 }
-function Read-GameRoot {
+function Read-GameExe {
     while ($true) {
         Write-Host ("   $Amber" + (T '没有在注册表中找到《影之刃零》。' 'Phantom Blade Zero was not found in the registry.') + $R)
-        $path = Read-Host ('   ' + (T '请输入游戏目录（含 platform 文件夹的那一层，也可粘贴 PBZ.exe 路径；直接回车退出）' 'Game folder (the one that contains "platform"; a path to PBZ.exe also works; Enter to quit)'))
+        $path = Read-Host ('   ' + (T '请输入游戏目录（含 platform 文件夹的那一层或 PBZ.exe 所在文件夹，也可粘贴 PBZ.exe 路径；直接回车退出）' 'Game folder (the one that contains "platform", or the folder of PBZ.exe; a path to PBZ.exe also works; Enter to quit)'))
         if (-not $path) { exit 1 }
         $path = $path.Trim().Trim('"')
-        if ($path -match '\\PBZ\.exe$') { $path = Split-Path $path }
-        foreach ($candidate in @($path, (Split-Path $path -ErrorAction SilentlyContinue), (Split-Path (Split-Path $path -ErrorAction SilentlyContinue) -ErrorAction SilentlyContinue))) {
-            if (Test-GameRoot $candidate) { return @($candidate, (T '手动输入' 'entered by hand')) }
+        $candidates = @($path)
+        try {
+            $parent = Split-Path $path -Parent
+            if ($parent) { $candidates += $parent; $grand = Split-Path $parent -Parent; if ($grand) { $candidates += $grand } }
+        } catch {}
+        foreach ($candidate in $candidates) {
+            $exe = Find-GameExe $candidate
+            if ($exe) { return @($exe, (T '手动输入' 'entered by hand')) }
         }
-        Write-Host ("   $Red" + (T '这个目录下没有 platform\steam\PBZ.exe。' 'There is no platform\steam\PBZ.exe under this folder.') + $R)
+        Write-Host ("   $Red" + (T '这个目录下没有 PBZ.exe（Steam 版在 platform\steam 里）。' 'There is no PBZ.exe under this folder (the Steam version keeps it in platform\steam).') + $R)
     }
+}
+function Select-Game([object[]]$Games) {
+    if ($Games.Count -eq 1) { return $Games[0] }
+    Write-Host ('   ' + (T '找到多个《影之刃零》安装，选择要安装到哪一个：' 'Found more than one Phantom Blade Zero install; pick one:'))
+    Write-Host ''
+    $items = @()
+    for ($i = 0; $i -lt [Math]::Min($Games.Count, 9); $i++) { $items += ,@([string]($i + 1), (Fit (Split-Path $Games[$i][0]) 52), $Games[$i][1]) }
+    $items += ,@('0', (T '退出' 'Quit'), '')
+    $selected = Read-Choice $items
+    if ($selected -eq '0') { exit 0 }
+    return $Games[[int]$selected - 1]
 }
 
 # ---- State ----------------------------------------------------------------------------
@@ -206,11 +254,16 @@ function Get-InstallState([string]$Target) {
     return @((T '有其他 MOD 的 version.dll（安装时会备份）' "Another mod's version.dll (backed up on install)"), $Amber, 'foreign')
 }
 function Get-GameVersion([string]$Exe) {
-    if ($ExeSha256.StartsWith('__')) { return @((T '未校验（开发版安装脚本）' 'Not checked (development installer)'), $Muted, $true) }
-    $mismatch = @((T '与本 MOD 不匹配：只有关闭自适应扳机可用' 'Does not match: only the adaptive-trigger switch works'), $Red, $false)
-    if ((Get-Item -LiteralPath $Exe).Length -ne [long]$ExeBytes) { return $mismatch }
-    if ((Get-Sha $Exe) -ne $ExeSha256) { return $mismatch }
-    return @((T '与本 MOD 匹配' 'Matches this build'), $Green, $true)
+    if ($ExeBuilds.StartsWith('__')) { return @((T '未校验（开发版安装脚本）' 'Not checked (development installer)'), $Muted, $true) }
+    $size = (Get-Item -LiteralPath $Exe).Length
+    $sha = $null
+    foreach ($build in $ExeBuilds.Split(';')) {
+        $fields = $build.Split('|')
+        if ($fields.Count -ne 3 -or $size -ne [long]$fields[1]) { continue }
+        if (-not $sha) { $sha = Get-Sha $Exe }
+        if ($sha -eq $fields[2]) { return @(((T '与本 MOD 匹配（{0} 版）' 'Matches this build ({0})') -f $fields[0]), $Green, $true) }
+    }
+    return @((T '与本 MOD 不匹配：只有关闭自适应扳机可用' 'Does not match: only the adaptive-trigger switch works'), $Red, $false)
 }
 
 # ---- Menu -----------------------------------------------------------------------------
@@ -278,6 +331,8 @@ function Install-Dll([string]$Selected, [string]$Target) {
             Write-Host ("   $Amber" + (T '原有的 version.dll 不属于豪之刃，已备份为 ' 'The existing version.dll belongs to another mod; backed up as ') + (Split-Path $backup -Leaf) + $R)
         }
         Copy-Item -LiteralPath $source -Destination $Target -Force
+        # The copy keeps the ZIP's "downloaded from the internet" mark, which some security software refuses.
+        Unblock-File -LiteralPath $Target -ErrorAction SilentlyContinue
     } catch {
         if (Test-AccessDenied $_) { Restart-Elevated $Selected; return $false }
         Write-Host ("   $Red" + (T '复制失败：' 'Copy failed: ') + $_.Exception.Message + $R); return $false
@@ -296,7 +351,7 @@ function Install-Dll([string]$Selected, [string]$Target) {
 }
 function Uninstall-Dll([string]$Target) {
     if (-not (Test-Path -LiteralPath $Target)) { Write-Host ("   $Muted" + (T '没有安装，不需要卸载。' 'Nothing is installed.') + $R); return }
-    if (-not (Test-OurDll $Target)) { Write-Host ("   $Amber" + (T 'platform\steam\version.dll 不属于豪之刃，没有删除。' 'platform\steam\version.dll belongs to another mod; left in place.') + $R); return }
+    if (-not (Test-OurDll $Target)) { Write-Host ("   $Amber" + (T 'PBZ.exe 旁边的 version.dll 不属于豪之刃，没有删除。' 'The version.dll next to PBZ.exe belongs to another mod; left in place.') + $R); return }
     if (-not (Wait-GameClosed)) { return }
     try { Remove-Item -LiteralPath $Target -Force } catch {
         if (Test-AccessDenied $_) { Restart-Elevated '3'; return }
@@ -307,22 +362,31 @@ function Uninstall-Dll([string]$Target) {
         Move-Item -LiteralPath $backup.FullName -Destination $Target
         Write-Host ("   $Green" + (T '✓ 已卸载，并还原了安装前备份的 version.dll' '✓ Uninstalled; the version.dll backed up at install time is restored') + $R)
     } else { Write-Host ("   $Green" + (T '✓ 已卸载' '✓ Uninstalled') + $R) }
-    Write-Host ("   $Muted" + (T '设置文件 PBZDebugMenu.ini 与日志保留在 platform\steam，可手动删除。' 'PBZDebugMenu.ini and the logs stay in platform\steam; delete them by hand if you want.') + $R)
+    Write-Host ("   $Muted" + (T '设置文件 PBZDebugMenu.ini 与日志保留在 PBZ.exe 所在文件夹，可手动删除。' 'PBZDebugMenu.ini and the logs stay next to PBZ.exe; delete them by hand if you want.') + $R)
+}
+
+# EnvCheck.exe (same folder): checks runtimes, system parts, the game and the install, and repairs what it can; it
+# runs in this window and asks for administrator rights itself when a repair needs them.
+function Invoke-EnvCheck([string]$Exe) {
+    $tool = Join-Path $Here 'EnvCheck.exe'
+    if (-not (Test-Path -LiteralPath $tool)) { Write-Host ("   $Red" + (T '安装包里缺少 EnvCheck.exe' 'EnvCheck.exe is missing from the package') + $R); return }
+    Clear-Host
+    & $tool --game $Exe --package $Here --lang $(if ($Zh) { 'zh' } else { 'en' }) --no-pause
 }
 
 # ---- Main -----------------------------------------------------------------------------
 Show-Banner
-$found = Find-GameRoot
-if (-not $found) { $found = Read-GameRoot }
-$root = $found[0]
-$exe = Join-Path $root 'platform\steam\PBZ.exe'
-$target = Join-Path $root 'platform\steam\version.dll'
+$games = Find-Games
+$found = if ($games.Count) { Select-Game $games } else { Read-GameExe }
+$exe = $found[0]
+$folder = Split-Path $exe
+$target = Join-Path $folder 'version.dll'
 Write-Host ("   $Muted" + (T '正在校验游戏版本…' 'Checking the game version…') + $R)
 $version = Get-GameVersion $exe
 while ($true) {
     $state = Get-InstallState $target
     Show-Banner
-    Show-Box @(@((T '游戏目录' 'Game folder'), "$root ($($found[1]))", $Ivory), @((T '游戏版本' 'Game version'), $version[0], $version[1]),
+    Show-Box @(@((T '游戏目录' 'Game folder'), "$folder ($($found[1]))", $Ivory), @((T '游戏版本' 'Game version'), $version[0], $version[1]),
                @((T '当前状态' 'Installed'), $state[0], $state[1]))
     $selected = $Choice
     $Choice = ''
@@ -331,6 +395,7 @@ while ($true) {
             @('1', (T '安装完整版' 'Install full'), (T '面板（F10）与全部功能，含关闭自适应扳机' 'Panel (F10) and every feature, triggers off included')),
             @('2', (T '安装精简版' 'Install triggers-only'), (T '只关闭 DualSense 自适应扳机' 'Only turns off DualSense adaptive triggers')),
             @('3', (T '卸载' 'Uninstall'), (T '删除 version.dll，保留设置文件' 'Removes version.dll, keeps the settings file')),
+            @('4', (T '环境检查与修复' 'Check and repair'), (T '运行库、系统组件、游戏版本、安装位置，发现问题可一键修复' 'Runtimes, system parts, game build, install location; repairs what it finds')),
             @('0', (T '退出' 'Quit'), ''))
     }
     Write-Host ''
@@ -338,6 +403,7 @@ while ($true) {
         '1' { [void](Install-Dll '1' $target) }
         '2' { [void](Install-Dll '2' $target) }
         '3' { Uninstall-Dll $target }
+        '4' { Invoke-EnvCheck $exe }
         default { exit 0 }
     }
     Write-Host ''
