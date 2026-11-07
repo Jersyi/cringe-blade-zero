@@ -13,8 +13,9 @@
 // <Action> (keyboard), <Action>.Xbox and <Action>.PS; each value is kb: / xb: / ps:
 // plus tokens joined by '+', and a value without a prefix is a chord of that key's
 // device ("F10", "Ctrl + F10", "Y + B"). Bindings missing from the ini are written
-// with their defaults (Layout=2; an ini from the one-binding layout is migrated).
-// ToggleHub (the panel, default F10) falls back to F10 when empty or unreadable.
+// with their defaults (Layout=3; an ini from the one-binding layout is migrated, one of Layout=2 gets the panel's
+// pad chords). ToggleHub (the panel: F10, View + Menu, Create + Options) falls back to F10 when the keyboard one is
+// empty or unreadable. Pad chords fire while a text box has the focus; keyboard chords do not.
 namespace UiHotkeys {
 enum class Action : int {
     ToggleHub = 0,
@@ -88,7 +89,22 @@ void NoteSonyReport(int kind, const unsigned char* data, int size);
 void NoteDualSenseTouch(const unsigned char* data, int size);
 // While true, this module closes its own Sony handles so the weapon reader can own the device.
 void YieldSony(bool yield);
+// PadButton: pad buttons in the layout of PadLevel::buttons and Chord::buttons.
+namespace PadButton {
+constexpr unsigned Up = 1u << 0, Down = 1u << 1, Left = 1u << 2, Right = 1u << 3, Menu = 1u << 4, View = 1u << 5;
+constexpr unsigned L3 = 1u << 6, R3 = 1u << 7, LB = 1u << 8, RB = 1u << 9, A = 1u << 10, B = 1u << 11, X = 1u << 12, Y = 1u << 13;
+constexpr unsigned LT = 1u << 14, RT = 1u << 15;
+}
+// UI worker. While on (the panel is up and navigated with the pad), of the pad chords only ToggleHub fires; buttons
+// held when it goes off stay out of pad chords until released.
+void SetPadNavigation(bool on);
+// UI worker: SetFocus for a pad focus move. A bind box that gets the focus this way is not armed.
+void FocusFromPad(HWND control);
+// UI worker: arms the bind box `control` for capture. False when it is not one.
+bool ArmBox(HWND control);
 // Offline tests only, before the first Tick: stands in for XInputGetState.
 using PadStateReader = DWORD(WINAPI*)(DWORD user, void* state);
 void SetXInputForTest(PadStateReader reader);
+// PAD / HOTKEY lines (controllers found, pad in hand, hotkey fires) go here; set before Initialize.
+void SetLogger(void (*log)(const char*));
 }

@@ -15,6 +15,17 @@ bool ForcedOff();
 void SetForcedOff(bool off);                     // persisted in the ini
 void Status(wchar_t* out, size_t size);
 
+// Full mod only (game_pad_gate), never the triggers-only DLL.
+// GetProcAddress results of the game executable pass through `filter` (it returns the function to hand out).
+using ProcFilter = FARPROC (*)(HMODULE module, LPCSTR name, FARPROC real);
+void SetProcFilter(ProcFilter filter);
+// DllMain: ReadFile / GetOverlappedResult(Ex) of the executable; each input report the game reads from a DualSense
+// handle passes through `filter` once, in the game's buffer, before the game sees it.
+using ReadFilter = void (*)(HANDLE handle, uint8_t* report, DWORD size);
+void InstallReadHooks(ReadFilter filter);
+// Replaces (dll, function) entries in a module's import address table; the first old value goes to *original.
+int PatchImport(HMODULE module, const char* dll, const char* function, void* hook, void** original);
+
 // Exposed for pad_triggers_test.
 bool RewriteReport(uint8_t* report, size_t size, bool force_reset);  // true when the report was changed
 int SteamSlotFromExport(const uint8_t* code);    // vtable slot of a "mov rax,[rcx]; jmp [rax+disp]" thunk, or -1

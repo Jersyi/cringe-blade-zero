@@ -24,6 +24,7 @@
 #include "donate_page.h"
 #include <windows.h>
 #include <windowsx.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -73,6 +74,7 @@ namespace {
 HWND game_ = nullptr;
 DWORD game_tid_ = 0;
 std::atomic<int> game_keys_{0}, game_setfocus_{0}, game_killfocus_{0}, game_clicks_{0};
+bool real_pads_ = false;  // --pads: the machine's own XInput / HID pads instead of the fake one
 // UE marks Slate inactive on WM_ACTIVATEAPP(FALSE); CommonUI then ignores the mouse in game menus.
 std::atomic<int> game_app_off_{0}, game_app_on_{0}, game_inactive_{0}, game_active_{0}, game_off_by_worker_{0};
 std::atomic<DWORD> game_app_off_thread_{0}, worker_tid_{0};
@@ -176,10 +178,12 @@ DWORD WINAPI WorkerMain(void* ready) {
     worker_tid_.store(GetCurrentThreadId());
     SetWindowsHookExW(WH_CBT, &WorkerCbt, nullptr, GetCurrentThreadId());
     const std::wstring path = IniPath(); const wchar_t* ini = path.c_str();
-    UiHotkeys::SetXInputForTest(&FakeXInput);
+    if (!real_pads_) UiHotkeys::SetXInputForTest(&FakeXInput);
+    UiHotkeys::SetLogger(&LogLine);
     UiHost::GuardActivation(&LogLine); UiCursor::SetLogger(&LogLine);
     UiI18n::Initialize(ini); UiTheme::Initialize(); DebugHub::Initialize(); UiHotkeys::Initialize(ini);
     UiHotkeys::Bind(UiHotkeys::Action::GearUp, [] { ++pad_fires_; });
+    UiHotkeys::Bind(UiHotkeys::Action::ToggleHub, [] { DebugHub::Toggle(); });  // as the mod binds it
     UiLoadBanner::Initialize(&LogLine); EntryFocus::Initialize();
     SettingsStore::Initialize(ini); HubPause::Initialize(&LogLine); GrabExtras::Initialize(&LogLine); MotianGrabMenu::Initialize(&LogLine); GearWidget::Initialize(&LogLine);
     for (int page = 0; page < static_cast<int>(DebugHub::Page::Supplement); ++page)
@@ -322,6 +326,10 @@ bool BindXbox(HWND box, unsigned buttons, DWORD sony_ms = 0) {
     fake_pad_.store(0); Sleep(350);
     return armed;
 }
+HWND Focused() { GUITHREADINFO info{sizeof(info)}; GetGUIThreadInfo(game_tid_, &info); return info.hwndFocus; }
+bool ClassOf(HWND window, const wchar_t* cls) { wchar_t name[64]{}; return window && GetClassNameW(window, name, 64) > 0 && !_wcsicmp(name, cls); }
+// A fake pad press held long enough for the worker's poll (shorter than the hub's repeat delay), then the release.
+void Tap(unsigned buttons, DWORD hold = 90) { fake_pad_.store(buttons); Sleep(hold); fake_pad_.store(0); Sleep(120); }
 int Click() {
     if (!OursForeground()) { Log("  skipped click: another process owns the foreground"); return -1; }
     RECT rect{}; GetWindowRect(game_, &rect);
@@ -344,6 +352,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     if (arguments && *arguments) log_path = arguments;
     _wfopen_s(&log_, log_path.c_str(), L"w");
     HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    // --pads=<seconds>: the real pads (XInput and HID, no fake) over the fake game; the PAD / HOTKEY lines the
+    // mod would log, for that long (press buttons meanwhile), then exit. A check of what this machine's pads read as.
+    if (const wchar_t* pads = arguments ? wcsstr(arguments, L"--pads=") : nullptr) {
+        real_pads_ = true;
+        HANDLE g = CreateThread(nullptr, 0, GameMain, ready, 0, nullptr); WaitForSingleObject(ready, 5000);
+        Foreground(game_); Sleep(200);
+        HANDLE w = CreateThread(nullptr, 0, WorkerMain, ready, 0, nullptr); WaitForSingleObject(ready, 5000);
+        Sleep(static_cast<DWORD>((std::max)(1, _wtoi(pads + 7))) * 1000);
+        Log("pads: in hand=%d prompts=%d", static_cast<int>(UiHotkeys::ActivePad()), static_cast<int>(UiHotkeys::InputDevice()));
+        stop_.store(true); PostThreadMessageW(game_tid_, WM_NULL, 0, 0);
+        WaitForSingleObject(w, 5000); WaitForSingleObject(g, 5000);
+        return 0;
+    }
     // --shot=<file.bmp> [--page=N] [--lang=en]: open the hub over the fake game, save its pixels, exit.
     const wchar_t* shot = arguments ? wcsstr(arguments, L"--shot=") : nullptr;
     if (shot) {
@@ -411,7 +432,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         const UiHotkeys::Chord hair = UiHotkeys::Get(UiHotkeys::Action::HairMode);
         Check(hair.device == UiHotkeys::Device::Keyboard && hair.key == VK_F11 && hair.modifiers == 2, "a hand-typed ini chord without prefix reads as a keyboard chord");
         Log("  [ini] Layout=%ls GrabRelease=%ls / %ls / %ls", Saved(L"Layout").c_str(), Saved(L"GrabRelease").c_str(), Saved(L"GrabRelease.Xbox").c_str(), Saved(L"GrabRelease.PS").c_str());
-        Check(Saved(L"Layout") == L"2" && Saved(L"GrabRelease") == L"kb:G" && Saved(L"GrabRelease.Xbox") == L"xb:Y+A" && Saved(L"GrabRelease.PS") == L"ps:Triangle+Cross",
+        Check(Saved(L"Layout") == L"3" && Saved(L"GrabRelease") == L"kb:G" && Saved(L"GrabRelease.Xbox") == L"xb:Y+A" && Saved(L"GrabRelease.PS") == L"ps:Triangle+Cross",
             "a one-binding pad chord migrates into the Xbox and PlayStation sets, the keyboard gets its default");
         Check(Saved(L"NpcSkill") == L"kb:X" && Saved(L"NpcSkill.Xbox") == L"xb:L3+R3" && Saved(L"WeaponSwap.Xbox") == L"xb:LB+L3" && Saved(L"WeaponSwap.PS") == L"ps:SwipeLeft+SwipeRight",
             "every device's defaults are written to the ini");
@@ -533,16 +554,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         Check(Saved(L"GearUp.Xbox") == L"xb:LB+RB" && Saved(L"GearUp") == L"kb:plus", "Xbox LB+RB records into the Xbox set; the keyboard binding stays");
         Check(UiHotkeys::InputDevice() == Device::Xbox && Shown(UiHotkeys::Action::GearUp) == L"LB + RB", "after an Xbox press the prompts show the Xbox set");
         const int fired = pad_fires_.load();
+        // While the hub is up its pad navigation owns the pad (LB / RB change the page): GearUp stays quiet.
+        fake_pad_.store(0x0100 | 0x0200); Sleep(250); fake_pad_.store(0); Sleep(250);
+        Check(pad_fires_.load() == fired, "pad chords other than the panel's do not fire while the hub is up");
+        DebugHub::Toggle(); Sleep(900);
+        if (!OursForeground()) { Foreground(game_); Sleep(150); }
         fake_pad_.store(0x0100 | 0x0200); Sleep(250); fake_pad_.store(0); Sleep(250);
         Check(pad_fires_.load() == fired + 1, "Xbox LB+RB fires its action once");
         fake_pad_.store(0x0100); Sleep(250); fake_pad_.store(0); Sleep(250);
         Check(pad_fires_.load() == fired + 1, "LB alone does not fire LB+RB");
+        DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(900);
         RECT g{}; GetClientRect(glyphs, &g);
         PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(g.right - 6, g.bottom / 2)); Sleep(300);
         Log("  pad type PlayStation: PadGlyphs=%ls, active=%d", Saved(L"PadGlyphs").c_str(), static_cast<int>(UiHotkeys::ActivePad()));
         Check(Saved(L"PadGlyphs") == L"ps" && UiHotkeys::ActivePad() == Device::PlayStation, "the pad type switch picks the PlayStation set");
+        DebugHub::Toggle(); Sleep(900);
         fake_pad_.store(0x0100 | 0x0200); Sleep(250); fake_pad_.store(0); Sleep(250);
         Check(pad_fires_.load() == fired + 1, "with the PlayStation set in use the Xbox chord does not fire");
+        DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(900);
         PostMessageW(glyphs, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(6, g.bottom / 2)); Sleep(300);
         Check(Saved(L"PadGlyphs") == L"auto" && UiHotkeys::ActivePad() == Device::Xbox, "back to auto: the Xbox pad in hand picks the Xbox set");
         // Steam Input / DS4Windows: a DualSense press also shows up as XInput, a moment earlier.
@@ -553,7 +582,85 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
         Check(UiHotkeys::ActivePad() == Device::PlayStation && UiHotkeys::Hint(UiHotkeys::Action::GearDown) == L"三角 + 方块",
             "a DualSense press switches to the PlayStation set; prompts name its buttons");
     } else Check(false, "hotkey page has the per-device gear bind boxes and the pad type switch");
-    DebugHub::Toggle(); Sleep(900);
+    // Pad navigation with the fake XInput pad: View + Menu opens and closes the hub, RB / LB change the page, the
+    // D-pad moves the focus, A confirms, B steps back, and no other pad chord fires meanwhile.
+    if (DebugHub::Visible()) { DebugHub::Toggle(); Sleep(900); }
+    if (!OursForeground()) { Foreground(game_); Sleep(150); }
+    if (!OursForeground()) Log("  skipped pad navigation checks: another process owns the foreground");
+    else {
+        Check(Saved(L"Layout") == L"3" && Saved(L"ToggleHub.Xbox") == L"xb:View+Menu" && Saved(L"ToggleHub.PS") == L"ps:Create+Options",
+            "the panel's pad chords are written with their defaults (Layout=3)");
+        const int fired = pad_fires_.load();
+        fake_pad_.store(0x0020); Sleep(60); fake_pad_.store(0x0030); Sleep(200); fake_pad_.store(0); Sleep(800);
+        Report("hub opened by View + Menu");
+        Check(DebugHub::Visible(), "View then Menu opens the hub");
+        Check(ClassOf(Focused(), L"PBZDebugHubNav_v1"), "the sidebar has the focus when the hub opens");
+        Log("  pad in use: %d (1 = Xbox)", static_cast<int>(UiHotkeys::ActivePad()));
+        DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(500);
+        Tap(0x0200); Sleep(400);
+        Check(Visible(L"PBZDonatePage_v1") != nullptr, "RB goes to the next page (Donate after the hotkeys)");
+        Tap(0x0100); Sleep(400);
+        Check(Visible(L"PBZHotkeyBind_v1") != nullptr, "LB goes back a page");
+        Tap(0x0100 | 0x0200); Sleep(300);
+        Check(UiHotkeys::ActivePad() == Device::Xbox && pad_fires_.load() == fired, "LB + RB (GearUp on the Xbox set) does not fire while the hub is up");
+        DebugHub::ShowPage(DebugHub::Page::MotianGrab); Sleep(700);
+        HWND grab = nullptr; EnumChildWindows(game_, FindGrabPage, reinterpret_cast<LPARAM>(&grab));
+        Tap(0x0008); Sleep(200);
+        const HWND first = Focused();
+        Log("  Right from the sidebar: focus %s", Describe(first).c_str());
+        Check(grab && first && IsChild(grab, first), "D-pad right from the sidebar moves the focus into the page");
+        const HWND box = Visible(L"Button", BS_TYPEMASK, BS_AUTOCHECKBOX);
+        int steps = 0;
+        while (box && Focused() != box && steps < 40) { Tap(0x0002, 60); ++steps; }
+        Log("  D-pad down to the first checkbox: %d steps, focus %s", steps, Describe(Focused()).c_str());
+        Check(box && Focused() == box, "D-pad down walks the focus to the checkbox");
+        if (box && Focused() == box) {
+            const LRESULT before = SendMessageW(box, BM_GETCHECK, 0, 0);
+            Tap(0x1000); Sleep(200);
+            const LRESULT after = SendMessageW(box, BM_GETCHECK, 0, 0);
+            Check(after != before, "A toggles the focused checkbox");
+            if (after != before) { Tap(0x1000); Sleep(200); }
+            Tap(0x0002, 60); Sleep(100);
+            const HWND next = Focused();
+            Tap(0x0001, 60); Sleep(100);
+            Check(next != box && grab && IsChild(grab, next) && Focused() == box, "D-pad down then up: the next control and back");
+        }
+        steps = 0;
+        while (!ClassOf(Focused(), L"ComboBox") && steps < 40) { Tap(0x0002, 60); ++steps; }
+        Log("  D-pad down to a drop-down list: %d steps, focus %s", steps, Describe(Focused()).c_str());
+        if (const HWND combo = ClassOf(Focused(), L"ComboBox") ? Focused() : nullptr) {
+            Tap(0x1000); Sleep(300);
+            const HWND popup = FindWindowExW(game_, nullptr, L"PBZDropdownList_v1", nullptr);
+            const HWND top = FindWindowW(L"PBZDropdownList_v1", nullptr);
+            Check((popup && IsWindowVisible(popup)) || (top && IsWindowVisible(top)), "A opens the focused drop-down list");
+            Tap(0x2000); Sleep(300);
+            Check(!(popup && IsWindowVisible(popup)) && !(top && IsWindowVisible(top)) && DebugHub::Visible() && Focused() == combo,
+                "B closes the drop-down list; the hub and the focus stay");
+        } else Check(false, "D-pad down reaches a drop-down list on the grab page");
+        Tap(0x2000); Sleep(200);
+        Check(ClassOf(Focused(), L"PBZDebugHubNav_v1") && DebugHub::Visible(), "B returns the focus to the sidebar");
+        Tap(0x2000); Sleep(900);
+        Check(!DebugHub::Visible(), "B in the sidebar hides the hub");
+        Check(Keys(3) == 3, "keys reach the game after the hub closed by B");
+        fake_pad_.store(0x0020 | 0x0010); Sleep(250); fake_pad_.store(0); Sleep(900);
+        Check(DebugHub::Visible(), "View + Menu pressed together opens the hub");
+        DebugHub::ShowPage(DebugHub::Page::Hotkeys); Sleep(600);
+        Tap(0x0008); Sleep(200);
+        steps = 0;
+        while (!ClassOf(Focused(), L"PBZHotkeyBind_v1") && steps < 10) { Tap(0x0002, 60); ++steps; }
+        Log("  hotkey page: %d steps to a bind box, focus %s", steps, Describe(Focused()).c_str());
+        Check(ClassOf(Focused(), L"PBZHotkeyBind_v1") && !UiHotkeys::Capturing(), "a bind box reached with the D-pad is not armed");
+        Tap(0x1000); Sleep(200);
+        Check(UiHotkeys::Capturing(), "A arms the focused bind box");
+        Hold(VK_ESCAPE, 120); Sleep(300);
+        Check(!UiHotkeys::Capturing(), "Esc cancels the capture");
+        if (!DebugHub::Visible()) { DebugHub::Toggle(); Sleep(900); }
+        fake_pad_.store(0x0020 | 0x0010); Sleep(250); fake_pad_.store(0); Sleep(900);
+        Check(!DebugHub::Visible(), "View + Menu closes the hub");
+        Check(pad_fires_.load() == fired, "no pad chord fired during pad navigation");
+        Check(Keys(3) == 3, "keys reach the game after the hub closed by View + Menu");
+    }
+    if (DebugHub::Visible()) { DebugHub::Toggle(); Sleep(900); }
     Check(Keys(3) == 3, "keys reach the game after the mouse checks");
     if (OursForeground()) {
         Hold(VK_F23, 120); Sleep(100);

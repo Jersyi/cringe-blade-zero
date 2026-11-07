@@ -12,6 +12,7 @@
 #include "groom_force.h"
 #include "hair_controls.h"
 #include "pad_triggers.h"
+#include "game_pad_gate.h"
 #include "boss_menu.h"
 #include "debug_hub.h"
 #include "ui_i18n.h"
@@ -339,6 +340,8 @@ DWORD WINAPI Worker(void*) {
     GroomForce::Initialize(&LogLine, &NpcRetarget::OwnsAppearance);
     const std::wstring directory = log_path.substr(0, log_path.find_last_of(L"\\/") + 1);
     UiI18n::Initialize((directory+L"PBZDebugMenu.ini").c_str());
+    UiHotkeys::SetLogger(&LogLine);
+    GamePadGate::SetLogger(&LogLine);
     UiHotkeys::Initialize((directory+L"PBZDebugMenu.ini").c_str());
     SettingsStore::Initialize((directory+L"PBZDebugMenu.ini").c_str());
     HubPause::Initialize(&LogLine);
@@ -421,6 +424,9 @@ DWORD WINAPI Worker(void*) {
     while (!InterlockedCompareExchange(&stop_worker, 0, 0)) {
         UiHotkeys::Tick();
         DebugHub::Tick();
+        // The game reads its pads at rest while the panel is up; the panel chord never reaches it.
+        GamePadGate::Update(DebugHub::ObscuresGameplay(), UiHotkeys::Get(UiHotkeys::Action::ToggleHub, UiHotkeys::Device::Xbox).buttons,
+            UiHotkeys::Get(UiHotkeys::Action::ToggleHub, UiHotkeys::Device::PlayStation).buttons);
         UiLoadBanner::Tick();
         GearWidget::Tick();
         SkillToast::Tick();
@@ -474,7 +480,8 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
         wchar_t host[MAX_PATH]{};
         if (GetModuleFileNameW(nullptr, host, MAX_PATH)) {
             const wchar_t* name = wcsrchr(host, L'\\');
-            if (!_wcsicmp(name ? name + 1 : host, L"PBZ.exe")) PadTriggers::Install();
+            // GamePadGate (game_pad_gate.h): the same kind of entries for the game's pad reads (XInput, DualSense).
+            if (!_wcsicmp(name ? name + 1 : host, L"PBZ.exe")) { PadTriggers::Install(); GamePadGate::Install(); }
         }
         // Thread execution begins after loader initialization. Heavy work and
         // LoadLibrary are deliberately absent from this loader-lock callback.

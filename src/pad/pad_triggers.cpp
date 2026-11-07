@@ -13,6 +13,9 @@ using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED)
 using DeviceIoControlFn = BOOL(WINAPI*)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
 using GetProcFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using OverlappedFn = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
+using OverlappedExFn = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, DWORD, BOOL);
 using SetOutputReportFn = BOOLEAN(__stdcall*)(HANDLE, PVOID, ULONG);
 using SetTriggerFn = void (*)(void*, uint64_t, const void*);
 
@@ -33,6 +36,18 @@ WriteFileFn real_write = nullptr;
 DeviceIoControlFn real_ioctl = nullptr;
 CloseHandleFn real_close = nullptr;
 GetProcFn real_get_proc = nullptr;
+ReadFileFn real_read = nullptr;
+OverlappedFn real_overlapped = nullptr;
+OverlappedExFn real_overlapped_ex = nullptr;
+ProcFilter volatile proc_filter = nullptr;
+ReadFilter volatile read_filter = nullptr;
+// Overlapped reads of DualSense handles still in flight: the buffer is filtered when GetOverlappedResult(Ex) reports
+// the read done (SDL's hidapi: ReadFile -> ERROR_IO_PENDING -> GetOverlappedResult).
+struct PendingRead { HANDLE handle; OVERLAPPED* overlapped; uint8_t* buffer; };
+PendingRead pending_reads[16]{};
+volatile LONG pending_count = 0;
+SRWLOCK pending_lock = SRWLOCK_INIT;
+void Forget(HANDLE h);
 SetOutputReportFn volatile real_set_output = nullptr;
 SetTriggerFn real_set_trigger = nullptr;
 int steam_slot = -1, installed = 0;
@@ -136,7 +151,7 @@ HANDLE WINAPI HookCreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURIT
     return h;
 }
 BOOL WINAPI HookCloseHandle(HANDLE h) {
-    if (pad_count) Untrack(h);
+    if (pad_count && Tracked(h)) { Untrack(h); Forget(h); }
     return real_close(h);
 }
 BOOL WINAPI HookWriteFile(HANDLE h, LPCVOID data, DWORD size, LPDWORD written, LPOVERLAPPED overlapped) {
@@ -160,7 +175,77 @@ FARPROC WINAPI HookGetProcAddress(HMODULE module, LPCSTR name) {
         InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&real_set_output), reinterpret_cast<void*>(real), nullptr);
         if (reinterpret_cast<FARPROC>(real_set_output) == real) return reinterpret_cast<FARPROC>(&HookSetOutputReport);
     }
+    if (const ProcFilter filter = proc_filter) {
+        const DWORD error = GetLastError();
+        const FARPROC handed = filter(module, name, real);
+        SetLastError(error);
+        return handed;
+    }
     return real;
+}
+void Remember(HANDLE h, OVERLAPPED* overlapped, uint8_t* buffer) {
+    AcquireSRWLockExclusive(&pending_lock);
+    PendingRead* free_slot = nullptr;
+    for (PendingRead& read : pending_reads) {
+        if (read.handle == h && read.overlapped == overlapped) { free_slot = &read; break; }
+        if (!read.handle && !free_slot) free_slot = &read;
+    }
+    if (free_slot) {
+        if (!free_slot->handle) InterlockedIncrement(&pending_count);
+        *free_slot = {h, overlapped, buffer};
+    }
+    ReleaseSRWLockExclusive(&pending_lock);
+}
+uint8_t* Take(HANDLE h, OVERLAPPED* overlapped) {
+    uint8_t* buffer = nullptr;
+    AcquireSRWLockExclusive(&pending_lock);
+    for (PendingRead& read : pending_reads)
+        if (read.handle == h && read.overlapped == overlapped) { buffer = read.buffer; read = {}; InterlockedDecrement(&pending_count); break; }
+    ReleaseSRWLockExclusive(&pending_lock);
+    return buffer;
+}
+void Forget(HANDLE h) {
+    if (!InterlockedCompareExchange(&pending_count, 0, 0)) return;
+    AcquireSRWLockExclusive(&pending_lock);
+    for (PendingRead& read : pending_reads) if (read.handle == h) { read = {}; InterlockedDecrement(&pending_count); }
+    ReleaseSRWLockExclusive(&pending_lock);
+}
+BOOL WINAPI HookReadFile(HANDLE h, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
+    const BOOL ok = real_read(h, buffer, size, read, overlapped);
+    const ReadFilter filter = read_filter;
+    if (!filter || !buffer || !Tracked(h)) return ok;
+    const DWORD error = GetLastError();
+    if (ok) {
+        const DWORD n = read ? *read : overlapped ? static_cast<DWORD>(overlapped->InternalHigh) : 0;
+        if (overlapped) Take(h, overlapped);
+        if (n) filter(h, static_cast<uint8_t*>(buffer), n < size ? n : size);
+    } else if (error == ERROR_IO_PENDING && overlapped) {
+        Remember(h, overlapped, static_cast<uint8_t*>(buffer));
+    }
+    SetLastError(error);
+    return ok;
+}
+void Finish(HANDLE h, OVERLAPPED* overlapped, BOOL ok, DWORD* n) {
+    const DWORD error = GetLastError();
+    if (ok) {
+        if (uint8_t* buffer = Take(h, overlapped)) {
+            const DWORD bytes = n ? *n : static_cast<DWORD>(overlapped->InternalHigh);
+            if (bytes) if (const ReadFilter filter = read_filter) filter(h, buffer, bytes);
+        }
+    } else if (error != ERROR_IO_INCOMPLETE && error != WAIT_TIMEOUT && error != WAIT_IO_COMPLETION) {
+        Take(h, overlapped);  // failed or cancelled
+    }
+    SetLastError(error);
+}
+BOOL WINAPI HookGetOverlappedResult(HANDLE h, LPOVERLAPPED overlapped, LPDWORD n, BOOL wait) {
+    const BOOL ok = real_overlapped(h, overlapped, n, wait);
+    if (overlapped && InterlockedCompareExchange(&pending_count, 0, 0) && Tracked(h)) Finish(h, overlapped, ok, n);
+    return ok;
+}
+BOOL WINAPI HookGetOverlappedResultEx(HANDLE h, LPOVERLAPPED overlapped, LPDWORD n, DWORD ms, BOOL alertable) {
+    const BOOL ok = real_overlapped_ex(h, overlapped, n, ms, alertable);
+    if (overlapped && InterlockedCompareExchange(&pending_count, 0, 0) && Tracked(h)) Finish(h, overlapped, ok, n);
+    return ok;
 }
 
 void HookSetTrigger(void* self, uint64_t pad, const void* param) {
@@ -309,6 +394,19 @@ bool HookSteamInput(void* object, int slot) {
     return ok;
 }
 void TrackForTest(HANDLE handle) { Track(handle); }
+void SetProcFilter(ProcFilter filter) { proc_filter = filter; }
+int PatchImport(HMODULE module, const char* dll, const char* function, void* hook, void** original) {
+    return PatchImports(module, dll, function, hook, original);
+}
+void InstallReadHooks(ReadFilter filter) {
+    static volatile LONG done = 0;
+    if (InterlockedExchange(&done, 1)) { read_filter = filter; return; }
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    Patch(exe, {"kernel32.dll", "api-ms-win-core-file-l1-1-0.dll", "api-ms-win-core-file-l1-2-0.dll", "kernelbase.dll"}, "ReadFile", &HookReadFile, real_read);
+    Patch(exe, {"kernel32.dll", "api-ms-win-core-io-l1-1-0.dll", "api-ms-win-core-io-l1-1-1.dll", "kernelbase.dll"}, "GetOverlappedResult", &HookGetOverlappedResult, real_overlapped);
+    Patch(exe, {"kernel32.dll", "api-ms-win-core-io-l1-1-1.dll", "kernelbase.dll"}, "GetOverlappedResultEx", &HookGetOverlappedResultEx, real_overlapped_ex);
+    read_filter = filter;
+}
 
 void Install() {
     if (installed) return;

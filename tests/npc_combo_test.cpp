@@ -254,6 +254,19 @@ int main() {
         Remove(br, static_cast<size_t>(inv));
         Check(!InvincibleFor(br, bk, c) && !InvincibleFor(br, bk, 0) && at(c).mods[kModSpeed] == speed, "removing 无敌 breaks its arrows only");
     }
+    {
+        // 无视防御: a modifier like 无敌, its own slot; a move or the trigger may point at it; saved as Z.
+        const int guard = static_cast<int>(br.chain.size()); br.chain.push_back(ModifierNode(NodeType::IgnoreGuard, 0, 0));
+        Check(IsModifier(br.chain.back()) && SlotOf(NodeType::IgnoreGuard) == kModIgnoreGuard && !IgnoreGuardFor(br, bk, c), "a 无视防御 nothing points at covers nothing");
+        Check(LinkModifier(br, c, guard) && at(c).mods[kModIgnoreGuard] == guard && at(c).mods[kModSpeed] == speed && IgnoreGuardFor(br, bk, c) && !IgnoreGuardFor(br, bk, 0),
+              "C at 无视防御: only C, its 加速 stays");
+        Check(LinkModifier(br, bk, guard) && IgnoreGuardFor(br, bk, 0) && !InvincibleFor(br, bk, 0), "the trigger at 无视防御: every move of its chain");
+        const Config round = Decode(Encode(br));
+        Check(Encode(br).find(L"|Z:") != std::wstring::npos && round.chain[static_cast<size_t>(guard)].type == NodeType::IgnoreGuard && IgnoreGuardFor(round, bk, 0) &&
+              IgnoreGuardFor(round, bk, c) && Encode(round) == Encode(br), "无视防御 saved as Z and its arrows read back");
+        Remove(br, static_cast<size_t>(guard));
+        Check(!IgnoreGuardFor(br, bk, c) && !IgnoreGuardFor(br, bk, 0) && at(c).mods[kModSpeed] == speed, "removing 无视防御 breaks its arrows only");
+    }
     Remove(br, static_cast<size_t>(armor));
     Remove(br, static_cast<size_t>(c));  // 加速 5 -> 4, 武器属性 6 -> 5, the chain's 加速 7 -> 6
     Check(at(b).routes[1].next == -1 && at(4).type == NodeType::Speed && PointersTo(br, 4).nodes == 0 && at(bk).mods[kModWeapon] == 5 &&
@@ -801,7 +814,7 @@ int main() {
         const int fmod = static_cast<int>(fh.chain.size()); fh.chain.push_back(ModifierNode(NodeType::ForceHit, 40, 50));
         const int fmod2 = static_cast<int>(fh.chain.size()); fh.chain.push_back(ModifierNode(NodeType::ForceHit, 40, 150)); fh.chain.back().hit = static_cast<int>(HitKind::Break);
         EnsureKey(fh);  // the NPC key node Decode adds
-        Check(IsModifier(fh.chain[static_cast<size_t>(fmod)]) && SlotOf(NodeType::ForceHit) == kModForceHit && kModForceHit + 1 == kModSlots && fh.chain[1].mods[kModForceHit] == -1 &&
+        Check(IsModifier(fh.chain[static_cast<size_t>(fmod)]) && SlotOf(NodeType::ForceHit) == kModForceHit && kModForceHit < kModSlots && fh.chain[1].mods[kModForceHit] == -1 &&
               ForceHitFor(fh, 0, 1) < 0 && fh.chain[static_cast<size_t>(fmod)].hit == static_cast<int>(HitKind::Launch),
               "a new 强制受击 is 击飞 and forces nothing until something points at it");
         Check(LinkModifier(fh, 0, fmod) && LinkModifier(fh, 2, fmod2) && !LinkModifier(fh, 3, fmod) && ForceHitFor(fh, 0, 1) == static_cast<int>(HitKind::Launch) &&

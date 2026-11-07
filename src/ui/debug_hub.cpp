@@ -11,6 +11,7 @@
 #include "ui_surface.h"
 #include "ui_assets.h"
 #include <windowsx.h>
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -657,8 +658,11 @@ void PaintHub(HWND hwnd) {
     Text(dc,brand,{tile.right+S(12),tile.top,SidebarWidth()-S(8),tile.top+S(22)},Display(UiTheme::Font::Heading,brand),UiTheme::Text(),DT_SINGLELINE|DT_LEFT|DT_VCENTER|DT_END_ELLIPSIS);
     UiHotkeys::Draw(dc,tile.right+S(12),tile.top+S(25),S(18),UiHotkeys::Get(UiHotkeys::Action::ToggleHub),SidebarWidth()-S(8));
     // Shortcut legend at the bottom of the sidebar, drawn as key caps.
-    struct Hint { const wchar_t* keys[2]; const wchar_t* label; };
-    const Hint hints[]={{{L"Esc"},L"隐藏面板"},{{L"Ctrl",L"Tab"},L"切换页面"}};
+    struct Hint { const wchar_t* keys[2]; const wchar_t* label; unsigned pad[2]; };
+    const UiHotkeys::Device device=UiHotkeys::InputDevice();
+    const bool pad=device!=UiHotkeys::Device::Keyboard;
+    const Hint hints[]={{{L"Esc"},pad?L"返回 / 隐藏面板":L"隐藏面板",{UiHotkeys::PadButton::B}},
+                        {{L"Ctrl",L"Tab"},L"切换页面",{UiHotkeys::PadButton::LB,UiHotkeys::PadButton::RB}}};
     int y=client.bottom-S(22)-static_cast<int>(std::size(hints))*S(30);
     const int legend_top=NavTop()+NavCount()*NavStep()+S(8);
     if (y<legend_top) y=legend_top;
@@ -666,8 +670,11 @@ void PaintHub(HWND hwnd) {
     for (size_t hint_index=0;hint_index<std::size(hints);++hint_index) {
         const Hint& hint=hints[hint_index];
         int x=S(22);
-        if (hint_index==0) x=UiHotkeys::Draw(dc,x,y+S(3),S(22),UiHotkeys::Get(UiHotkeys::Action::ToggleHub),SidebarWidth()-S(78));
-        for (const wchar_t* key:hint.keys) {
+        // The panel chord also shows under the name; on a pad the row keeps room for B's label.
+        if (hint_index==0&&!pad) x=UiHotkeys::Draw(dc,x,y+S(3),S(22),UiHotkeys::Get(UiHotkeys::Action::ToggleHub),SidebarWidth()-S(78));
+        if (pad) {
+            for (const unsigned button:hint.pad) if (button) x=UiHotkeys::Draw(dc,x,y+S(3),S(22),UiHotkeys::Chord{device,0,0,button},SidebarWidth()-S(60));
+        } else for (const wchar_t* key:hint.keys) {
             if (!key) continue;
             x=UiHotkeys::DrawKey(dc,x,y+S(3),S(22),key)+S(5);
         }
@@ -942,6 +949,126 @@ bool TextEntryFocused() {
 void ReleaseTopmost() {
     if (window_) SetWindowPos(window_,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
 }
+// ---- pad navigation --------------------------------------------------------------
+// The panel with either pad (the buttons UiHotkeys reads, one layout for both): up / down (D-pad or left stick) move
+// between controls, a list's selection and a dropdown's rows; left / right go to the focused control (a drop-down
+// list's value, the language switch, filter chips); A confirms (a button's click, a drop-down list opens, a bind box
+// waits for a chord); B steps back (a dropdown closes, the focus returns to the sidebar, then the panel hides); LB / RB
+// change the page, LT / RT scroll it. Only presses made while the panel is up count: the chord that opened it does
+// nothing here.
+namespace {
+namespace Pad=UiHotkeys::PadButton;
+constexpr ULONGLONG kPadRepeatDelay=380,kPadRepeatEvery=110;
+struct PadNav { unsigned was=~0u,way=0; ULONGLONG next=0; };
+PadNav pad_nav_;
+bool ClassIs(HWND window,const wchar_t* name) { wchar_t found[64]{}; return window&&GetClassNameW(window,found,64)>0&&!_wcsicmp(found,name); }
+bool InHub(HWND window) { return window&&window_&&(window==window_||IsChild(window_,window)); }
+void SendKey(HWND window,UINT vk) {
+    if (!window) return;
+    const LPARAM scan=static_cast<LPARAM>(MapVirtualKeyW(vk,MAPVK_VK_TO_VSC))<<16;
+    const LPARAM extended=(vk==VK_UP||vk==VK_DOWN||vk==VK_LEFT||vk==VK_RIGHT)?(1<<24):0;
+    SendMessageW(window,WM_KEYDOWN,vk,1|scan|extended);
+    if (IsWindow(window)) SendMessageW(window,WM_KEYUP,vk,static_cast<LPARAM>(0xC0000001u)|scan|extended);
+}
+void ShowCues() { if (window_) SendMessageW(window_,WM_UPDATEUISTATE,MAKEWPARAM(UIS_CLEAR,UISF_HIDEFOCUS),0); }
+void PadFocus(HWND target) {
+    if (!target) return;
+    UiHotkeys::FocusFromPad(target);
+    ShowCues();
+}
+void EnterPage() {
+    const HWND page=entries[static_cast<size_t>(selected_)].window;
+    if (!page||!IsWindowVisible(page)) return;
+    const HWND first=GetNextDlgTabItem(page,nullptr,FALSE);
+    PadFocus(first&&IsChild(page,first)?first:page);
+}
+// A list moves its own selection until an end; then the focus moves on.
+bool ListStep(HWND list,int direction) {
+    int count=0,at=-1;
+    if (ClassIs(list,L"ListBox")) { count=static_cast<int>(SendMessageW(list,LB_GETCOUNT,0,0)); at=static_cast<int>(SendMessageW(list,LB_GETCARETINDEX,0,0)); }
+    else if (ClassIs(list,WC_LISTVIEWW)) { count=static_cast<int>(SendMessageW(list,LVM_GETITEMCOUNT,0,0)); at=static_cast<int>(SendMessageW(list,LVM_GETNEXTITEM,static_cast<WPARAM>(-1),LVNI_FOCUSED)); }
+    else return false;
+    if (count<=0||(direction<0?at<=0:at>=count-1)) return false;
+    SendKey(list,direction<0?VK_UP:VK_DOWN);
+    return true;
+}
+void PadVertical(int direction) {
+    const HWND focus=GetFocus(); const UINT vk=direction<0?VK_UP:VK_DOWN;
+    if (UiTheme::PopupActive()) { SendKey(focus,vk); return; }
+    if (!InHub(focus)) { PadFocus(nav_); return; }
+    if (focus==nav_) { SendKey(nav_,vk); ShowCues(); return; }
+    const HWND page=entries[static_cast<size_t>(selected_)].window;
+    const bool in_page=page&&(focus==page||IsChild(page,focus));
+    if (in_page&&ListStep(focus,direction)) { ShowCues(); return; }
+    // Debug supplement cards move to the card above / below themselves.
+    if (in_page&&ClassIs(focus,L"PBZSupplementCard_v1")) { SendKey(focus,vk); if (GetFocus()!=focus) { ShowCues(); return; } }
+    const HWND next=GetNextDlgTabItem(window_,focus,direction<0);
+    if (!next||next==focus||(direction>0&&next==nav_)) return;  // no wrap from the last control to the sidebar
+    PadFocus(next);
+}
+void PadHorizontal(int direction) {
+    const HWND focus=GetFocus();
+    if (UiTheme::PopupActive()) return;
+    if (!InHub(focus)) { PadFocus(nav_); return; }
+    if (focus==nav_) { if (direction>0) EnterPage(); return; }
+    SendKey(focus,direction<0?VK_LEFT:VK_RIGHT);
+    ShowCues();
+}
+void PadConfirm() {
+    const HWND focus=GetFocus();
+    if (UiTheme::PopupActive()) { SendKey(focus,VK_RETURN); return; }
+    if (!InHub(focus)) { PadFocus(nav_); return; }
+    if (focus==nav_) { EnterPage(); return; }
+    if (UiHotkeys::ArmBox(focus)) return;
+    if (ClassIs(focus,L"ComboBox")) { SendMessageW(focus,CB_SHOWDROPDOWN,TRUE,0); return; }
+    if (ClassIs(focus,L"Edit")||ClassIs(focus,L"ListBox")||ClassIs(focus,WC_LISTVIEWW)) return;
+    if (ClassIs(focus,L"Button")&&(GetWindowLongPtrW(focus,GWL_STYLE)&BS_TYPEMASK)==BS_GROUPBOX) return;
+    SendKey(focus,VK_SPACE);
+}
+void PadBack() {
+    if (UiTheme::DismissPopup()) return;
+    const HWND focus=GetFocus();
+    if (InHub(focus)&&focus!=nav_) { PadFocus(nav_); return; }
+    Hide();
+}
+void PadPage(int direction) {
+    Select(NavPage((NavRow(selected_)+direction+NavCount())%NavCount()));
+    ShowCues();
+}
+void PadScroll(int direction) {
+    const Entry& page=entries[static_cast<size_t>(selected_)];
+    ScrollTo(page.target_x,page.target_y+direction*0.8*(view_.bottom-view_.top));
+}
+void PadTick() {
+    const UiHotkeys::PadLevel level=UiHotkeys::CurrentPad();
+    const bool open=window_&&IsWindowVisible(window_)&&!hide_pending_&&!parked_;
+    UiHotkeys::SetPadNavigation(open);
+    const unsigned buttons=(level.buttons|level.stick)&0xFFFFu;  // stick ways use the D-pad bits
+    const ULONGLONG now=GetTickCount64();
+    if (!open||!UiHost::InGame()||UiHotkeys::Capturing()||now-level.at>500) { pad_nav_.was=buttons; pad_nav_.way=0; return; }
+    const unsigned pressed=buttons&~pad_nav_.was;
+    pad_nav_.was=buttons;
+    // Directions and triggers repeat while held: the first step at once, then after a pause at a steady rate.
+    constexpr unsigned kRepeat=Pad::Up|Pad::Down|Pad::Left|Pad::Right|Pad::LT|Pad::RT;
+    unsigned step=0;
+    if (pressed&kRepeat) {
+        const unsigned fresh=pressed&kRepeat;
+        pad_nav_.way=fresh&(0u-fresh); pad_nav_.next=now+kPadRepeatDelay; step=pad_nav_.way;
+    } else if (pad_nav_.way&&(buttons&pad_nav_.way)) {
+        if (now>=pad_nav_.next) { step=pad_nav_.way; pad_nav_.next=now+kPadRepeatEvery; }
+    } else pad_nav_.way=0;
+    if (step&Pad::Up) PadVertical(-1);
+    else if (step&Pad::Down) PadVertical(1);
+    else if (step&Pad::Left) PadHorizontal(-1);
+    else if (step&Pad::Right) PadHorizontal(1);
+    else if (step&Pad::LT) PadScroll(-1);
+    else if (step&Pad::RT) PadScroll(1);
+    if (pressed&Pad::A) PadConfirm();
+    else if (pressed&Pad::B) PadBack();
+    else if (pressed&Pad::LB) PadPage(-1);
+    else if (pressed&Pad::RB) PadPage(1);
+}
+}
 void Tick() {
     if (!enabled_) return;
     const LONG request=InterlockedExchange(&pending_page_,-1),toggle=InterlockedExchange(&pending_toggle_,0);
@@ -994,6 +1121,7 @@ void Tick() {
         InvalidateRect(window_,nullptr,FALSE);
     }
     if (layout_dirty_&&window_) { layout_dirty_=false; ActiveLayout(); }
+    PadTick();
     MotionTick(); ToastTick(GetTickCount64()); RevealFocus();
     if (!window_||!IsWindowVisible(window_)||hide_pending_||parked_) ReturnFocus();
     UiHost::Tick();

@@ -4686,6 +4686,63 @@ void SetComboTags(ComboTags& tags,bool want) {
 }
 void SetComboArmor(bool want){SetComboTags(armor_,want);}
 void SetComboInvincible(bool want){SetComboTags(invincible_,want);}
+// ---- 无视防御 ----
+// While a move under a 无视防御 node plays, every enemy within kSkillDamageRangeCm of the chain's pawn (hostile and alive:
+// DamageCandidate) carries the game's own CharacterState.AIState.CanNotDeflect as a loose tag (the AbilityUtils call
+// 霸体 uses). It is the state the game's GE_CanNotDeflect gives (bosses take it during their own attacks, shield
+// holders while their shield is up, divers while they dive) and the one the YaoJu upgrade's explosion puts on enemies
+// (GE_YaoJu_Explode_CanNotDeflect): an enemy in it does not deflect, so it neither blocks nor parries the hero's hits,
+// which land with their damage and hit reactions. The enemies around are looked for again every kGuardScanMs (one
+// coming close gets the tag too; one whose tag the game took off gets it again). Each tag added is taken off exactly
+// once when no move under 无视防御 plays any more or the chain stops; on a dead ability system nothing.
+constexpr const wchar_t* kIgnoreGuardTag=L"CharacterState.AIState.CanNotDeflect";
+constexpr ULONGLONG kGuardScanMs=250;
+struct GuardTarget{Identity pawn,asc;int added=0;};
+struct IgnoreGuardHold{bool on=false;int node=-1;ULONGLONG scan=0;std::vector<GuardTarget> targets;uint32_t readded=0;};
+IgnoreGuardHold ignore_guard_;
+void IgnoreGuardOff(const char* why){
+    int removed=0;
+    for(GuardTarget& t:ignore_guard_.targets)for(;t.added>0;--t.added)if(Same(t.asc)&&ArmorTag(t.asc.object,kIgnoreGuardTag,false))++removed;
+    Logf("NPC_COMBO ignore-guard off node=%d enemies=%zu tags-removed=%d%s",ignore_guard_.node,ignore_guard_.targets.size(),removed,why);
+    ignore_guard_={};
+}
+void SetComboIgnoreGuard(bool want){
+    if(!want){if(ignore_guard_.on)IgnoreGuardOff("");return;}
+    const ULONGLONG now=GetTickCount64();
+    if(ignore_guard_.on&&now<ignore_guard_.scan)return;
+    const Identity& pawn=ChainPawn();
+    if(!Same(pawn))return;
+    const bool first=!ignore_guard_.on;
+    ignore_guard_.on=true;ignore_guard_.node=combo_.playing;ignore_guard_.scan=now+kGuardScanMs;
+    Vector at{};{Call where(pawn.object,"K2_GetActorLocation");if(!where.Invoke())return;at=where.Get<Vector>("ReturnValue");}
+    Call actors(ue::Default("/Script/Engine.Default__GameplayStatics"),"GetAllActorsOfClass");
+    if(!actors.Set("WorldContextObject",pawn.object).Set("ActorClass",Class("/Script/Engine.Pawn")).Invoke())return;
+    const Array list=actors.Get<Array>("OutActors");
+    int fresh=0,again=0;
+    if(list.data&&list.num>0&&list.num<=2048&&FaceReadable(list.data,static_cast<size_t>(list.num)*sizeof(Object*)))
+        for(int32_t i=0;i<list.num;++i){
+            Object* enemy=static_cast<Object**>(list.data)[i];
+            if(!ue::Alive(enemy)||enemy==pawn.object)continue;
+            const auto known=std::find_if(ignore_guard_.targets.begin(),ignore_guard_.targets.end(),[&](const GuardTarget& t){return t.pawn.object==enemy&&Same(t.pawn);});
+            if(known!=ignore_guard_.targets.end()){
+                if(Same(known->asc)&&!LooseTagOn(known->asc.object,kIgnoreGuardTag)&&ArmorTag(known->asc.object,kIgnoreGuardTag,true)){++known->added;++again;}
+                continue;}
+            if(ignore_guard_.targets.size()>=kSkillDamageTargetsMax)continue;
+            Call where(enemy,"K2_GetActorLocation");if(!where.Invoke())continue;
+            const Vector p=where.Get<Vector>("ReturnValue");const double dx=p.x-at.x,dy=p.y-at.y,dz=p.z-at.z;
+            if(!(dx*dx+dy*dy+dz*dz<=kSkillDamageRangeCm*kSkillDamageRangeCm))continue;
+            DamageTarget probe;if(!DamageCandidate(enemy,pawn.object,probe))continue;
+            Object* asc=PawnAsc(enemy);if(!ue::Alive(asc))continue;
+            GuardTarget target{Id(enemy),Id(asc),0};
+            if(ArmorTag(asc,kIgnoreGuardTag,true)){target.added=1;++fresh;}
+            ignore_guard_.targets.push_back(target);
+        }
+    ue::Free(list.data);
+    if(first)Logf("NPC_COMBO ignore-guard on node=%d enemies=%d (CharacterState.AIState.CanNotDeflect as a loose tag)",combo_.playing,fresh);
+    else if(fresh||(again&&ignore_guard_.readded<8)){
+        if(again)++ignore_guard_.readded;
+        Logf("NPC_COMBO ignore-guard node=%d: %d more enemies, %d tag(s) the game took off added again",combo_.playing,fresh,again);}
+}
 // ---- BOSS 技能 looks ----
 int32_t LookNow(){return active_&&!cleanup_pending_&&selected_>=0&&static_cast<size_t>(selected_)<std::size(kProfiles)?selected_:-1;}
 bool LookSettled(int32_t row){return waiting_action_<0&&LookNow()==row&&(row<0||source_driver_mode_);}
@@ -4731,6 +4788,7 @@ void ResetCombo(const char* why,const std::wstring& note) {
     EndSpeed(why);
     SetComboArmor(false);
     SetComboInvincible(false);
+    SetComboIgnoreGuard(false);
     BeginWeaponReturn(why);
     BeginReturn(why);
     EndGroup(why);EndTeleport(why);
@@ -4961,9 +5019,10 @@ void PlayNodeImpl(int index,int button,ULONGLONG now) {
     if(!CastMove(context,package,L"派生链",kChainWaitMs)){ResetCombo("grant-failed",L"派生链停止：这一招无法授予主角");return;}
     combo_.cursor=index;combo_.playing=index;combo_.button=button;combo_.phase=ComboRun::Phase::Starting;combo_.at=now;combo_.cut_at=0;
     combo_.rated=nullptr;combo_.first_rated=false;combo_.rate_check=0;
-    Logf("NPC_COMBO play node=%d button=%d trigger=%d %s speed=%d%%%s%s%s",index,button,combo_.trigger,NpcCombo::ShortName(package).c_str(),
+    Logf("NPC_COMBO play node=%d button=%d trigger=%d %s speed=%d%%%s%s%s%s",index,button,combo_.trigger,NpcCombo::ShortName(package).c_str(),
          NpcCombo::SpeedFor(combo_.config,combo_.trigger,index),NpcCombo::WeaponOn(combo_.config,combo_.trigger)?" weapon":"",
-         NpcCombo::ArmorFor(combo_.config,combo_.trigger,index)?" armor":"",NpcCombo::InvincibleFor(combo_.config,combo_.trigger,index)?" invincible":"");
+         NpcCombo::ArmorFor(combo_.config,combo_.trigger,index)?" armor":"",NpcCombo::InvincibleFor(combo_.config,combo_.trigger,index)?" invincible":"",
+         NpcCombo::IgnoreGuardFor(combo_.config,combo_.trigger,index)?" ignore-guard":"");
     PublishCombo(L"派生链播放中");
 }
 // The playing move's name as SkillCast knows it.
@@ -5397,12 +5456,15 @@ void DriveCombo() {
     if(!ComboReady()||combo_.trigger<0){
         if(armor_.on)SetComboArmor(false);
         if(invincible_.on)SetComboInvincible(false);
+        if(ignore_guard_.on)SetComboIgnoreGuard(false);
         if(speed_.via!=SpeedHold::Via::None)EndSpeed(combo_.trigger<0?"no-chain":"chain-off");  // never leave the 加速 on the hero
         return;}
     using P=ComboRun::Phase;
     // 霸体 / 无敌 from the move's start, through its look or weapon change (the blink) too.
     SetComboArmor(combo_.phase!=P::Idle&&combo_.playing>=0&&NpcCombo::ArmorFor(combo_.config,combo_.trigger,combo_.playing));
     SetComboInvincible(combo_.phase!=P::Idle&&combo_.playing>=0&&NpcCombo::InvincibleFor(combo_.config,combo_.trigger,combo_.playing));
+    // 无视防御 on the enemies around, likewise from the move's start.
+    SetComboIgnoreGuard(combo_.phase!=P::Idle&&combo_.playing>=0&&NpcCombo::IgnoreGuardFor(combo_.config,combo_.trigger,combo_.playing));
     if(borrow_.stage==Borrow::Stage::Going||borrow_.stage==Borrow::Stage::Returning)return;  // the look is changing: presses wait
     if(weapon_.stage==WeaponHold::Stage::Taking||weapon_.stage==WeaponHold::Stage::Returning)return;  // so is the weapon
     const ULONGLONG now=GetTickCount64();

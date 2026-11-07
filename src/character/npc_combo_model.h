@@ -164,7 +164,9 @@ inline bool Fires(Trigger trigger, unsigned bits) {
 // trigger, every BOSS 技能 of its chain; or a frame, the ones it holds) points at: the look that BOSS 技能 takes is
 // kept, as a 变身 node's is (the hero does not change back after it, nor when the chain ends). ForceHit (强制受击,
 // `hit` = its HitKind) takes a trigger or a move, as 霸体 does: every enemy such a move hits plays that hit reaction of
-// the game's (击飞, 击倒, 挑空, 击退, 破防, 硬直) whatever the hit itself was, through its 霸体 (endure) too. PreInput
+// the game's (击飞, 击倒, 挑空, 击退, 破防, 硬直) whatever the hit itself was, through its 霸体 (endure) too. IgnoreGuard
+// (无视防御) takes a trigger or a move, as 霸体 does: while such a move plays the enemies around cannot deflect (block or
+// parry) it, so its hits land with their damage and hit reactions (the game's CharacterState.AIState.CanNotDeflect). PreInput
 // (预输入, ms = kPreInputMin..kPreInputMax, 0: never) is the chain's own setting, one fixed node per chain that cannot be
 // removed and takes no wires: a press made while a move plays is kept that long for the move's 派生点 (counted from the
 // press, or from the end of the intervals / the branch row's pause it waits for), then cleared. WeaponActions
@@ -173,15 +175,15 @@ inline bool Fires(Trigger trigger, unsigned bits) {
 // weapon is the hero's main weapon, that action (完美闪避, 处决, 简易处决, 格挡 ...) is cut and the row's wire plays
 // instead. A 处决 row takes the quick ones too unless a 简易处决 row is there; a dodge's own row goes before 任意闪避.
 enum class NodeType : int { Skill, Interval, Trigger, AutoDodge, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, WeaponMove, Damage, Group, Teleport,
-                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions };
+                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard };
 // One row of a branch: a press of `button` (a Trigger, the NPC key included) at least pause_ms after the press
 // before it goes on to `next`. A 自定义组合键 / 自定义按键 row is pressed with its own keys, as such a trigger is: `keys`
 // (the hero's buttons / keyboard, mouse and pad keys) in order (each within `window` ms, default kKeyWindowDefault)
 // or together (`chord`); 自定义按键 with `swallow` cancels the game's action of its keys.
 struct Route { int button = static_cast<int>(Trigger::Light); int pause_ms = 0; int next = -1; std::vector<int> keys; bool chord = false; int window = 400; bool swallow = false; };
-// The modifier slots of a node's `mods`: the 加速, 霸体, 武器属性, 允许中断, 伤害倍率, 无敌, 保留变身 and 强制受击 node it
-// points at (-1 none).
-enum ModSlot : int { kModSpeed, kModArmor, kModWeapon, kModInterrupt, kModDamage, kModInvincible, kModKeepLook, kModForceHit, kModSlots };
+// The modifier slots of a node's `mods`: the 加速, 霸体, 武器属性, 允许中断, 伤害倍率, 无敌, 保留变身, 强制受击 and 无视防御 node
+// it points at (-1 none).
+enum ModSlot : int { kModSpeed, kModArmor, kModWeapon, kModInterrupt, kModDamage, kModInvincible, kModKeepLook, kModForceHit, kModIgnoreGuard, kModSlots };
 // A node on the page's canvas: x, y its top-left (96-dpi units); next the node its exec output is wired to (-1
 // none). A branch has no `next`: each route is an output of its own. A modifier has neither. A move's `ms` is its
 // 派生点: how long after it starts the next move may cut it (0: when it ends).
@@ -192,7 +194,7 @@ constexpr int kTeleportLiftMin = 0, kTeleportLiftMax = 300, kTeleportLiftDefault
 constexpr int kGroupMinW = 300, kGroupMinH = 180, kGroupNewW = 460, kGroupNewH = 300, kGroupMaxSize = 4000, kGroupDepthMax = 4;
 struct Node {
     NodeType type = NodeType::Skill; std::string ability; int ms = 0; int x = 0, y = 0; int next = -1;
-    int trigger = 0; bool on = true; int speed = 100; std::vector<Route> routes; std::array<int, kModSlots> mods{{-1, -1, -1, -1, -1, -1, -1, -1}};
+    int trigger = 0; bool on = true; int speed = 100; std::vector<Route> routes; std::array<int, kModSlots> mods{{-1, -1, -1, -1, -1, -1, -1, -1, -1}};
     int hit = 0;  // 强制受击: its HitKind
     std::string boss;  // BOSS 技能: the look (NPC skin id) whose move `ability` is
     std::string weapon;  // 武器派生: the weapon (backpack id) whose ability `ability` is; 处决 trigger: only this weapon's (empty: any)
@@ -342,16 +344,17 @@ inline bool EmptyMove(const Node& node) {
 }
 inline bool IsModifier(const Node& node) {
     return node.type == NodeType::Speed || node.type == NodeType::Weapon || node.type == NodeType::Armor || node.type == NodeType::Interrupt ||
-           node.type == NodeType::Damage || node.type == NodeType::Invincible || node.type == NodeType::KeepLook || node.type == NodeType::ForceHit;
+           node.type == NodeType::Damage || node.type == NodeType::Invincible || node.type == NodeType::KeepLook || node.type == NodeType::ForceHit ||
+           node.type == NodeType::IgnoreGuard;
 }
 // A modifier's slot in `mods` (-1: not a modifier).
 inline int SlotOf(NodeType type) {
     return type == NodeType::Speed ? kModSpeed : type == NodeType::Armor ? kModArmor : type == NodeType::Weapon ? kModWeapon : type == NodeType::Interrupt ? kModInterrupt :
            type == NodeType::Damage ? kModDamage : type == NodeType::Invincible ? kModInvincible : type == NodeType::KeepLook ? kModKeepLook :
-           type == NodeType::ForceHit ? kModForceHit : -1;
+           type == NodeType::ForceHit ? kModForceHit : type == NodeType::IgnoreGuard ? kModIgnoreGuard : -1;
 }
 // May node `from` point at modifier `mod`: a trigger may point at any; a move at 加速 / 霸体 / 允许中断 / 伤害倍率 / 无敌 /
-// 强制受击;
+// 强制受击 / 无视防御;
 // 保留变身 only a trigger, a BOSS 技能 or a frame (the BOSS 技能 it holds).
 inline bool ModifierFits(const std::vector<Node>& chain, int from, int mod) {
     if (from < 0 || mod < 0 || static_cast<size_t>(from) >= chain.size() || static_cast<size_t>(mod) >= chain.size() || from == mod) return false;
@@ -957,6 +960,12 @@ inline bool ArmorFor(const Config& config, int trigger, int move) {
 inline bool InvincibleFor(const Config& config, int trigger, int move) {
     return ModFor(config, trigger, move, kModInvincible) >= 0;
 }
+// Can the enemies not deflect (block or parry) a move of `trigger`'s chain while it plays (the move, a frame it sits in
+// or the trigger points at a 无视防御 node)? A grab is never deflected anyway.
+inline bool IgnoreGuardFor(const Config& config, int trigger, int move) {
+    if (move >= 0 && static_cast<size_t>(move) < config.chain.size() && config.chain[static_cast<size_t>(move)].type == NodeType::Grab) return false;
+    return ModFor(config, trigger, move, kModIgnoreGuard) >= 0;
+}
 // Is the look a BOSS 技能 of `trigger`'s chain takes kept after it (保留变身: the move, a frame it sits in or the
 // trigger points at one)? Only a BOSS 技能 takes a look of its own.
 inline bool KeepLookFor(const Config& config, int trigger, int move) {
@@ -1125,6 +1134,7 @@ inline std::wstring Encode(const Config& config) {
         case NodeType::Armor: text += "|H:" + pos(node); break;
         case NodeType::Interrupt: text += "|C:" + pos(node); break;
         case NodeType::Invincible: text += "|N:" + pos(node); break;
+        case NodeType::IgnoreGuard: text += "|Z:" + pos(node); break;
         case NodeType::KeepLook: text += "|E:" + pos(node); break;
         case NodeType::ForceHit: text += "|Q:" + std::to_string(ClampHitKind(node.hit)) + "," + pos(node); break;
         case NodeType::PreInput: text += "|J:" + std::to_string(ClampPreInput(node.ms)) + "," + pos(node); break;
@@ -1290,13 +1300,14 @@ inline Config Decode(const std::wstring& wide) {
             Node node; node.type = NodeType::AutoDodge; place(node, f, 0);
             if (f.size() == 4) node.ms = ClampCancel(std::atoi(f[3].c_str()));
             config.chain.push_back(node);
-        } else if (part[0] == 'V' || part[0] == 'W' || part[0] == 'H' || part[0] == 'C' || part[0] == 'N' || part[0] == 'E') {
+        } else if (part[0] == 'V' || part[0] == 'W' || part[0] == 'H' || part[0] == 'C' || part[0] == 'N' || part[0] == 'E' || part[0] == 'Z') {
             // "x,y" (after a speed's percent); an older one adds the node it pointed at, now that node's arrow.
             const std::vector<std::string> f = Split(part.substr(2), ',');
             const size_t first = part[0] == 'V' ? 1 : 0;
             if (f.size() != first + 2 && f.size() != first + 3) continue;
             Node node = ModifierNode(part[0] == 'V' ? NodeType::Speed : part[0] == 'W' ? NodeType::Weapon : part[0] == 'H' ? NodeType::Armor :
-                                     part[0] == 'N' ? NodeType::Invincible : part[0] == 'E' ? NodeType::KeepLook : NodeType::Interrupt, 0, 0);
+                                     part[0] == 'N' ? NodeType::Invincible : part[0] == 'E' ? NodeType::KeepLook : part[0] == 'Z' ? NodeType::IgnoreGuard :
+                                     NodeType::Interrupt, 0, 0);
             if (first) node.speed = ClampSpeed(std::atoi(f[0].c_str()));
             node.x = ClampPosition(std::atoi(f[first].c_str())); node.y = ClampPosition(std::atoi(f[first + 1].c_str()));
             if (f.size() == first + 3) arrows.push_back({std::atoi(f[first + 2].c_str()), static_cast<int>(config.chain.size())});

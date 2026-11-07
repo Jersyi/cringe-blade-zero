@@ -40,7 +40,7 @@ RECT Canvas();
 POINT Tool(int button);      // ComboMenu's Button order: Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab,
                              // BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage, Group, Teleport, Invincible (21), Look (22, 变身), HeroLook (23, 变回主角),
                              // KeepLook (24, 保留变身), ForceHit (25, 强制受击), WeaponActions (26, 武器派生修改), Toast (27, 派生提示), Dummy (28, 测试木桩),
-                             // AutoDodge (29, 按摇杆方向闪避)
+                             // AutoDodge (29, 按摇杆方向闪避), IgnoreGuard (30, 无视防御)
 int Zoom();                  // percent
 bool SearchOpen();
 size_t Picked();              // nodes selected now (框选 / Ctrl + click; one node selected alone: 1)

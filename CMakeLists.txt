@@ -24,7 +24,8 @@ add_library(version SHARED
     src/grab/motian_grab.cpp src/grab/motian_grab_menu.cpp src/grab/grab_extras.cpp
     src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp src/ui/skill_toast.cpp src/core/title_control.cpp
     src/weapons/weapon_presets.cpp src/weapons/weapon_icons.cpp src/weapons/weapon_presets_menu.cpp
-    src/pad/pad_triggers.cpp src/core/ue_runtime.cpp src/core/game_thread.cpp src/core/game_build.cpp src/hair/groom_force.cpp
+    src/pad/pad_triggers.cpp src/pad/pad_gate.cpp src/pad/game_pad_gate.cpp
+    src/core/ue_runtime.cpp src/core/game_thread.cpp src/core/game_build.cpp src/hair/groom_force.cpp
     src/supplement/debug_supplement.cpp src/supplement/supplement_menu.cpp src/ui/donate_page.cpp
     src/core/forwarders.asm src/core/version.def)
 pbz_settings(version)
@@ -85,6 +86,15 @@ pbz_settings(supplement_layout_test)
 # DualSense adaptive-trigger rewrite (pad_triggers.h): report layouts, Steam vtable hook, import-table path.
 add_executable(pad_triggers_test tests/pad_triggers_test.cpp src/pad/pad_triggers.cpp)
 pbz_settings(pad_triggers_test)
+
+# What the game may see of a pad while the panel is up: hold, release, panel chord, XInput / DualSense reports.
+add_executable(pad_gate_test tests/pad_gate_test.cpp src/pad/pad_gate.cpp)
+pbz_settings(pad_gate_test)
+# The gate's import hooks on a stand-in executable: delay-loaded XInput, GetProcAddress, HID reads (sync / overlapped).
+add_executable(game_pad_gate_test tests/game_pad_gate_test.cpp src/pad/game_pad_gate.cpp src/pad/pad_gate.cpp src/pad/pad_triggers.cpp)
+pbz_settings(game_pad_gate_test)
+target_link_libraries(game_pad_gate_test PRIVATE xinput delayimp user32)
+target_link_options(game_pad_gate_test PRIVATE /DELAYLOAD:XINPUT1_4.dll)
 
 # 招式派生 model: move kinds, chain plan / slow-down rate, hero dodge families, ini text.
 add_executable(npc_combo_test tests/npc_combo_test.cpp)

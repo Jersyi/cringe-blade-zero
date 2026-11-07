@@ -500,7 +500,7 @@ int wmain(int argc, wchar_t** argv) {
     drag(ComboMenu::Probe::ModOut(free_node), ComboMenu::Probe::Header(free_node));
     check(mod(free_node, NpcCombo::kModSpeed) == speed_node && mod(free_node, NpcCombo::kModArmor) == armor_node, "an arrow onto a node that is not a modifier changes nothing");
     drag(ComboMenu::Probe::ModOut(free_node), bare());
-    check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 7, "an arrow dropped on empty canvas lists the modifiers a move may point at (加速, 霸体, 无敌, 允许中断, 伤害倍率, 强制受击)");
+    check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 8, "an arrow dropped on empty canvas lists the modifiers a move may point at (加速, 霸体, 无敌, 无视防御, 允许中断, 伤害倍率, 强制受击)");
     { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_modsearch"); shot(path); }
     key_down(VK_RETURN);
     { const NpcCombo::Config c = now(); check(c.chain.back().type == NpcCombo::NodeType::Speed && mod(free_node, NpcCombo::kModSpeed) == static_cast<int>(c.chain.size()) - 1, "picking 加速 adds one the move points at"); }
@@ -518,6 +518,15 @@ int wmain(int argc, wchar_t** argv) {
         check(c.chain.back().type == NpcCombo::NodeType::Invincible && mod(free_node, NpcCombo::kModInvincible) == inv_node && NpcCombo::InvincibleFor(c, -1, free_node) &&
               mod(free_node, NpcCombo::kModArmor) == armor_node && mod(free_node, NpcCombo::kModInterrupt) == cut_node, "+ 无敌 with a move selected: the move points at it, its 霸体 and 允许中断 stay");
         check(NpcCombo::Decode(NpcCombo::Encode(c)).chain[static_cast<size_t>(inv_node)].type == NpcCombo::NodeType::Invincible, "the page saves 无敌 and reads it back");
+    }
+    // 无视防御: + 无视防御 with a move selected points the move at it; its other arrows stay.
+    ComboMenu::Probe::Show(free_node); click(ComboMenu::Probe::Header(free_node));
+    click(ComboMenu::Probe::Tool(30));
+    {
+        const int guard_node = static_cast<int>(now().chain.size()) - 1; const NpcCombo::Config c = now();
+        check(c.chain.back().type == NpcCombo::NodeType::IgnoreGuard && mod(free_node, NpcCombo::kModIgnoreGuard) == guard_node && NpcCombo::IgnoreGuardFor(c, -1, free_node) &&
+              mod(free_node, NpcCombo::kModArmor) == armor_node && mod(free_node, NpcCombo::kModInterrupt) == cut_node, "+ 无视防御 with a move selected: the move points at it, its other arrows stay");
+        check(NpcCombo::Decode(NpcCombo::Encode(c)).chain[static_cast<size_t>(guard_node)].type == NpcCombo::NodeType::IgnoreGuard, "the page saves 无视防御 and reads it back");
     }
     // Every arrow ends in a head in its modifier's colour, just outside the card it points at, at 50 %, 100 % and 150 %,
     // and still over another card laid across it.

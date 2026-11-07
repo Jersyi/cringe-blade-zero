@@ -40,9 +40,9 @@ constexpr float kZooms[]={.5f,.625f,.75f,.875f,1.f,1.25f,1.5f};
 // Node geometry in canvas units (96 dpi, zoom 1).
 constexpr int kHeader=28,kRow=24,kPad=8,kPin=6,kGrid=16,kMajor=128;
 enum class Button : int { Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage,
-                          Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, Count };
+                          Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, Count };
 // The canvas tools, laid out right to left.
-constexpr Button kTools[]={Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::Interrupt,Button::Invincible,Button::ForceHit,Button::Armor,Button::Damage,Button::Speed,Button::AddTrigger,Button::Branch,Button::Grab,Button::WeaponActions,Button::WeaponMove,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
+constexpr Button kTools[]={Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::ForceHit,Button::Armor,Button::Damage,Button::Speed,Button::AddTrigger,Button::Branch,Button::Grab,Button::WeaponActions,Button::WeaponMove,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
 enum class Part : int {
     None, Button, Pill, Tab, StripLeft, StripRight, Canvas, Search, WeaponRow,
     Node, NodeIn, NodeOut, NodeMinus, NodePlus, NodeValue, NodeField, NodeField2, NodeField3, NodeField4, NodeToggle, NodeToggle2, GroupResize, NodeRemove,
@@ -74,7 +74,7 @@ struct DragState { Drag mode=Drag::None; Hit hit; POINT start{},last{}; bool mov
 // weapon field lists the weapons too, 任意武器 first.
 enum class ItemKind { Move, Interval, AutoDodge, Trigger, Branch, Speed, Weapon, Armor, Interrupt, Grab, Button, GrabMove, BossSkill, BossLook, BossMove, File, SaveAs,
                       WeaponMove, Damage, WeaponPick, WeaponSkill, Group, Teleport, TeleportDist, TeleportLift, ComboKey, ComboMode, RawKey, Invincible,
-                      Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain };
+                      Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain, IgnoreGuard };
 struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; };
 struct SearchRow { bool header=false; size_t item=0; std::wstring text; };
 struct Search {
@@ -560,6 +560,7 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Weapon: return Tr(L"武器属性");
     case NodeType::Armor: return Tr(L"霸体");
     case NodeType::Invincible: return Tr(L"无敌");
+    case NodeType::IgnoreGuard: return Tr(L"无视防御");
     case NodeType::KeepLook: return Tr(L"保留变身");
     case NodeType::ForceHit: return Tr(L"强制受击");
     case NodeType::Interrupt: return Tr(L"允许中断");
@@ -646,6 +647,10 @@ std::wstring ModifierNote(size_t index) {
         else _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招打中的敌人被强制%s").c_str(),from.nodes,kind.c_str());
         return text;
     }
+    if (node.type==NodeType::IgnoreGuard) {
+        if (from.triggers) return Tr(L"整条链无视防御：敌人格挡、弹反不了");
+        wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招无视防御").c_str(),from.nodes); return text;
+    }
     if (node.type==NodeType::Invincible) {
         if (from.triggers) return Tr(L"整条链无敌：招式中不会被打到");
         wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招无敌").c_str(),from.nodes); return text;
@@ -708,7 +713,7 @@ std::wstring NodeNote(size_t index) {
     case NodeType::AutoDodge: return moves_.dodges.empty()?Tr(L"这个外观没有闪避"):wired?Tr(L"按摇杆方向选 Boss 闪避"):Tr(L"未连接");
     case NodeType::Trigger: return {};
     case NodeType::Branch: return Tr(L"上一招后按哪个键，接哪一招");
-    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: return ModifierNote(index);
+    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: return ModifierNote(index);
     case NodeType::WeaponMove: {
         if (!wired) return Tr(L"未连接");
         return Tr(L"拿这把武器放这一招，放完换回");
@@ -788,7 +793,7 @@ SIZE NodeSize(HDC dc,size_t index) {
         const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):WeaponMoveText(node.weapon,node.ability))+L"  ▾")+60;
         return {std::clamp((std::max)((std::max)(title,weapon),(std::max)(move,note)),280,440),kHeader+kRow*4+kPad};
     }
-    if (node.type==NodeType::Armor||node.type==NodeType::Interrupt||node.type==NodeType::Invincible||node.type==NodeType::KeepLook) return {std::clamp((std::max)(title,note),200,340),kHeader+kRow+kPad};
+    if (node.type==NodeType::Armor||node.type==NodeType::Interrupt||node.type==NodeType::Invincible||node.type==NodeType::KeepLook||node.type==NodeType::IgnoreGuard) return {std::clamp((std::max)(title,note),200,340),kHeader+kRow+kPad};
     if (node.type==NodeType::BossSkill) {
         const int look=Units(dc,UiTheme::Font::Body,(node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss))+L"  ▾")+60;
         const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):MoveText(node.ability))+L"  ▾")+60;
@@ -1280,6 +1285,7 @@ void SearchItems() {
         add({ItemKind::Speed,Tr(L"加速"),flow});
         add({ItemKind::Armor,Tr(L"霸体"),flow});
         add({ItemKind::Invincible,Tr(L"无敌"),flow});
+        add({ItemKind::IgnoreGuard,Tr(L"无视防御"),flow});
         add({ItemKind::Interrupt,Tr(L"允许中断"),flow});
         add({ItemKind::Damage,Tr(L"伤害倍率"),flow});
         if (At(search_.mod_from)&&NpcCombo::StartsChain(config_.chain[static_cast<size_t>(search_.mod_from)])) add({ItemKind::Weapon,Tr(L"武器属性"),flow});
@@ -1475,6 +1481,7 @@ void SearchItems() {
     add({ItemKind::Speed,Tr(L"加速"),flow});
     add({ItemKind::Armor,Tr(L"霸体"),flow});
     add({ItemKind::Invincible,Tr(L"无敌"),flow});
+    add({ItemKind::IgnoreGuard,Tr(L"无视防御"),flow});
     add({ItemKind::KeepLook,Tr(L"保留变身"),flow});
     add({ItemKind::ForceHit,Tr(L"强制受击"),flow});
     add({ItemKind::Interrupt,Tr(L"允许中断"),flow});
@@ -1800,6 +1807,7 @@ void SearchPick(int row) {
     case ItemKind::Weapon: node=NpcCombo::ModifierNode(NodeType::Weapon,0,0); break;
     case ItemKind::Armor: node=NpcCombo::ModifierNode(NodeType::Armor,0,0); break;
     case ItemKind::Invincible: node=NpcCombo::ModifierNode(NodeType::Invincible,0,0); break;
+    case ItemKind::IgnoreGuard: node=NpcCombo::ModifierNode(NodeType::IgnoreGuard,0,0); break;
     case ItemKind::KeepLook: node=NpcCombo::ModifierNode(NodeType::KeepLook,0,0); break;
     case ItemKind::ForceHit: node=NpcCombo::ModifierNode(NodeType::ForceHit,0,0); break;
     case ItemKind::Interrupt: node=NpcCombo::ModifierNode(NodeType::Interrupt,0,0); break;
@@ -1846,6 +1854,7 @@ void PressButton(Button button) {
     case Button::Weapon: AddModifier(NodeType::Weapon); return;
     case Button::Armor: AddModifier(NodeType::Armor); return;
     case Button::Invincible: AddModifier(NodeType::Invincible); return;
+    case Button::IgnoreGuard: AddModifier(NodeType::IgnoreGuard); return;
     case Button::KeepLook: AddModifier(NodeType::KeepLook); return;
     case Button::ForceHit: AddModifier(NodeType::ForceHit); return;
     case Button::Interrupt: AddModifier(NodeType::Interrupt); return;
@@ -1989,6 +1998,7 @@ std::wstring ButtonText(Button button) {
     case Button::Weapon: return Tr(L"+ 武器属性");
     case Button::Armor: return Tr(L"+ 霸体");
     case Button::Invincible: return Tr(L"+ 无敌");
+    case Button::IgnoreGuard: return Tr(L"+ 无视防御");
     case Button::KeepLook: return Tr(L"+ 保留变身");
     case Button::ForceHit: return Tr(L"+ 强制受击");
     case Button::Interrupt: return Tr(L"+ 允许中断");
@@ -2282,6 +2292,7 @@ COLORREF ModColor(NodeType type) {
     if (type==NodeType::Weapon) return UiTheme::Mix(RGB(214,160,60),UiTheme::Text(),15);
     if (type==NodeType::Armor) return UiTheme::Mix(RGB(200,96,70),UiTheme::Text(),15);
     if (type==NodeType::Invincible) return UiTheme::Mix(RGB(232,196,84),UiTheme::Text(),12);
+    if (type==NodeType::IgnoreGuard) return UiTheme::Mix(RGB(120,150,240),UiTheme::Text(),15);
     if (type==NodeType::KeepLook) return UiTheme::Mix(RGB(168,120,232),UiTheme::Text(),15);
     if (type==NodeType::ForceHit) return UiTheme::Mix(RGB(236,128,48),UiTheme::Text(),15);
     if (type==NodeType::Interrupt) return UiTheme::Mix(RGB(70,190,150),UiTheme::Text(),15);
@@ -2766,7 +2777,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             }
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
-        case NodeType::Armor: case NodeType::Interrupt: case NodeType::Invincible: case NodeType::KeepLook:
+        case NodeType::Armor: case NodeType::Interrupt: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::IgnoreGuard:
             Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
             Label(dc,NodeNote(i),Row(s.rect,0),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;

@@ -40,7 +40,10 @@ $readme = @"
   施放 NPC 技能     X       L3 + R3    L3 + R3
   切换武器预设      Z       LB + L3    触控板左右滑
   提升 / 降低挡位   = / -
+  显示 / 隐藏面板   F10     View + Menu  Create + Options
   都可在面板“快捷键”页或 PBZDebugMenu.ini 的 [Hotkeys] 修改。
+  面板里用手柄：十字键 / 左摇杆移动，A（叉）确认，B（圈）返回，LB / RB（L1 / R1）切换页面，LT / RT（L2 / R2）滚动。
+  面板打开时游戏收不到手柄按键。
 
 精简版
   triggers_only\version.dll 只关闭 DualSense 自适应扳机，没有面板和其他功能。

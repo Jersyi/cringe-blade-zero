@@ -11,6 +11,8 @@
 #include <cmath>
 #include <array>
 #include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -48,7 +50,7 @@ constexpr Chord KeyChord(unsigned vk, unsigned modifiers = 0) { return {Device::
 constexpr Chord XboxChord(unsigned buttons) { return {Device::Xbox, 0, 0, buttons}; }
 constexpr Chord PsChord(unsigned buttons) { return {Device::PlayStation, 0, 0, buttons}; }
 const Spec kSpecs[kCount] = {
-    {L"ToggleHub", L"显示或隐藏面板", KeyChord(VK_F10), {}, {}},
+    {L"ToggleHub", L"显示或隐藏面板", KeyChord(VK_F10), XboxChord(kView | kMenu), PsChord(kView | kMenu)},
     {L"ShowBoss", L"Boss 连战", {}, {}, {}},
     {L"ShowAi", L"Boss AI", {}, {}, {}},
     {L"ShowCharacter", L"角色替换", {}, {}, {}},
@@ -127,6 +129,13 @@ unsigned version_ = 0, look_ = ~0u;
 // The device behind the latest press: none yet, the keyboard / mouse, or a pad.
 bool input_known_ = false, input_pad_ = false;
 unsigned pad_seen_ = 0;
+// While the panel is up its pad navigation owns the pad: of the pad chords only ToggleHub fires. Buttons still held
+// when it ends stay out of pad chords until released (B that closed the panel is not half of Y + B).
+std::atomic<bool> pad_nav_{false};
+bool pad_nav_was_ = false;
+unsigned pad_stale_ = 0;
+// A focus move by pad navigation: a bind box it lands on is not armed (A arms it).
+bool quiet_focus_ = false;
 // Pad chords store button bits only, so one chord fires on Xbox and
 // PlayStation pads alike; the device just names the glyphs.
 enum class Glyphs : int { Auto, Xbox, PlayStation };
@@ -141,6 +150,28 @@ ULONGLONG next_devices_ = 0;
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, void*);
 XInputGetStateFn xinput_ = nullptr;
 bool xinput_tried_ = false;
+// PAD / HOTKEY lines in the mod log: the controllers found (on every change), the pad in hand when it changes,
+// the first press of each pad, and every hotkey fire. Pads are otherwise invisible in a player's log.
+void (*log_)(const char*) = nullptr;
+unsigned xinput_slots_ = 0;            // XInput users that answered on the latest read
+bool pads_read_ = false;               // ReadPad ran once: the inventory line then names the XInput slots
+std::string controllers_said_;
+Device hand_said_ = Device::Keyboard, hand_seen_ = Device::Keyboard;
+ULONGLONG hand_at_ = 0;  // when last_pad_ last changed: a mirrored press flips it for a frame, logged only once it holds
+bool xbox_press_said_ = false, sony_press_said_ = false;
+void Logf(const char* format, ...) {
+    if (!log_) return;
+    char line[512]{};
+    va_list args; va_start(args, format); _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args); va_end(args);
+    log_(line);
+}
+std::string Narrow(const std::wstring& text) {
+    std::string out; out.reserve(text.size());
+    for (const wchar_t c : text) out.push_back(c > 0 && c < 0x80 ? static_cast<char>(c) : '?');
+    return out;
+}
+std::wstring Format(const Chord& chord);
+const char* DeviceName(Device device) { return device == Device::Xbox ? "Xbox" : device == Device::PlayStation ? "PlayStation" : "keyboard"; }
 // Passive reader: a shared GENERIC_READ handle receives its own copy of every
 // interrupt report. No GET_REPORT control requests are sent to the pad.
 struct SonyDev {
@@ -260,9 +291,12 @@ bool SameToken(const std::wstring& token, const wchar_t* name) {
 void EnsureXInput() {
     if (xinput_tried_) return;
     xinput_tried_ = true;
-    HMODULE module = LoadLibraryW(L"XInput1_4.dll");
-    if (!module) module = LoadLibraryW(L"XInput1_3.dll");
+    const wchar_t* name = L"XInput1_4.dll";
+    HMODULE module = LoadLibraryW(name);
+    if (!module) module = LoadLibraryW(name = L"XInput1_3.dll");
     if (module) xinput_ = reinterpret_cast<XInputGetStateFn>(GetProcAddress(module, "XInputGetState"));
+    if (xinput_) Logf("PAD XInput from %ls (Xbox pads and the virtual pads of Steam Input / DS4Windows)", name);
+    else Logf("PAD XInput missing (XInput1_4.dll / XInput1_3.dll): Xbox pads cannot fire hotkeys");
 }
 // The left stick as one of four ways, by its main axis: pushed past kStickOn it takes that way, and keeps it while the
 // stick stays past kStickOff along it and is not turned past the diagonal (so a turn from up to down passes the middle
@@ -286,10 +320,12 @@ unsigned ReadPad() {
     bool live = false;
     float stick_x = 0, stick_y = 0;
     const auto take = [&](float x, float y) { if (x * x + y * y > stick_x * stick_x + stick_y * stick_y) { stick_x = x; stick_y = y; } };
+    unsigned slots = 0;
     if (xinput_) for (DWORD user = 0; user < 4; ++user) {
         XState state{};
         if (xinput_(user, &state) != 0) continue;
         live = true;
+        slots |= 1u << user;
         take((std::max)(-1.f, state.pad.lx / 32767.f), (std::max)(-1.f, state.pad.ly / 32767.f));
         const WORD bits = state.pad.buttons;
         if (bits & 0x0001) xbox |= kUp;
@@ -310,6 +346,8 @@ unsigned ReadPad() {
         if (state.pad.right > 30) xbox |= kRT;
     }
     xinput_live_ = live;
+    xinput_slots_ = slots;
+    pads_read_ = true;
     if (GetTickCount64() - sony_stick_at_.load(std::memory_order_relaxed) < 200) {
         const unsigned packed = sony_stick_.load(std::memory_order_relaxed);
         take(((static_cast<int>(packed & 0xFFu)) - 128) / 127.f, (128 - static_cast<int>((packed >> 8) & 0xFFu)) / 127.f);
@@ -323,6 +361,19 @@ unsigned ReadPad() {
     // DualSense into XInput, so a Sony press wins over its mirrored copy.
     if (sony & ~sony_was_) last_pad_ = Device::PlayStation;
     else if ((xbox & ~xbox_was_) && !sony) last_pad_ = Device::Xbox;
+    if ((xbox & ~xbox_was_) && !xbox_press_said_) {
+        xbox_press_said_ = true;
+        Logf("PAD first XInput press %s (slots 0x%x)", Narrow(Format(Chord{Device::Xbox, 0, 0, xbox & ~xbox_was_})).c_str(), slots);
+    }
+    if ((sony & ~sony_was_) && !sony_press_said_) {
+        sony_press_said_ = true;
+        Logf("PAD first PlayStation press %s", Narrow(Format(Chord{Device::PlayStation, 0, 0, sony & ~sony_was_})).c_str());
+    }
+    if (last_pad_ != hand_seen_) { hand_seen_ = last_pad_; hand_at_ = GetTickCount64(); }
+    if (last_pad_ != hand_said_ && last_pad_ != Device::Keyboard && GetTickCount64() - hand_at_ >= 250) {
+        hand_said_ = last_pad_;
+        Logf("PAD in hand: %s (its hotkey set fires, prompts show its buttons)", DeviceName(last_pad_));
+    }
     sony_was_ = sony;
     xbox_was_ = xbox;
     const unsigned mask = xbox | sony;
@@ -337,7 +388,7 @@ bool ContainsI(const wchar_t* text, const wchar_t* needle) {
     return false;
 }
 void RefreshDevices() {
-    if (GetTickCount64() < next_devices_) return;
+    if (!pads_read_ || GetTickCount64() < next_devices_) return;
     next_devices_ = GetTickCount64() + 1500;
     UINT count = 0;
     if (GetRawInputDeviceList(nullptr, &count, sizeof(RAWINPUTDEVICELIST)) != 0 || !count) {
@@ -348,6 +399,7 @@ void RefreshDevices() {
     std::vector<RAWINPUTDEVICELIST> devices(count);
     if (GetRawInputDeviceList(devices.data(), &count, sizeof(RAWINPUTDEVICELIST)) == static_cast<UINT>(-1)) return;
     bool sony = false, xbox = false;
+    std::vector<std::wstring> seen;  // one entry per pad model (VID:PID), not per HID collection
     for (UINT i = 0; i < count; ++i) {
         if (devices[i].dwType != RIM_TYPEHID) continue;
         // Game controllers only: a Microsoft keyboard's media keys are a VID_045E HID too.
@@ -360,12 +412,23 @@ void RefreshDevices() {
         UINT chars = ARRAYSIZE(name); // RIDI_DEVICENAME counts characters, not bytes.
         if (GetRawInputDeviceInfoW(devices[i].hDevice, RIDI_DEVICENAME, name, &chars) == static_cast<UINT>(-1)) continue;
         // USB paths read VID_054C&PID_..., Bluetooth ones ..._VID&0002054c_PID&...
-        if (ContainsI(name, L"VID_054C") || ContainsI(name, L"054C_PID")) sony = true;
-        else if (ContainsI(name, L"VID_045E") || ContainsI(name, L"045E_PID") || ContainsI(name, L"IG_")) xbox = true;
+        const bool is_sony = ContainsI(name, L"VID_054C") || ContainsI(name, L"054C_PID");
+        const bool is_xbox = !is_sony && (ContainsI(name, L"VID_045E") || ContainsI(name, L"045E_PID") || ContainsI(name, L"IG_"));
+        sony = sony || is_sony; xbox = xbox || is_xbox;
+        wchar_t entry[48]{};
+        _snwprintf_s(entry, _countof(entry), _TRUNCATE, L"%ls %04lX:%04lX", is_sony ? L"PlayStation" : is_xbox ? L"Xbox" : L"other",
+            info.hid.dwVendorId & 0xFFFF, info.hid.dwProductId & 0xFFFF);
+        if (std::find(seen.begin(), seen.end(), entry) == seen.end()) seen.push_back(entry);
     }
     // XInput cannot tell two pads apart. A lone DualSense (no Xbox HID) keeps the PS glyphs.
     pad_style_ = sony && !xbox ? Device::PlayStation : Device::Xbox;
     pad_hid_ = sony || xbox;
+    std::wstring list;
+    for (const std::wstring& entry : seen) list += (list.empty() ? L"" : L", ") + entry;
+    char said[384]{};
+    _snprintf_s(said, sizeof(said), _TRUNCATE, "HID [%s] XInput slots 0x%x; before a press the %s set is used",
+        list.empty() ? "none" : Narrow(list).c_str(), xinput_slots_, DeviceName(pad_style_));
+    if (said != controllers_said_) { controllers_said_ = said; Logf("PAD controllers: %s", said); }
 }
 bool ParseSony(int kind, const unsigned char* data, int size, unsigned& buttons) {
     if (!data || size < 10 || (kind != 1 && kind != 2)) return false;
@@ -1205,7 +1268,7 @@ std::atomic<unsigned> level_buttons_{0};
 std::atomic<unsigned> level_flags_{0};  // 1: in game, 2: PlayStation pad
 std::atomic<ULONGLONG> level_at_{0};
 std::atomic<unsigned> level_stick_{0};
-void Snapshot(bool fire) {
+void Snapshot(bool fire, bool pad_fire) {
     const unsigned mods = Mods(), pad = ReadPad();
     level_buttons_.store(pad & 0xFFFFu, std::memory_order_relaxed);
     level_stick_.store(stick_now_, std::memory_order_relaxed);
@@ -1215,12 +1278,20 @@ void Snapshot(bool fire) {
     pad_seen_ = pad;
     const size_t active = static_cast<size_t>(PadNow());
     if (blocking_ && !Satisfied(block_, mods, pad)) blocking_ = false;
+    const bool nav = pad_nav_.load(std::memory_order_relaxed);
+    if (nav != pad_nav_was_) { pad_nav_was_ = nav; if (!nav) pad_stale_ = pad; }
+    pad_stale_ &= pad;
+    const unsigned chord_pad = pad & ~pad_stale_;
     for (int i = 0; i < kCount; ++i) {
         const Chord& key = chords_[static_cast<size_t>(i)][0];
         const Chord& held = chords_[static_cast<size_t>(i)][active];
-        const bool down = Satisfied(key, mods, pad) || Satisfied(held, mods, pad);
+        const bool by_key = Satisfied(key, mods, pad);
+        const bool by_pad = !(nav && i != static_cast<int>(Action::ToggleHub)) && Satisfied(held, mods, chord_pad);
+        const bool down = by_key || by_pad;
         const bool blocked = blocking_ && (Conflicts(block_, key) || Conflicts(block_, held));
-        if (fire && down && !was_[static_cast<size_t>(i)] && !blocked) {
+        if ((by_key ? fire : pad_fire) && down && !was_[static_cast<size_t>(i)] && !blocked) {
+            const Chord& by = by_key ? key : held;
+            Logf("HOTKEY %ls by %s%s", kSpecs[i].id, Narrow(Format(by)).c_str(), handlers_[static_cast<size_t>(i)] ? "" : " (no handler)");
             if (handlers_[static_cast<size_t>(i)]) handlers_[static_cast<size_t>(i)]();
         }
         was_[static_cast<size_t>(i)] = down;
@@ -1265,7 +1336,7 @@ LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         return DefWindowProcW(window, message, wparam, lparam);
     }
     case WM_ERASEBKGND: return 1;
-    case WM_SETFOCUS: ArmAt(window, index, slot); return 0;
+    case WM_SETFOCUS: if (quiet_focus_) InvalidateRect(window, nullptr, FALSE); else ArmAt(window, index, slot); return 0;
     case WM_KILLFOCUS:
         if (arm_.active && arm_.control == window) Disarm();
         InvalidateRect(window, nullptr, FALSE); return 0;
@@ -1282,7 +1353,8 @@ LRESULT CALLBACK BindProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         HDC draw = bitmap ? dc : target;
         const bool armed = arm_.active && arm_.control == window;
         const COLORREF paper = UiTheme::Mix(UiTheme::Base(), UiTheme::Panel(), 72);
-        const COLORREF edge = armed ? UiTheme::Accent() : UiTheme::Mix(UiTheme::Border(), UiTheme::Base(), 15);
+        const COLORREF edge = armed ? UiTheme::Accent() : GetFocus() == window ? UiTheme::Mix(UiTheme::Border(), UiTheme::Accent(), 60)
+            : UiTheme::Mix(UiTheme::Border(), UiTheme::Base(), 15);
         // The off-screen bitmap starts black: paint the page colour first so the
         // anti-aliased corners blend into the page instead of a black square.
         FillRect(draw, &client, UiTheme::Background());
@@ -1515,6 +1587,19 @@ void NoteDualSenseTouch(const unsigned char* data, int size) {
     NoteSonyStick(1, data, size);
 }
 void YieldSony(bool yield) { yield_sony_.store(yield, std::memory_order_relaxed); }
+void SetLogger(void (*log)(const char*)) { log_ = log; }
+void SetPadNavigation(bool on) { pad_nav_.store(on, std::memory_order_relaxed); }
+void FocusFromPad(HWND control) {
+    if (!control) return;
+    quiet_focus_ = true;
+    SetFocus(control);
+    quiet_focus_ = false;
+}
+bool ArmBox(HWND control) {
+    for (int i = 0; i < kCount; ++i) for (int slot = 0; slot < kSlots; ++slot)
+        if (control && boxes_[static_cast<size_t>(i)][static_cast<size_t>(slot)] == control) { ArmAt(control, i, slot); return true; }
+    return false;
+}
 void SetXInputForTest(PadStateReader reader) {
     xinput_ = reader;
     xinput_tried_ = true;
@@ -1545,7 +1630,9 @@ void Initialize(const wchar_t* config_file) {
     for (int i = 0; i < 3; ++i) if (!_wcsicmp(glyphs, kGlyphNames[i])) glyphs_ = static_cast<Glyphs>(i);
     wchar_t layout[8]{};
     GetPrivateProfileStringW(L"Hotkeys", L"Layout", L"", layout, 8, config_.c_str());
-    const bool legacy = wcscmp(layout, L"2") != 0;
+    const bool legacy = wcscmp(layout, L"2") != 0 && wcscmp(layout, L"3") != 0;
+    // Layout 2 had no pad chord for the panel and wrote ToggleHub.Xbox / .PS empty: those take the new defaults.
+    const bool no_pad_hub = wcscmp(layout, L"3") != 0;
     // Bindings missing from the ini are written with their defaults, so each can be changed there by
     // hand; a migrated ini is written whole. A value that does not parse is left for the user to see.
     std::array<std::array<bool, kSlots>, kCount> write{};
@@ -1556,6 +1643,7 @@ void Initialize(const wchar_t* config_file) {
             wchar_t buffer[160]{};
             GetPrivateProfileStringW(L"Hotkeys", KeyName(i, slot).c_str(), L"*", buffer, 160, config_.c_str());
             if (!wcscmp(buffer, L"*")) { write[static_cast<size_t>(i)][static_cast<size_t>(slot)] = true; continue; }
+            if (no_pad_hub && i == static_cast<int>(Action::ToggleHub) && slot > 0 && !buffer[0]) { write[static_cast<size_t>(i)][static_cast<size_t>(slot)] = true; continue; }
             Chord parsed;
             if (Parse(buffer, parsed, static_cast<Device>(slot)) && Fit(parsed, slot)) chords_[static_cast<size_t>(i)][static_cast<size_t>(slot)] = parsed;
         }
@@ -1570,7 +1658,7 @@ void Initialize(const wchar_t* config_file) {
         write[static_cast<size_t>(i)][static_cast<size_t>(slot)] = true;
     }
     for (int i = 0; i < kCount; ++i) for (int slot = 0; slot < kSlots; ++slot) if (!Fixed(i) && write[static_cast<size_t>(i)][static_cast<size_t>(slot)]) Save(i, slot);
-    if (legacy) WritePrivateProfileStringW(L"Hotkeys", L"Layout", L"2", config_.c_str());
+    if (no_pad_hub) WritePrivateProfileStringW(L"Hotkeys", L"Layout", L"3", config_.c_str());
     NoteChange();
     RefreshHints();
     look_ = ~0u;
@@ -1589,8 +1677,9 @@ void Tick() {
     UiHost::Tick();
     RefreshDevices();
     if (arm_.active) StepCapture();
-    const bool fire = !arm_.active && UiHost::InGame() && !TextEntry();
-    Snapshot(fire);
+    const bool in_game = !arm_.active && UiHost::InGame();
+    const bool fire = in_game && !TextEntry();
+    Snapshot(fire, in_game);
     // A key or mouse press in the game names the keyboard as the device in use (a pad press, the pad: Snapshot).
     if (RememberKeys() && UiHost::InGame()) { input_known_ = true; input_pad_ = false; }
     // Another device, pad set, language or binding: new prompts, and the page and sidebar redrawn.
