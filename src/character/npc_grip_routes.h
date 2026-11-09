@@ -15,12 +15,13 @@ struct Attached {
     bool owner_is_pawn = false;   // the hero's own part (collision boxes, its own effects)
     bool owner_is_world = false;  // owned by the WorldSettings actor: the engine's effect pools (Niagara / Cascade)
     bool effect = false;          // an effect component (FXSystemComponent: Niagara, Cascade)
+    bool weapon_actor = false;    // native weapon class; arbitrary attached actors (lights/cameras) are not weapons
 };
 
-// Things that are weapons: another actor's components that are not effects. Pooled effects (a footstep or landing
+// Only native weapon actors' non-effect components are weapon routes. Pooled effects (a footstep or landing
 // burst on foot_r_Socket, a dash trail on Root) are owned by WorldSettings, come and go every few frames and must
 // never remap a socket the game itself reads (feet, root, interaction).
-inline bool Weapon(const Attached& a) { return a.owner_alive && !a.owner_is_pawn && !a.owner_is_world && !a.effect; }
+inline bool Weapon(const Attached& a) { return a.weapon_actor && a.owner_alive && !a.owner_is_pawn && !a.owner_is_world && !a.effect; }
 
 // May the socket of this attachment become a route now: a weapon, on a named socket the mesh has, not routed yet.
 inline bool TakesRoute(const Attached& a, bool socket_exists, bool routed) { return Weapon(a) && a.socket && socket_exists && !routed; }

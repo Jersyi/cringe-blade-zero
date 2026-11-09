@@ -38,6 +38,9 @@ struct Record {
     int original_corner = 0;
     bool original_corner_known = false;
     int width = 0, height = 0, dpi = 0;
+    // SetHole: a rectangle (screen) where neither the hub nor the plate is, so the game shows through (招式预览).
+    RECT hole{}, applied_hole{}, plate_hole{};
+    bool hole_written = false;
     Snapshot snapshot;
 };
 std::unordered_map<HWND, std::unique_ptr<Record>> records;
@@ -84,22 +87,51 @@ bool EnsureClass() {
     WNDCLASSEXW existing{sizeof(existing)};
     return GetClassInfoExW(type.hInstance, kPlate, &existing) && existing.lpfnWndProc == PlateProc;
 }
-void SetRoundRegion(Record& record, int width, int height) {
+// The hole in window coordinates (empty: none), clipped to the window.
+RECT HoleIn(const Record& record, const RECT& window) {
+    RECT hole{}, local = record.hole, bounds{0, 0, window.right - window.left, window.bottom - window.top};
+    if (IsRectEmpty(&local)) return hole;
+    OffsetRect(&local, -window.left, -window.top);
+    if (!IntersectRect(&hole, &local, &bounds)) hole = {};
+    return hole;
+}
+void SetRoundRegion(Record& record, const RECT& window) {
+    const int width = static_cast<int>(window.right - window.left), height = static_cast<int>(window.bottom - window.top);
     const int dpi = static_cast<int>(GetDpiForWindow(record.hub));
-    if (record.width == width && record.height == height && record.dpi == dpi) return;
-    record.width = width; record.height = height; record.dpi = dpi;
-    if (IsZoomed(record.hub)) {
-        SetWindowRgn(record.hub, nullptr, TRUE); record.region_written = true;
-        return;
+    const RECT hole = HoleIn(record, window);
+    if (record.width == width && record.height == height && record.dpi == dpi && EqualRect(&hole, &record.applied_hole)) return;
+    record.width = width; record.height = height; record.dpi = dpi; record.applied_hole = hole;
+    const bool cut = !IsRectEmpty(&hole);
+    if (!cut) {
+        if (IsZoomed(record.hub)) { SetWindowRgn(record.hub, nullptr, TRUE); record.region_written = true; record.hole_written = false; return; }
+        // Windows 11 rounds (and anti-aliases) the corners itself; the region is the fallback.
+        if (record.snapshot.dwm_corners) {
+            if (record.hole_written) { SetWindowRgn(record.hub, nullptr, TRUE); record.hole_written = false; }
+            return;
+        }
     }
-    // Windows 11 rounds (and anti-aliases) the corners itself; the region is the fallback.
-    if (record.snapshot.dwm_corners) return;
     const int diameter = MulDiv(16, (std::max)(96, dpi), 96);
-    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+    HRGN region = record.snapshot.dwm_corners || IsZoomed(record.hub) ? CreateRectRgn(0, 0, width, height) : CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+    if (region && cut) {
+        HRGN gap = CreateRectRgnIndirect(&hole);
+        if (gap) { CombineRgn(region, region, gap, RGN_DIFF); DeleteObject(gap); }
+    }
     if (region) {
-        if (SetWindowRgn(record.hub, region, TRUE)) record.region_written = true;
+        if (SetWindowRgn(record.hub, region, TRUE)) { record.region_written = true; record.hole_written = cut; }
         else DeleteObject(region); // On success ownership belongs to Windows.
     }
+}
+// The plate (same place and size as the hub) gets the same hole, else its blur would show there.
+void SetPlateHole(Record& record, const RECT& window) {
+    if (!record.plate) return;
+    const RECT hole = HoleIn(record, window);
+    if (EqualRect(&hole, &record.plate_hole)) return;
+    record.plate_hole = hole;
+    if (IsRectEmpty(&hole)) { SetWindowRgn(record.plate, nullptr, TRUE); return; }
+    HRGN region = CreateRectRgn(0, 0, window.right - window.left, window.bottom - window.top), gap = CreateRectRgnIndirect(&hole);
+    if (region && gap) CombineRgn(region, region, gap, RGN_DIFF);
+    if (gap) DeleteObject(gap);
+    if (region && !SetWindowRgn(record.plate, region, TRUE)) DeleteObject(region);
 }
 void Configure(Record& record) {
     BOOL composition = FALSE;
@@ -209,7 +241,7 @@ void Sync(HWND hub) {
     RECT rect{}; if (!GetWindowRect(hub, &rect)) return;
     const int width = static_cast<int>(rect.right - rect.left), height = static_cast<int>(rect.bottom - rect.top);
     if (width <= 0 || height <= 0) return;
-    SetRoundRegion(*record, width, height);
+    SetRoundRegion(*record, rect);
     if (!record->plate) return;
     if (!(GetWindowLongPtrW(record->plate, GWL_STYLE) & WS_CHILD) && !UiHost::Attach(record->plate)) {
         ShowWindow(record->plate, SW_HIDE);
@@ -225,8 +257,16 @@ void Sync(HWND hub) {
     const UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
     // The plate is a sibling behind the hub, both clipped to the game client.
     SetWindowPos(record->plate, hub, x, y, width, height, flags);
+    SetPlateHole(*record, rect);
     record->snapshot.plate_visible = IsWindowVisible(record->plate) != FALSE;
 }
+bool SetHole(HWND hub, const RECT* screen) {
+    Record* record = Find(hub); if (!record) return false;
+    const RECT hole = screen ? *screen : RECT{};
+    if (!EqualRect(&hole, &record->hole)) { record->hole = hole; Sync(hub); }
+    return true;
+}
+bool CanHole(HWND hub) { return Find(hub) != nullptr; }
 void Hide(HWND hub) {
     Record* record = Find(hub); if (!record) return;
     if (record->plate) ShowWindow(record->plate, SW_HIDE);

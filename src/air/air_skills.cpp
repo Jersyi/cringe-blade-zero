@@ -1,4 +1,5 @@
 #include "air_skills.h"
+#include "air_attack_reset.h"
 #include "ue_runtime.h"
 #include "game_build.h"
 #include "settings_store.h"
@@ -1695,6 +1696,28 @@ bool GameplayInputAllowed(const Context& context) {
     Call paused(ue::Default("/Script/Engine.Default__GameplayStatics"),"IsGamePaused");
     return paused.Set("WorldContextObject",context.pawn).Invoke()&&!paused.Get<bool>("ReturnValue");
 }
+AirAttackReset ResetAirAttacks(const Context& context) {
+    const Identity pawn=Identify(context.pawn),asc=Identify(context.asc),input=Identify(context.input);
+    Name tags[3]{};
+    for (size_t i=0;i<3;++i) {
+        tags[i]=ue::MakeName(kAirAttackTags[i]);
+        if (tags[i].None()) return {};
+    }
+    const auto valid=[&]() { return Same(pawn)&&Same(asc)&&Same(input)&&Property(context.input,"AbilitySystem")==context.asc; };
+    const auto read=[&](size_t i,int32_t& value) {
+        if (!valid()) return false;
+        Call count(context.asc,"GetGameplayTagCount");
+        if (!count.Set("GameplayTag",tags[i]).Invoke()||!count.Slot("ReturnValue",sizeof(value))) return false;
+        value=count.Get<int32_t>("ReturnValue");
+        return count.Ok();
+    };
+    const auto remove=[&](size_t i) {
+        if (!valid()) return false;
+        Call change(ue::Default("/Script/SGameUtils.Default__AbilityUtils"),"RemoveLooseGameplayTagForSystem");
+        return change.Set("AbilitySystem",context.asc).Set("GameplayTag",tags[i]).Set("bShouldReplicate",false).Invoke();
+    };
+    return ResetAirAttackStages(read,remove);
+}
 void FinishStep(const Context& context) {
     if (!step_.requested) return;
     if (!Same(step_.pawn) || step_.pawn.object!=context.pawn) { step_={}; return; }
@@ -1722,11 +1745,18 @@ void FinishStep(const Context& context) {
     // frame proves real upward movement, not merely a successful dispatch.
     if (!GameplayInputAllowed(context)) { step_.requested=GetTickCount64(); return; }
     const PendingStep completed=step_; step_={};
+    // A confirmed JC starts a fresh air-attack sequence even with every optional
+    // resource reward disabled. No reset on a queued/failed or ordinary jump.
+    const AirAttackReset attacks=ResetAirAttacks(context);
+    Logf("AIR_JC_ATTACK_RESET verified=%d before=%d,%d,%d after=%d,%d,%d",
+        attacks.verified?1:0,attacks.before[0],attacks.before[1],attacks.before[2],attacks.after[0],attacks.after[1],attacks.after[2]);
     const RewardResult rewards=ApplyRewards(context);
     const float full=rewards.shachi_max; const bool refill=rewards.shachi;
     const ResourceReward& pure=rewards.pure; const ResourceReward& shadow=rewards.shadow; const Restored& restored=rewards.skills;
     AcquireSRWLockExclusive(&state_lock);
     ++state_.bounces; state_.cooldown_restores+=restored.cooldowns; state_.restored_charges+=restored.charges;
+    state_.last_air_attack_reset_verified=attacks.verified;
+    if (attacks.verified) ++state_.air_attack_resets; else ++state_.air_attack_reset_failures;
     state_.failed_restores+=restored.failed;
     if (options_.reward_shachi) { state_.last_shachi_max=full; state_.last_shachi=refill?full:0; }
     if (options_.reward_pure_shachi) state_.pure_shachi=pure;
@@ -1742,7 +1772,9 @@ void FinishStep(const Context& context) {
     }
     ReleaseSRWLockExclusive(&state_lock);
     ArmSlowFall(context);
-    JcGate("ascent_verified",L"JC 已确认实际上升；仅发放已勾选奖励，结果见读回");
+    JcGate("ascent_verified",attacks.verified?
+        L"JC 已确认：空中普攻限制已重置；资源按勾选项恢复":
+        L"JC 已确认：空中普攻重置未通过读回；资源按勾选项恢复");
     Status(L"JC已确认；杀气回满%s，精纯杀气 %.0f→%.0f/%.0f%s，意识之影 %.0f→%.0f/%.0f%s；CD %u/充能 %u/未通过 %u",
         !options_.reward_shachi?L"已关闭":refill?L"成功":L"未完成",pure.before,pure.after,pure.maximum,!options_.reward_pure_shachi?L"（关闭）":pure.verified?L"":L"（未通过）",
         shadow.before,shadow.after,shadow.maximum,!options_.reward_spirit_shadow?L"（关闭）":shadow.verified?L"":L"（未通过）",restored.cooldowns,restored.charges,restored.failed);
@@ -1941,6 +1973,12 @@ void DumpDash(const Context& c) {
 }
 void DumpTags(const Context& c) {
     DumpDash(c);
+    for (const wchar_t* tag:kAirAttackTags) {
+        Call count(c.asc,"GetGameplayTagCount"); char text[96]{};
+        WideCharToMultiByte(CP_UTF8,0,tag,-1,text,sizeof(text),nullptr,nullptr);
+        const bool ok=count.Set("GameplayTag",ue::MakeName(tag)).Invoke();
+        Logf("AIR_TAGS attack %s=%d known=%d",text,ok?count.Get<int32_t>("ReturnValue"):-1,ok?1:0);
+    }
     Call owned(c.asc,"GetOwnedGameplayTags","/Script/GameplayTags.GameplayTagAssetInterface");
     if (owned.Slot("TagContainer",32)&&owned.Invoke()) {
         const Tags tags=owned.Get<Tags>("TagContainer"); DumpTagList("asc",tags); ue::Free(tags.tags.data); ue::Free(tags.parents.data);

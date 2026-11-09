@@ -2,7 +2,8 @@
 #include <windows.h>
 #include <string>
 
-// UI worker only. Hub page 招式派生: the applied NPC skin's moves by kind (top), then a Blueprint-style canvas of
+// UI worker only. Hub page 招式派生: a canvas with a right-side weapon / node library; node types and Boss move
+// kinds are grouped inside the node tab. The Blueprint-style canvas holds
 // trigger nodes (the NPC skill key, hero buttons), moves, intervals, 按键分支 (which button pressed next, after
 // which pause, leads where) and the 加速 / 霸体 / 允许中断 / 武器属性 modifiers, which triggers and moves point at with
 // straight arrows. Edits are saved per skin at once (NpcCombo); the game thread plays them (npc_retarget). The header
@@ -11,6 +12,12 @@ namespace ComboMenu {
 HWND CreatePage(HWND parent);
 void Tick();
 void Shutdown();
+// Worker thread, the command file's "combo ...": "menu" shows the page; "preview <look row> <move, 1-based>" holds
+// that move's 招式预览 card up (top middle of the canvas) as if the mouse rested on it; "preview off" lets it go;
+// "handsoff on|off": an open hub leaves the real mouse alone (tests in the background); "curve [close]" opens the
+// first 加速 node's curve window (a test curve when the chain has none) and logs where it sits (COMBO_TEST lines).
+bool HandleCommand(const char* arguments);
+void SetLogger(void (*log)(const char*));
 // Screen points (page client coordinates) for the offline preview's scripted mouse checks.
 namespace Probe {
 POINT Header(int node);      // -1: the NPC key node
@@ -40,7 +47,7 @@ RECT Canvas();
 POINT Tool(int button);      // ComboMenu's Button order: Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab,
                              // BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage, Group, Teleport, Invincible (21), Look (22, 变身), HeroLook (23, 变回主角),
                              // KeepLook (24, 保留变身), ForceHit (25, 强制受击), WeaponActions (26, 武器派生修改), Toast (27, 派生提示), Dummy (28, 测试木桩),
-                             // AutoDodge (29, 按摇杆方向闪避), IgnoreGuard (30, 无视防御)
+                             // AutoDodge (29, 按摇杆方向闪避), IgnoreGuard (30, 无视防御), KeepChain (31, 保持派生)
 int Zoom();                  // percent
 bool SearchOpen();
 size_t Picked();              // nodes selected now (框选 / Ctrl + click; one node selected alone: 1)
@@ -49,6 +56,10 @@ bool Empty(POINT p);          // bare canvas there
 void Put(int node, int below);  // moves a node just under another (test setup)
 void Show(int node);         // pans so the node sits at the canvas's top-left
 size_t SearchRows();
+int SearchSelected();            // the search box's picked row
+POINT SearchRow(int row);        // an item row's middle in the search box ({-1,-1}: a group header, or scrolled away)
+RECT SearchBox();                // the open search box
+RECT PreviewCard();              // the 招式预览 card as last drawn (empty: none asked)
 POINT WeaponRowOf(const char* id);  // the weapon list's row for a weapon id ({-1,-1}: not listed or scrolled away)
 size_t WeaponRows();             // weapons listed
 POINT Field2(int node);          // a node's second field (a BOSS 技能's / 武器派生's move, a 处决 trigger's weapon, a 组合键's keys)
@@ -57,9 +68,29 @@ POINT Field4(int node);          // a 组合键 / 自定义按键 trigger's 继�
 POINT Header();                  // the 派生表 header (a click lists the chains to edit)
 std::string EditedProfile();     // the profile whose chain the page edits now
 POINT Toggle2(int node);         // a 自定义按键 trigger's 吞掉 checkbox
+POINT Toggle(int node);          // a trigger's 启用 checkbox; a 加速's 曲线调节 checkbox (Field: its 编辑曲线…)
 int RecordingNode();             // the 自定义按键 node recording keys (-1: none)
 int RecordingRoute();            // its branch row recording keys (-1: none, or the node's own keys; -5: its 继续派生 key)
-void ScrollWeapons(int pixels);  // scrolls the weapon list (test setup)
+void ScrollWeapons(int pixels);  // turns the weapon list page (test setup)
+// Hidden-window layout probes: no input injection, focus, mouse capture or file writes.
+void Library(int tab, int category);
+RECT LibraryBox();
+RECT LibraryTabBox(int tab);
+RECT LibraryCategoryBox(int category);
+void LibraryTurn(int delta);
+int LibraryPage();
+int LibraryPageCount();
+int ToolCategory(int button);
+RECT ToolBox(int button);
+// Direct trim probes: no focus/capture; end/wheel use normal saves (isolated test folder required).
+void TrimPreviewAt(int node);
+RECT TrimBarBox(int node);
+POINT HoldValuePoint(int node);
+bool ValueWheel(POINT p,int direction);
+bool TrimBegin(int node,POINT p);
+void TrimMove(POINT p);
+void TrimEnd(POINT p);
+int TrimValue(int node,bool end);
 POINT Resize(int node);  // a 组合 frame's size handle
 POINT Body(int node);    // an empty point in a 组合 frame's body
 }

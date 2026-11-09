@@ -4,6 +4,7 @@
 // texts included.
 #include "npc_combo_model.h"
 #include "grab_boss.h"
+#include <chrono>
 #include <cstdio>
 
 namespace {
@@ -267,6 +268,59 @@ int main() {
         Remove(br, static_cast<size_t>(guard));
         Check(!IgnoreGuardFor(br, bk, c) && !IgnoreGuardFor(br, bk, 0) && at(c).mods[kModSpeed] == speed, "removing 无视防御 breaks its arrows only");
     }
+    {
+        // 保持派生: a modifier with its own time (0.5-30 s, a new one 3 s); a move or the trigger may point at it; saved as k.
+        const int keep = static_cast<int>(br.chain.size()); br.chain.push_back(ModifierNode(NodeType::KeepChain, 0, 0));
+        Check(IsModifier(br.chain.back()) && SlotOf(NodeType::KeepChain) == kModKeepChain && br.chain.back().ms == kKeepChainDefault && KeepChainFor(br, bk, c) == 0 &&
+              ModifierFits(br.chain, c, keep) && ModifierFits(br.chain, bk, keep), "a 保持派生 nothing points at keeps nothing; a new one waits 3 s; a move and a trigger may point at it");
+        Check(LinkModifier(br, c, keep) && at(c).mods[kModKeepChain] == keep && at(c).mods[kModSpeed] == speed && KeepChainFor(br, bk, c) == kKeepChainDefault &&
+              KeepChainFor(br, bk, 0) == 0, "C at 保持派生: only C, its 加速 stays");
+        br.chain[static_cast<size_t>(keep)].ms = 99999;
+        Check(LinkModifier(br, bk, keep) && KeepChainFor(br, bk, 0) == kKeepChainMax && KeepChainFor(br, bk, c) == kKeepChainMax, "the trigger at 保持派生: every move of its chain, its time clamped");
+        br.chain[static_cast<size_t>(keep)].ms = 4500;
+        const Config round = Decode(Encode(br));
+        Check(Encode(br).find(L"|k:4500,") != std::wstring::npos && round.chain[static_cast<size_t>(keep)].type == NodeType::KeepChain && KeepChainFor(round, bk, 0) == 4500 &&
+              KeepChainFor(round, bk, c) == 4500 && Encode(round) == Encode(br), "保持派生 saved as k with its time, its arrows read back");
+        int short_keep = -1; for (const Node& n : Decode(L"E1|k:100,0,0|k:x").chain) if (n.type == NodeType::KeepChain) short_keep = short_keep < 0 ? n.ms : -2;
+        Check(short_keep == kKeepChainMin, "a saved 保持派生 time is clamped, a broken one is left out");
+        Remove(br, static_cast<size_t>(keep));
+        Check(KeepChainFor(br, bk, c) == 0 && KeepChainFor(br, bk, 0) == 0 && at(c).mods[kModSpeed] == speed, "removing 保持派生 breaks its arrows only");
+    }
+    {
+        // BOSS 援护: a press passes through it (the boss is called in) to the move after it; with nothing after it the
+        // 援护 is the hop's move; it takes a move's modifiers; saved as a with its look and move.
+        Config as;  // 0 light trigger -> 1 援护 -> 2 A -> 3 援护 (end); 4 援护 not picked yet
+        as.chain.push_back(TriggerNode(Trigger::Light, 0, 0));
+        Node help; help.type = NodeType::Assist; help.boss = "DangHui"; help.ability = "GA_DangHui_Skill_01";
+        as.chain.push_back(help);
+        as.chain.push_back({NodeType::Skill, "GA_A"});
+        help.ability = "GA_DangHui_Skill_02"; as.chain.push_back(help);
+        Node unset; unset.type = NodeType::Assist; unset.boss = "DangHui"; as.chain.push_back(unset);
+        as.chain[0].next = 1; as.chain[1].next = 2; as.chain[2].next = 3;
+        EnsureKey(as);  // as Decode leaves it: the NPC key node after these
+        Check(IsMove(as.chain[1]) && PicksBossMove(as.chain[1]) && EmptyMove(as.chain[4]) && !IsMove(as.chain[4]) && TakesModifiers(as.chain[1]) && CancelOf(as, 1) == 0,
+              "a picked 援护 is a move that takes modifiers and has no 派生点; one without its move passes presses on");
+        Hop through = Follow(as, 0, L, light, -1);
+        Check(through.move == 2 && through.assists.size() == 1 && through.assists[0] == 1 && through.button == L, "the first press calls the 援护 in and plays A");
+        Check(Follow(as, 0, L, heavy, -1).move == -1 && Follow(as, 0, L, heavy, -1).assists.empty(), "a press the wire does not take calls nobody");
+        Hop last = Follow(as, 2, L, light, 300);
+        Check(last.move == 3 && last.assists.empty(), "a 援护 with nothing after it is the press's move");
+        Check(Follow(as, 3, L, light, 300).move == -1, "the chain ends after the last 援护");
+        as.chain[3].next = 4;  // 援护 -> 援护 not picked: still the picked one's press
+        last = Follow(as, 2, L, light, 300);
+        Check(last.move == 3 && last.assists.empty(), "an unpicked node after a 援护 passes on and the 援护 stays the move");
+        const int damage = static_cast<int>(as.chain.size()); as.chain.push_back(ModifierNode(NodeType::Damage, 0, 0));
+        const int keep = static_cast<int>(as.chain.size()); as.chain.push_back(ModifierNode(NodeType::KeepChain, 0, 0));
+        Check(ModifierFits(as.chain, 1, damage) && LinkModifier(as, 1, damage) && LinkModifier(as, 3, keep) && DamageFor(as, 0, 1) == kDamageNew &&
+              KeepChainFor(as, 0, 3) == kKeepChainDefault && DamageFor(as, 0, 2) == kDamageDefault, "a 援护 points at 伤害倍率 and 保持派生 for itself only");
+        Check(!ModifierFits(as.chain, 1, static_cast<int>(as.chain.size())), "nothing past the chain fits");
+        const std::wstring text = Encode(as); const Config round = Decode(text);
+        Check(text.find(L"|a:DangHui,GA_DangHui_Skill_01,") != std::wstring::npos && text.find(L"|a:DangHui,_,") != std::wstring::npos &&
+              round.chain.size() == as.chain.size() && round.chain[1].type == NodeType::Assist && round.chain[1].boss == "DangHui" &&
+              round.chain[4].ability.empty() && DamageFor(round, 0, 1) == kDamageNew && Encode(round) == text, "援护 saved as a with its look and move, its arrows read back");
+        int broken = 0; for (const Node& n : Decode(L"E1|a:DangHui,GA_X,0,0|a:x").chain) broken += n.type == NodeType::Assist;
+        Check(broken == 0, "a broken 援护 is left out");
+    }
     Remove(br, static_cast<size_t>(armor));
     Remove(br, static_cast<size_t>(c));  // 加速 5 -> 4, 武器属性 6 -> 5, the chain's 加速 7 -> 6
     Check(at(b).routes[1].next == -1 && at(4).type == NodeType::Speed && PointersTo(br, 4).nodes == 0 && at(bk).mods[kModWeapon] == 5 &&
@@ -289,6 +343,29 @@ int main() {
     Check(Near(MoveRate(1000, 0, 1.0, 1.0, 1.0), 10.0) && Near(MoveRate(2000, 0, 1.0, 1.0, 1.0), 10.0) && Near(MoveRate(100, 0, 1.0, 0, 1.0), 0.0) && kSpeedMax == 1000,
           "加速 up to ×10 (1000 %); an unknown rate stays");
     Check(Near(Lasts(2.0, 1.0, 0.5), 4.0), "Lasts follows rate and RateScale");
+    {  // 加速 曲线调节
+        const std::vector<CurvePoint> flat = {{0, 200}, {100, 200}}, curve = DefaultCurve(100);
+        Check(Near(CurveSpeed(flat, 0.3), 200) && Near(CurveSpeed(curve, 0), 100) && Near(CurveSpeed(curve, 0.5), 200) && Near(CurveSpeed(curve, 1), 100),
+              "a curve passes through its points and holds its ends");
+        bool bounded = true; for (int i = 0; i <= 100; ++i) { const double v = CurveSpeed(curve, i / 100.0); bounded = bounded && v >= 99.999 && v <= 200.001; }
+        Check(bounded && CurveSpeed(curve, 0.25) > 100 && CurveSpeed(curve, 0.25) < 200, "monotone pieces: never over the peak, never under the ends");
+        Check(Near(CurveMeanSpeed(flat), 200) && Near(CurveProgress(flat, 0.5), 0.5) && CurveProgress(curve, 0.5) > 0.5 - 1e-9 && Near(CurveProgress(curve, 1), 1),
+              "a flat curve is its speed; a peaked one passes the middle by half its time");
+        const std::vector<CurvePoint> messy = CleanCurve({{70, 300}, {5, 5000}, {71, 150}, {120, 20}});
+        Check(messy.size() == 4 && messy[0].t == 0 && messy[0].speed == kSpeedMax && messy[1].t == 5 && messy[2].t == 70 && messy[2].speed == 150 && messy[3].t == 100 &&
+              messy[3].speed == kSpeedMin, "cleaned: sorted, clamped, near points merged, both ends present");
+        Config cc; cc.chain.push_back(TriggerNode(Trigger::NpcKey, 0, 0));
+        Node sv = ModifierNode(NodeType::Speed, 3, 4); sv.speed = 150; sv.curve = true; sv.points = {{0, 100}, {40, 300}, {100, 120}}; cc.chain.push_back(sv);
+        Node off = ModifierNode(NodeType::Speed, 5, 6); off.speed = 200; off.curve = false; off.points = {{0, 100}, {100, 400}}; cc.chain.push_back(off);
+        cc.chain[0].mods[kModSpeed] = 1;
+        const std::wstring ctext = Encode(cc);
+        Check(ctext.find(L"|V:150~0:100;40:300;100:120,3,4|V:200~0:100;100:400!,5,6") != std::wstring::npos, "a curve after the percent, '!' when it is off");
+        const Config cback = Decode(ctext);
+        Check(cback.chain.size() == 3 && cback.chain[1].curve && cback.chain[1].points.size() == 3 && cback.chain[1].points[1].t == 40 && cback.chain[1].points[1].speed == 300 &&
+              !cback.chain[2].curve && cback.chain[2].points.size() == 2 && cback.chain[2].speed == 200 && Encode(cback) == ctext && CurveOn(SpeedNodeFor(cback, 0, -1)),
+              "decode the curve back (on and off), the same text again");
+        Check(Decode(L"E1|T:0,1200,1,0,0,-1|V:150~zz,1,2").chain[1].speed == 150, "a broken curve keeps the percent");
+    }
 
     // Stick direction relative to facing.
     Check(Direction(0, 0) == 'B' && Direction(0.9, 0.1) == 'F' && Direction(-0.9, 0.2) == 'B' && Direction(0.1, 0.8) == 'R' && Direction(0.2, -0.9) == 'L',
@@ -755,7 +832,7 @@ int main() {
           canvas1.chain[3].trigger == static_cast<int>(Trigger::Dash) && canvas1.chain[3].x == 30 && canvas1.chain[4].x == 330, "the first canvas: B: is the key node, R: a trigger");
     Check(Decode(L"").enabled && Decode(L"").chain.size() == 1 && KeyTrigger(Decode(L"")) == 0, "nothing saved: on, just the key node");
     std::wstring many = L"E1"; for (int i = 0; i < 80; ++i) many += L"|S:GA_A,0,0,-1";
-    Check(Decode(many).chain.size() == kMaxNodes + 1, "at most kMaxNodes nodes are read, then the key node");
+    Check(Decode(many).chain.size() == 81, "80 nodes (more than the old 64) are all read, then the key node");
     {
         // 变身 / 变回主角: moves a press reaches (the same button again on a straight wire), kept by the text, no
         // modifiers, no 派生点; a 变身 with no boss picked passes the press on; both may sit in a 组合.
@@ -910,6 +987,267 @@ int main() {
               "a second J is dropped and the wires point pre_at the same nodes");
         const Config wired = Decode(L"E1|T:1,1200,1,0,0,1|J:300,0,0|S:GA_X_Skill_01,300,0,-1");
         Check(wired.chain[0].next == -1, "a wire saved into 预输入 is dropped");
+    }
+
+    // 钩子: the chain sickle's hook move (a 武器派生 of ShachiHook with a "g:" mark).
+    {
+        Config hc = Linked({{NodeType::Skill, "GA_A"}});  // A0 key1
+        const int h = InsertAfter(hc, 0, HookNode(5, 6));
+        const Node& hn = hc.chain[static_cast<size_t>(h)];
+        Check(hn.type == NodeType::Hook && IsMove(hn) && !EmptyMove(hn) && CastsWeapon(hn) && TakesModifiers(hn) && hn.weapon == kHookWeapon && hn.ability == kHookPull && !hn.hook_self,
+              "a new 钩子 pulls the target over (Drag) with the chain sickle and is a move");
+        hc.chain[static_cast<size_t>(h)].ms = 400;
+        Check(Follow(hc, 0, K, key, 100).move == h && CancelOf(hc, h) == 400, "the press after A plays it; its 派生点");
+        SetHookMode(hc.chain[static_cast<size_t>(h)], true);
+        Check(hc.chain[static_cast<size_t>(h)].ability == kHookGo && hc.chain[static_cast<size_t>(h)].hook_self, "勾过去 casts HookMove");
+        const std::wstring htext = Encode(hc);
+        const Config hback = Decode(htext);
+        Check(htext.find(L"|Y:ShachiHook,GA_Hun_ShachiHook_HookMove,5,6,") != std::wstring::npos && htext.find(L"|g:" + std::to_wstring(h)) != std::wstring::npos &&
+              hback.chain[static_cast<size_t>(h)].type == NodeType::Hook && hback.chain[static_cast<size_t>(h)].hook_self && Encode(hback) == htext,
+              "saved as a 武器派生 of its move with a g: mark and read back as a 钩子");
+        std::wstring older = htext; older.erase(older.find(L"|g:"), 3 + std::to_wstring(h).size());
+        Check(Decode(older).chain[static_cast<size_t>(h)].type == NodeType::WeaponMove && Decode(older).chain[static_cast<size_t>(h)].ability == kHookGo,
+              "without the mark (an older build) it is that 武器派生");
+        {
+            Config ac = hc; Node& an = ac.chain[static_cast<size_t>(h)];
+            SetHookAuto(an);
+            Check(an.hook_auto && !an.hook_self && an.ability == kHookPull && an.weapon == kHookWeapon, "auto is written as the pull (Drag)");
+            const std::wstring atext = Encode(ac);
+            const Config aback = Decode(atext);
+            Check(atext.find(L"|q:" + std::to_wstring(h)) != std::wstring::npos && aback.chain[static_cast<size_t>(h)].hook_auto && Encode(aback) == atext,
+                  "auto is saved with a q: mark and read back");
+            std::wstring aolder = atext; aolder.erase(aolder.find(L"|q:"), 3 + std::to_wstring(h).size());
+            const Config aold = Decode(aolder);
+            Check(aold.chain[static_cast<size_t>(h)].type == NodeType::Hook && !aold.chain[static_cast<size_t>(h)].hook_auto && aold.chain[static_cast<size_t>(h)].ability == kHookPull,
+                  "without the q: mark (an older build) auto plays as the pull");
+            ResolveHook(an, true);
+            Check(an.hook_auto && an.hook_self && an.ability == kHookGo, "resolving auto to go keeps it auto");
+            SetHookMode(an, false);
+            Check(!an.hook_auto && !an.hook_self && an.ability == kHookPull, "picking a mode clears auto");
+        }
+        Check(Decode(L"E1|Y:Long,GA_Hun_Long_AAA,1,2,-1|g:0").chain[0].type == NodeType::WeaponMove, "a mark on another weapon's move is ignored");
+        {
+            // Reach and speed: defaults leave the text as before; set ones go in an "r:" mark and come back.
+            Config rc = hc; Node& rn = rc.chain[static_cast<size_t>(h)];
+            Check(rn.hook_dist == kHookDistDefault && rn.hook_speed == kHookSpeedDefault && Encode(rc).find(L"|r:") == std::wstring::npos, "a new 钩子 reaches 15 m at x1, no mark");
+            rn.hook_dist = 2200; rn.hook_speed = 150;
+            const std::wstring rtext = Encode(rc);
+            const Config rback = Decode(rtext);
+            Check(rtext.find(L"|r:" + std::to_wstring(h) + L",2200,150") != std::wstring::npos && rback.chain[static_cast<size_t>(h)].hook_dist == 2200 &&
+                  rback.chain[static_cast<size_t>(h)].hook_speed == 150 && Encode(rback) == rtext, "its reach and speed are saved with an r: mark and read back");
+            Check(SpeedFor(rc, KeyTrigger(rc), h) == 150 && std::fabs(HookPace(rc, h) - 1.5) < 1e-9 && HookPace(rc, 0) == 1.0, "its speed paces it (no 加速)");
+            const int sp = static_cast<int>(rc.chain.size()); rc.chain.push_back(ModifierNode(NodeType::Speed, 0, 0)); rc.chain[static_cast<size_t>(sp)].speed = 200;
+            rc.chain[static_cast<size_t>(h)].mods[kModSpeed] = sp;
+            Check(SpeedFor(rc, KeyTrigger(rc), h) == 300, "with a 加速 x2 on it: x3");
+            Check(Decode(L"E1|Y:ShachiHook,GA_Hun_ShachiHook_Drag,1,2,-1|g:0|r:0,99999,1").chain[0].hook_dist == kHookDistMax &&
+                  Decode(L"E1|Y:ShachiHook,GA_Hun_ShachiHook_Drag,1,2,-1|g:0|r:0,99999,1").chain[0].hook_speed == kHookSpeedMin, "a mark's values are clamped");
+            Check(Decode(L"E1|Y:ShachiHook,GA_Hun_ShachiHook_Drag,1,2,-1|r:0,900,200").chain[0].hook_dist == kHookDistDefault, "without the g: mark it is no 钩子: the mark is ignored");
+        }
+    }
+    // 按住: a light trigger (no hold) -> A -> branch {light -> B, light held 1 s -> C, heavy held 0.5 s -> D}; a light
+    // trigger held 0.8 s -> E.
+    {
+        Config hold;
+        hold.chain.push_back(TriggerNode(Trigger::Light, 0, 0));  // 0
+        hold.chain.push_back({NodeType::Skill, "GA_A"});            // 1
+        Node fork2 = BranchNode(0, 0); fork2.routes = {{L, 0, 3}, {L, 0, 4}, {H, 0, 5}};
+        fork2.routes[1].hold_ms = 1000; fork2.routes[2].hold_ms = 500;
+        hold.chain.push_back(fork2);                                 // 2
+        hold.chain.push_back({NodeType::Skill, "GA_B"});            // 3
+        hold.chain.push_back({NodeType::Skill, "GA_C"});            // 4
+        hold.chain.push_back({NodeType::Skill, "GA_D"});            // 5
+        Node held_trigger = TriggerNode(Trigger::Light, 0, 0); held_trigger.hold_ms = 800; held_trigger.next = 7;
+        hold.chain.push_back(held_trigger);                          // 6
+        hold.chain.push_back({NodeType::Skill, "GA_E"});            // 7
+        hold.chain[0].next = 1; hold.chain[1].next = 2;
+        EnsureKey(hold);
+        Press tap = light, long_light = light, mid_light = light, short_heavy = heavy, long_heavy = heavy;
+        long_light.hold_ms = 1200; mid_light.hold_ms = 600; short_heavy.hold_ms = 300; long_heavy.hold_ms = 500;
+        Check(Follow(hold, 1, L, tap, 100).move == 3 && Follow(hold, 1, L, mid_light, 100).move == 3 && Follow(hold, 1, L, long_light, 100).move == 4,
+              "a tap and a short hold take the tap row; held past 1 s, the hold row");
+        Check(Follow(hold, 1, L, long_light, 100).hold_ms == 1000 && Follow(hold, 1, L, tap, 100).hold_ms == 0, "the hop says the hold of its row");
+        Check(Follow(hold, 1, L, short_heavy, 100).move < 0 && Follow(hold, 1, L, long_heavy, 100).move == 5, "a row with only a hold takes no shorter press");
+        Check(TriggerFor(hold, tap) == 0 && TriggerFor(hold, mid_light) == 0 && TriggerFor(hold, long_light) == 6 && TriggerHold(hold, 6) == 800 && TriggerHold(hold, 0) == 0,
+              "the trigger with the longest hold reached starts the chain");
+        hold.chain[0].on = false;
+        Check(TriggerFor(hold, tap) < 0 && TriggerFor(hold, long_light) == 6, "with only the held trigger a tap starts nothing");
+        hold.chain[0].on = true;
+        const std::wstring hold_text = Encode(hold);
+        const Config hold_back = Decode(hold_text);
+        Check(hold_text.find(L"|w:2,1,1000") != std::wstring::npos && hold_text.find(L"|w:2,2,500") != std::wstring::npos && hold_text.find(L"|w:6,-1,800") != std::wstring::npos &&
+              hold_back.chain[2].routes[1].hold_ms == 1000 && hold_back.chain[2].routes[0].hold_ms == 0 && hold_back.chain[6].hold_ms == 800 && Encode(hold_back) == hold_text,
+              "saved as w:node,row,ms marks and read back");
+        Check(Decode(L"E1|T:1,1200,1,0,0,-1|w:0,-1,99999").chain[0].hold_ms == kHoldMax && Decode(L"E1|T:1,1200,1,0,0,-1|w:0,3,500").chain[0].hold_ms == 0 &&
+              Decode(L"E1|S:GA_A,0,0,-1|w:0,-1,500").chain[0].hold_ms == 0, "a long hold is clamped; a mark on a missing row or another node is ignored");
+    }
+
+    // 裁剪: a BOSS 技能 -> a trim node (1.2 s .. 2.4 s of its montage), its 加速 beside it.
+    {
+        Config tc;
+        tc.chain.push_back(TriggerNode(Trigger::NpcKey, 0, 0));                       // 0
+        Node boss; boss.type = NodeType::BossSkill; boss.boss = "MoTianYoung"; boss.ability = "GA_MoTian_Skill_03";
+        tc.chain.push_back(boss);                                                     // 1
+        Node trim = ModifierNode(NodeType::Trim, 400, 200); trim.trim_from = 1200; trim.trim_to = 2400;
+        tc.chain.push_back(trim);                                                     // 2
+        tc.chain.push_back(ModifierNode(NodeType::Speed, 400, 300));                  // 3 (x1.50)
+        tc.chain.push_back({NodeType::Skill, "GA_Hero"});                             // 4
+        tc.chain[0].next = 1;
+        Check(IsModifier(tc.chain[2]) && SlotOf(NodeType::Trim) == kModTrim && NoMods()[kModTrim] == -1 && Node{}.mods[kModTrim] == -1, "a 裁剪 is a modifier in its own slot; new nodes point cursor_at none");
+        Check(LinkModifier(tc, 1, 2) && LinkModifier(tc, 1, 3) && !LinkModifier(tc, 4, 2) && !LinkModifier(tc, 0, 2), "only a BOSS 技能 points cursor_at a 裁剪");
+        const TrimRange r = TrimFor(tc, 1);
+        Check(r.on && r.from == 1.2 && r.to == 2.4 && SpeedFor(tc, 0, 1) == kSpeedNew && TrimmedBy(tc, 2) == 1 && !TrimFor(tc, 4).on, "its range and its 加速 both reach the move");
+        Check(std::fabs(TrimSpan(r, 3.0) - 1.2) < 1e-9 && std::fabs(TrimSpan(r, 2.0) - 0.8) < 1e-9 && std::fabs(TrimProgress(r, 1.8, 3.0) - 0.5) < 1e-9 && TrimProgress(r, 0.5, 3.0) == 0,
+              "the span ends cursor_at the montage's end when that comes first; a curve runs over the part");
+        Node open = trim; open.trim_to = 0; Node trim_late = trim; trim_late.trim_to = 1000;
+        Check(TrimOf(open).to == 0 && std::fabs(TrimSpan(TrimOf(open), 3.0) - 1.8) < 1e-9 && TrimOf(trim_late).to == 0, "no end (or one before the start): to the montage's end");
+        const std::wstring saved_text = Encode(tc);
+        const Config again = Decode(saved_text);
+        Check(saved_text.find(L"|c:2,1200,2400") != std::wstring::npos && again.chain[2].type == NodeType::Trim && again.chain[2].trim_from == 1200 && again.chain[2].trim_to == 2400 &&
+              again.chain[1].mods[kModTrim] == 2 && again.chain[1].mods[kModSpeed] == 3 && Encode(again) == saved_text, "saved as a 武器属性 with a c: mark, read trim_late with its arrow");
+        std::wstring older = saved_text; older.erase(older.find(L"|c:"), std::wstring(L"|c:2,1200,2400").size());
+        const Config old_build = Decode(older);
+        Check(old_build.chain[2].type == NodeType::Weapon && old_build.chain[1].mods[kModWeapon] == -1 && old_build.chain[1].mods[kModSpeed] == 3,
+              "without the mark (an older build) it is an unlinked 武器属性 and the move keeps its 加速");
+        Check(Decode(L"E1|T:0,1200,1,0,0,1|S:GA_A,0,0,-1|W:5,5|c:1,100,200").chain[1].type == NodeType::Skill, "a mark on another node is ignored");
+        Check(Decode(L"E1|W:5,5|c:0,99999,-5").chain[0].trim_from == kTrimMax && Decode(L"E1|W:5,5|c:0,99999,-5").chain[0].trim_to == 0, "a mark's times are clamped");
+    }
+    // 滞空 (a modifier), 空中释放 (the chain's fixed node) and 强制受击 击飞's height.
+    {
+        Config ac;
+        ac.chain.push_back(TriggerNode(Trigger::NpcKey, 0, 0));                       // 0
+        Node boss; boss.type = NodeType::BossSkill; boss.boss = "MoTian"; boss.ability = "GA_MoTian_Skill_01";
+        ac.chain.push_back(boss);                                                     // 1
+        boss.ability = "GA_MoTian_Skill_02"; ac.chain.push_back(boss);                // 2
+        ac.chain.push_back(HookNode(0, 0));                                           // 3
+        Node tp; tp.type = NodeType::Teleport; ac.chain.push_back(tp);                // 4
+        ac.chain[0].next = 1; ac.chain[1].next = 2; ac.chain[2].next = 3; ac.chain[3].next = 4;
+        Check(!AirFor(ac, 0, 1, true).on && AirDefaultNode(ac) < 0, "with no 空中释放 node (an older chain before it is added) nothing is lifted");
+        EnsurePreInput(ac); EnsureAirDefault(ac); EnsureAirDefault(ac);
+        const int fixed = AirDefaultNode(ac), pre = PreInputNode(ac);
+        const Node& fn = ac.chain[static_cast<size_t>(fixed)];
+        Check(fixed == 6 && fn.on && IsSetting(fn) && !IsModifier(fn) && fn.air_lift == kAirSelfLiftDefault && fn.air_hang == kAirSelfHangDefault &&
+              fn.air_foe_lift == kAirFoeLiftDefault && fn.air_foe_hang == kAirFoeHangDefault && fn.y == ac.chain[static_cast<size_t>(pre)].y && fn.x == ac.chain[static_cast<size_t>(pre)].x + 460,
+              "EnsureAirDefault adds one 空中释放 (on, its defaults) right of the 预输入, once");
+        const AirSet ground = AirFor(ac, 0, 1, false), air = AirFor(ac, 0, 1, true);
+        Check(!ground.on && air.on && air.fixed && air.self_lift == kAirSelfLiftDefault && air.self_hang == kAirSelfHangDefault && air.foe_lift == kAirFoeLiftDefault &&
+              air.foe_hang == kAirFoeHangDefault, "a move with no 滞空 takes 空中释放's values only when cast in the air");
+        Check(!AirFor(ac, 0, 3, true).on && !AirFor(ac, 0, 4, true).on && TakesAir(ac.chain[1]) && !TakesAir(ac.chain[3]) && !TakesAir(ac.chain[4]),
+              "a 钩子 or a 瞬移 carries the hero its own way: no 滞空 on it");
+        ac.chain[static_cast<size_t>(fixed)].on = false;
+        Check(!AirFor(ac, 0, 1, true).on, "空中释放 switched off: air casts are left alone");
+        ac.chain[static_cast<size_t>(fixed)].on = true;
+        Node a = ModifierNode(NodeType::Air, 300, 200); a.air_lift = 250; a.air_hang = 90; a.air_foe_lift = 400; a.air_foe_hang = 100;
+        ac.chain.push_back(a); const int an = static_cast<int>(ac.chain.size()) - 1;  // 7
+        Check(IsModifier(ac.chain[static_cast<size_t>(an)]) && SlotOf(NodeType::Air) == kModAir && kModAir < kModSlots && Node{}.mods[kModAir] == -1 &&
+              ModifierNode(NodeType::Air, 0, 0).air_lift == kAirSelfLiftNew && ModifierNode(NodeType::Air, 0, 0).air_foe_hang == kAirFoeHangNew, "a 滞空 is a modifier in its own slot; a new one has its own values");
+        Check(LinkModifier(ac, 1, an) && !LinkModifier(ac, 3, an) && !LinkModifier(ac, 4, an) && !LinkModifier(ac, fixed, an), "a move the hero casts points at a 滞空; a 钩子, a 瞬移 or 空中释放 does not");
+        const AirSet own = AirFor(ac, 0, 1, false);
+        Check(own.on && !own.fixed && own.self_lift == 250 && own.self_hang == 90 && own.foe_lift == 400 && own.foe_hang == 100 && AirFor(ac, 0, 1, true).self_lift == 250 &&
+              !AirFor(ac, 0, 2, false).on && AirFor(ac, 0, 2, true).fixed, "a move pointing at a 滞空 takes its values, on the ground too; the next move still takes 空中释放's in the air");
+        Check(LinkModifier(ac, 0, an) && AirFor(ac, 0, 2, false).self_lift == 250 && !AirFor(ac, 0, 3, true).on, "a trigger's 滞空 covers every move of its chain the hero casts");
+        Check(OutCount(ac.chain[static_cast<size_t>(fixed)]) == 0 && !Groupable(ac.chain[static_cast<size_t>(fixed)]), "空中释放 has no wires and sits in no frame");
+        Link(ac, 2, fixed); Check(ac.chain[2].next == 3, "no wire goes into 空中释放");
+        const size_t before = ac.chain.size(); Remove(ac, static_cast<size_t>(fixed));
+        Check(ac.chain.size() == before && AirDefaultNode(ac) == fixed, "空中释放 is never removed");
+        // 击飞's height.
+        Node fh = ModifierNode(NodeType::ForceHit, 0, 0);
+        Check(fh.launch == kLaunchDefault && kLaunchDefault == 300 && fh.hit == static_cast<int>(HitKind::Launch), "a new 强制受击 is 击飞, 3 m high");
+        fh.launch = 500; ac.chain.push_back(fh); const int fhn = static_cast<int>(ac.chain.size()) - 1;  // 8
+        Check(LinkModifier(ac, 2, fhn) && ForceLaunchFor(ac, 0, 2) == 500 && ForceLaunchFor(ac, 0, 1) == 0, "the move under the 击飞 throws its enemies that high");
+        ac.chain[static_cast<size_t>(fhn)].hit = static_cast<int>(HitKind::Knockdown);
+        Check(ForceLaunchFor(ac, 0, 2) == 0, "any other hit reaction throws nobody up");
+        ac.chain[static_cast<size_t>(fhn)].hit = static_cast<int>(HitKind::Launch);
+        // The text: unwired 间隔 with marks; read back the same.
+        const std::wstring saved_text = Encode(ac);
+        const Config again = Decode(saved_text);
+        Check(saved_text.find(L"|f:7,250,90,400,100") != std::wstring::npos && saved_text.find(L"|j:6,1,80,60,80,60") != std::wstring::npos &&
+              saved_text.find(L"|u:8,500") != std::wstring::npos && again.chain[7].type == NodeType::Air && again.chain[6].type == NodeType::AirDefault &&
+              again.chain[1].mods[kModAir] == 7 && again.chain[0].mods[kModAir] == 7 && again.chain[8].launch == 500 && AirFor(again, 0, 1, false).foe_lift == 400 &&
+              Encode(again) == saved_text, "saved with f: / j: / u: marks, read back with its arrows and values");
+        std::wstring older = saved_text;
+        for (const wchar_t* mark : {L"|f:", L"|j:", L"|u:"}) { const size_t from = older.find(mark); older.erase(from, older.find(L'|', from + 1) - from); }
+        const Config old_build = Decode(older);
+        Check(old_build.chain.size() == again.chain.size() && old_build.chain[7].type == NodeType::Interval && old_build.chain[6].type == NodeType::Interval &&
+              old_build.chain[7].next < 0 && old_build.chain[1].mods[kModAir] == -1 && old_build.chain[2].mods[kModForceHit] == 8 && old_build.chain[8].launch == kLaunchDefault,
+              "without the marks (an older build) they are unwired 间隔, every index stays, 击飞 keeps its arrow");
+        Config off = again; off.chain[6].on = false; off.chain[8].launch = kLaunchDefault;
+        const std::wstring off_text = Encode(off);
+        Check(off_text.find(L"|j:6,0,") != std::wstring::npos && off_text.find(L"|u:") == std::wstring::npos && !Decode(off_text).chain[6].on, "空中释放 off is kept; the default height writes no mark");
+        const Config clamped = Decode(L"E1|T:0,1200,1,0,0,-1|I:500,0,0,-1|I:500,0,0,-1|I:500,0,0,-1|f:1,99999,500,-5,-1|j:2,1,5000,101,3,4|j:3,1,1,1,1,1");
+        Check(clamped.chain[1].type == NodeType::Air && clamped.chain[1].air_lift == kAirLiftMax && clamped.chain[1].air_hang == kAirHangMax && clamped.chain[1].air_foe_lift == 0 &&
+              clamped.chain[1].air_foe_hang == 0 && clamped.chain[2].type == NodeType::AirDefault && clamped.chain[2].air_lift == kAirLiftMax && clamped.chain[2].air_hang == kAirHangMax &&
+              clamped.chain[3].type == NodeType::Interval,
+              "a mark's values are clamped; a second 空中释放 mark is ignored");
+        Check(Decode(L"E1|T:0,1200,1,0,0,1|S:GA_A,0,0,-1|f:1,1,1,1,1").chain[1].type == NodeType::Skill && Decode(L"E1|T:0,1200,1,0,0,-1|I:500,0,0,2|S:GA_A,0,0,-1|f:1,1,1,1,1").chain[1].type == NodeType::Interval,
+              "a mark on another node (or a wired 间隔) is ignored");
+    }
+    // 空中派生 and the hero's own skills under 滞空 / 空中释放.
+    {
+        Config sc; sc.chain.push_back(TriggerNode(Trigger::Light, 0, 0));                       // 0: ground light
+        Node sg; sg.type = NodeType::Skill; sg.ability = "GA_Ground"; sc.chain.push_back(sg);         // 1
+        sc.chain.push_back(AirSetNode(0, 300));                                                 // 2: 空中派生
+        Node sa; sa.type = NodeType::Skill; sa.ability = "GA_Air"; sc.chain.push_back(sa);            // 3
+        Node sk; sk.type = NodeType::Skill; sk.ability = "GA_AirKey"; sc.chain.push_back(sk);         // 4
+        sc.chain[0].next = 1; sc.chain[2].routes[0].next = 3; sc.chain[2].routes[4].next = 4;      // light row, NPC key row
+        EnsureKey(sc);
+        Press sl{1u << static_cast<int>(Trigger::Light)}; Press air_light = sl; air_light.airborne = true;
+        Press skey; skey.key = true; Press air_key = skey; air_key.airborne = true;
+        Check(sc.chain[2].routes.size() == 5 && sc.chain[2].routes[4].button == static_cast<int>(Trigger::NpcKey) && IsAirSet(sc.chain[2]) && StartsChain(sc.chain[2]) &&
+              !HasWeaponActions(sc), "a new 空中派生: 轻攻击, 重攻击, 影之武装, 战技, NPC 技能键 rows; it starts chains and names no weapon");
+        Check(TriggerFor(sc, sl) == 0 && Follow(sc, 0, StartButton(sc, 0, sl), sl, -1).move == 1, "on the ground the light attack starts the ground chain");
+        Check(TriggerFor(sc, air_light) == 2 && StartButton(sc, 2, air_light) == static_cast<int>(Trigger::Light) && Follow(sc, 2, static_cast<int>(Trigger::Light), air_light, -1).move == 3,
+              "in the air the 空中派生's light row goes first");
+        Check(TriggerFor(sc, air_key) == 2 && Follow(sc, 2, 0, air_key, -1).move == 4 && TriggerFor(sc, skey) != 2, "its NPC key row: in the air only");
+        Press air_heavy{1u << static_cast<int>(Trigger::Heavy)}; air_heavy.airborne = true;
+        Check(TriggerFor(sc, air_heavy) < 0, "an unwired row takes nothing (the game plays the press)");
+        sc.chain[2].on = false;
+        Check(TriggerFor(sc, air_light) == 0, "switched off, the air press goes to the ground chain");
+        sc.chain[2].on = true;
+        const std::wstring stext = Encode(sc);
+        const Config sback = Decode(stext);
+        Check(stext.find(L"|O:0,300,_,") != std::wstring::npos && stext.find(L"|s:2") != std::wstring::npos && IsAirSet(sback.chain[2]) && sback.chain[2].routes.size() == 5 &&
+              sback.chain[2].routes[4].next == 4 && Encode(sback) == stext, "saved as a 武器派生修改 with no weapon and an s: mark, read back the same");
+        std::wstring solder = stext; { const size_t from = solder.find(L"|s:"); solder.erase(from, solder.find(L'|', from + 1) == std::wstring::npos ? std::wstring::npos : solder.find(L'|', from + 1) - from); }
+        const Config sold = Decode(solder);
+        Check(!IsAirSet(sold.chain[2]) && sold.chain[2].weapon.empty() && sold.chain[2].routes.size() == 4 && TriggerFor(sold, air_light) == 0,
+              "without the mark it is a 武器派生修改 with no weapon (its NPC key row dropped): it takes nothing");
+        Check(Decode(L"E1|O:0,0,_,1200,13,1,1,2|s:0|S:GA_A,0,0,-1|S:GA_B,0,0,-1").chain[0].routes.size() == 1, "an execution row is no 空中派生 row");
+        // The hero's own skills.
+        Config so; so.chain.push_back(TriggerNode(Trigger::Shachi, 0, 0));
+        Node san = ModifierNode(NodeType::Air, 0, 0); san.air_lift = 200; san.air_hang = 50; san.air_foe_lift = 150; san.air_foe_hang = 40; so.chain.push_back(san);
+        EnsureAirDefault(so);
+        const unsigned sshachi = 1u << static_cast<int>(Trigger::Shachi), sart = 1u << static_cast<int>(Trigger::CombatArt), slightb = 1u << static_cast<int>(Trigger::Light);
+        Check(!OwnAirFor(so, sshachi, false).on && OwnAirFor(so, sshachi, true).fixed && OwnAirFor(so, sart, true).self_lift == kAirSelfLiftDefault && !OwnAirFor(so, slightb, true).on,
+              "空中释放 on the hero's skills cast in the air (影之武装, 战技), not its light attack");
+        int strig = -1;
+        Check(LinkModifier(so, 0, 1) && OwnAirFor(so, sshachi, false, &strig).self_lift == 200 && strig == 0 && !OwnAirFor(so, sshachi, false, &strig).fixed &&
+              OwnAirFor(so, sshachi, true).foe_hang == 40, "a trigger's 滞空 acts on its own action, on the ground too, with no chain after it");
+        Check(!OwnAirFor(so, 1u << static_cast<int>(Trigger::Execution), true).on, "never an execution");
+        so.chain[static_cast<size_t>(AirDefaultNode(so))].on = false;
+        Check(!OwnAirFor(so, sart, true).on, "空中释放 off: the hero's skills fall as before");
+    }
+    // No node limit in use: 2000 nodes are added, saved, read trim_late and walked, quickly.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        Config big; big.chain.push_back(TriggerNode(Trigger::Light, 0, 0));
+        int last = 0;
+        for (int i = 0; i < 2000; ++i) { Node n; n.type = NodeType::Skill; n.ability = "GA_" + std::to_string(i % 37); n.x = (i % 40) * 320; n.y = (i / 40) * 160;
+            const int added = InsertAfter(big, last, n); if (added < 0) break; last = added; }
+        for (int i = 0; i < 200; ++i) { Node sp = ModifierNode(NodeType::Speed, 0, 0); big.chain.push_back(sp); LinkModifier(big, 1 + i * 10, static_cast<int>(big.chain.size()) - 1); }
+        const std::wstring saved_text = Encode(big);
+        const Config trim_late = Decode(saved_text);
+        int walked = 0;
+        for (int cursor_at = 0, step = 0; step < 2100; ++step) { const Hop next_hop = Follow(trim_late, cursor_at, static_cast<int>(Trigger::Light), light, 100); if (next_hop.move < 0) break; cursor_at = next_hop.move; ++walked; }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const Config twice = Decode(Encode(trim_late));
+        std::printf("INFO 2000-node chain: %zu nodes, %zu read back, walked %d\n", big.chain.size(), trim_late.chain.size(), walked);
+        Check(big.chain.size() == 2201 && trim_late.chain.size() == big.chain.size() + 1 && Encode(twice) == Encode(trim_late) && walked == 2000 &&
+              trim_late.chain[1991].mods[kModSpeed] == 2200,
+              "2000 moves and 200 加速 (no cap in use): added, saved, read back (plus the key node), every press walks on");
+        Check(ms < 3000, "the 2000-node round trip and walk stay quick");
+        std::printf("INFO 2000-node chain: %zu chars saved, round trip + walk %.0f ms\n", saved_text.size(), ms);
+        Check(Decode(std::wstring(L"E1") + [] { std::wstring m; for (int i = 0; i < 10100; ++i) m += L"|S:GA_A,0,0,-1"; return m; }()).chain.size() == kMaxNodes + 1,
+              "a broken file with more than kMaxNodes nodes stops there (then the key node)");
     }
 
     std::printf("failures=%d\n", failures);

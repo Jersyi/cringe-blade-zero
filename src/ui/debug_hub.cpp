@@ -44,9 +44,10 @@ constexpr const wchar_t* kSubtitles[kPages]={
     L"快捷键或触控板滑动切换两套装备，切换前自动记忆",
     L"键盘、Xbox、PlayStation 各一套，自动识别",
     L"补充包中的原版调试功能：战斗、移动、画面、进度与剧情",
+    L"Steam 房间、邀请与替身（联机第 0 阶段）",
     L"MOD 完全免费，不打赏也可以使用全部功能",
 };
-constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE8AB,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A,0xEB51};
+constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE8AB,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A,0xE774,0xEB51};
 struct Entry { const wchar_t* title=L""; Factory factory; HWND window=nullptr; int width=0,height=0; double x=0,y=0; int target_x=0,target_y=0; };
 std::array<Entry,kPages> entries;
 // Sidebar rows: registered pages only, in page order (the debug supplement may be missing before Donate).
@@ -229,7 +230,9 @@ bool HubFocused() {
 }
 void KeepInside() {
     if (!window_||!held_open_||hide_pending_) return;
-    if (!UiHost::InGame()) {
+    // Hands off (combo handsoff on: a test with the game in the background) keeps the hub up without the game active.
+    const bool background_test=UiCursor::HandsOff()&&UiHost::Game()&&UiHost::ClientSize().cx>0;
+    if (!UiHost::InGame()&&!background_test) {
         if (!parked_) {
             ShowWindow(window_,SW_HIDE); UiGlass::Hide(window_);
             if (toast_.window) ShowWindow(toast_.window,SW_HIDE);
@@ -822,7 +825,7 @@ void Select(int index) {
     for (size_t i=0;i<entries.size();++i) if (entries[i].window) ShowWindow(entries[i].window,static_cast<int>(i)==index?SW_SHOW:SW_HIDE);
     ActiveLayout();
     InvalidateRect(window_,nullptr,FALSE); InvalidateRect(nav_,nullptr,FALSE);
-    if (GetFocus()!=nav_) SetFocus(nav_);
+    if (GetFocus()!=nav_&&!UiCursor::HandsOff()) SetFocus(nav_);  // hands off (tests): the focus would activate the game
 }
 bool Create() {
     if (window_) return true;
@@ -856,12 +859,14 @@ bool Create() {
     rest_={x,y,x+width,y+height};
     SetWindowPos(window_,nullptr,child?x:0,child?y:0,width,height,SWP_NOZORDER|SWP_NOACTIVATE|SWP_HIDEWINDOW);
     if (!child) rest_={0,0,width,height};
-    nav_=CreateWindowExW(0,kNav,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP,0,0,1,1,window_,nullptr,instance,nullptr);
+    // Every child clips its siblings: the 加速曲线 window floats over the nav and the rail as their sibling, and a child
+    // without WS_CLIPSIBLINGS painted its strip over it (11-08).
+    nav_=CreateWindowExW(0,kNav,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS,0,0,1,1,window_,nullptr,instance,nullptr);
     viewport_=CreateWindowExW(WS_EX_CONTROLPARENT,kViewport,L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN|WS_CLIPSIBLINGS,0,0,1,1,window_,nullptr,instance,nullptr);
-    segment_=CreateWindowExW(0,kSegment,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP,0,0,1,1,window_,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLanguage)),instance,nullptr);
-    close_=CreateWindowExW(0,kClose,L"",WS_CHILD|WS_VISIBLE,0,0,1,1,window_,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCloseId)),instance,nullptr);
-    pause_=CreateWindowExW(0,kPause,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP,0,0,1,1,window_,nullptr,instance,nullptr);
-    for (HWND& rail:rails_) rail=CreateWindowExW(0,kRail,L"",WS_CHILD,0,0,1,1,window_,nullptr,instance,nullptr);
+    segment_=CreateWindowExW(0,kSegment,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS,0,0,1,1,window_,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLanguage)),instance,nullptr);
+    close_=CreateWindowExW(0,kClose,L"",WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS,0,0,1,1,window_,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCloseId)),instance,nullptr);
+    pause_=CreateWindowExW(0,kPause,L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_CLIPSIBLINGS,0,0,1,1,window_,nullptr,instance,nullptr);
+    for (HWND& rail:rails_) rail=CreateWindowExW(0,kRail,L"",WS_CHILD|WS_CLIPSIBLINGS,0,0,1,1,window_,nullptr,instance,nullptr);
     if (!nav_||!viewport_||!segment_||!close_||!pause_||!rails_[0]||!rails_[1]) { DestroyWindow(window_); return false; }
     knob_.Jump(UiI18n::GetLanguage()==UiI18n::Language::English?1:0); pause_knob_.Jump(HubPause::Enabled()?1:0); pause_hover_.Jump(0); pill_.Jump(NavRow(selected_)); title_.Jump(1); page_.Jump(0);
     opacity_.Jump(0); rise_.Jump(S(12));
@@ -1087,7 +1092,9 @@ void Tick() {
             BeginFade(1);
             ShowWindow(window_,SW_SHOWNA);
             SetWindowPos(window_,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            FocusHub();
+            // The focus on the nav activates the game window when it is not the active one (a test in the background:
+            // combo handsoff on); there the hub opens without taking the keyboard.
+            if (!UiCursor::HandsOff()) FocusHub();
             UiGlass::Sync(window_);
         }
     }
@@ -1172,6 +1179,8 @@ void SetMinimum(HWND page,int min_width,int min_height) {
 bool IsEmbedded(HWND child) { return child&&viewport_&&IsChild(viewport_,child); }
 bool Visible() { return window_&&IsWindowVisible(window_)&&!parked_; }
 bool ObscuresGameplay() { return window_&&IsWindowVisible(window_)&&!IsIconic(window_)&&!parked_; }
+bool SetPreviewHole(const RECT* screen) { return window_&&UiGlass::SetHole(window_,screen); }
+bool PreviewHoleSupported() { return window_&&IsWindowVisible(window_)&&!parked_&&UiGlass::CanHole(window_); }
 void RefreshChrome() {
     if (window_) InvalidateRect(window_,nullptr,FALSE);
     if (nav_) InvalidateRect(nav_,nullptr,FALSE);

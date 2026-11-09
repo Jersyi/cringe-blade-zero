@@ -15,4 +15,5 @@ void Sync(bool open);          // UI worker, every hub tick
 // running (boss rush travel / spawn) is in progress; no pause is taken or kept.
 void OnGameThread(bool hold_off);
 bool Holding();                // a pause set by the hub is active
+bool Wanted();                 // the hub is open with PauseGame on (whether or not a hold-off lets the world run)
 }

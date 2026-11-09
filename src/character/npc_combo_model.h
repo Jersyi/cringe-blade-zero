@@ -174,28 +174,86 @@ inline bool Fires(Trigger trigger, unsigned bits) {
 // weapon: a row per hero action (`routes`: button = a Trigger of the hero's actions, next = its output); while that
 // weapon is the hero's main weapon, that action (完美闪避, 处决, 简易处决, 格挡 ...) is cut and the row's wire plays
 // instead. A 处决 row takes the quick ones too unless a 简易处决 row is there; a dodge's own row goes before 任意闪避.
+// 空中派生 is a 武器派生修改 with air_set and no weapon: while the hero is in the air its rows (the NPC key or a hero
+// action, never an execution) start their wires in place of the triggers, so the air has a set of chains of its own.
+// A chain going on keeps going (a move that throws the hero up continues as wired); only a press that would start a
+// chain is taken by it. In the text it is a 武器派生修改 with weapon "_" and an "s:" mark, inert in an older build.
+// KeepChain (保持派生, ms = kKeepChainMin..kKeepChainMax) takes a trigger or a move, as 霸体 does: while the chain is at
+// such a move (playing it, or waiting after it) and goes on from there, no press of the hero ends the chain. A press
+// the chain does not take there (a dodge, an attack with no row, another trigger's button, the same trigger again) is
+// left to the game, cutting the move if one plays (the chain's own presses still wait for the 派生点); the chain stays
+// where it was and waits the node's ms (its own timer, in place of the trigger's reset time) from the move's end or
+// from the last such press, whichever is later. A chain with nothing after its move ends as before.
+// Assist (BOSS 援护, `boss` = an NPC skin id, `ability` = that look's move) does not move the hero: a press that reaches
+// it calls a copy of that boss in, an actor of its own (it jumps in from outside the camera's view, casts the move at
+// the hero's target and leaves), and the press goes on through it to the move after it, which the hero plays as usual
+// (none: the chain waits at the 援护 as after a move that has ended). It takes the modifiers a move takes: 加速, 伤害倍率,
+// 武器属性 (its trigger's), 强制受击, 无视防御, 霸体 and 无敌 act on the boss and its cast; under 允许中断 the node's next call
+// takes the place of its boss still casting (else up to three bosses are in at once); 保持派生 keeps the chain at it.
+// Hook (钩子) is the hero's own chain sickle (追命锁镰, the 影之武装 ShachiHook) as a move: the lock target (none: the
+// nearest enemy, locked for it) is hooked, and the hero pulls it over (勾过来: GA_Hun_ShachiHook_Drag) or pulls itself
+// over to it (勾过去, hook_self: GA_Hun_ShachiHook_HookMove). The weapon is held for it as for a 武器派生 (`weapon` and
+// `ability` are set from the mode, SetHookMode); it takes the modifiers and the 派生点 a 武器派生 takes. In the text it is a
+// 武器派生 of that ability with a "g:" mark, so an older build plays it as that 武器派生. 自动 (hook_auto, SetHookAuto,
+// a "q:" mark; written as 勾过来) picks the mode when it plays: a target whose guard is broken (破防) is pulled over, any
+// other the hero goes to. It is thrown where the player aims (the lock target, else an enemy under the crosshair, else
+// the ground or the wall there, which the hero flies to, whatever the mode) up to hook_dist cm away, and hook_speed
+// paces it (the hook move's time with the 加速 it takes, and the pull and flight it is carried on with); an "r:" mark
+// keeps both when either is not its default.
+// Air (滞空) takes a trigger or a move, as 霸体 does (a move the hero casts: a skill, a BOSS 技能, a 武器派生, the stick's
+// dodge; or a frame, the ones it holds): the move throws the hero up air_lift cm when it starts (as a jump of that
+// height, the hero's own gravity slowing it) and holds it in the air while it plays (air_hang percent of its gravity
+// taken away: 100 hovers); each enemy it hits is thrown up air_foe_lift cm (once per move) and held likewise
+// (air_foe_hang) while the move plays and a moment after its last hit. AirDefault (空中释放) is the chain's own: one fixed
+// node per chain, as 预输入 (never removed, no wires), with the same four values and `on`: a move cast while the hero is
+// in the air that points at no 滞空 (nor its frames or trigger) takes its values. Written as an unwired 间隔 with an
+// "f:" (滞空) or "j:" (空中释放) mark, so an older build keeps every index and ignores them. 强制受击 击飞's `launch`
+// (cm): the enemies it hits are thrown up that high (once per move; with a 滞空, the higher of the two lifts); a "u:"
+// mark keeps it when it is not kLaunchDefault.
+// 按住 (hold_ms, kHoldMin..kHoldMax): a trigger or a branch row with a hold takes its button only once it has been held
+// that long; a press of that button that is let go sooner is a tap (rows and triggers without a hold take it). When
+// one button has rows with holds, its press waits: the longest hold is taken the moment it is reached, otherwise the
+// longest hold reached when the button is let go (a tap: none).
 enum class NodeType : int { Skill, Interval, Trigger, AutoDodge, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, WeaponMove, Damage, Group, Teleport,
-                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard };
+                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirDefault };
 // One row of a branch: a press of `button` (a Trigger, the NPC key included) at least pause_ms after the press
 // before it goes on to `next`. A 自定义组合键 / 自定义按键 row is pressed with its own keys, as such a trigger is: `keys`
 // (the hero's buttons / keyboard, mouse and pad keys) in order (each within `window` ms, default kKeyWindowDefault)
 // or together (`chord`); 自定义按键 with `swallow` cancels the game's action of its keys.
-struct Route { int button = static_cast<int>(Trigger::Light); int pause_ms = 0; int next = -1; std::vector<int> keys; bool chord = false; int window = 400; bool swallow = false; };
-// The modifier slots of a node's `mods`: the 加速, 霸体, 武器属性, 允许中断, 伤害倍率, 无敌, 保留变身, 强制受击 and 无视防御 node
-// it points at (-1 none).
-enum ModSlot : int { kModSpeed, kModArmor, kModWeapon, kModInterrupt, kModDamage, kModInvincible, kModKeepLook, kModForceHit, kModIgnoreGuard, kModSlots };
+// hold_ms: 按住, how long the button must be held for this row (0: any press).
+struct Route { int button = static_cast<int>(Trigger::Light); int pause_ms = 0; int next = -1; std::vector<int> keys; bool chord = false; int window = 400; bool swallow = false;
+               int hold_ms = 0; };
+// The modifier slots of a node's `mods`: the 加速, 霸体, 武器属性, 允许中断, 伤害倍率, 无敌, 保留变身, 强制受击, 无视防御,
+// 保持派生, 裁剪 and 滞空 node it points at (-1 none).
+enum ModSlot : int { kModSpeed, kModArmor, kModWeapon, kModInterrupt, kModDamage, kModInvincible, kModKeepLook, kModForceHit, kModIgnoreGuard, kModKeepChain, kModTrim,
+                     kModAir, kModSlots };
+// Every slot empty (-1), however many slots there are.
+inline constexpr std::array<int, kModSlots> NoMods() { std::array<int, kModSlots> mods{}; for (size_t i = 0; i < mods.size(); ++i) mods[i] = -1; return mods; }
 // A node on the page's canvas: x, y its top-left (96-dpi units); next the node its exec output is wired to (-1
 // none). A branch has no `next`: each route is an output of its own. A modifier has neither. A move's `ms` is its
 // 派生点: how long after it starts the next move may cut it (0: when it ends).
 // 瞬移: how far in front of the target the hero lands (capsule centre to centre, cm) and how high above the ground.
 constexpr int kTeleportDistMin = 50, kTeleportDistMax = 1000, kTeleportDistDefault = 150, kTeleportDistStep = 10;
 constexpr int kTeleportLiftMin = 0, kTeleportLiftMax = 300, kTeleportLiftDefault = 30, kTeleportLiftStep = 5;
+// 滞空 / 空中释放: lifts (cm) and hangs (percent of the gravity taken away); a new 滞空's values and the 空中释放 ones.
+constexpr int kAirLiftMin = 0, kAirLiftMax = 1000, kAirLiftStep = 10;
+constexpr int kAirHangMin = 0, kAirHangMax = 100, kAirHangStep = 5;
+constexpr int kAirSelfLiftNew = 150, kAirSelfHangNew = 70, kAirFoeLiftNew = 200, kAirFoeHangNew = 70;
+constexpr int kAirSelfLiftDefault = 80, kAirSelfHangDefault = 60, kAirFoeLiftDefault = 80, kAirFoeHangDefault = 60;
+// 强制受击 击飞: how high the enemies it hits are thrown (cm).
+constexpr int kLaunchMin = 0, kLaunchMax = 1500, kLaunchDefault = 300, kLaunchStep = 10;
+inline int ClampAirLift(int cm) { return std::clamp(cm, kAirLiftMin, kAirLiftMax); }
+inline int ClampAirHang(int percent) { return std::clamp(percent, kAirHangMin, kAirHangMax); }
+inline int ClampLaunch(int cm) { return std::clamp(cm, kLaunchMin, kLaunchMax); }
 // 组合: its frame on the canvas (96-dpi units) and how deep frames may sit in one another.
 constexpr int kGroupMinW = 300, kGroupMinH = 180, kGroupNewW = 460, kGroupNewH = 300, kGroupMaxSize = 4000, kGroupDepthMax = 4;
 struct Node {
     NodeType type = NodeType::Skill; std::string ability; int ms = 0; int x = 0, y = 0; int next = -1;
-    int trigger = 0; bool on = true; int speed = 100; std::vector<Route> routes; std::array<int, kModSlots> mods{{-1, -1, -1, -1, -1, -1, -1, -1, -1}};
+    int trigger = 0; bool on = true; int speed = 100; std::vector<Route> routes; std::array<int, kModSlots> mods = NoMods();
     int hit = 0;  // 强制受击: its HitKind
+    int launch = kLaunchDefault;  // 强制受击 击飞: how high the enemies are thrown (cm)
+    // 滞空 / 空中释放: the hero's lift (cm) and hang (percent), the enemies' it hits; 空中释放 uses `on` too.
+    int air_lift = kAirSelfLiftNew, air_hang = kAirSelfHangNew, air_foe_lift = kAirFoeLiftNew, air_foe_hang = kAirFoeHangNew;
     std::string boss;  // BOSS 技能: the look (NPC skin id) whose move `ability` is
     std::string weapon;  // 武器派生: the weapon (backpack id) whose ability `ability` is; 处决 trigger: only this weapon's (empty: any)
     int group = -1;  // the 组合 node this node sits in (-1: none)
@@ -204,10 +262,30 @@ struct Node {
     std::vector<int> keys; bool chord = false; int window = 400;  // 自定义组合键 / 自定义按键: its buttons, together or in order (ms between two)
     bool swallow = false;  // 自定义按键: its keys' presses cancel the hero action they start (default: the game keeps them)
     int then = -1;  // 自定义组合键 / 自定义按键: its 继续派生 key (kThenOwn: its own keys again)
+    // 加速's 曲线调节: the speed follows `points` over the move (t: percent of the montage's length, 0..100; speed:
+    // percent, kSpeedMin..kSpeedMax) in place of the one `speed`. Points stay sorted by t, the first at 0 and the last
+    // at 100. Kept when the curve is switched off (so switching it on again brings it back).
+    bool curve = false;
+    // BOSS 技能 / 投技's 不变身: the hero keeps the look it has; the move's animation plays on it (retargeted: the hero's
+    // own bone lengths, the move's rotations) instead of taking the boss's look behind the blink.
+    bool own_look = false;
+    bool hook_self = false;  // 钩子: 勾过去 (the hero pulls itself to the target); false: 勾过来 (the target is pulled over)
+    bool hook_auto = false;  // 钩子: 自动 (勾过来 a target whose guard is broken, else 勾过去); hook_self is what it plays as
+    int hook_dist = 1500, hook_speed = 100;  // 钩子: the farthest aim it takes (cm) and its speed (percent): kHookDist*, kHookSpeed*
+    int hold_ms = 0;  // a trigger's 按住: how long its button must be held to start the chain (0: any press)
+    bool air_set = false;  // 武器派生修改 as 空中派生: its rows take the presses made in the air (no weapon)
+    // 裁剪: the part of the BOSS 技能 pointing at it that plays, in its montage's own time (ms): from trim_from to trim_to
+    // (0, or not after trim_from: to its end).
+    int trim_from = 0, trim_to = 0;
+    struct CurvePoint { int t = 0; int speed = 100; };
+    std::vector<CurvePoint> points;
 };
 // placed: false when the text had no places (saved before the canvas), so the page lays the nodes out once.
 struct Config { bool enabled = true; std::vector<Node> chain; bool placed = true; };
-constexpr size_t kMaxNodes = 64, kMaxRoutes = 6;
+// kMaxNodes: no limit a page reaches in use; only a guard against a broken or hostile file (memory, drawing time).
+constexpr size_t kMaxNodes = 10000, kMaxRoutes = 6;
+constexpr int kTrimMax = 60000, kTrimStep = 50;  // 裁剪, ms of the move's montage
+inline int ClampTrim(int ms) { return std::clamp(ms, 0, kTrimMax); }
 constexpr int kIntervalMin = 50, kIntervalMax = 10000, kIntervalDefault = 500, kIntervalStep = 50;
 constexpr int kResetMin = 100, kResetMax = 5000, kResetDefault = 1200, kResetStep = 100;
 constexpr int kSpeedMin = 50, kSpeedMax = 1000, kSpeedDefault = 100, kSpeedNew = 150, kSpeedStep = 10;
@@ -215,14 +293,117 @@ constexpr int kCancelMin = 0, kCancelMax = 10000, kCancelStep = 50;
 constexpr int kPauseMin = 0, kPauseMax = 10000, kPauseStep = 100;
 constexpr int kDamageMin = 0, kDamageMax = 1000, kDamageDefault = 100, kDamageNew = 200, kDamageStep = 10;
 constexpr int kPreInputMin = 0, kPreInputMax = 5000, kPreInputDefault = 300, kPreInputStep = 50;
+constexpr int kKeepChainMin = 500, kKeepChainMax = 30000, kKeepChainDefault = 3000, kKeepChainStep = 100;
+constexpr int kHoldMin = 0, kHoldMax = 5000, kHoldStep = 100;  // 按住, ms
+inline int ClampHold(int ms) { return std::clamp(ms, kHoldMin, kHoldMax); }
+// 钩子: the hero's chain sickle (the 影之武装 ShachiHook) and its two hook moves.
+constexpr const char* kHookWeapon = "ShachiHook";
+constexpr const char* kHookPull = "GA_Hun_ShachiHook_Drag";      // 勾过来
+constexpr const char* kHookGo = "GA_Hun_ShachiHook_HookMove";    // 勾过去
+// 钩子's reach (cm, from the hero: the game's own aim trace reaches 30 m) and speed (percent).
+constexpr int kHookDistMin = 300, kHookDistMax = 3000, kHookDistDefault = 1500, kHookDistStep = 50;
+constexpr int kHookSpeedMin = 50, kHookSpeedMax = 300, kHookSpeedDefault = 100, kHookSpeedStep = 10;
+inline int ClampHookDist(int cm) { return std::clamp(cm, kHookDistMin, kHookDistMax); }
+inline int ClampHookSpeed(int percent) { return std::clamp(percent, kHookSpeedMin, kHookSpeedMax); }
 constexpr int kCanvasLimit = 20000;  // node positions stay within +-this
 inline int ClampInterval(int ms) { return std::clamp(ms, kIntervalMin, kIntervalMax); }
 inline int ClampReset(int ms) { return std::clamp(ms, kResetMin, kResetMax); }
 inline int ClampSpeed(int percent) { return std::clamp(percent, kSpeedMin, kSpeedMax); }
+// 加速 曲线: at most this many points; two of them never closer than kCurveGap percent of the move.
+constexpr size_t kCurvePointsMax = 16;
+constexpr int kCurveGap = 2;
+using CurvePoint = Node::CurvePoint;
+// A curve as the editor and the ini keep it: sorted by t, clamped, two points closer than kCurveGap merged (the later
+// one kept), the ends at 0 and 100 (added at the nearest point's speed when missing), at most kCurvePointsMax points.
+inline std::vector<CurvePoint> CleanCurve(std::vector<CurvePoint> points) {
+    for (CurvePoint& p : points) { p.t = std::clamp(p.t, 0, 100); p.speed = ClampSpeed(p.speed); }
+    std::stable_sort(points.begin(), points.end(), [](const CurvePoint& a, const CurvePoint& b) { return a.t < b.t; });
+    std::vector<CurvePoint> out;
+    for (const CurvePoint& p : points) {
+        if (!out.empty() && p.t - out.back().t < kCurveGap) { out.back().speed = p.speed; if (p.t == 100) out.back().t = 100; continue; }
+        out.push_back(p);
+    }
+    if (out.empty()) out.push_back({0, kSpeedDefault});
+    if (out.front().t != 0) { if (out.front().t < kCurveGap) out.front().t = 0; else out.insert(out.begin(), CurvePoint{0, out.front().speed}); }
+    if (out.back().t != 100) { if (100 - out.back().t < kCurveGap && out.size() > 1) out.back().t = 100; else out.push_back({100, out.back().speed}); }
+    while (out.size() > kCurvePointsMax) out.erase(out.end() - 2);
+    return out;
+}
+// A new curve: the node's one speed at the start and end, twice that (at most kSpeedMax) in the middle.
+inline std::vector<CurvePoint> DefaultCurve(int speed) {
+    const int base = ClampSpeed(speed);
+    return {{0, base}, {50, ClampSpeed(base * 2)}, {100, base}};
+}
+// The curve's speed (percent, not rounded) at t01 (0..1 of the move): a monotone cubic through the points (no
+// overshoot between two points, flat where a point is a peak or a dip), held at the ends.
+inline double CurveSpeed(const std::vector<CurvePoint>& points, double t01) {
+    if (points.empty()) return kSpeedDefault;
+    if (points.size() == 1) return ClampSpeed(points[0].speed);
+    const double t = std::clamp(t01, 0.0, 1.0) * 100.0;
+    const size_t n = points.size();
+    if (t <= points.front().t) return points.front().speed;
+    if (t >= points.back().t) return points.back().speed;
+    size_t k = 0;
+    while (k + 2 < n && t >= points[k + 1].t) ++k;
+    // Fritsch-Carlson slopes at the two ends of segment k.
+    const auto delta = [&](size_t i) { const double h = points[i + 1].t - points[i].t; return h > 0 ? (points[i + 1].speed - points[i].speed) / h : 0.0; };
+    const auto slope = [&](size_t i) {
+        if (i == 0) return delta(0);
+        if (i == n - 1) return delta(n - 2);
+        const double a = delta(i - 1), b = delta(i);
+        if (a * b <= 0) return 0.0;
+        const double ha = points[i].t - points[i - 1].t, hb = points[i + 1].t - points[i].t;
+        return 3 * (ha + hb) / ((2 * hb + ha) / a + (hb + 2 * ha) / b);
+    };
+    const double h = points[k + 1].t - points[k].t;
+    if (!(h > 0)) return points[k + 1].speed;
+    const double s = (t - points[k].t) / h, y0 = points[k].speed, y1 = points[k + 1].speed;
+    const double m0 = slope(k) * h, m1 = slope(k + 1) * h;
+    const double s2 = s * s, s3 = s2 * s;
+    const double y = (2 * s3 - 3 * s2 + 1) * y0 + (s3 - 2 * s2 + s) * m0 + (-2 * s3 + 3 * s2) * y1 + (s3 - s2) * m1;
+    return std::clamp(y, static_cast<double>(kSpeedMin), static_cast<double>(kSpeedMax));
+}
+// The curve's mean speed over the move in montage time (percent): how long the move lasts is its length at this speed.
+inline double CurveMeanSpeed(const std::vector<CurvePoint>& points) {
+    // time = integral of dt / speed: the mean speed is the harmonic mean over t.
+    double time = 0; const int steps = 200;
+    for (int i = 0; i < steps; ++i) time += 1.0 / (std::max)(1.0, CurveSpeed(points, (i + 0.5) / steps));
+    return time > 0 ? steps / time : kSpeedDefault;
+}
+// Where (0..1 of the montage) a move under the curve is after `fraction` (0..1) of the time it lasts: what a preview
+// steps through when it plays the move at the curve's pace.
+inline double CurveProgress(const std::vector<CurvePoint>& points, double fraction) {
+    const int steps = 200; double total = 0;
+    for (int i = 0; i < steps; ++i) total += 1.0 / (std::max)(1.0, CurveSpeed(points, (i + 0.5) / steps));
+    const double want = std::clamp(fraction, 0.0, 1.0) * total; double at = 0;
+    for (int i = 0; i < steps; ++i) {
+        const double piece = 1.0 / (std::max)(1.0, CurveSpeed(points, (i + 0.5) / steps));
+        if (at + piece >= want) return (i + (piece > 0 ? (want - at) / piece : 0)) / steps;
+        at += piece;
+    }
+    return 1.0;
+}
+// The ini text of a curve: "~t:speed;t:speed;..." after a 加速's percent (an older build reads the percent alone).
+inline std::string CurveText(const std::vector<CurvePoint>& points) {
+    std::string text = "~";
+    for (size_t i = 0; i < points.size(); ++i) text += (i ? ";" : "") + std::to_string(points[i].t) + ":" + std::to_string(points[i].speed);
+    return text;
+}
+inline std::vector<CurvePoint> ParseCurve(const std::string& text) {
+    std::vector<CurvePoint> points; size_t at = 0;
+    while (at < text.size() && points.size() < kCurvePointsMax * 2) {
+        size_t end = text.find(';', at); if (end == std::string::npos) end = text.size();
+        const std::string piece = text.substr(at, end - at); const size_t colon = piece.find(':');
+        if (colon != std::string::npos) points.push_back({std::atoi(piece.substr(0, colon).c_str()), std::atoi(piece.substr(colon + 1).c_str())});
+        at = end + 1;
+    }
+    return points.empty() ? points : CleanCurve(points);  // nothing readable: no curve
+}
 inline int ClampPause(int ms) { return std::clamp(ms, kPauseMin, kPauseMax); }
 inline int ClampDamage(int percent) { return std::clamp(percent, kDamageMin, kDamageMax); }
 inline int ClampCancel(int ms) { return std::clamp(ms, kCancelMin, kCancelMax); }
 inline int ClampPreInput(int ms) { return std::clamp(ms, kPreInputMin, kPreInputMax); }
+inline int ClampKeepChain(int ms) { return std::clamp(ms, kKeepChainMin, kKeepChainMax); }
 inline int ClampPosition(int v) { return std::clamp(v, -kCanvasLimit, kCanvasLimit); }
 inline int ClampTeleportDist(int cm) { return std::clamp(cm, kTeleportDistMin, kTeleportDistMax); }
 inline int ClampTeleportLift(int cm) { return std::clamp(cm, kTeleportLiftMin, kTeleportLiftMax); }
@@ -301,6 +482,11 @@ inline bool WeaponTrigger(int trigger) { return trigger == static_cast<int>(Trig
 inline bool ValidWeaponAction(int button) {
     return ValidButton(button) && button != static_cast<int>(Trigger::NpcKey) && button != static_cast<int>(Trigger::Combo) && button != static_cast<int>(Trigger::Keys);
 }
+// A 空中派生 row's press: the NPC key or a hero action (never an execution, nor own keys).
+inline bool ValidAirAction(int button) {
+    return button == static_cast<int>(Trigger::NpcKey) || (ValidWeaponAction(button) && !WeaponTrigger(button));
+}
+inline bool IsAirSet(const Node& node) { return node.type == NodeType::WeaponActions && node.air_set; }
 // A node that starts chains (a trigger, a 武器派生修改), and one whose outputs are its rows (a branch, a 武器派生修改).
 inline bool StartsChain(const Node& node) { return node.type == NodeType::Trigger || node.type == NodeType::WeaponActions; }
 inline bool HasRows(const Node& node) { return node.type == NodeType::Branch || node.type == NodeType::WeaponActions; }
@@ -333,40 +519,62 @@ inline bool IsMove(const Node& node) {
     return node.type == NodeType::AutoDodge || node.type == NodeType::Group || node.type == NodeType::Teleport || node.type == NodeType::HeroLook ||
            (node.type == NodeType::Look && !node.boss.empty()) ||
            ((node.type == NodeType::Skill || node.type == NodeType::Grab) && !node.ability.empty()) ||
-           (node.type == NodeType::BossSkill && !node.ability.empty() && !node.boss.empty()) ||
-           (node.type == NodeType::WeaponMove && !node.ability.empty() && !node.weapon.empty());
+           ((node.type == NodeType::BossSkill || node.type == NodeType::Assist) && !node.ability.empty() && !node.boss.empty()) ||
+           (node.type == NodeType::WeaponMove && !node.ability.empty() && !node.weapon.empty()) || node.type == NodeType::Hook;
 }
+// A move the hero plays with a weapon held for it (武器派生, 钩子: `weapon`, `ability`).
+inline bool CastsWeapon(const Node& node) { return node.type == NodeType::WeaponMove || node.type == NodeType::Hook; }
+// 钩子: its mode sets the weapon and the ability it casts.
+// ResolveHook: the move it plays now (自动 stays 自动).
+inline void ResolveHook(Node& node, bool self) { node.hook_self = self; node.weapon = kHookWeapon; node.ability = self ? kHookGo : kHookPull; }
+inline void SetHookMode(Node& node, bool self) { node.hook_auto = false; ResolveHook(node, self); }
+inline void SetHookAuto(Node& node) { ResolveHook(node, false); node.hook_auto = true; }
+inline Node HookNode(int x, int y, bool self = false) { Node node; node.type = NodeType::Hook; node.x = x; node.y = y; SetHookMode(node, self); return node; }
+inline bool HookAbility(const std::string& weapon, const std::string& ability) { return weapon == kHookWeapon && (ability == kHookPull || ability == kHookGo); }
+// A node whose look and move are picked from a boss (BOSS 技能, BOSS 援护).
+inline bool PicksBossMove(const Node& node) { return node.type == NodeType::BossSkill || node.type == NodeType::Assist; }
 // A move node whose move is unknown (a bad name, a BOSS 技能 or 投技 not picked yet): a press passes through it.
 inline bool EmptyMove(const Node& node) {
-    return ((node.type == NodeType::Skill || node.type == NodeType::Grab) && node.ability.empty()) || (node.type == NodeType::BossSkill && (node.ability.empty() || node.boss.empty())) ||
+    return ((node.type == NodeType::Skill || node.type == NodeType::Grab) && node.ability.empty()) ||
+           ((node.type == NodeType::BossSkill || node.type == NodeType::Assist) && (node.ability.empty() || node.boss.empty())) ||
            (node.type == NodeType::Look && node.boss.empty()) ||
            (node.type == NodeType::WeaponMove && (node.ability.empty() || node.weapon.empty()));
 }
 inline bool IsModifier(const Node& node) {
     return node.type == NodeType::Speed || node.type == NodeType::Weapon || node.type == NodeType::Armor || node.type == NodeType::Interrupt ||
            node.type == NodeType::Damage || node.type == NodeType::Invincible || node.type == NodeType::KeepLook || node.type == NodeType::ForceHit ||
-           node.type == NodeType::IgnoreGuard;
+           node.type == NodeType::IgnoreGuard || node.type == NodeType::KeepChain || node.type == NodeType::Trim || node.type == NodeType::Air;
 }
 // A modifier's slot in `mods` (-1: not a modifier).
 inline int SlotOf(NodeType type) {
     return type == NodeType::Speed ? kModSpeed : type == NodeType::Armor ? kModArmor : type == NodeType::Weapon ? kModWeapon : type == NodeType::Interrupt ? kModInterrupt :
            type == NodeType::Damage ? kModDamage : type == NodeType::Invincible ? kModInvincible : type == NodeType::KeepLook ? kModKeepLook :
-           type == NodeType::ForceHit ? kModForceHit : type == NodeType::IgnoreGuard ? kModIgnoreGuard : -1;
+           type == NodeType::ForceHit ? kModForceHit : type == NodeType::IgnoreGuard ? kModIgnoreGuard : type == NodeType::KeepChain ? kModKeepChain : type == NodeType::Trim ? kModTrim :
+           type == NodeType::Air ? kModAir : -1;
+}
+// A move 滞空 / 空中释放 act on: one the hero casts and moves in (not a 钩子 or a 瞬移, which carry the hero their own
+// way, nor a 投技, a 援护 or a look change).
+inline bool TakesAir(const Node& node) {
+    return node.type == NodeType::Skill || node.type == NodeType::BossSkill || node.type == NodeType::WeaponMove || node.type == NodeType::AutoDodge;
 }
 // May node `from` point at modifier `mod`: a trigger may point at any; a move at 加速 / 霸体 / 允许中断 / 伤害倍率 / 无敌 /
-// 强制受击 / 无视防御;
+// 强制受击 / 无视防御 / 保持派生;
 // 保留变身 only a trigger, a BOSS 技能 or a frame (the BOSS 技能 it holds).
 inline bool ModifierFits(const std::vector<Node>& chain, int from, int mod) {
     if (from < 0 || mod < 0 || static_cast<size_t>(from) >= chain.size() || static_cast<size_t>(mod) >= chain.size() || from == mod) return false;
     const Node& source = chain[static_cast<size_t>(from)]; const Node& target = chain[static_cast<size_t>(mod)];
     if (!IsModifier(target)) return false;
     if (target.type == NodeType::KeepLook) return StartsChain(source) || source.type == NodeType::BossSkill || source.type == NodeType::Group;
+    if (target.type == NodeType::Trim) return source.type == NodeType::BossSkill;  // its own montage's part
+    if (target.type == NodeType::Air) return StartsChain(source) || TakesAir(source) || source.type == NodeType::Group;
     if (source.type == NodeType::Grab) return target.type == NodeType::Interrupt;
     return StartsChain(source) ||
            (target.type != NodeType::Weapon && IsMove(source) && source.type != NodeType::Grab && source.type != NodeType::Look && source.type != NodeType::HeroLook);
 }
 // A 变身 / 变回主角 node (set or not).
 inline bool IsLookChange(const Node& node) { return node.type == NodeType::Look || node.type == NodeType::HeroLook; }
+// Nodes with a 不变身 choice: a BOSS 技能 or a 投技 (both take a boss's look by default).
+inline bool TakesOwnLook(const Node& node) { return node.type == NodeType::BossSkill || node.type == NodeType::Grab; }
 // Can node `from` point at any modifier (has the pin for it)?
 inline bool TakesModifiers(const Node& node) { return StartsChain(node) || (IsMove(node) && !IsLookChange(node)); }
 // A node chains start from (a trigger or a 武器派生修改): no exec wire goes into it.
@@ -382,14 +590,23 @@ inline Node WeaponActionsNode(int x, int y) {
     for (const Trigger t : {Trigger::PerfectDodge, Trigger::Execution, Trigger::SimpleExecution, Trigger::Stance}) { Route route; route.button = static_cast<int>(t); node.routes.push_back(route); }
     return node;
 }
-// Does the config have a 武器派生修改 (the hero's presses then name the main weapon)?
+// Does the config have a 武器派生修改 (the hero's presses then name the main weapon)? A 空中派生 names none.
 inline bool HasWeaponActions(const Config& config) {
-    for (const Node& node : config.chain) if (node.type == NodeType::WeaponActions) return true;
+    for (const Node& node : config.chain) if (node.type == NodeType::WeaponActions && !node.air_set) return true;
     return false;
 }
-// A 加速 (×1.5), 伤害倍率 (200%), 武器属性, 霸体, 允许中断, 无敌, 保留变身 or 强制受击 (击飞) node; nothing points at it yet.
+// A 空中派生 with the rows 轻攻击, 重攻击, 影之武装, 战技 and NPC 技能键 (unwired).
+inline Node AirSetNode(int x, int y) {
+    Node node; node.type = NodeType::WeaponActions; node.air_set = true; node.ms = kResetDefault; node.x = x; node.y = y;
+    for (const Trigger t : {Trigger::Light, Trigger::Heavy, Trigger::Shachi, Trigger::CombatArt, Trigger::NpcKey}) { Route route; route.button = static_cast<int>(t); node.routes.push_back(route); }
+    return node;
+}
+// A 加速 (×1.5), 伤害倍率 (200%), 武器属性, 霸体, 允许中断, 无敌, 保留变身, 强制受击 (击飞), 无视防御 or 保持派生 (3 s) node;
+// nothing points at it yet.
 inline Node ModifierNode(NodeType type, int x, int y) {
-    Node node; node.type = type; node.speed = type == NodeType::Damage ? kDamageNew : kSpeedNew; node.x = x; node.y = y; return node;
+    Node node; node.type = type; node.speed = type == NodeType::Damage ? kDamageNew : kSpeedNew; node.x = x; node.y = y;
+    if (type == NodeType::KeepChain) node.ms = kKeepChainDefault;
+    return node;
 }
 // The NPC skill key's trigger node (-1 when there is none).
 inline int KeyTrigger(const Config& config) {
@@ -401,6 +618,8 @@ inline int KeyTrigger(const Config& config) {
 inline void EnsureKey(Config& config) { if (KeyTrigger(config) < 0) config.chain.push_back(TriggerNode(Trigger::NpcKey, 24, 24)); }
 // 预输入: the chain's one fixed node (never removed, no wires).
 inline bool IsPreInput(const Node& node) { return node.type == NodeType::PreInput; }
+// The chain's fixed settings (预输入, 空中释放): never removed, no wires, not in a frame.
+inline bool IsSetting(const Node& node) { return node.type == NodeType::PreInput || node.type == NodeType::AirDefault; }
 inline int PreInputNode(const Config& config) {
     for (size_t i = 0; i < config.chain.size(); ++i) if (IsPreInput(config.chain[i])) return static_cast<int>(i);
     return -1;
@@ -421,17 +640,39 @@ inline void EnsurePreInput(Config& config) {
     Node node; node.type = NodeType::PreInput; node.ms = kPreInputDefault; node.x = ClampPosition(x); node.y = ClampPosition(y - 120);
     config.chain.push_back(node);
 }
+// 空中释放: the chain's other fixed node (on, kAir*Default), placed right of the 预输入.
+inline int AirDefaultNode(const Config& config) {
+    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].type == NodeType::AirDefault) return static_cast<int>(i);
+    return -1;
+}
+inline Node AirDefaultSetting(int x, int y) {
+    Node node; node.type = NodeType::AirDefault; node.on = true; node.x = ClampPosition(x); node.y = ClampPosition(y);
+    node.air_lift = kAirSelfLiftDefault; node.air_hang = kAirSelfHangDefault; node.air_foe_lift = kAirFoeLiftDefault; node.air_foe_hang = kAirFoeHangDefault;
+    return node;
+}
+inline void EnsureAirDefault(Config& config) {
+    if (AirDefaultNode(config) >= 0) return;
+    const int pre = PreInputNode(config);
+    int x = 24, y = 24;
+    if (pre >= 0) { x = config.chain[static_cast<size_t>(pre)].x + 460; y = config.chain[static_cast<size_t>(pre)].y; }
+    else if (!config.chain.empty()) {
+        x = y = kCanvasLimit;
+        for (const Node& n : config.chain) { x = (std::min)(x, n.x); y = (std::min)(y, n.y); }
+        y -= 120;
+    }
+    config.chain.push_back(AirDefaultSetting(x, y));
+}
 
 // A node's exec outputs: one, one per row of a branch or a 武器派生修改, none for a modifier (its wire is not an exec
 // wire).
-inline size_t OutCount(const Node& node) { return HasRows(node) ? node.routes.size() : IsModifier(node) || IsPreInput(node) ? 0 : 1; }
+inline size_t OutCount(const Node& node) { return HasRows(node) ? node.routes.size() : IsModifier(node) || IsSetting(node) ? 0 : 1; }
 inline int OutOf(const Node& node, size_t out) {
-    if (IsModifier(node) || IsPreInput(node)) return -1;
+    if (IsModifier(node) || IsSetting(node)) return -1;
     if (HasRows(node)) return out < node.routes.size() ? node.routes[out].next : -1;
     return out == 0 ? node.next : -1;
 }
 inline void SetOut(Node& node, size_t out, int to) {
-    if (IsModifier(node) || IsPreInput(node)) return;
+    if (IsModifier(node) || IsSetting(node)) return;
     if (HasRows(node)) { if (out < node.routes.size()) node.routes[out].next = to; }
     else if (out == 0) node.next = to;
 }
@@ -471,8 +712,8 @@ inline void Link(Config& config, int from, int to, size_t out = 0) {
     const int count = static_cast<int>(config.chain.size());
     if (from < 0 || from >= count || to < -1 || to >= count || from == to) return;
     Node& node = config.chain[static_cast<size_t>(from)];
-    if (IsModifier(node) || IsPreInput(node)) return;
-    if (to >= 0 && (IsTrigger(config, to) || IsModifier(config.chain[static_cast<size_t>(to)]) || IsPreInput(config.chain[static_cast<size_t>(to)]))) return;
+    if (IsModifier(node) || IsSetting(node)) return;
+    if (to >= 0 && (IsTrigger(config, to) || IsModifier(config.chain[static_cast<size_t>(to)]) || IsSetting(config.chain[static_cast<size_t>(to)]))) return;
     SetOut(node, out, to);
 }
 // Points node `from` at modifier `mod` (replacing what it pointed at in that modifier's slot); false when it may not.
@@ -501,7 +742,7 @@ inline Pointers PointersTo(const Config& config, int mod) {
 // (a branch takes it on its first row).
 inline int InsertAfter(Config& config, int after, Node node, size_t out = 0) {
     if (config.chain.size() >= kMaxNodes) return -1;
-    const bool wire = after >= 0 && static_cast<size_t>(after) < config.chain.size() && !StartsChain(node) && !IsModifier(node) && !IsPreInput(node) &&
+    const bool wire = after >= 0 && static_cast<size_t>(after) < config.chain.size() && !StartsChain(node) && !IsModifier(node) && !IsSetting(node) &&
                       out < OutCount(config.chain[static_cast<size_t>(after)]);
     const int fed = wire ? OutOf(config.chain[static_cast<size_t>(after)], out) : -1;
     node.next = -1; node.mods.fill(-1);
@@ -527,9 +768,9 @@ inline int Tail(const Config& config, int trigger) {
     }
 }
 // Removes a node; every exec wire into it goes on to what its first output fed, so the chain stays joined; arrows
-// into a removed modifier go. The 预输入 node stays.
+// into a removed modifier go. The 预输入 and 空中释放 nodes stay.
 inline void Remove(Config& config, size_t index) {
-    if (index >= config.chain.size() || IsPreInput(config.chain[index])) return;
+    if (index >= config.chain.size() || IsSetting(config.chain[index])) return;
     const int gone = static_cast<int>(index);
     const int parent = config.chain[index].group;  // a removed 组合's nodes go to the frame it sat in
     int after = OutOf(config.chain[index], 0); if (after == gone) after = -1;
@@ -555,7 +796,9 @@ inline void Remove(Config& config, size_t index) {
 // combo: the 自定义组合键 trigger whose keys were pressed (-1: none); branch, row: the 自定义组合键 / 自定义按键 branch row
 // whose keys were pressed (-1: none; bits then hold that row's button). then: a press of the 继续派生 key of the
 // 自定义按键 chain going on (bits 0: it starts nothing).
-struct Press { unsigned bits = 0; bool key = false; std::string weapon; int combo = -1; int branch = -1, row = -1; bool then = false; };
+// hold_ms: how long the button has been held when the press is taken (按住; 0: the moment it went down).
+// airborne: the hero was in the air at the press (a 空中派生 takes it).
+struct Press { unsigned bits = 0; bool key = false; std::string weapon; int combo = -1; int branch = -1, row = -1; bool then = false; int hold_ms = 0; bool airborne = false; };
 inline bool Matches(int button, const Press& press) {
     if (button == kThenKeyButton) return press.then;
     if (press.then) return false;
@@ -568,8 +811,10 @@ inline bool Matches(int button, const Press& press) {
 // to a move means the same button again. A branch takes the row of the pressed button whose pause has passed
 // (since_ms: since the press before, the last press the chain took; -1: none), the longest such pause when several
 // do; an unwired row never matches. A 自定义组合键 / 自定义按键 row matches only its own keys (Press::branch / row).
-// branch, row: the branch row the hop took (-1: none).
-struct Hop { int move = -1; int wait_ms = 0; int button = 0; int pause_ms = 0; int branch = -1, row = -1; };
+// branch, row: the branch row the hop took (-1: none). assists: the BOSS 援护 nodes the press passed on its way to
+// `move` (they are called in as it plays); a press that meets nothing to play after a 援护 has that 援护 as its move.
+// hold_ms: the 按住 of the branch row the hop took (0: none).
+struct Hop { int move = -1; int wait_ms = 0; int button = 0; int pause_ms = 0; int branch = -1, row = -1; std::vector<int> assists; int hold_ms = 0; };
 // Is this row's press its keys (a 自定义组合键 / 自定义按键 row), and are they enough to press (2 to 6 buttons; 1 to 6 keys)?
 inline bool KeysRoute(const Route& route) { return OwnKeysTrigger(route.button); }
 inline bool KeysRouteReady(const Route& route) {
@@ -581,14 +826,17 @@ inline bool KeysRouteReady(const Route& route) {
 }
 // How specific a hero action is among those one press fires: a dodge's own over 任意闪避, 简易处决 over 处决.
 inline int ActionRank(int button) { return button == static_cast<int>(Trigger::AnyDodge) || button == static_cast<int>(Trigger::Execution) ? 0 : 1; }
-// The row of a 武器派生修改 a press takes (-1: none): its weapon is the press's, the row is wired and fires on the
-// press; the most specific such row (ActionRank), the first of those.
+// The row of a 武器派生修改 a press takes (-1: none): its weapon is the press's (a 空中派生: the press was made in the
+// air), the row is wired and fires on the press; the most specific such row (ActionRank), the first of those.
 inline int WeaponActionsRow(const Node& node, const Press& press) {
-    if (node.type != NodeType::WeaponActions || !node.on || node.weapon.empty() || press.key || node.weapon != press.weapon) return -1;
+    if (node.type != NodeType::WeaponActions || !node.on) return -1;
+    if (node.air_set ? !press.airborne : node.weapon.empty() || press.key || node.weapon != press.weapon) return -1;
     int best = -1;
     for (size_t r = 0; r < node.routes.size(); ++r) {
         const Route& route = node.routes[r];
-        if (route.next < 0 || !ValidWeaponAction(route.button) || !Fires(static_cast<Trigger>(route.button), press.bits)) continue;
+        if (route.next < 0) continue;
+        if (node.air_set ? !ValidAirAction(route.button) || !Matches(route.button, press) :
+                           !ValidWeaponAction(route.button) || !Fires(static_cast<Trigger>(route.button), press.bits)) continue;
         if (best < 0 || ActionRank(route.button) > ActionRank(node.routes[static_cast<size_t>(best)].button)) best = static_cast<int>(r);
     }
     return best;
@@ -607,45 +855,72 @@ inline Hop Follow(const Config& config, int from, int button, const Press& press
         if (row < 0) return {};
         hop.button = start.routes[static_cast<size_t>(row)].button; i = start.routes[static_cast<size_t>(row)].next;
     }
+    // Past a BOSS 援护 a press that finds nothing more to play stops at the last 援护 (it is the hop's move).
+    const auto rest = [&]() -> Hop {
+        if (hop.assists.empty()) return {};
+        Hop last = hop; last.move = last.assists.back(); last.assists.pop_back();
+        if (then && last.branch < 0) last.button = ThenButton(origin);
+        last.wait_ms = (std::min)(last.wait_ms, kIntervalMax * 4); return last;
+    };
     while (i >= 0 && i < count && !seen[static_cast<size_t>(i)]) {
         seen[static_cast<size_t>(i)] = true;
         const Node& node = config.chain[static_cast<size_t>(i)];
         if (node.type == NodeType::Interval) { hop.wait_ms += ClampInterval(node.ms); i = node.next; continue; }
         if (EmptyMove(node)) { i = node.next; continue; }  // a bad name passes on
+        if (node.type == NodeType::Assist) {  // called in on the way: the press goes on to what follows
+            if (!Matches(hop.button, press)) return {};
+            hop.assists.push_back(i); i = node.next; continue;
+        }
         if (IsMove(node)) {
             if (!Matches(hop.button, press)) return {};
             if (then && hop.branch < 0) hop.button = ThenButton(origin);
             hop.move = i; hop.wait_ms = (std::min)(hop.wait_ms, kIntervalMax * 4); return hop;
         }
-        if (node.type != NodeType::Branch) return {};
+        if (node.type != NodeType::Branch) return rest();
+        if (!hop.assists.empty()) return rest();  // a branch after a 援护 is the next press's
+        // The longest hold the press has reached first (按住), then the longest pause.
         int best = -1;
         for (size_t r = 0; r < node.routes.size(); ++r) {
             const Route& route = node.routes[r];
             if (route.next < 0) continue;
             if (KeysRoute(route) ? press.branch != i || press.row != static_cast<int>(r) || !KeysRouteReady(route) : !Matches(route.button, press)) continue;
-            const int pause = ClampPause(route.pause_ms);
+            const int pause = ClampPause(route.pause_ms), hold = ClampHold(route.hold_ms);
             if (pause > 0 && (since_ms < 0 || since_ms < pause)) continue;
-            if (best < 0 || pause > ClampPause(node.routes[static_cast<size_t>(best)].pause_ms)) best = static_cast<int>(r);
+            if (hold > press.hold_ms) continue;
+            if (best < 0) { best = static_cast<int>(r); continue; }
+            const Route& was = node.routes[static_cast<size_t>(best)];
+            const int was_hold = ClampHold(was.hold_ms);
+            if (hold > was_hold || (hold == was_hold && pause > ClampPause(was.pause_ms))) best = static_cast<int>(r);
         }
         if (best < 0) return {};
         hop.button = node.routes[static_cast<size_t>(best)].button; hop.pause_ms = ClampPause(node.routes[static_cast<size_t>(best)].pause_ms);
+        hop.hold_ms = ClampHold(node.routes[static_cast<size_t>(best)].hold_ms);
         hop.branch = i; hop.row = best;
         i = node.routes[static_cast<size_t>(best)].next;
     }
-    return {};
+    return rest();
 }
-// The trigger a press starts (an `on` trigger with a chain whose button it is; -1 none). A 武器派生修改 of the press's
-// weapon with a row for it goes first.
+// The trigger a press starts (an `on` trigger with a chain whose button it is and whose 按住 the press has reached; -1
+// none): the one with the longest such hold, the first of those. A 空中派生 with a row for a press made in the air goes
+// first, then a 武器派生修改 of the press's weapon with a row for it.
 inline int TriggerFor(const Config& config, const Press& press) {
+    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].air_set && WeaponActionsRow(config.chain[i], press) >= 0) return static_cast<int>(i);
     for (size_t i = 0; i < config.chain.size(); ++i) if (WeaponActionsRow(config.chain[i], press) >= 0) return static_cast<int>(i);
+    int best = -1;
     for (size_t i = 0; i < config.chain.size(); ++i) {
         const Node& node = config.chain[i];
         if (node.type == NodeType::Trigger && node.on && node.next >= 0 && Matches(node.trigger, press) &&
             (!WeaponTrigger(node.trigger) || node.weapon.empty() || node.weapon == press.weapon) &&
-            (!OwnKeysTrigger(node.trigger) || press.combo == static_cast<int>(i)))
-            return static_cast<int>(i);
+            (!OwnKeysTrigger(node.trigger) || press.combo == static_cast<int>(i)) && ClampHold(node.hold_ms) <= press.hold_ms &&
+            (best < 0 || ClampHold(node.hold_ms) > ClampHold(config.chain[static_cast<size_t>(best)].hold_ms)))
+            best = static_cast<int>(i);
     }
-    return -1;
+    return best;
+}
+// The 按住 a trigger or a 武器派生修改 needs (a 武器派生修改: none).
+inline int TriggerHold(const Config& config, int start) {
+    return start >= 0 && static_cast<size_t>(start) < config.chain.size() && config.chain[static_cast<size_t>(start)].type == NodeType::Trigger ?
+           ClampHold(config.chain[static_cast<size_t>(start)].hold_ms) : 0;
 }
 // The button a chain starts on from `start`: a trigger's own, or the 武器派生修改 row the press takes (-1: none).
 inline int StartButton(const Config& config, int start, const Press& press) {
@@ -770,7 +1045,8 @@ inline int MaxPause(const Config& config, int move) {
 // A move's 派生点 in ms from its start (0: none, it is cut when it ends).
 inline int CancelOf(const Config& config, int move) {
     if (move < 0 || static_cast<size_t>(move) >= config.chain.size() || !IsMove(config.chain[static_cast<size_t>(move)]) ||
-        config.chain[static_cast<size_t>(move)].type == NodeType::Grab || IsLookChange(config.chain[static_cast<size_t>(move)])) return 0;
+        config.chain[static_cast<size_t>(move)].type == NodeType::Grab || config.chain[static_cast<size_t>(move)].type == NodeType::Assist ||
+        IsLookChange(config.chain[static_cast<size_t>(move)])) return 0;
     return ClampCancel(config.chain[static_cast<size_t>(move)].ms);
 }
 // When the next move may cut a playing one, in ms from its start: its 派生点 or the end of the intervals straight
@@ -850,6 +1126,34 @@ inline int ModOf(const Config& config, int from, int slot) {
     const int mod = config.chain[static_cast<size_t>(from)].mods[static_cast<size_t>(slot)];
     return mod >= 0 && static_cast<size_t>(mod) < config.chain.size() && SlotOf(config.chain[static_cast<size_t>(mod)].type) == slot ? mod : -1;
 }
+// 裁剪: the part of a move that plays (seconds of its montage). A BOSS 技能 pointing at a 裁剪 node (its own arrow only):
+// from trim_from to trim_to; `to` 0 means to the end (also a trim_to not after trim_from).
+struct TrimRange { bool on = false; double from = 0, to = 0; };
+inline TrimRange TrimOf(const Node& trim) {
+    TrimRange r; r.from = ClampTrim(trim.trim_from) / 1000.0;
+    const int to = ClampTrim(trim.trim_to); r.to = to > ClampTrim(trim.trim_from) ? to / 1000.0 : 0;
+    r.on = r.from > 0 || r.to > 0; return r;
+}
+inline TrimRange TrimFor(const Config& config, int index) {
+    if (index < 0 || static_cast<size_t>(index) >= config.chain.size() || config.chain[static_cast<size_t>(index)].type != NodeType::BossSkill) return {};
+    const int mod = ModOf(config, index, kModTrim);
+    return mod >= 0 ? TrimOf(config.chain[static_cast<size_t>(mod)]) : TrimRange{};
+}
+// The part's span on a montage `length` s long (to the end when `to` is 0 or past it; 0 when nothing is left).
+inline double TrimSpan(const TrimRange& r, double length) {
+    const double end = r.to > 0 && (length <= 0 || r.to < length) ? r.to : length;
+    return end > r.from ? end - r.from : 0;
+}
+// Where a 加速 curve is along a trimmed move: the part's own progress (0..1).
+inline double TrimProgress(const TrimRange& r, double position, double length) {
+    const double span = TrimSpan(r, length);
+    return span > 0 ? std::clamp((position - r.from) / span, 0.0, 1.0) : (length > 0 ? std::clamp(position / length, 0.0, 1.0) : 0.0);
+}
+// The first BOSS 技能 pointing at a 裁剪 node (-1: none).
+inline int TrimmedBy(const Config& config, int trim) {
+    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].type == NodeType::BossSkill && ModOf(config, static_cast<int>(i), kModTrim) == trim) return static_cast<int>(i);
+    return -1;
+}
 // ---- 组合 ----
 // A 组合 (Group) is one move of the chain made of the nodes in its frame (`group` = its index), played straight one
 // after another without a press: each starts at the 派生点 of the one before (or its end, or the end of the intervals
@@ -862,7 +1166,7 @@ inline bool IsGroup(const Config& config, int index) {
 }
 // May this node sit in a frame (moves, 组合 and intervals; never triggers, branches or modifiers)?
 inline bool Groupable(const Node& node) {
-    return !StartsChain(node) && !HasRows(node) && !IsModifier(node) && !IsPreInput(node);
+    return !StartsChain(node) && !HasRows(node) && !IsModifier(node) && !IsSetting(node);
 }
 // Does node `index` sit in frame `group`, directly or through frames inside it?
 inline bool InGroup(const Config& config, int index, int group) {
@@ -944,13 +1248,34 @@ inline int ModFor(const Config& config, int trigger, int move, int slot) {
     return mod >= 0 ? mod : ModOf(config, trigger, slot);
 }
 // The speed a move of `trigger`'s chain plays at, in percent: the 加速 node the move points at, else its frames',
-// else the one the trigger points at, else 100.
+// else the one the trigger points at, else 100 (a curve: its mean pace; the game thread follows the curve itself).
+// A 钩子 plays at that times its own speed.
 inline int SpeedFor(const Config& config, int trigger, int move) {
-    if (move >= 0 && static_cast<size_t>(move) < config.chain.size() && config.chain[static_cast<size_t>(move)].type == NodeType::Grab) return kSpeedDefault;
-    if (move >= 0 && static_cast<size_t>(move) < config.chain.size() && config.chain[static_cast<size_t>(move)].type == NodeType::Grab) return kSpeedDefault;
+    const Node* own = move >= 0 && static_cast<size_t>(move) < config.chain.size() ? &config.chain[static_cast<size_t>(move)] : nullptr;
+    if (own && own->type == NodeType::Grab) return kSpeedDefault;
     const int mod = ModFor(config, trigger, move, kModSpeed);
-    return mod < 0 ? kSpeedDefault : ClampSpeed(config.chain[static_cast<size_t>(mod)].speed);
+    int percent = kSpeedDefault;
+    if (mod >= 0) {
+        const Node& speed = config.chain[static_cast<size_t>(mod)];
+        // 曲线调节: its mean pace (how long the move lasts under it).
+        percent = speed.curve && speed.points.size() >= 2 ? ClampSpeed(static_cast<int>(std::lround(CurveMeanSpeed(speed.points)))) : ClampSpeed(speed.speed);
+    }
+    if (own && own->type == NodeType::Hook) percent = ClampSpeed(static_cast<int>(std::lround(percent * ClampHookSpeed(own->hook_speed) / 100.0)));
+    return percent;
 }
+// A 钩子's own speed as a factor (1 for any other node).
+inline double HookPace(const Config& config, int move) {
+    const Node* own = move >= 0 && static_cast<size_t>(move) < config.chain.size() ? &config.chain[static_cast<size_t>(move)] : nullptr;
+    return own && own->type == NodeType::Hook ? ClampHookSpeed(own->hook_speed) / 100.0 : 1.0;
+}
+// The 加速 node a move of `trigger`'s chain takes (as SpeedFor picks it), or null; a grab takes none.
+inline const Node* SpeedNodeFor(const Config& config, int trigger, int move) {
+    if (move >= 0 && static_cast<size_t>(move) < config.chain.size() && config.chain[static_cast<size_t>(move)].type == NodeType::Grab) return nullptr;
+    const int mod = ModFor(config, trigger, move, kModSpeed);
+    return mod < 0 ? nullptr : &config.chain[static_cast<size_t>(mod)];
+}
+// Does that 加速 follow a curve (2+ points, 曲线调节 on)?
+inline bool CurveOn(const Node* speed) { return speed && speed->type == NodeType::Speed && speed->curve && speed->points.size() >= 2; }
 // Is a move of `trigger`'s chain under 霸体 (the move, a frame it sits in or the trigger points at a 霸体 node)?
 inline bool ArmorFor(const Config& config, int trigger, int move) {
     return ModFor(config, trigger, move, kModArmor) >= 0;
@@ -965,6 +1290,12 @@ inline bool InvincibleFor(const Config& config, int trigger, int move) {
 inline bool IgnoreGuardFor(const Config& config, int trigger, int move) {
     if (move >= 0 && static_cast<size_t>(move) < config.chain.size() && config.chain[static_cast<size_t>(move)].type == NodeType::Grab) return false;
     return ModFor(config, trigger, move, kModIgnoreGuard) >= 0;
+}
+// 保持派生 at the chain's place `at` (a move it plays or waits after; a trigger, a 组合): its time in ms, from the move,
+// a frame it sits in or the trigger (0: none, the chain ends on a press it does not take as before).
+inline int KeepChainFor(const Config& config, int trigger, int at) {
+    const int mod = ModFor(config, trigger, at, kModKeepChain);
+    return mod < 0 ? 0 : ClampKeepChain(config.chain[static_cast<size_t>(mod)].ms);
 }
 // Is the look a BOSS 技能 of `trigger`'s chain takes kept after it (保留变身: the move, a frame it sits in or the
 // trigger points at one)? Only a BOSS 技能 takes a look of its own.
@@ -983,6 +1314,61 @@ inline int ForceHitFor(const Config& config, int trigger, int move) {
     if (move >= 0 && static_cast<size_t>(move) < config.chain.size() && config.chain[static_cast<size_t>(move)].type == NodeType::Grab) return -1;
     const int mod = ModFor(config, trigger, move, kModForceHit);
     return mod < 0 ? -1 : ClampHitKind(config.chain[static_cast<size_t>(mod)].hit);
+}
+// How high a move of `trigger`'s chain throws the enemies it hits under a 强制受击 击飞 (cm; 0: none, or not 击飞).
+inline int ForceLaunchFor(const Config& config, int trigger, int move) {
+    const int kind = ForceHitFor(config, trigger, move);
+    if (kind != static_cast<int>(HitKind::Launch)) return 0;
+    return ClampLaunch(config.chain[static_cast<size_t>(ModFor(config, trigger, move, kModForceHit))].launch);
+}
+// 滞空 for a move of `trigger`'s chain: the 滞空 node it points at (else its frames', else the trigger's); with none,
+// the 空中释放 values when it is cast in the air (`airborne`) and 空中释放 is on. `fixed`: those are 空中释放's.
+struct AirSet { bool on = false, fixed = false; int self_lift = 0, self_hang = 0, foe_lift = 0, foe_hang = 0; };
+inline AirSet AirFor(const Config& config, int trigger, int move, bool airborne) {
+    AirSet set;
+    if (move < 0 || static_cast<size_t>(move) >= config.chain.size() || !TakesAir(config.chain[static_cast<size_t>(move)])) return set;
+    int from = ModFor(config, trigger, move, kModAir);
+    if (from < 0) {
+        from = AirDefaultNode(config);
+        if (!airborne || from < 0 || !config.chain[static_cast<size_t>(from)].on) return set;
+        set.fixed = true;
+    }
+    const Node& node = config.chain[static_cast<size_t>(from)];
+    set.on = true; set.self_lift = ClampAirLift(node.air_lift); set.self_hang = ClampAirHang(node.air_hang);
+    set.foe_lift = ClampAirLift(node.air_foe_lift); set.foe_hang = ClampAirHang(node.air_foe_hang);
+    return set;
+}
+// The hero's skills 空中释放 acts on when the game plays them (not chain moves): 影之武装, 战技, 特殊攻击. The light and
+// heavy attacks keep the game's own air attacks; dodges, jumps and 格挡 their own movement.
+inline constexpr unsigned kOwnAirSkills = (1u << static_cast<int>(Trigger::Shachi)) | (1u << static_cast<int>(Trigger::CombatArt)) |
+                                          (1u << static_cast<int>(Trigger::Special));
+// Executions are played with their target: neither node acts on them.
+inline constexpr unsigned kOwnAirNever = (1u << static_cast<int>(Trigger::Execution)) | (1u << static_cast<int>(Trigger::SimpleExecution));
+// 滞空 / 空中释放 for one of the hero's own actions the game plays (ActionBits `bits`; the chain played no move for that
+// press): the 滞空 node a hero trigger of that action points at (the trigger on, whether or not it has a chain), else,
+// cast in the air (`airborne`) and one of kOwnAirSkills, the 空中释放 values when it is on. `trigger`: the trigger whose
+// 滞空 it takes (-1: 空中释放 or none).
+inline AirSet OwnAirFor(const Config& config, unsigned bits, bool airborne, int* trigger = nullptr) {
+    AirSet set;
+    if (trigger) *trigger = -1;
+    if (!config.enabled || !bits || (bits & kOwnAirNever)) return set;
+    const auto take = [&](const Node& node) {
+        set.on = true; set.self_lift = ClampAirLift(node.air_lift); set.self_hang = ClampAirHang(node.air_hang);
+        set.foe_lift = ClampAirLift(node.air_foe_lift); set.foe_hang = ClampAirHang(node.air_foe_hang);
+    };
+    for (size_t i = 0; i < config.chain.size(); ++i) {
+        const Node& node = config.chain[i];
+        if (node.type != NodeType::Trigger || !node.on || !Fires(static_cast<Trigger>(node.trigger), bits)) continue;
+        const int mod = node.mods[kModAir];
+        if (mod < 0 || static_cast<size_t>(mod) >= config.chain.size() || config.chain[static_cast<size_t>(mod)].type != NodeType::Air) continue;
+        take(config.chain[static_cast<size_t>(mod)]);
+        if (trigger) *trigger = static_cast<int>(i);
+        return set;
+    }
+    const int from = AirDefaultNode(config);
+    if (!airborne || !(bits & kOwnAirSkills) || from < 0 || !config.chain[static_cast<size_t>(from)].on) return set;
+    take(config.chain[static_cast<size_t>(from)]); set.fixed = true;
+    return set;
 }
 // The share of its damage a move of `trigger`'s chain deals, in percent: the 伤害倍率 node the move points at, else
 // its frames', else the one the trigger points at, else 100. A grab measures its own damage (投技页).
@@ -1124,21 +1510,35 @@ inline std::wstring Encode(const Config& config) {
             break;
         case NodeType::Interval: text += "|I:" + std::to_string(ClampInterval(node.ms)) + "," + at(node); break;
         case NodeType::AutoDodge: text += "|A:" + at(node) + (ClampCancel(node.ms) ? "," + std::to_string(ClampCancel(node.ms)) : ""); break;
-        case NodeType::Speed: text += "|V:" + std::to_string(ClampSpeed(node.speed)) + "," + pos(node); break;
+        case NodeType::Speed:
+            // "V:percent[~t:s;t:s...[!]],x,y": the curve's points after "~" ("!" at their end: kept, but off).
+            text += "|V:" + std::to_string(ClampSpeed(node.speed)) + (node.points.size() >= 2 ? CurveText(node.points) + (node.curve ? "" : "!") : std::string()) + "," + pos(node);
+            break;
         case NodeType::Damage: text += "|D:" + std::to_string(ClampDamage(node.speed)) + "," + pos(node); break;
         case NodeType::WeaponMove:
             text += "|Y:" + (AbilityName(node.weapon) ? node.weapon : std::string("_")) + "," + (AbilityName(node.ability) ? node.ability : std::string("_")) + "," + at(node) +
                     (ClampCancel(node.ms) ? "," + std::to_string(ClampCancel(node.ms)) : "");
             break;
+        case NodeType::Hook:  // a 武器派生 of its hook move; the "g:" mark below makes it a 钩子 again
+            text += std::string("|Y:") + kHookWeapon + "," + (node.hook_self ? kHookGo : kHookPull) + "," + at(node) +
+                    (ClampCancel(node.ms) ? "," + std::to_string(ClampCancel(node.ms)) : "");
+            break;
         case NodeType::Weapon: text += "|W:" + pos(node); break;
+        case NodeType::Trim: text += "|W:" + pos(node); break;  // the "c:" mark below makes it a 裁剪 again
         case NodeType::Armor: text += "|H:" + pos(node); break;
         case NodeType::Interrupt: text += "|C:" + pos(node); break;
         case NodeType::Invincible: text += "|N:" + pos(node); break;
         case NodeType::IgnoreGuard: text += "|Z:" + pos(node); break;
         case NodeType::KeepLook: text += "|E:" + pos(node); break;
         case NodeType::ForceHit: text += "|Q:" + std::to_string(ClampHitKind(node.hit)) + "," + pos(node); break;
+        case NodeType::KeepChain: text += "|k:" + std::to_string(ClampKeepChain(node.ms)) + "," + pos(node); break;
         case NodeType::PreInput: text += "|J:" + std::to_string(ClampPreInput(node.ms)) + "," + pos(node); break;
+        // An unwired 间隔 in an older build; the "f:" / "j:" marks below make them 滞空 / 空中释放 again.
+        case NodeType::Air: case NodeType::AirDefault: text += "|I:" + std::to_string(kIntervalDefault) + "," + pos(node) + ",-1"; break;
         case NodeType::Grab: text += "|G:" + at(node) + (GrabMoveId(node.ability) ? "," + node.ability : std::string()); break;
+        case NodeType::Assist:
+            text += "|a:" + (AbilityName(node.boss) ? node.boss : std::string("_")) + "," + (AbilityName(node.ability) ? node.ability : std::string("_")) + "," + at(node);
+            break;
         case NodeType::BossSkill:
             text += "|X:" + (AbilityName(node.boss) ? node.boss : std::string("_")) + "," + (AbilityName(node.ability) ? node.ability : std::string("_")) + "," + at(node) +
                     (ClampCancel(node.ms) ? "," + std::to_string(ClampCancel(node.ms)) : "");
@@ -1159,7 +1559,8 @@ inline std::wstring Encode(const Config& config) {
             break;
         case NodeType::WeaponActions:
             text += "|O:" + pos(node) + "," + (AbilityName(node.weapon) ? node.weapon : std::string("_")) + "," + std::to_string(ClampReset(node.ms));
-            for (const Route& route : node.routes) if (ValidWeaponAction(route.button)) text += "," + std::to_string(route.button) + "," + std::to_string(route.next);
+            for (const Route& route : node.routes)
+                if (node.air_set ? ValidAirAction(route.button) : ValidWeaponAction(route.button)) text += "," + std::to_string(route.button) + "," + std::to_string(route.next);
             break;
         case NodeType::Branch:
             text += "|K:" + std::to_string(ClampPosition(node.x)) + "," + std::to_string(ClampPosition(node.y));
@@ -1174,6 +1575,45 @@ inline std::wstring Encode(const Config& config) {
             const int mod = ModOf(config, static_cast<int>(i), s);
             if (mod >= 0) text += "|L:" + std::to_string(i) + "," + std::to_string(mod);
         }
+    // 不变身 marks: "h:node" (an older build ignores them; the node keeps its look change there).
+    for (size_t i = 0; i < config.chain.size(); ++i)
+        if (TakesOwnLook(config.chain[i]) && config.chain[i].own_look) text += "|h:" + std::to_string(i);
+    // 钩子 marks: "g:node" (an older build plays the 武器派生 it is written as).
+    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].type == NodeType::Hook) text += "|g:" + std::to_string(i);
+    // 空中派生 marks: "s:node" (an older build reads a 武器派生修改 with no weapon, which takes nothing).
+    for (size_t i = 0; i < config.chain.size(); ++i) if (IsAirSet(config.chain[i])) text += "|s:" + std::to_string(i);
+    // 钩子 自动 marks: "q:node" (an older build plays it as 勾过来).
+    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].type == NodeType::Hook && config.chain[i].hook_auto) text += "|q:" + std::to_string(i);
+    // 钩子 reach marks: "r:node,cm,percent" when either is not its default (an older build throws it as before).
+    for (size_t i = 0; i < config.chain.size(); ++i) {
+        const Node& node = config.chain[i];
+        if (node.type == NodeType::Hook && (ClampHookDist(node.hook_dist) != kHookDistDefault || ClampHookSpeed(node.hook_speed) != kHookSpeedDefault))
+            text += "|r:" + std::to_string(i) + "," + std::to_string(ClampHookDist(node.hook_dist)) + "," + std::to_string(ClampHookSpeed(node.hook_speed));
+    }
+    // 滞空 marks: "f:node,lift,hang,foe lift,foe hang"; 空中释放: "j:node,on,lift,hang,foe lift,foe hang"; 击飞's
+    // height: "u:node,cm" when not kLaunchDefault.
+    const auto air = [](const Node& n) {
+        return std::to_string(ClampAirLift(n.air_lift)) + "," + std::to_string(ClampAirHang(n.air_hang)) + "," + std::to_string(ClampAirLift(n.air_foe_lift)) + "," +
+               std::to_string(ClampAirHang(n.air_foe_hang));
+    };
+    for (size_t i = 0; i < config.chain.size(); ++i) {
+        const Node& node = config.chain[i];
+        if (node.type == NodeType::Air) text += "|f:" + std::to_string(i) + "," + air(node);
+        if (node.type == NodeType::AirDefault) text += "|j:" + std::to_string(i) + "," + (node.on ? "1," : "0,") + air(node);
+        if (node.type == NodeType::ForceHit && ClampLaunch(node.launch) != kLaunchDefault) text += "|u:" + std::to_string(i) + "," + std::to_string(ClampLaunch(node.launch));
+    }
+    // 裁剪 marks: "c:node,from,to" (ms); an older build reads a 武器属性 there, and a BOSS 技能's arrow to it does not fit one.
+    for (size_t i = 0; i < config.chain.size(); ++i)
+        if (config.chain[i].type == NodeType::Trim)
+            text += "|c:" + std::to_string(i) + "," + std::to_string(ClampTrim(config.chain[i].trim_from)) + "," + std::to_string(ClampTrim(config.chain[i].trim_to));
+    // 按住 marks: "w:node,row,ms" (row -1: a trigger's own); an older build takes any press.
+    for (size_t i = 0; i < config.chain.size(); ++i) {
+        const Node& node = config.chain[i];
+        if (node.type == NodeType::Trigger && ClampHold(node.hold_ms) > 0) text += "|w:" + std::to_string(i) + ",-1," + std::to_string(ClampHold(node.hold_ms));
+        if (node.type == NodeType::Branch)
+            for (size_t r = 0; r < node.routes.size(); ++r)
+                if (ClampHold(node.routes[r].hold_ms) > 0) text += "|w:" + std::to_string(i) + "," + std::to_string(r) + "," + std::to_string(ClampHold(node.routes[r].hold_ms));
+    }
     return std::wstring(text.begin(), text.end());
 }
 inline Config Decode(const std::wstring& wide) {
@@ -1183,6 +1623,18 @@ inline Config Decode(const std::wstring& wide) {
     std::vector<OldReplace> olds;
     bool triggers = false, old_key = false, placed = true; int start = -1, start_x = 24, start_y = 24;
     std::vector<std::pair<int, int>> arrows;  // node -> modifier
+    std::vector<int> own_looks;  // 不变身 BOSS 技能 / 投技 nodes
+    std::vector<int> hooks, auto_hooks;  // 钩子 nodes (written as 武器派生), and those that are 自动
+    std::vector<int> air_sets;  // 空中派生 nodes (written as 武器派生修改)
+    struct ReachMark { int node = -1, dist = kHookDistDefault, speed = kHookSpeedDefault; };
+    std::vector<ReachMark> reaches;  // 钩子 distance and speed
+    struct HoldMark { int node = -1, row = -1, ms = 0; };
+    std::vector<HoldMark> holds;  // 按住
+    struct TrimMark { int node = -1, from = 0, to = 0; };
+    std::vector<TrimMark> trims;  // 裁剪 (written as 武器属性)
+    struct AirMark { int node = -1; bool fixed = false, on = true; int lift = 0, hang = 0, foe_lift = 0, foe_hang = 0; };
+    std::vector<AirMark> airs;  // 滞空 / 空中释放 (written as 间隔)
+    std::vector<std::pair<int, int>> launches;  // 强制受击 击飞 heights
     std::vector<std::pair<int, std::string>> frames;  // 组合 -> its nodes ("3;4;7")
     const auto place = [](Node& node, const std::vector<std::string>& f, size_t first) {
         node.x = ClampPosition(std::atoi(f[first].c_str())); node.y = ClampPosition(std::atoi(f[first + 1].c_str())); node.next = std::atoi(f[first + 2].c_str());
@@ -1194,6 +1646,38 @@ inline Config Decode(const std::wstring& wide) {
         else if (part[0] == 'L') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
             if (f.size() == 2) arrows.push_back({std::atoi(f[0].c_str()), std::atoi(f[1].c_str())});
+        } else if (part[0] == 'h') {
+            const std::string f = part.substr(2);
+            if (!f.empty() && std::isdigit(static_cast<unsigned char>(f[0]))) own_looks.push_back(std::atoi(f.c_str()));
+        } else if (part[0] == 'g') {
+            const std::string f = part.substr(2);
+            if (!f.empty() && std::isdigit(static_cast<unsigned char>(f[0]))) hooks.push_back(std::atoi(f.c_str()));
+        } else if (part[0] == 'q') {
+            const std::string f = part.substr(2);
+            if (!f.empty() && std::isdigit(static_cast<unsigned char>(f[0]))) auto_hooks.push_back(std::atoi(f.c_str()));
+        } else if (part[0] == 's') {
+            const std::string f = part.substr(2);
+            if (!f.empty() && std::isdigit(static_cast<unsigned char>(f[0]))) air_sets.push_back(std::atoi(f.c_str()));
+        } else if (part[0] == 'r') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() == 3) reaches.push_back({std::atoi(f[0].c_str()), ClampHookDist(std::atoi(f[1].c_str())), ClampHookSpeed(std::atoi(f[2].c_str()))});
+        } else if (part[0] == 'w') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() == 3) holds.push_back({std::atoi(f[0].c_str()), std::atoi(f[1].c_str()), ClampHold(std::atoi(f[2].c_str()))});
+        } else if (part[0] == 'f' || part[0] == 'j') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            const size_t first = part[0] == 'j' ? 2 : 1;
+            if (f.size() != first + 4) continue;
+            AirMark mark; mark.node = std::atoi(f[0].c_str()); mark.fixed = part[0] == 'j'; mark.on = !mark.fixed || f[1] != "0";
+            mark.lift = ClampAirLift(std::atoi(f[first].c_str())); mark.hang = ClampAirHang(std::atoi(f[first + 1].c_str()));
+            mark.foe_lift = ClampAirLift(std::atoi(f[first + 2].c_str())); mark.foe_hang = ClampAirHang(std::atoi(f[first + 3].c_str()));
+            airs.push_back(mark);
+        } else if (part[0] == 'u') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() == 2) launches.push_back({std::atoi(f[0].c_str()), ClampLaunch(std::atoi(f[1].c_str()))});
+        } else if (part[0] == 'c') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() == 3) trims.push_back({std::atoi(f[0].c_str()), ClampTrim(std::atoi(f[1].c_str())), ClampTrim(std::atoi(f[2].c_str()))});
         } else if (part[0] == 'B') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
             if (f.size() != 3) continue;
@@ -1237,6 +1721,14 @@ inline Config Decode(const std::wstring& wide) {
             if (AbilityName(f[1]) && f[1] != "_") node.ability = f[1];
             place(node, f, 2);
             if (f.size() == 6) node.ms = ClampCancel(std::atoi(f[5].c_str()));
+            config.chain.push_back(node);
+        } else if (part[0] == 'a') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() != 5) continue;
+            Node node; node.type = NodeType::Assist;
+            if (AbilityName(f[0]) && f[0] != "_") node.boss = f[0];
+            if (AbilityName(f[1]) && f[1] != "_") node.ability = f[1];
+            place(node, f, 2);
             config.chain.push_back(node);
         } else if (part[0] == 'Y') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
@@ -1308,9 +1800,25 @@ inline Config Decode(const std::wstring& wide) {
             Node node = ModifierNode(part[0] == 'V' ? NodeType::Speed : part[0] == 'W' ? NodeType::Weapon : part[0] == 'H' ? NodeType::Armor :
                                      part[0] == 'N' ? NodeType::Invincible : part[0] == 'E' ? NodeType::KeepLook : part[0] == 'Z' ? NodeType::IgnoreGuard :
                                      NodeType::Interrupt, 0, 0);
-            if (first) node.speed = ClampSpeed(std::atoi(f[0].c_str()));
+            if (first) {
+                node.speed = ClampSpeed(std::atoi(f[0].c_str()));
+                const size_t tilde = f[0].find('~');
+                if (tilde != std::string::npos) {
+                    std::string curve = f[0].substr(tilde + 1);
+                    const bool off = !curve.empty() && curve.back() == '!';
+                    if (off) curve.pop_back();
+                    node.points = ParseCurve(curve); node.curve = !off && node.points.size() >= 2;
+                }
+            }
             node.x = ClampPosition(std::atoi(f[first].c_str())); node.y = ClampPosition(std::atoi(f[first + 1].c_str()));
             if (f.size() == first + 3) arrows.push_back({std::atoi(f[first + 2].c_str()), static_cast<int>(config.chain.size())});
+            config.chain.push_back(node);
+        } else if (part[0] == 'k') {
+            // 保持派生: "ms,x,y".
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() != 3) continue;
+            Node node = ModifierNode(NodeType::KeepChain, 0, 0); node.ms = ClampKeepChain(std::atoi(f[0].c_str()));
+            node.x = ClampPosition(std::atoi(f[1].c_str())); node.y = ClampPosition(std::atoi(f[2].c_str()));
             config.chain.push_back(node);
         } else if (part[0] == 'O') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
@@ -1321,7 +1829,7 @@ inline Config Decode(const std::wstring& wide) {
             node.ms = ClampReset(std::atoi(f[3].c_str()));
             for (size_t r = 4; r + 1 < f.size() && node.routes.size() < kMaxRoutes; r += 2) {
                 Route route; route.button = std::atoi(f[r].c_str()); route.next = std::atoi(f[r + 1].c_str());
-                if (ValidWeaponAction(route.button)) node.routes.push_back(route);
+                if (ValidWeaponAction(route.button) || ValidAirAction(route.button)) node.routes.push_back(route);  // which: once the "s:" marks are read
             }
             config.chain.push_back(node);
         } else if (part[0] == 'K') {
@@ -1355,7 +1863,7 @@ inline Config Decode(const std::wstring& wide) {
     }
     const int count = static_cast<int>(config.chain.size());
     for (Node& node : config.chain) {
-        if (IsModifier(node) || IsPreInput(node)) node.next = -1;
+        if (IsModifier(node) || IsSetting(node)) node.next = -1;
         for (size_t o = 0; o < OutCount(node); ++o) { const int to = OutOf(node, o); if (to < -1 || to >= count) SetOut(node, o, -1); }
     }
     if (!triggers) {
@@ -1375,6 +1883,30 @@ inline Config Decode(const std::wstring& wide) {
             config.chain.push_back(trigger); config.chain.push_back(move);
         }
     }
+    // 滞空 / 空中释放 first too (unwired 间隔 in the text; 空中释放 once).
+    for (const AirMark& a : airs) {
+        if (a.node < 0 || a.node >= count) continue;
+        Node& node = config.chain[static_cast<size_t>(a.node)];
+        if (node.type != NodeType::Interval || node.next >= 0 || (a.fixed && AirDefaultNode(config) >= 0)) continue;
+        node.type = a.fixed ? NodeType::AirDefault : NodeType::Air; node.ms = 0; node.on = a.on;
+        node.air_lift = a.lift; node.air_hang = a.hang; node.air_foe_lift = a.foe_lift; node.air_foe_hang = a.foe_hang;
+    }
+    for (const auto& [i, cm] : launches)
+        if (i >= 0 && i < count && config.chain[static_cast<size_t>(i)].type == NodeType::ForceHit) config.chain[static_cast<size_t>(i)].launch = cm;
+    // 空中派生: its rows the air's (the NPC key too, no execution); a 武器派生修改's the weapon's.
+    for (const int i : air_sets)
+        if (i >= 0 && i < count && config.chain[static_cast<size_t>(i)].type == NodeType::WeaponActions) {
+            config.chain[static_cast<size_t>(i)].air_set = true; config.chain[static_cast<size_t>(i)].weapon.clear(); }
+    for (Node& node : config.chain)
+        if (node.type == NodeType::WeaponActions)
+            node.routes.erase(std::remove_if(node.routes.begin(), node.routes.end(), [&](const Route& r) {
+                return node.air_set ? !ValidAirAction(r.button) : !ValidWeaponAction(r.button); }), node.routes.end());
+    // 裁剪 nodes first (their arrows fit a 裁剪, not the 武器属性 they are written as).
+    for (const TrimMark& t : trims) {
+        if (t.node < 0 || t.node >= count) continue;
+        Node& node = config.chain[static_cast<size_t>(t.node)];
+        if (node.type == NodeType::Weapon) { node.type = NodeType::Trim; node.trim_from = t.from; node.trim_to = t.to; }
+    }
     // Arrows only where they fit (one per slot: the last one read wins); no exec wire into a trigger, a modifier or
     // itself.
     for (const auto& arrow : arrows) if (arrow.first < count && arrow.second < count) LinkModifier(config, arrow.first, arrow.second);
@@ -1384,7 +1916,7 @@ inline Config Decode(const std::wstring& wide) {
         for (size_t o = 0; o < OutCount(node); ++o) {
             const int to = OutOf(node, o);
             if (to >= 0 && (to == static_cast<int>(i) || StartsChain(config.chain[static_cast<size_t>(to)]) || IsModifier(config.chain[static_cast<size_t>(to)]) ||
-                            IsPreInput(config.chain[static_cast<size_t>(to)])))
+                            IsSetting(config.chain[static_cast<size_t>(to)])))
                 SetOut(node, o, -1);
         }
     }
@@ -1396,6 +1928,23 @@ inline Config Decode(const std::wstring& wide) {
             if (item.empty() || i < 0 || i >= count || config.chain[static_cast<size_t>(i)].group >= 0) continue;
             if (CanJoin(config, i, frame)) config.chain[static_cast<size_t>(i)].group = frame;
         }
+    }
+    for (const int i : own_looks) if (i >= 0 && i < count && TakesOwnLook(config.chain[static_cast<size_t>(i)])) config.chain[static_cast<size_t>(i)].own_look = true;
+    for (const int i : hooks) {
+        if (i < 0 || i >= count) continue;
+        Node& node = config.chain[static_cast<size_t>(i)];
+        if (node.type == NodeType::WeaponMove && HookAbility(node.weapon, node.ability)) { node.type = NodeType::Hook; SetHookMode(node, node.ability == kHookGo); }
+    }
+    for (const int i : auto_hooks)
+        if (i >= 0 && i < count && config.chain[static_cast<size_t>(i)].type == NodeType::Hook) SetHookAuto(config.chain[static_cast<size_t>(i)]);
+    for (const ReachMark& r : reaches)
+        if (r.node >= 0 && r.node < count && config.chain[static_cast<size_t>(r.node)].type == NodeType::Hook) {
+            config.chain[static_cast<size_t>(r.node)].hook_dist = r.dist; config.chain[static_cast<size_t>(r.node)].hook_speed = r.speed; }
+    for (const HoldMark& h : holds) {
+        if (h.node < 0 || h.node >= count) continue;
+        Node& node = config.chain[static_cast<size_t>(h.node)];
+        if (h.row < 0 && node.type == NodeType::Trigger) node.hold_ms = h.ms;
+        else if (h.row >= 0 && node.type == NodeType::Branch && static_cast<size_t>(h.row) < node.routes.size()) node.routes[static_cast<size_t>(h.row)].hold_ms = h.ms;
     }
     EnsureKey(config);
     config.placed = placed;

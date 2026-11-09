@@ -9,7 +9,7 @@
 namespace TestDummy {
 using Logger = void (*)(const char*);
 void Initialize(Logger logger);
-void Request(bool spawn);  // true: spawn (again, in front of the hero), false: remove
+void Request(bool spawn, double distance = 350.0);  // true: spawn (again, `distance` cm in front of the hero), false: remove
 struct Snapshot { bool present = false, busy = false; std::wstring status; };
 Snapshot GetSnapshot();
 void OnGameThreadGuarded();

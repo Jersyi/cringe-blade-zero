@@ -15,8 +15,8 @@ struct Item {
     bool removed = false;    // its code reaches a native the 11-04 game emptied or a removed console command
     bool available = false;  // the loaded class has its event and every function it calls by name
 };
-// sequence counts every finished call request; ok means the event ran.
-struct Result { uint64_t sequence = 0; int32_t item = -1; bool ok = false; };
+// sequence counts finished requests; for cinematics ok means IsInSequence confirmed playback.
+struct Result { uint64_t sequence = 0; int32_t item = -1; bool ok = false; std::wstring message; };
 struct Snapshot {
     uint64_t generation = 0;  // bumps whenever the published state changes
     bool present = false, mounted = false, loaded = false;
@@ -32,4 +32,5 @@ bool RequestLoad();         // UI/worker: load the class and check every item ag
 bool RequestCall(int32_t item);
 bool HandleCommand(const char* verb, const char* argument);  // "supplement status|load|list|call <item>"
 void OnGameThreadGuarded();
+bool NeedsWorld();          // game thread: a pending cinematic needs unpaused world ticks
 }

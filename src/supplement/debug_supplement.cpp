@@ -2,6 +2,7 @@
 #include "debug_supplement_catalog.generated.h"
 #include "ue_runtime.h"
 #include "game_build.h"
+#include "sequence_request.h"
 #include <windows.h>
 #include <algorithm>
 #include <cstdarg>
@@ -63,6 +64,7 @@ int32_t active_item_ = -1;
 std::map<std::wstring, Object*> functions_;  // the loaded class chain by name, most derived first
 bool available_[kItemCount]{};
 uint32_t calls_ = 0;
+SupplementSequence::Request sequence_request_;
 bool KnownCheat(const char* command);
 Object* Instance();
 
@@ -82,14 +84,14 @@ std::string Utf8(const std::wstring& text) {
 }
 std::wstring WideName(Name name) { wchar_t text[256]{}; ue::NameWide(name, text, 256); return text; }
 
-bool HasContainer(const std::wstring& directory) {
+bool HasContainer(const std::wstring& directory, const wchar_t* name) {
     for (const wchar_t* extension : {L".pak", L".utoc", L".ucas"})
-        if (GetFileAttributesW((directory + kContainer + extension).c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+        if (GetFileAttributesW((directory + name + extension).c_str()) == INVALID_FILE_ATTRIBUTES) return false;
     return true;
 }
 // Looked up under Paks like the engine's own pak search (mod managers use ~mods\<mod>\).
-std::wstring FindContainer(const std::wstring& directory, int depth) {
-    if (HasContainer(directory)) return directory;
+std::wstring FindContainer(const std::wstring& directory, int depth, const wchar_t* name = kContainer) {
+    if (HasContainer(directory, name)) return directory;
     if (depth <= 0) return {};
     WIN32_FIND_DATAW data{};
     HANDLE find = FindFirstFileW((directory + L"*").c_str(), &data);
@@ -97,7 +99,7 @@ std::wstring FindContainer(const std::wstring& directory, int depth) {
     std::wstring found;
     do {
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(data.cFileName, L".") && wcscmp(data.cFileName, L".."))
-            found = FindContainer(directory + data.cFileName + L"\\", depth - 1);
+            found = FindContainer(directory + data.cFileName + L"\\", depth - 1, name);
     } while (found.empty() && FindNextFileW(find, &data));
     FindClose(find);
     return found;
@@ -107,7 +109,7 @@ void Publish(const wchar_t* status, int32_t finished_item = -1, bool ok = false)
     AcquireSRWLockExclusive(&state_lock);
     if (finished_item >= 0) {
         const uint64_t sequence = state_.results.empty() ? 1 : state_.results.back().sequence + 1;
-        state_.results.push_back({sequence, finished_item, ok});
+        state_.results.push_back({sequence, finished_item, ok, status});
         if (state_.results.size() > 32) state_.results.erase(state_.results.begin());
     }
     state_.present = present_;
@@ -147,22 +149,26 @@ void CopyText(const wchar_t* text, char* out, size_t size) {
         out[n] = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { strncpy_s(out, size, "?", _TRUNCATE); }
 }
-// Once per process, on the game thread; the engine keeps the container mounted until exit (the status message's
-// shared string is left to the engine allocator: one small block on a failed mount).
-void Mount() {
-    mount_tried_ = true;
-    if (!ue::Base() || !EngineCodeMatches()) { Log("SUPPLEMENT mount skipped: engine code differs from the pinned build"); return; }
+// Once per container and process, on the game thread; the engine keeps a container mounted until exit (the status
+// message's shared string is left to the engine allocator: one small block on a failed mount).
+bool MountPak(const std::wstring& pak, const char* tag) {
+    if (!ue::Base() || !EngineCodeMatches()) { Logf("%s mount skipped: engine code differs from the pinned build", tag); return false; }
     void* manager = reinterpret_cast<FileManagerGet>(ue::Base() + kFileManagerGetRva)();
     void* pak_file = manager ? reinterpret_cast<FindPlatformFile>(ue::Base() + kFindPlatformFileRva)(manager, L"PakFile") : nullptr;
-    if (!pak_file) { Log("SUPPLEMENT mount skipped: no PakFile platform layer"); return; }
+    if (!pak_file) { Logf("%s mount skipped: no PakFile platform layer", tag); return false; }
     PakMountArgs args;
-    args.filename = pak_path_.c_str();
-    args.order = 4;  // the base game's own order; the supplement packages exist nowhere else
+    args.filename = pak.c_str();
+    args.order = 4;  // the base game's own order; these packages exist nowhere else
     IoStatus status;
-    mounted_ = reinterpret_cast<PakMount>(ue::Base() + kPakMountRva)(pak_file, &args, &status, nullptr);
+    const bool ok = reinterpret_cast<PakMount>(ue::Base() + kPakMountRva)(pak_file, &args, &status, nullptr);
     char message[256]{};
     CopyText(status.message, message, sizeof(message));
-    Logf("SUPPLEMENT mount %s ok=%d io=%u system=%u (%s)", Utf8(pak_path_).c_str(), mounted_ ? 1 : 0, status.code, status.system, message);
+    Logf("%s mount %s ok=%d io=%u system=%u (%s)", tag, Utf8(pak).c_str(), ok ? 1 : 0, status.code, status.system, message);
+    return ok;
+}
+void Mount() {
+    mount_tried_ = true;
+    mounted_ = MountPak(pak_path_, "SUPPLEMENT");
 }
 
 // The class is found if loaded, else loaded blocking; a package that is not mounted returns null.
@@ -1327,12 +1333,95 @@ void TeleportThroughHelp(const Request& request) {
     if (!FirstParameter(function, sizeof(Vector), name, sizeof(name)) || !Call(help_, function).Set(name, location).Invoke())
         Log("SUPPLEMENT teleport refused: TeleportCharacter(vector) not found");
 }
+bool SequencePlaying(bool& playing) {
+    Object* manager = Subsystem("/Script/ProjectPBZ.PBZLevelSequenceManager");
+    Call query(manager, "IsInSequence");
+    if (!manager || !query.Slot("ReturnValue", sizeof(bool)) || !query.Invoke()) return false;
+    playing = query.Get<bool>("ReturnValue");
+    return true;
+}
+// Keys come from the cooked catalog, including its actor/node indices. Query
+// the row through the engine; do not gate playback on a guessed FArrayProperty
+// or sparse RowMap layout (the previous preflight rejected valid cooked rows).
+bool SequenceExists(const std::wstring& text) {
+    SupplementSequence::Key key;
+    if(!SupplementSequence::Parse(text,key)){Log("SUPPLEMENT sequence preflight: malformed key");return false;}
+    bool authored=false;
+    for(const auto& item:DebugSupplementCatalog::kItems)
+        if(std::wcscmp(item.category,L"播放Seq")==0&&*item.arg&&text==item.arg){authored=true;break;}
+    if(!authored){Logf("SUPPLEMENT sequence preflight: key not in cooked catalog %s",Utf8(text).c_str());return false;}
+    Object* table=LoadAsset(L"/Game/PBZContent/Blueprint/FlowGraph/DebugUI/FlowLogic/FlowLogicPlaySeqTable",L"FlowLogicPlaySeqTable");
+    Call exists(ue::Default("/Script/Engine.Default__DataTableFunctionLibrary"),"DoesDataTableRowExist");
+    if(!table||!exists.Slot("ReturnValue",sizeof(bool))||
+       !exists.Set("Table",table).Set("RowName",ue::MakeName(key.row.c_str())).Invoke()){
+        Logf("SUPPLEMENT sequence preflight: table=%p native row query unavailable",static_cast<void*>(table));return false;}
+    const bool found=exists.Get<bool>("ReturnValue");
+    Logf("SUPPLEMENT sequence preflight: native row=%s found=%d actor=%d node=%d",Utf8(key.row).c_str(),found?1:0,key.actor,key.node);
+    return found;
+}
+
+void FinishSequence(bool ok, const wchar_t* reason) {
+    const int item = sequence_request_.item;
+    if (item < 0) return;
+    const auto& entry = DebugSupplementCatalog::kItems[item];
+    const std::wstring status = std::wstring(reason) + L"：" + entry.label;
+    Logf("SUPPLEMENT sequence #%d ok=%d %s", item, ok ? 1 : 0, Utf8(status).c_str());
+    sequence_request_.Clear();
+    if (ok) ++calls_;
+    Publish(status.c_str(), item, ok);
+}
+void DriveSequence() {
+    if (sequence_request_.item < 0) return;
+    Object* world = CurrentWorld();
+    bool playing = false;
+    const bool ready = world && SequencePlaying(playing);
+    Call pause(ue::Default("/Script/Engine.Default__GameplayStatics"), "IsGamePaused");
+    const bool paused = !world || !pause.Slot("ReturnValue", sizeof(bool)) ||
+        !pause.Set("WorldContextObject", world).Invoke() || pause.Get<bool>("ReturnValue");
+    using Step = SupplementSequence::Request::Step;
+    switch (sequence_request_.Poll(GetTickCount64(), ready, paused, playing)) {
+    case Step::Started: FinishSequence(true, L"已开始播放"); return;
+    case Step::Timeout: FinishSequence(false, L"播放超时，未检测到过场开始"); return;
+    case Step::Wait: return;
+    case Step::Invoke: break;
+    }
+    if (playing) { FinishSequence(false, L"当前过场尚未结束，请结束后再播放"); return; }
+    const auto& item = DebugSupplementCatalog::kItems[sequence_request_.item];
+    Object* instance = Instance();
+    Object* event = Function(item.event);
+    const int key_offset = instance ? ue::Offset(class_, "FlowPlaySeqID") : -1;
+    std::wstring key = item.arg;
+    if (key.empty() && key_offset >= 0) key = WideName(ue::At<Name>(instance, key_offset));
+    if (!instance || !event || key_offset < 0) {
+        Logf("SUPPLEMENT sequence preflight: instance=%p event=%p keyOffset=%d",static_cast<void*>(instance),static_cast<void*>(event),key_offset);
+        FinishSequence(false,L"无法播放，过场控制器未就绪");return;
+    }
+    if(!SequenceExists(key)){FinishSequence(false,L"无法播放，过场表项校验失败（详细原因已记录）");return;}
+    Call call(instance, event);
+    if (*item.arg) {
+        // Fail closed: never invoke a zero/None SeqID when the signature differs.
+        if (!call.Slot("SeqID", sizeof(Name))) { FinishSequence(false, L"无法播放，过场参数不兼容"); return; }
+        call.Set("SeqID", ue::MakeName(key.c_str()));
+    }
+    const Name previous_key=ue::At<Name>(instance,key_offset);
+    if(*item.arg)ue::At<Name>(instance,key_offset)=Name{};
+    active_item_ = sequence_request_.item;
+    const bool ran = call.Invoke();
+    active_item_ = -1;
+    if (!ran || ue::At<Name>(instance, key_offset).None()) {
+        ue::At<Name>(instance,key_offset)=previous_key;
+        FinishSequence(false, L"播放请求未被过场流程接受"); return;
+    }
+    Logf("SUPPLEMENT sequence #%d dispatched key=%s; awaiting IsInSequence", sequence_request_.item, Utf8(key).c_str());
+    Publish((std::wstring(L"正在准备过场：")+item.label).c_str());
+}
 void Tick() {
     if (!mount_tried_) {
         Mount();
         Publish(mounted_ ? L"补充包已挂载" : L"补充包挂载失败");
     }
     GuardFlight();
+    DriveSequence();
     Request request;
     AcquireSRWLockExclusive(&queue_lock);
     const bool any = !queue_.empty();
@@ -1359,6 +1448,13 @@ void Tick() {
         Logf("SUPPLEMENT call refused #%d %s: %s", request.item, Utf8(item.label).c_str(), item.removed ? "removed by the game" : "missing functions");
         _snwprintf_s(status, _countof(status), _TRUNCATE, item.removed ? L"当前游戏版本不支持这一项：%ls" : L"当前游戏缺少这一项需要的函数：%ls", item.label);
         Refuse(request.item, status);
+        return;
+    }
+    if (!std::wcscmp(item.category, L"播放Seq")) {
+        if (!sequence_request_.Begin(request.item, GetTickCount64())) {
+            Refuse(request.item, L"已有过场正在准备，请等待播放结果"); return;
+        }
+        Publish((std::wstring(L"正在准备过场：")+item.label).c_str());
         return;
     }
     if (*item.native) {
@@ -1400,7 +1496,8 @@ void Fault() {
     RaiseBudgets(false);
     class_ = nullptr; instance_ = nullptr; help_ = nullptr; functions_.clear();
     Log("SUPPLEMENT request fault; state cleared");
-    Publish(L"执行时出现异常，已重置", active_item_, false);
+    Publish(L"执行时出现异常，已重置", active_item_ >= 0 ? active_item_ : sequence_request_.item, false);
+    sequence_request_.Clear();
     active_item_ = -1;
 }
 bool Enqueue(Request request) {
@@ -1428,6 +1525,7 @@ void Initialize(Logger logger, const wchar_t* executable_directory) {
     Publish(present_ ? L"已找到补充包" : L"未找到补充包");
 }
 bool Present() { return present_; }
+bool NeedsWorld() { return sequence_request_.item >= 0; }
 Snapshot GetSnapshot() {
     AcquireSRWLockShared(&state_lock);
     Snapshot copy = state_;

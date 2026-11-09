@@ -9,6 +9,9 @@ namespace UiCursor {
 // Logs the game window's activation changes (UI_FOCUS lines).
 void SetLogger(void (*log)(const char*));
 void Sync(bool open);
+// Tests: while on, an open hub never shows, sets, releases or clips the real mouse (combo handsoff on|off).
+void SetHandsOff(bool on);
+bool HandsOff();
 void AfterTick();
 // Click diagnostics (HUB_CLICK lines, the first 40 presses of a session; no behaviour change). The hub is a child of
 // the game window on another thread, so a click on it waits for the game thread to answer the parent notifications.

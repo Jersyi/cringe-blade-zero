@@ -58,6 +58,9 @@ Chord Get(Action action);
 Chord Get(Action action, Device device);
 // Any thread: some binding is set.
 bool Bound(Action action);
+// Any thread: a binding of the action is held down as of the worker's latest poll (in the game, no text box or capture
+// up), as it fires: the keyboard chord, or the active pad's.
+bool Held(Action action);
 // Any thread: Get(action) as text in the UI language ("G", "Y + B", "三角 + 圈").
 std::wstring Hint(Action action);
 // Any thread: the pad buttons held as of the worker's latest poll (Xbox and PlayStation presses on one layout: bits

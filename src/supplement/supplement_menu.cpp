@@ -101,8 +101,8 @@ SIZE Extent(HDC dc,HFONT font,const std::wstring& text,int wrap=0) {
     return {area.right,(std::max)(static_cast<LONG>(metrics.tmHeight),area.bottom)};
 }
 // Paints into an off-screen bitmap; off-screen bitmaps start black, so the page colour goes first.
-template<class Draw> void Buffered(HWND window,Draw draw) {
-    PAINTSTRUCT paint{}; const HDC target=BeginPaint(window,&paint);
+template<class Draw> void Buffered(HWND window,Draw draw,HDC destination=nullptr) {
+    PAINTSTRUCT paint{}; const HDC target=destination?destination:BeginPaint(window,&paint);
     RECT client{}; GetClientRect(window,&client);
     const int width=(std::max)(1L,client.right),height=(std::max)(1L,client.bottom);
     const HDC dc=CreateCompatibleDC(target);
@@ -113,12 +113,33 @@ template<class Draw> void Buffered(HWND window,Draw draw) {
     { Gdiplus::Graphics graphics(surface); graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias); draw(surface,graphics,client); }
     if (bitmap) { BitBlt(target,0,0,width,height,dc,0,0,SRCCOPY); SelectObject(dc,old); DeleteObject(bitmap); }
     if (dc) DeleteDC(dc);
-    EndPaint(window,&paint);
+    if (!destination) EndPaint(window,&paint);
 }
 COLORREF Paper() { return UiTheme::Mix(UiTheme::Base(),UiTheme::Panel(),72); }
 
 // ---- card geometry -------------------------------------------------------------------
 // Title row, an optional note of up to two lines, then the options as equal pills in balanced rows.
+// Full sequence names retain their flow/instance suffix. Wrap even underscore-only identifiers;
+// DrawText's normal word wrapping cannot fit those into a narrow cell without clipping.
+bool SequenceCard(const CardView& view) {
+    return view.count>0&&!std::wcscmp(DebugSupplementCatalog::kItems[OptionItem(view,0)].category,L"播放Seq");
+}
+std::wstring WrappedSequence(HDC dc,HFONT font,const std::wstring& text,int width) {
+    std::wstring out,line;
+    for (wchar_t c:text) {
+        if (c==L'\n') { out+=line+L"\n"; line.clear(); continue; }
+        if (!line.empty()&&Extent(dc,font,line+c).cx>width) { out+=line+L"\n"; line.clear(); }
+        line+=c;
+    }
+    return out+line;
+}
+std::wstring SequenceText(const CardView& view,int option) {
+    std::wstring text=Tr(OptionLabel(view,option));
+    const auto at=text.find(L" / ");
+    if (at!=text.npos) text.replace(at,3,L"\n");
+    return text;
+}
+
 Geometry Measure(const CardView& view,int width,HDC dc,HWND reference) {
     const auto m=UiLayout::For(reference);
     Geometry g; g.pad=m.S(14); g.title=m.S(24); g.seg_h=m.S(34); g.gap=m.S(6);
@@ -129,6 +150,19 @@ Geometry Measure(const CardView& view,int width,HDC dc,HWND reference) {
         g.note=(std::min)(static_cast<int>(Extent(dc,small_font,note,inner).cy),2*static_cast<int>(Extent(dc,small_font,L"Ag").cy));
     }
     const HFONT body=UiTheme::GetFont(UiTheme::Font::Strong,reference);
+    if (SequenceCard(view)) {
+        g.per_row=(std::max)(1,inner/m.S(360));
+        g.rows=(view.count+g.per_row-1)/g.per_row;
+        const int cell=(inner-(g.per_row-1)*g.gap)/g.per_row;
+        const int line_height=Extent(dc,body,L"Ag").cy;
+        for (int i=0;i<view.count;++i) {
+            const auto wrapped=WrappedSequence(dc,body,SequenceText(view,i),cell-m.S(24));
+            const int lines=1+static_cast<int>(std::count(wrapped.begin(),wrapped.end(),L'\n'));
+            g.seg_h=(std::max)(g.seg_h,lines*line_height+m.S(20));
+        }
+        g.height=g.pad+g.title+(g.note?m.S(3)+g.note:0)+m.S(14)+g.rows*g.seg_h+(g.rows-1)*g.gap+g.pad;
+        return g;
+    }
     int widest=m.S(56);
     for (int i=0;i<view.count;++i) widest=(std::max)(widest,static_cast<int>(Extent(dc,body,Tr(OptionLabel(view,i))).cx)+m.S(26));
     if (view.count>7) widest=(std::min)(widest,(std::max)(m.S(56),(inner-3*g.gap)/4));  // long lists (过场): four a row, ends elided
@@ -166,9 +200,10 @@ void Activate(CardView& view,int option) {
     view.armed=-1;
     if (!DebugSupplement::RequestCall(item)) { DebugHub::Notify(Tr(L"请求未接受，请稍后重试。").c_str()); Animate(view); return; }
     view.waiting|=uint64_t{1}<<option;
+    if (SequenceCard(view)) DebugHub::Hide();
     Animate(view);
 }
-void PaintCard(HWND window) {
+void PaintCard(HWND window,HDC target=nullptr) {
     Buffered(window,[&](HDC dc,Gdiplus::Graphics& graphics,const RECT& client) {
         CardView* view=View(window); if (!view) return;
         const auto m=UiLayout::For(window); const ULONGLONG now=GetTickCount64();
@@ -223,7 +258,12 @@ void PaintCard(HWND window) {
             if (waiting) text+=L"…";
             const HFONT font=chosen||armed?strong:body;
             RECT label_rect=rect; InflateRect(&label_rect,-m.S(6),0);
-            Label(dc,text,label_rect,font,ink,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+            if (SequenceCard(*view)) {
+                InflateRect(&label_rect,-m.S(6),-m.S(10));
+                const auto full=armed?Tr(L"再点确认"):SequenceText(*view,i);
+                const auto wrapped=WrappedSequence(dc,strong,full,label_rect.right-label_rect.left);
+                Label(dc,wrapped,label_rect,strong,ink,DT_LEFT|DT_EDITCONTROL);
+            } else Label(dc,text,label_rect,font,ink,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
             if (removed) {
                 const int width=(std::min)(static_cast<int>(Extent(dc,font,text).cx),static_cast<int>(label_rect.right-label_rect.left));
                 const int middle=(rect.left+rect.right)/2,y=(rect.top+rect.bottom)/2;
@@ -231,7 +271,7 @@ void PaintCard(HWND window) {
                 graphics.DrawLine(&pen,middle-width/2-m.S(3),y,middle+width/2+m.S(3),y);
             }
         }
-    });
+    },target);
 }
 CardView* Neighbour(const CardView& view,int step) {
     const auto at=static_cast<int>(&view-cards_.data());
@@ -253,6 +293,7 @@ LRESULT CALLBACK CardProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) 
     case WM_NCDESTROY: view->window=nullptr; SetWindowLongPtrW(window,GWLP_USERDATA,0); break;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: PaintCard(window); return 0;
+    case WM_PRINTCLIENT: PaintCard(window,reinterpret_cast<HDC>(wparam)); return 0;
     case WM_SIZE: InvalidateRect(window,nullptr,FALSE); return 0;
     case WM_TIMER: {
         if (wparam!=kMotion) break;
@@ -297,7 +338,9 @@ LRESULT CALLBACK CardProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) 
         if (wparam==VK_LEFT) view->focus=(std::max)(0,view->focus-1);
         else if (wparam==VK_RIGHT) view->focus=(std::min)(view->count-1,view->focus+1);
         else if (wparam==VK_UP||wparam==VK_DOWN) {
-            if (CardView* next=Neighbour(*view,wparam==VK_UP?-1:1)) {
+            const int option=view->focus+(wparam==VK_UP?-view->geo.per_row:view->geo.per_row);
+            if (SequenceCard(*view)&&option>=0&&option<view->count) view->focus=option;
+            else if (CardView* next=Neighbour(*view,wparam==VK_UP?-1:1)) {
                 next->keyboard=true; next->focus=(std::min)(view->focus,next->count-1); SetFocus(next->window);
             }
         } else if (wparam==VK_RETURN||wparam==VK_SPACE) Activate(*view,view->focus);
@@ -430,12 +473,15 @@ void Layout() {
             const int h=UiLayout::TextHeight(subtitles_[static_cast<size_t>(s)],w);
             UiLayout::Place(subtitles_[static_cast<size_t>(s)],x,y,w,h); y+=h+gap;
         }
-        for (size_t first=0;first<shown.size();first+=static_cast<size_t>(columns)) {
-            const size_t last=(std::min)(shown.size(),first+static_cast<size_t>(columns));
+        // Each map's cinematic catalog uses the whole page width, with readable multiline entries.
+        const bool sequence=SequenceCard(*shown.front());
+        const int section_columns=sequence?1:columns,section_width=sequence?w:card_width;
+        for (size_t first=0;first<shown.size();first+=static_cast<size_t>(section_columns)) {
+            const size_t last=(std::min)(shown.size(),first+static_cast<size_t>(section_columns));
             int row_height=0;
-            for (size_t i=first;i<last;++i) { shown[i]->geo=Measure(*shown[i],card_width,dc,window_); row_height=(std::max)(row_height,shown[i]->geo.height); }
+            for (size_t i=first;i<last;++i) { shown[i]->geo=Measure(*shown[i],section_width,dc,window_); row_height=(std::max)(row_height,shown[i]->geo.height); }
             for (size_t i=first;i<last;++i) {
-                UiLayout::Place(shown[i]->window,x+static_cast<int>(i-first)*(card_width+gap),y,card_width,row_height);
+                UiLayout::Place(shown[i]->window,x+static_cast<int>(i-first)*(section_width+gap),y,section_width,row_height);
                 Show(shown[i]->window,true); InvalidateRect(shown[i]->window,nullptr,FALSE);
             }
             y+=row_height+gap;
@@ -477,6 +523,7 @@ void ApplyResult(const DebugSupplement::Result& result) {
     view.pulse.Jump(1); view.pulse.Set(0,1400,GetTickCount64(),Reduced());
     if (result.ok&&view.card->remembers) view.chosen=option;
     last_=Tr(result.ok?L"已执行：":L"未执行：")+Tr(view.card->title)+L" · "+Tr(OptionLabel(view,option));
+    if (!result.message.empty()) last_=Tr(result.message.c_str());
     if (!result.ok) DebugHub::Notify(Tr(snapshot_.status.c_str()).c_str());
     Animate(view);
 }

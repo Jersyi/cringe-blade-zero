@@ -26,12 +26,19 @@ struct Vector { double x = 0, y = 0, z = 0; };
 struct Rotator { double pitch = 0, yaw = 0, roll = 0; };
 // parent / socket / base: where the stand-in hangs and its relative location there; hand: the hand
 // bone above that socket, which the skin display's same-named hand replaces (FollowSkinHands).
+#pragma warning(push)
+#pragma warning(disable : 4324)  // Transform is 16-byte aligned: the struct pads to it
 struct Display {
     Object* component = nullptr; ue::Name name; bool visible = true;
-    Object* parent = nullptr; ue::Name parent_name, socket, hand; double base[3]{}, moved[3]{}; bool follow_refused = false;
+    Object* parent = nullptr; ue::Name parent_name, socket, hand; double base[3]{}; bool follow_refused = false;
+    // Held (FollowSkinHands): it hangs on the visible mesh's hand bone (holder) with the Boss's grip; else on its parent
+    // at its socket with `attached`. A switch keeps it where it is and blends the relative from `from` over kSwitchMs.
+    Transform attached; Object* holder = nullptr; ue::Name holder_name; Transform from; ULONGLONG switched = 0;
+    Transform last_grip; bool has_grip = false;
     // As the boss's own weapon actor hangs: its socket on the boss skeleton, the mesh template's relative transform.
     std::string boss_socket; Transform own_relative; Object* asset = nullptr; bool skeletal = false;
 };
+#pragma warning(pop)
 // What a grab cut by the move chain still owes its target (HandOff / HandOffEnd).
 struct Owed {
     int32_t id = 0; Object* target = nullptr; ue::Name target_name; std::wstring move; float native = 0, hp_max = -1; uint32_t hits = 0; Options options;
@@ -55,12 +62,26 @@ struct Session {
     ULONGLONG next_scan = 0;
     // Invisible Boss-skeleton mesh replaying the player's montage.
     Object* proxy = nullptr; ue::Name proxy_name; Object* proxy_montage = nullptr; double proxy_scale = 1;
+    // The player's montage position at the last tick (proxy_seen: of proxy_montage) and its length: the proxy is set
+    // one step ahead of it (SyncProxy), the step the player's montage takes this frame.
+    float proxy_last = -1, proxy_length = 0; bool proxy_seen = false, own_hand_logged = false;
     // The grab's own montage on the player (Posing): the one playing at Begin, or the first within
     // kMontageSettleMs; pose_over once another montage or none replaces it.
     Object* grab_montage = nullptr; ULONGLONG began = 0; bool pose_over = false;
     // Current model / executing boss (skin size * hero_over_boss): the boss weapon's size. The player's
     // model size scales the pose proxy. Neither the models nor the victim are moved or scaled.
     double scale = 1, model = 1;
+    // How well a stand-in stays in the visible fist (logged at the end): each tick, the hand offset wanted now minus
+    // the one its last placement gives in the socket's current frame (what was drawn), and how far the fist moved.
+    // How still the weapon sits in the fist while held (logged at the end): the grip's move a tick, and the switches.
+    uint32_t hold_frames = 0, hold_switches = 0; double hold_sum = 0, hold_max = 0;
+    ULONGLONG probe_at = 0;  // GRAB_EXTRAS probe lines (where the stand-ins are, twice a second)
+    // The player's main slot drawn when the grab began (sheathed: the grab still shows the boss weapon in hand), and the
+    // stand-ins' last shown state with its reasons (logged when it changes).
+    bool armed_known = false, armed_at_begin = true; int shown_logged = -1;
+    // Ticks since Begin: the stand-ins show from the second one on (the proxy's first pose is not the move's yet, and the
+    // first placement put the weapon about 90 cm off for a frame).
+    int ticks = 0;
 };
 Session session_;
 SkinDisplay skin_display_ = nullptr;
@@ -97,6 +118,15 @@ bool Bool(Object* object, const char* property, bool& value) {
     const uint8_t byte_offset = ue::At<uint8_t>(field, 0x71), mask = ue::At<uint8_t>(field, 0x73);
     if (offset < 0 || byte_offset > 7 || !mask) return false;
     value = (ue::At<uint8_t>(object, offset + byte_offset) & mask) != 0; return true;
+}
+bool PutBool(Object* object, const char* property, bool value) {
+    Object* field = object ? Field(ue::ClassOf(object), property) : nullptr;
+    if (!field || ue::At<uint8_t>(field, 0x70) != 1) return false;
+    const int32_t offset = ue::At<int32_t>(field, static_cast<int32_t>(ue::layout::kPropOffset));
+    const uint8_t byte_offset = ue::At<uint8_t>(field, 0x71), byte_mask = ue::At<uint8_t>(field, 0x72), mask = ue::At<uint8_t>(field, 0x73);
+    if (offset < 0 || byte_offset > 7 || !mask || !byte_mask) return false;
+    uint8_t& byte = ue::At<uint8_t>(object, offset + byte_offset);
+    byte = static_cast<uint8_t>((byte & ~mask) | (value ? byte_mask : 0)); return true;
 }
 bool Readable(const void* p, size_t size) {
     MEMORY_BASIC_INFORMATION info{};
@@ -279,7 +309,11 @@ ue::Name Grip(Object* mesh, ue::Name socket, const double* boss_rest, Transform&
 // the weapon drifts off the hand or floats. An invisible mesh on the Boss's own
 // skeleton, attached to the player's mesh and scaled to the player's height,
 // replays the same montage at the same position every tick; the weapon hangs
-// from that mesh's socket exactly as the Boss's weapon actor does.
+// from that mesh's socket exactly as the Boss's weapon actor does. It shook
+// until 11-08: never rendered, the mesh's update-rate optimisation evaluated it
+// every few frames only (now off), and the position it was given was the
+// player's of the frame before (now one step ahead: the step the player's
+// montage took since the tick before, which it takes again this frame).
 bool CreateProxy(Object* pawn, Object* mesh, Object* asset, double scale) {
     Object* skeletal = ue::FindObject("/Script/Engine.SkeletalMeshComponent");
     if (!skeletal || !ue::Alive(asset) || !ue::Alive(mesh)) return false;
@@ -302,8 +336,11 @@ bool CreateProxy(Object* pawn, Object* mesh, Object* asset, double scale) {
         if (offset > 0 && offset < 0x2000) ue::At<uint8_t>(proxy, offset) = 0; // AlwaysTickPoseAndRefreshBones
     }
     Call(proxy, "SetForcedLOD").Set("InNewForcedLOD", int32_t{1}).Invoke();
+    const bool every_frame = PutBool(proxy, "bEnableUpdateRateOptimizations", false);  // a never rendered mesh is evaluated every 4th frame otherwise
+    const bool after = Call(proxy, "AddTickPrerequisiteComponent").Set("PrerequisiteComponent", mesh).Invoke();
     Call(proxy, "SetAnimationMode").Set("InAnimationMode", uint8_t{1}).Invoke(); // AnimationSingleNode
     session_.proxy = proxy; session_.proxy_name = ue::NameOf(proxy); session_.proxy_scale = scale;
+    Logf("GRAB_EXTRAS pose proxy scale=%.3f updateRateOptimizationsOff=%d ticksAfterPlayer=%d", scale, every_frame ? 1 : 0, after ? 1 : 0);
     return true;
 }
 void SyncProxy() {
@@ -317,13 +354,25 @@ void SyncProxy() {
     if (montage != session_.proxy_montage) {
         if (!Call(session_.proxy, "PlayAnimation").Set("NewAnimToPlay", montage).Set("bLooping", false).Invoke()) return;
         Call(session_.proxy, "SetPlayRate").Set("Rate", 0.f).Invoke();
-        session_.proxy_montage = montage;
+        session_.proxy_montage = montage; session_.proxy_seen = false; session_.proxy_last = -1;
+        Call length(montage, "GetPlayLength"); session_.proxy_length = length.Invoke() ? length.Get<float>("ReturnValue") : 0.f;
         char name[160]{}; ue::NameText(ue::NameOf(montage), name, sizeof(name));
         Logf("GRAB_EXTRAS pose proxy plays %s", name);
     }
     Call position(anim, "Montage_GetPosition");
-    if (position.Set("Montage", montage).Invoke())
-        Call(session_.proxy, "SetPosition").Set("InPos", position.Get<float>("ReturnValue")).Set("bFireNotifies", false).Invoke();
+    if (!position.Set("Montage", montage).Invoke()) return;
+    const float now = position.Get<float>("ReturnValue");
+    if (!std::isfinite(now)) return;
+    // One step ahead: the step since the tick before, when it is a plain forward step (not a jump to another
+    // section, a stop or a restart), kept inside the montage.
+    float at = now;
+    if (session_.proxy_seen) {
+        const float step = now - session_.proxy_last;
+        if (step > 0 && step < .25f) at = now + step;
+        if (session_.proxy_length > 0 && at > session_.proxy_length) at = session_.proxy_length;
+    }
+    session_.proxy_last = now; session_.proxy_seen = true;
+    Call(session_.proxy, "SetPosition").Set("InPos", at).Set("bFireNotifies", false).Invoke();
 }
 void RemoveProxy() {
     if (session_.proxy && Same(session_.proxy, session_.proxy_name)) Call(session_.proxy, "K2_DestroyComponent").Set("Object", session_.proxy).Invoke();
@@ -370,40 +419,118 @@ bool SocketLocation(Object* mesh, ue::Name socket, Vector& at) {
     at = get.Get<Vector>("ReturnValue");
     return std::isfinite(at.x) && std::isfinite(at.y) && std::isfinite(at.z);
 }
-// With an NPC skin the player is drawn by another mesh, whose hands are not where the proxy's (or
-// the hidden player's) are. Each stand-in moves by the skin hand minus the hand it hangs on, so it
-// stays in the visible fist and keeps the Boss's own motion relative to that hand.
+// With an NPC skin the player is drawn by another mesh, whose hands are not where the proxy's (or the hidden player's)
+// are; without one (the hero's own body: 不变身, a boss no look plays) the player's arms keep their own lengths, so the
+// pose proxy's hand (the Boss's proportions at the player's height) is not where the player's fist is either. While the
+// Boss holds the weapon (its socket within kHoldEnterCm of the hand bone; let go past kHoldLeaveCm) a stand-in hangs
+// on the visible mesh's own hand bone with the Boss's grip (the weapon relative to the proxy's hand, its world size
+// kept): the engine carries it with that hand in the same frame, so it sits in the fist and turns with it. Moving it
+// by the hand offset from our tick (which runs before the world's) was a frame late and kept the Boss's wrist turn: it
+// floated off the fist and shook (11-08). A weapon the move lets go of (MoTian plants his in the ground for the throw)
+// hangs on its parent's socket as attached, where the Boss's pose puts it. A switch keeps the weapon where it is and
+// blends to its new place over kSwitchMs.
+constexpr double kHoldEnterCm = 35, kHoldLeaveCm = 60;
+constexpr ULONGLONG kSwitchMs = 150;
+double Gap(const Vector& a, const Vector& b) { return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z)); }
+double Gap(const Transform& a, const Transform& b) {
+    return std::sqrt((a.translation[0] - b.translation[0]) * (a.translation[0] - b.translation[0]) + (a.translation[1] - b.translation[1]) * (a.translation[1] - b.translation[1]) +
+                     (a.translation[2] - b.translation[2]) * (a.translation[2] - b.translation[2]));
+}
+// a * b (apply b, then a), as FQuat's operator*.
+void QuatMul(const double a[4], const double b[4], double out[4]) {
+    out[0] = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+    out[1] = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+    out[2] = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+    out[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+}
+double Safe(double v) { return std::fabs(v) > 1e-4 ? v : 1; }
+bool SocketWorld(Object* mesh, ue::Name socket, Transform& out) {
+    Call get(mesh, "GetSocketTransform");
+    if (!get.Set("InSocketName", socket).Set("TransformSpace", uint8_t{0}).Invoke()) return false;
+    out = get.Get<Transform>("ReturnValue");
+    return std::isfinite(Finite(out));
+}
+// The relative that puts `world` on a parent frame (UE: world = relative * parent), per-axis scale.
+Transform RelativeTo(const Transform& world, const Transform& parent) {
+    Transform out; const double inverse[4] = {-parent.rotation[0], -parent.rotation[1], -parent.rotation[2], parent.rotation[3]};
+    QuatMul(inverse, world.rotation, out.rotation);
+    const double offset[3] = {world.translation[0] - parent.translation[0], world.translation[1] - parent.translation[1], world.translation[2] - parent.translation[2]};
+    double local[3]{}; Rotate(inverse, offset, local);
+    for (int i = 0; i < 3; ++i) { out.translation[i] = local[i] / Safe(parent.scale[i]); out.scale[i] = world.scale[i] / Safe(parent.scale[i]); }
+    out.translation[3] = out.scale[3] = 0;
+    return out;
+}
+// The Boss's grip on a visible hand: the weapon's world (as the proxy holds it) relative to the proxy's hand, its
+// offset and size kept in world units on the visible hand.
+Transform GripOn(const Transform& weapon, const Transform& boss_hand, const Transform& hand) {
+    Transform out; const double inverse[4] = {-boss_hand.rotation[0], -boss_hand.rotation[1], -boss_hand.rotation[2], boss_hand.rotation[3]};
+    QuatMul(inverse, weapon.rotation, out.rotation);
+    const double offset[3] = {weapon.translation[0] - boss_hand.translation[0], weapon.translation[1] - boss_hand.translation[1], weapon.translation[2] - boss_hand.translation[2]};
+    double local[3]{}; Rotate(inverse, offset, local);
+    for (int i = 0; i < 3; ++i) { out.translation[i] = local[i] / Safe(hand.scale[i]); out.scale[i] = weapon.scale[i] / Safe(hand.scale[i]); }
+    out.translation[3] = out.scale[3] = 0;
+    return out;
+}
+Transform Blend(const Transform& a, const Transform& b, double t) {
+    Transform out; const double dot = a.rotation[0] * b.rotation[0] + a.rotation[1] * b.rotation[1] + a.rotation[2] * b.rotation[2] + a.rotation[3] * b.rotation[3];
+    const double sign = dot < 0 ? -1 : 1; double length = 0;
+    for (int i = 0; i < 4; ++i) { out.rotation[i] = a.rotation[i] * (1 - t) + b.rotation[i] * sign * t; length += out.rotation[i] * out.rotation[i]; }
+    length = std::sqrt(length) > 1e-9 ? std::sqrt(length) : 1;
+    for (int i = 0; i < 4; ++i) out.rotation[i] /= length;
+    for (int i = 0; i < 3; ++i) { out.translation[i] = a.translation[i] + (b.translation[i] - a.translation[i]) * t; out.scale[i] = a.scale[i] + (b.scale[i] - a.scale[i]) * t; }
+    out.translation[3] = out.scale[3] = 0;
+    return out;
+}
+// Hang the stand-in on (mesh, socket) where it is now; `from` is that place relative to the new frame.
+bool Rehang(Display& d, Object* mesh, ue::Name socket, Object* holder) {
+    Call world(d.component, "K2_GetComponentToWorld"); Transform frame{};
+    if (!world.Invoke() || !SocketWorld(mesh, socket, frame)) return false;
+    const Transform now = world.Get<Transform>("ReturnValue");
+    Call attach(d.component, "K2_AttachToComponent");
+    if (!attach.Set("Parent", mesh).Set("SocketName", socket).Set("LocationRule", uint8_t{1}).Set("RotationRule", uint8_t{1}).Set("ScaleRule", uint8_t{1})
+             .Set("bWeldSimulatedBodies", false).Invoke() || !attach.Get<bool>("ReturnValue")) return false;
+    d.from = RelativeTo(now, frame); d.switched = GetTickCount64();
+    d.holder = holder; d.holder_name = holder ? ue::NameOf(holder) : ue::Name{}; d.has_grip = false;
+    ++session_.hold_switches;
+    return true;
+}
 void FollowSkinHands() {
     double size = 1;
     Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(size)) : nullptr;
     if (!ue::Alive(skin)) skin = nullptr;
+    Object* own = nullptr;
+    if (!skin && session_.proxy && Same(session_.proxy, session_.proxy_name)) { ReadField(session_.pawn, "Mesh", own); if (!ue::Alive(own)) own = nullptr; }
+    const ULONGLONG now = GetTickCount64();
     for (Display& d : session_.displays) {
         if (d.hand.None() || !Same(d.component, d.name) || !Same(d.parent, d.parent_name)) continue;
-        double world[3]{};
-        Vector from{}, to{};
-        if (skin && SocketLocation(d.parent, d.hand, from) && SocketLocation(skin, d.hand, to)) {
-            world[0] = to.x - from.x; world[1] = to.y - from.y; world[2] = to.z - from.z;
-            const double length = std::sqrt(world[0] * world[0] + world[1] * world[1] + world[2] * world[2]);
-            if (!(length <= kFollowMaxCm)) {
-                if (!d.follow_refused) Logf("GRAB_EXTRAS skin hand %.1f cm from the stand-in's hand; correction skipped", length);
-                d.follow_refused = true; world[0] = world[1] = world[2] = 0;
-            }
-        } else if (!d.moved[0] && !d.moved[1] && !d.moved[2]) continue; // no skin and nothing to undo
-        // World offset -> the attach socket's space (UE: child world = relative * socket).
-        Call socket(d.parent, "GetSocketTransform");
-        if (!socket.Set("InSocketName", d.socket).Set("TransformSpace", uint8_t{0}).Invoke()) continue;
-        const Transform frame = socket.Get<Transform>("ReturnValue");
-        const double inverse[4] = {-frame.rotation[0], -frame.rotation[1], -frame.rotation[2], frame.rotation[3]};
-        double local[3]{}; Rotate(inverse, world, local);
-        bool same = true;
-        for (int i = 0; i < 3; ++i) {
-            const double scale = std::fabs(frame.scale[i]) > 1e-4 ? frame.scale[i] : 1;
-            local[i] /= scale; if (std::fabs(local[i] - d.moved[i]) > .05) same = false;
+        const bool lost = d.holder && !Same(d.holder, d.holder_name);  // the look it hung on is gone: back on the parent below
+        if (lost) d.holder = nullptr;
+        Object* visible = skin ? skin : (own && d.parent == session_.proxy ? own : nullptr);
+        Transform socket{}, boss_hand{}, hand{};
+        const bool poses = SocketWorld(d.parent, d.socket, socket) && SocketWorld(d.parent, d.hand, boss_hand);
+        const bool seen = visible && poses && SocketWorld(visible, d.hand, hand);
+        if (seen && !d.follow_refused && Gap(hand, boss_hand) > kFollowMaxCm) {
+            Logf("GRAB_EXTRAS skin hand %.1f cm from the stand-in's hand; it stays on the Boss pose", Gap(hand, boss_hand));
+            d.follow_refused = true;
         }
-        if (same) continue;
-        const Vector at{d.base[0] + local[0], d.base[1] + local[1], d.base[2] + local[2]};
-        if (Call(d.component, "K2_SetRelativeLocation").Set("NewLocation", at).Set("bSweep", false).Set("bTeleport", true).Invoke())
-            for (int i = 0; i < 3; ++i) d.moved[i] = local[i];
+        const double grip_gap = poses ? Gap(socket, boss_hand) : 1e9;
+        const bool held = seen && !d.follow_refused && grip_gap < (d.holder == visible ? kHoldLeaveCm : kHoldEnterCm);
+        if (held && d.holder != visible) { if (!Rehang(d, visible, d.hand, visible)) continue; }
+        else if (!held && (d.holder || lost)) { if (!Rehang(d, d.parent, d.socket, nullptr)) continue; }
+        Transform target = d.attached;
+        if (held) {
+            target = GripOn(Compose(d.attached, socket), boss_hand, hand);
+            if (d.has_grip) {
+                const double step = Gap(target, d.last_grip);
+                ++session_.hold_frames; session_.hold_sum += step; session_.hold_max = (std::max)(session_.hold_max, step);
+            }
+            d.last_grip = target; d.has_grip = true;
+        }
+        const double t = d.switched ? std::clamp(static_cast<double>(now - d.switched) / kSwitchMs, 0.0, 1.0) : 1.0;
+        if (t >= 1 && !held && !d.switched) continue;  // never moved: as attached
+        const Transform place = t < 1 ? Blend(d.from, target, t) : target;
+        if (t >= 1 && !held) d.switched = 0;  // back on the parent as attached: nothing more to set
+        Call(d.component, "K2_SetRelativeTransform").Set("NewTransform", place).Set("bSweep", false).Set("bTeleport", true).Invoke();
     }
 }
 bool ShowWeapon(Object* pawn, const Weapon& weapon) {
@@ -460,6 +587,7 @@ bool ShowWeapon(Object* pawn, const Weapon& weapon) {
     Display display; display.component = component; display.name = ue::NameOf(component);
     display.parent = parent; display.parent_name = ue::NameOf(parent); display.socket = attach_to;
     for (int i = 0; i < 3; ++i) display.base[i] = relative.translation[i];
+    display.attached = relative;
     display.hand = HandBone(parent, attach_to);
     display.boss_socket = weapon.socket ? weapon.socket : ""; display.own_relative = own_relative; display.asset = asset; display.skeletal = is_skeletal;
     session_.displays.push_back(display);
@@ -472,11 +600,13 @@ bool ShowWeapon(Object* pawn, const Weapon& weapon) {
 // character, i.e. on the player. SetWeaponForceHide (native 0x5e8f060 ->
 // 0x5e95d60) appends the actor index to a TArray<int32> at +0x60 of the slot's
 // current RuntimeWeaponSingleData (stride 0x120). Mirror that onto the stand-in.
-bool WeaponShouldShow(Object* weapons) {
+// armed: the main slot drawn (true when unreadable); the return: no force-hide on it (true when unreadable).
+bool WeaponShouldShow(Object* weapons, bool& armed_now) {
     static const ue::Name main_slot = ue::MakeName(L"Weapon.Slot.Main");
+    armed_now = true;
     if (!ue::Alive(weapons) || main_slot.None()) return true;
     Call armed(weapons, "IsArmed");
-    if (armed.Set("SlotTag", main_slot).Invoke() && !armed.Get<bool>("ReturnValue")) return false;
+    if (armed.Set("SlotTag", main_slot).Invoke() && !armed.Get<bool>("ReturnValue")) armed_now = false;
     Object* field = Field(ue::ClassOf(weapons), "RuntimeWeaponData");
     if (!field || ue::At<int32_t>(field, 0x34) != 80) return true;
     const int32_t offset = ue::At<int32_t>(field, static_cast<int32_t>(ue::layout::kPropOffset));
@@ -500,7 +630,16 @@ bool WeaponShouldShow(Object* weapons) {
 }
 void UpdateDisplays() {
     if (session_.displays.empty()) return;
-    const bool show = WeaponShouldShow(session_.weapons_component);
+    // The grab's own force-hides, and a sheathe during it; a sword already sheathed when the grab began (the grab from
+    // idle) does not hide the boss's weapon: the Boss always grabs with his in hand (it hid the stand-in all along, 11-08).
+    bool armed = true;
+    const bool unhidden = WeaponShouldShow(session_.weapons_component, armed);
+    if (!session_.armed_known) { session_.armed_known = true; session_.armed_at_begin = armed; }
+    const bool show = unhidden && (armed || !session_.armed_at_begin) && session_.ticks >= 2;
+    if (session_.shown_logged != (show ? 1 : 0)) {
+        session_.shown_logged = show ? 1 : 0;
+        Logf("GRAB_EXTRAS stand-ins %s (main slot drawn %d, drawn at the start %d, force-hidden %d)", show ? "shown" : "hidden", armed ? 1 : 0, session_.armed_at_begin ? 1 : 0, unhidden ? 0 : 1);
+    }
     for (Display& display : session_.displays) {
         if (display.visible == show || !Same(display.component, display.name)) continue;
         if (Call(display.component, "SetVisibility").Set("bNewVisibility", show).Set("bPropagateToChildren", true).Invoke()) display.visible = show;
@@ -721,8 +860,32 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
         static_cast<int>(session_.options.damage), static_cast<double>(session_.options.multiplier), static_cast<double>(session_.options.percent),
         session_.options.ignore_invulnerable ? 1 : 0, session_.health_offset >= 0 ? 1 : 0);
 }
+double Distance(const Vector& a, const Vector& b) { return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z)); }
+// Where each stand-in is and whether it draws: its place, size and visibility, the player's hand and the proxy's.
+void ProbeDisplays() {
+    Object* own = nullptr; ReadField(session_.pawn, "Mesh", own);
+    Call actor(session_.pawn, "K2_GetActorLocation"); const Vector pawn = actor.Invoke() ? actor.Get<Vector>("ReturnValue") : Vector{};
+    const ULONGLONG t = GetTickCount64() - session_.began;
+    for (const Display& d : session_.displays) {
+        if (!Same(d.component, d.name)) { Logf("GRAB_EXTRAS probe t=%llu stand-in gone", t); continue; }
+        Call at(d.component, "K2_GetComponentLocation"), size(d.component, "K2_GetComponentScale"), shown(d.component, "IsVisible");
+        const Vector w = at.Invoke() ? at.Get<Vector>("ReturnValue") : Vector{}, sc = size.Invoke() ? size.Get<Vector>("ReturnValue") : Vector{};
+        const bool visible = shown.Invoke() && shown.Get<bool>("ReturnValue");
+        bool hidden = false; Bool(d.component, "bHiddenInGame", hidden);
+        Vector hand{}, proxy_hand{};
+        const bool has_hand = ue::Alive(own) && !d.hand.None() && SocketLocation(own, d.hand, hand);
+        const bool has_proxy = Same(d.parent, d.parent_name) && !d.hand.None() && SocketLocation(d.parent, d.hand, proxy_hand);
+        Object* attached = nullptr; ReadField(d.component, "AttachParent", attached);
+        char hand_name[64]{}; ue::NameText(d.hand, hand_name, sizeof(hand_name));
+        Logf("GRAB_EXTRAS probe t=%llu visible=%d hiddenInGame=%d on=%s weapon=(%.0f,%.0f,%.0f) scale=%.2f %s: to the player's hand %.1f cm, to the proxy's %.1f cm, proxy hand to the player's %.1f cm; pawn=(%.0f,%.0f,%.0f)",
+             t, visible ? 1 : 0, hidden ? 1 : 0, attached == d.parent ? "boss pose" : d.holder && attached == d.holder ? "hand" : "other", w.x, w.y, w.z, sc.x, hand_name,
+             has_hand ? Distance(w, hand) : -1.0, has_proxy ? Distance(w, proxy_hand) : -1.0, has_hand && has_proxy ? Distance(hand, proxy_hand) : -1.0, pawn.x, pawn.y, pawn.z);
+    }
+}
 void Tick() {
     if (!session_.active || !Same(session_.pawn, session_.pawn_name)) return;
+    if (session_.ticks < 1000) ++session_.ticks;
+    if (GetTickCount64() >= session_.probe_at) { session_.probe_at = GetTickCount64() + 500; ProbeDisplays(); }
     if (!session_.damage_done && Same(session_.target, session_.target_name)) ScaleHits();
     UpdatePosing();
     if (!session_.options.hide_weapon) return;
@@ -741,6 +904,9 @@ void Tick() {
 void Finish(bool completed) {
     if (!session_.active) return;
     Logf("GRAB_EXTRAS finish completed=%d damage_done=%d", completed ? 1 : 0, session_.damage_done ? 1 : 0);
+    if (session_.hold_frames || session_.hold_switches)
+        Logf("GRAB_EXTRAS fist hold frames=%u: the grip moved mean=%.2f max=%.2f cm a tick in the hand; switches hand/boss pose=%u", session_.hold_frames,
+             session_.hold_frames ? session_.hold_sum / session_.hold_frames : 0.0, session_.hold_max, session_.hold_switches);
     if (Same(session_.pawn, session_.pawn_name)) { RemoveDisplays(); RemoveProxy(); RestoreWeapons(); }
     else { session_.displays.clear(); session_.hidden.clear(); }
     if (completed && !session_.damage_done) ApplyDamage();

@@ -157,6 +157,9 @@ int32_t chain_variant_=-1;     // the move the chain keeps loaded (-1: none)
 bool chain_swapped_=false;     // prepared_ holds the chain's move until its session ends
 bool chain_attempt_=false;     // Start runs for the chain
 ULONGLONG chain_deadline_=0;   // a chain grab asked for, tried until then
+// grab trigger test: that one queued request may start while the game window is not focused (the test driver runs the
+// game in the background and never takes the mouse); every other gate still applies.
+bool trigger_test_=false,focus_test_=false; ULONGLONG manual_test_until_=0;  // focus_test_: grab focustest (the next 10 s skip the focus gate)
 constexpr ULONGLONG kChainTriggerMs=1200;
 // A 黑伤 execution that was cancelled and waits for both sides to finish ending.
 struct Redirect {
@@ -746,7 +749,8 @@ bool InputGate(const char* reason,const wchar_t* message,bool allowed=false) {
     return allowed;
 }
 bool InputBaseAllowed(const Context& c) {
-    if (!input_focus_ || !input_focus_()) return InputGate("game_focus",L"等待回到游戏窗口；菜单 / 失焦时不触发投技");
+    const bool test=GetTickCount64()<manual_test_until_;  // until Start below has run (it gates again)
+    if ((!input_focus_ || !input_focus_()) && !test) return InputGate("game_focus",L"等待回到游戏窗口；菜单 / 失焦时不触发投技");
     if (!AliveHealth(c.pawn)) return InputGate("player_not_alive",L"当前主角生命状态不允许投技");
     // Hit-stun, knock-down and special moves no longer hold the grab back.
     if (!SafeState(c.pawn,true,true)) return InputGate("protected_player_state",L"受击、倒地、剧情或特殊移动中，等待恢复后投技");
@@ -2086,7 +2090,8 @@ bool StartAttempt(const Context& c) {
     timing.Next(1);
     // A redirected execution names its target; the move's own range then applies.
     Object* target=nullptr,*target_asc=nullptr,*target_execution=nullptr,*near_boss=nullptr;
-    double best=forced_target_||chain_attempt_?static_cast<double>(variant.max_range):options_.range;  // the chain: the move's own full range
+    // The chain, and a test request (grab trigger test: the dummy stands 350 cm away), use the move's own full range.
+    double best=forced_target_||chain_attempt_||GetTickCount64()<manual_test_until_?static_cast<double>(variant.max_range):options_.range;  // the chain: the move's own full range
     const char* near_reason=""; char near_detail[200]{};
     // The closest listed enemy that was refused, so a failed grab says why.
     Object* refused=nullptr; double refused_distance=1e30; const char* refused_reason=""; char refused_detail[200]{};
@@ -2572,6 +2577,8 @@ void Tick() {
         Logf("MOTIAN_GRAB_OPTIONS enabled=%d humanoid_bosses=%d positionCorrection=%d variant=%s range=%.1f tangExecution=%d transform=%d",options_.enabled?1:0,options_.allow_bosses?1:0,options_.position_correction?1:0,kVariants[options_.variant].id,options_.range,options_.tang_execution?1:0,options_.transform?1:0);
     }
     manual=trigger_;expected_variant=trigger_variant_;const bool may_transform=trigger_transform_;trigger_=false;trigger_variant_=-1;trigger_transform_=true;cancel=cancel_; cancel_=false;
+    const bool manual_test=manual&&trigger_test_; trigger_test_=false;
+    const bool focus_test=focus_test_; focus_test_=false;
     const int32_t chain_move=chain_request_;const bool chain_manual=chain_trigger_;const int32_t chain_manual_variant=chain_trigger_variant_;
     chain_request_=-2;chain_trigger_=false;chain_trigger_variant_=-1;
     const uint32_t cut_token=cut_request_,release_token=release_request_;cut_request_=release_request_=0;
@@ -2595,6 +2602,9 @@ void Tick() {
     if(manual&&HasResources()){manual=false;Status(L"当前投技尚未完整结束；未排队下一招");}
     if(manual&&transform_.stage){manual=false;Status(L"正在为上一次投技变身；本次请求已忽略");}
     if (manual) { manual_deadline_=GetTickCount64()+10000;manual_variant_=options_.variant;manual_transform_=may_transform;Status(L"已排队一次投技：10 秒内回到游戏；仍需通过焦点、生命与目标门控"); }
+    manual_test_until_=manual&&manual_test?GetTickCount64()+10000:manual?0:manual_test_until_;
+    if (manual&&manual_test) Logf("MOTIAN_GRAB test trigger queued: the focus gate is skipped for this request");
+    if (focus_test) { manual_test_until_=GetTickCount64()+10000; Logf("MOTIAN_GRAB focus test: the focus gate is skipped for 10 s (also the chain's grab)"); }
     if (cancel) {manual_deadline_=0;manual_variant_=-1;chain_deadline_=0;}
     // Grabs, the 黑伤 execution redirect and the move chain's grab share this module; a chord grab still ends when
     // grabs are switched off (a chain grab and a redirect do not).
@@ -2726,7 +2736,7 @@ void Tick() {
         manual_deadline_=0;manual_variant_=-1;combo_deadline_=0; combo_owner_={}; last_attempt_=GetTickCount64();
         AcquireSRWLockExclusive(&state_lock); ++state_.attempts; ReleaseSRWLockExclusive(&state_lock);
         Logf("MOTIAN_GRAB request combo=%d manual=%d",combo?1:0,manual?1:0);
-        Start(c); Publish(ready);
+        Start(c); manual_test_until_=0; Publish(ready);
     }
 }
 void SafeFinishExtras() { __try { GrabExtras::Finish(false); } __except(EXCEPTION_EXECUTE_HANDLER) {} }
@@ -2795,6 +2805,33 @@ bool RequestChainTrigger(int32_t variant) {
 void RequestCancel() { AcquireSRWLockExclusive(&request_lock); cancel_=true; ReleaseSRWLockExclusive(&request_lock); }
 void RequestCut(uint32_t token) { if (!token) return; AcquireSRWLockExclusive(&request_lock); cut_request_=token; ReleaseSRWLockExclusive(&request_lock); }
 void RequestRelease(uint32_t token) { if (!token) return; AcquireSRWLockExclusive(&request_lock); release_request_=token; ReleaseSRWLockExclusive(&request_lock); }
+std::string PreviewMontage(int32_t variant) {
+    if (variant < 0 || static_cast<size_t>(variant) >= std::size(kVariants)) return {};
+    const VariantData& v = kVariants[variant];
+    // The executor GA's name stem (GA_MoTian_GEx_02_Short -> GEx_02) picks the montage of its own move first.
+    std::string stem = v.source ? v.source : "";
+    if (const size_t dot = stem.find('.'); dot != std::string::npos) stem = stem.substr(0, dot);
+    stem = stem.substr(stem.find_last_of('/') + 1);
+    const auto lower = [](std::string text) { for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return text; };
+    std::string token;
+    for (const char* mark : {"gex_", "ca_", "skill_"}) {
+        const std::string low = lower(stem); const size_t at = low.find(mark);
+        if (at != std::string::npos) { token = low.substr(at, std::strlen(mark) + 2); break; }
+    }
+    std::string best; int best_score = -1;
+    for (size_t i = 0; i < v.dependency_count; ++i) {
+        const char* path = v.dependencies[i].path;
+        if (!path || v.dependencies[i].is_class) continue;
+        const std::string full = path, low = lower(full);
+        const std::string name = low.substr(low.find_last_of('.') + 1);
+        if (name.find("_montage") == std::string::npos) continue;
+        if (name.find("miss") != std::string::npos || name.find("ged") != std::string::npos || name.find("_hun_") != std::string::npos || name.find("_hun_montage") != std::string::npos)
+            continue;  // the target's side, the hero's side, a miss
+        const int score = (!token.empty() && name.find(token) != std::string::npos ? 2 : 0) + (name.find("gex") != std::string::npos ? 1 : 0);
+        if (score > best_score) { best_score = score; best = full; }
+    }
+    return best;
+}
 Snapshot GetSnapshot() { AcquireSRWLockShared(&state_lock); Snapshot copy=state_; ReleaseSRWLockShared(&state_lock); return copy; }
 void OnGameThreadGuarded() {
     ForgetReadable();
@@ -2811,6 +2848,7 @@ void OnGameThreadGuarded() {
         Status(L"投技原生调用异常，已停止新施放；保留清理记录"); Publish();
     }
 }
+ue::Object* HeldTarget() { return session_.began && Same(session_.target) ? session_.target.object : nullptr; }
 bool BeforeTravel() {
     bool result=false;ForgetReadable();
     __try {
@@ -2840,7 +2878,12 @@ bool HandleCommand(const char* verb,const char* arguments) {
         int value=-1; input>>value; if (value!=0 && value!=1) return false;
         Options o=GetSnapshot().options; o.tang_execution=value!=0; RequestOptions(o);
     }
-    else if (action=="trigger") RequestTrigger();
+    else if (action=="trigger") {
+        std::string mode; input>>mode;
+        if (mode=="test") { AcquireSRWLockExclusive(&request_lock); trigger_test_=true; ReleaseSRWLockExclusive(&request_lock); }
+        RequestTrigger();
+    }
+    else if (action=="focustest") { AcquireSRWLockExclusive(&request_lock); focus_test_=true; ReleaseSRWLockExclusive(&request_lock); }  // tests in the background
     else if (action=="cancel"||action=="cleanup") RequestCancel();
     else if (action=="variant") {
         std::string id; input>>id; Options o=GetSnapshot().options;

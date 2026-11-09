@@ -1265,6 +1265,7 @@ void StepCapture() {
 }
 // The keyboard set always fires; of the pad sets only the active pad's.
 std::atomic<unsigned> level_buttons_{0};
+std::atomic<unsigned> held_actions_{0};  // bit per Action: its chord held as of the latest Snapshot
 std::atomic<unsigned> level_flags_{0};  // 1: in game, 2: PlayStation pad
 std::atomic<ULONGLONG> level_at_{0};
 std::atomic<unsigned> level_stick_{0};
@@ -1282,6 +1283,7 @@ void Snapshot(bool fire, bool pad_fire) {
     if (nav != pad_nav_was_) { pad_nav_was_ = nav; if (!nav) pad_stale_ = pad; }
     pad_stale_ &= pad;
     const unsigned chord_pad = pad & ~pad_stale_;
+    unsigned held_now = 0;
     for (int i = 0; i < kCount; ++i) {
         const Chord& key = chords_[static_cast<size_t>(i)][0];
         const Chord& held = chords_[static_cast<size_t>(i)][active];
@@ -1295,7 +1297,9 @@ void Snapshot(bool fire, bool pad_fire) {
             if (handlers_[static_cast<size_t>(i)]) handlers_[static_cast<size_t>(i)]();
         }
         was_[static_cast<size_t>(i)] = down;
+        if (down && (by_key ? fire : pad_fire)) held_now |= 1u << i;
     }
+    held_actions_.store(held_now, std::memory_order_relaxed);
 }
 // A prompt in the UI language: key captions, pad buttons as the game names them.
 std::wstring HintText(const Chord& chord) {
@@ -1709,6 +1713,10 @@ Chord Get(Action action, Device device) {
 bool Bound(Action action) {
     const int index = static_cast<int>(action);
     return index >= 0 && index < kCount && (bound_.load(std::memory_order_relaxed) >> index & 1u) != 0;
+}
+bool Held(Action action) {
+    const int index = static_cast<int>(action);
+    return index >= 0 && index < kCount && (held_actions_.load(std::memory_order_relaxed) >> index & 1u) != 0;
 }
 std::wstring Hint(Action action) {
     const int index = static_cast<int>(action);

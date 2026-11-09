@@ -5,11 +5,14 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Every source folder is an include root, so headers are included by bare name.
-include_directories(src/core src/ui src/boss src/grab src/air src/weapons src/character src/hair src/pad src/supplement src/generated)
+include_directories(src/core src/ui src/boss src/grab src/air src/weapons src/character src/hair src/pad src/supplement src/net src/generated)
 
 function(pbz_settings target)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/EHsc>")
+    # Size: functions and data in their own COMDATs, unreferenced ones dropped and identical ones folded at link.
+    target_compile_options(${target} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/Gy;/Gw>")
+    target_link_options(${target} PRIVATE "$<$<CONFIG:Release>:/OPT:REF;/OPT:ICF>")
 endfunction()
 
 add_library(version SHARED
@@ -18,8 +21,8 @@ add_library(version SHARED
     src/ui/ui_host.cpp src/ui/ui_hotkeys.cpp src/ui/ui_cursor.cpp src/ui/ui_assets.cpp
     src/hair/hair_controls.cpp
     src/boss/boss_menu.cpp src/boss/boss_rush.cpp src/boss/boss_record_guard.cpp src/boss/boss_ai.cpp src/boss/boss_ai_menu.cpp
-    src/boss/entry_safety.cpp src/boss/entry_protection.cpp src/boss/entry_focus.cpp src/boss/test_dummy.cpp
-    src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp src/character/combo_menu.cpp
+    src/boss/entry_safety.cpp src/boss/entry_protection.cpp src/boss/entry_focus.cpp src/boss/test_dummy.cpp src/boss/boss_assist.cpp src/boss/move_preview.cpp
+    src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp
     src/air/air_skills.cpp src/air/air_skills_menu.cpp
     src/grab/motian_grab.cpp src/grab/motian_grab_menu.cpp src/grab/grab_extras.cpp
     src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp src/ui/skill_toast.cpp src/core/title_control.cpp
@@ -27,6 +30,7 @@ add_library(version SHARED
     src/pad/pad_triggers.cpp src/pad/pad_gate.cpp src/pad/game_pad_gate.cpp
     src/core/ue_runtime.cpp src/core/game_thread.cpp src/core/game_build.cpp src/hair/groom_force.cpp
     src/supplement/debug_supplement.cpp src/supplement/supplement_menu.cpp src/ui/donate_page.cpp
+    src/net/net_steam.cpp src/net/net_puppet.cpp src/net/net_page.cpp
     src/core/forwarders.asm src/core/version.def)
 pbz_settings(version)
 target_link_libraries(version PRIVATE bcrypt user32 gdi32 comctl32 cabinet)
@@ -40,6 +44,18 @@ set_target_properties(version_triggers PROPERTIES OUTPUT_NAME version
     ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/triggers_only ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/triggers_only_debug)
 
 # Tests
+add_executable(npc_cutscene_policy_test tests/npc_cutscene_policy_test.cpp)
+pbz_settings(npc_cutscene_policy_test)
+
+add_executable(npc_source_budget_test tests/npc_source_budget_test.cpp)
+pbz_settings(npc_source_budget_test)
+
+add_executable(combo_playback_rules_test tests/combo_playback_rules_test.cpp)
+pbz_settings(combo_playback_rules_test)
+
+add_executable(air_attack_reset_test tests/air_attack_reset_test.cpp)
+pbz_settings(air_attack_reset_test)
+
 add_executable(proxy_test tests/proxy_test.cpp)
 pbz_settings(proxy_test)
 
@@ -68,6 +84,9 @@ add_executable(game_build_test tests/game_build_test.cpp src/core/game_build.cpp
 pbz_settings(game_build_test)
 
 # NPC skin boss skills: attack-collider tags copied onto the hero per skin.
+add_executable(npc_skill_support_test tests/npc_skill_support_test.cpp)
+pbz_settings(npc_skill_support_test)
+
 add_executable(npc_skill_colliders_test tests/npc_skill_colliders_test.cpp)
 pbz_settings(npc_skill_colliders_test)
 
@@ -82,6 +101,11 @@ pbz_settings(npc_pose_transfer_test)
 # Debug supplement page: every catalog item on exactly one card.
 add_executable(supplement_layout_test tests/supplement_layout_test.cpp)
 pbz_settings(supplement_layout_test)
+
+add_executable(supplement_sequence_test tests/supplement_sequence_test.cpp
+    src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp)
+pbz_settings(supplement_sequence_test)
+target_link_libraries(supplement_sequence_test PRIVATE user32 gdi32 comctl32 gdiplus ole32)
 
 # DualSense adaptive-trigger rewrite (pad_triggers.h): report layouts, Steam vtable hook, import-table path.
 add_executable(pad_triggers_test tests/pad_triggers_test.cpp src/pad/pad_triggers.cpp)
@@ -101,10 +125,20 @@ add_executable(npc_combo_test tests/npc_combo_test.cpp)
 pbz_settings(npc_combo_test)
 
 # 招式派生 page rendered offline from the generated skill / dodge tables (stubbed game state) to a PNG.
-add_executable(combo_menu_preview tests/combo_menu_preview.cpp src/character/combo_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(combo_menu_preview tests/combo_menu_preview.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_menu_preview)
 target_link_libraries(combo_menu_preview PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
+
+# Hidden host only: no activation, capture, injected input, game launch or real chain folders.
+add_executable(combo_library_test tests/combo_library_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+    src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
+pbz_settings(combo_library_test)
+target_link_libraries(combo_library_test PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
+
+add_executable(combo_save_stress_test tests/combo_save_stress_test.cpp src/character/combo_file.cpp src/character/npc_combo.cpp src/core/settings_store.cpp)
+pbz_settings(combo_save_stress_test)
+target_link_libraries(combo_save_stress_test PRIVATE cabinet)
 
 # .combo files: format round trip, bad files, ini migration, save-as / select, live reload.
 add_executable(combo_file_test tests/combo_file_test.cpp src/character/combo_file.cpp src/character/npc_combo.cpp src/core/settings_store.cpp)

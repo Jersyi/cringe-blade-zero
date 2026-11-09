@@ -21,6 +21,7 @@ $readme = @"
   一键安装：先退出游戏，双击 Install.bat，按 1 安装完整版、2 安装精简版、3 卸载。
     安装器从注册表找到游戏目录（找不到时可手动输入 PBZ.exe 所在文件夹），校验游戏版本，复制后再校验 DLL；
     目录里已有其他 MOD 的 version.dll 时先备份，卸载时还原。界面语言随系统显示语言（中文 / 英文）。
+  Steam / WeGame 共用同一个 version.dll，无需分别下载。
   手动安装：把 version.dll 复制到 PBZ.exe 所在的文件夹：
     Steam 版   <PBZ 安装目录>\platform\steam\version.dll
     WeGame 版  WeGame 游戏目录里 PBZ.exe 的旁边

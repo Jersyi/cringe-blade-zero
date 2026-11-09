@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "ue_runtime.h"
 
 namespace MotianGrab {
 using Logger = void (*)(const char*);
@@ -87,9 +88,14 @@ void RequestCancel();
 void RequestCut(uint32_t token);
 void RequestRelease(uint32_t token);
 Snapshot GetSnapshot();
+// Any thread. The 招式预览 of a grab (Variant::index): the executor's own montage among its audited dependencies (not
+// the target's side, not a miss), as an object path; empty when none is listed.
+std::string PreviewMontage(int32_t variant);
 void OnGameThreadGuarded();
 // Cancel/verify only this module's exact grant handles before map/pawn changes.
 // False must block travel; selected options are retained.
 bool BeforeTravel();
 bool HandleCommand(const char* verb, const char* arguments);
+// GT only. The actor the running grab holds (its target), else null: 联机测试's puppet shows it with the hero.
+ue::Object* HeldTarget();
 }

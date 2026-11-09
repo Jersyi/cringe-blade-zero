@@ -706,10 +706,12 @@ void TestWeaponRoutes() {
     Attached pooled; pooled.socket = kFoot; pooled.owner_alive = true; pooled.owner_is_world = true; pooled.effect = true;
     Attached pooled_mesh = pooled; pooled_mesh.effect = false;  // anything the pools own, even not an effect class
     Attached trail; trail.socket = kHand; trail.owner_alive = true; trail.effect = true;  // a weapon actor's Niagara
-    Attached knife; knife.socket = kBack; knife.owner_alive = true;                       // a Shaqi weapon's mesh
+    Attached knife; knife.socket = kBack; knife.owner_alive = true; knife.weapon_actor = true; // a Shaqi weapon's mesh
     Attached own = knife; own.owner_is_pawn = true;                                       // the hero's own part
     Attached dead = knife; dead.owner_alive = false;
     Attached bare = knife; bare.socket = 0;
+    Attached light = knife; light.weapon_actor = false;
+    Check(!NpcGripRoutes::Weapon(light) && !NpcGripRoutes::TakesRoute(light, true, false), "cinematic lights and cameras never remap head sockets");
     Check(!NpcGripRoutes::Weapon(pooled) && !NpcGripRoutes::TakesRoute(pooled, true, false), "a pooled effect on foot_r_Socket (owner WorldSettings) is no route");
     Check(!NpcGripRoutes::TakesRoute(pooled_mesh, true, false), "nothing the effect pools own becomes a route");
     Check(!NpcGripRoutes::TakesRoute(trail, true, false), "a weapon actor's effect component is no route");
@@ -722,6 +724,7 @@ void TestWeaponRoutes() {
     Check(with_knife.size() == 1 && with_knife[0] == 2, "a discovered route with only an effect on its socket goes; the knife's stays; generated ones stay");
     const std::vector<size_t> nothing = NpcGripRoutes::StaleRoutes(routes, {});
     Check(nothing.size() == 2 && nothing[0] == 2 && nothing[1] == 1, "with nothing attached every discovered route goes, highest index first");
+    Check(NpcGripRoutes::StaleRoutes(routes, {light}).size() == 2, "a light cannot keep an old weapon route alive");
 }
 
 int main() {

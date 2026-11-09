@@ -21,6 +21,10 @@ bool SetOpacity(HWND hub, BYTE animation_opacity);
 // After move/resize/show/DPI/z-order changes. No activation or foreground calls.
 void Sync(HWND hub);
 void Hide(HWND hub);
+// A rectangle (screen coordinates; null: none) where neither the hub nor its plate is: the game shows through there
+// (the 招式预览 live view). False when the hub has no record here.
+bool SetHole(HWND hub, const RECT* screen);
+bool CanHole(HWND hub);
 Snapshot GetSnapshot(HWND hub);
 void Shutdown();
 }

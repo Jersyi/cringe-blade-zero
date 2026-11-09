@@ -29,6 +29,10 @@ Files GetFiles();
 bool SelectFile(const std::wstring& name);  // read it and make it the active set; false: missing or bad (status says)
 bool SaveFile();                            // write the active set again
 bool SaveAs(const std::wstring& name);      // the active set into name.combo, which becomes the active file
+// A path a Save As dialog picked (.combo added when missing): in the folder it is SaveAs(its name) (Folder, name set);
+// anywhere else the active set is copied there and the active file stays (Copy: only the folder's files are listed).
+enum class SavedTo { Failed, Folder, Copy };
+SavedTo SaveToPath(const std::wstring& path, std::wstring& name);
 bool Poll();                                // the folder and the active file read again when changed (true: reloaded)
 void StartWatcher();                        // a background thread: Poll on every folder change and once a second
 
@@ -39,6 +43,10 @@ Run GetRun();
 // How long a move's montage lasted at its own rate when it last played (seconds; 0 when it has not played yet).
 void RecordLength(const std::string& ability, float seconds);
 float Length(const std::string& ability);
+// A boss move's first montage, its length in its own time (seconds; 0 until the move played in a chain or in the 招式预览):
+// the page's 裁剪 timeline. Any thread.
+void RecordClip(const std::string& ability, float seconds);
+float Clip(const std::string& ability);
 // The hero's main weapon as a 武器属性 node last read it (game thread): its WeaponConfig name and strength
 // multiplier (ok false: not readable, the hits keep x1). serial 0: never read.
 struct WeaponInfo { std::wstring name; float scale = 1; bool ok = false; uint64_t serial = 0; };

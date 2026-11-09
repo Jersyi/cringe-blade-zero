@@ -3,11 +3,14 @@
 // scripted mouse and keyboard checks.
 //   combo_menu_preview.exe <out.png> [skin index] [width] [en]
 #include "combo_menu.h"
+#include "ui_cursor.h"
 #include "combo_weapons.h"
 #include "npc_combo.h"
 #include "npc_retarget.h"
 #include "motian_grab.h"
 #include "test_dummy.h"
+#include "move_preview.h"
+#include "speed_curve_window.h"
 #include "grab_boss.h"
 #include "debug_hub.h"
 #include "ui_hotkeys.h"
@@ -30,14 +33,37 @@ HWND host_ = nullptr, page_ = nullptr;
 int min_height_ = 600;
 int dummy_requests_ = 0;
 bool dummy_standing_ = false;
+int preview_from_=0,preview_to_=0;
+std::string preview_shown_;  // 招式预览 stand-in: the package the page asked for (empty: hidden)
 }
 // 测试木桩 stand-in: a request stands it up / takes it away at once (the game thread does that in the game).
 namespace TestDummy {
-void Request(bool spawn) { ++dummy_requests_; dummy_standing_ = spawn; }
+void Request(bool spawn, double) { ++dummy_requests_; dummy_standing_ = spawn; }
 Snapshot GetSnapshot() { Snapshot s; s.present = dummy_standing_; return s; }
 }
 
+// 招式预览 stand-in: what was asked is kept; one grey frame comes back.
+namespace MovePreview {
+void Show(const std::string&, const std::string& ability, int, const std::vector<NpcCombo::CurvePoint>&, int from, int to) { preview_shown_ = ability; preview_from_=from; preview_to_=to; }
+void Hide() { preview_shown_.clear(); }
+void Place(const RECT&) {}
+bool Latest(Frame& frame, uint64_t newer_than) {
+    if (preview_shown_.empty() || newer_than >= 1) return false;
+    frame.pixels.assign(static_cast<size_t>(kWidth) * kHeight, 0);
+    for (int y = 0; y < kHeight; ++y) for (int x = 0; x < kWidth; ++x) { const uint32_t g = 80 + static_cast<uint32_t>((x + y) % 90); frame.pixels[static_cast<size_t>(y) * kWidth + x] = 0xff000000u | (g << 16) | (g << 8) | g; }
+    frame.serial = 1; frame.status.clear(); return true;
+}
+}
 namespace NpcRetarget {
+bool MovePreviewSubject(int32_t skin, const std::string& ability, std::string& monster, std::string& package) {
+    monster.clear(); package.clear();
+    if (skin < 0 || static_cast<size_t>(skin) >= std::size(kNpcSkillSets) || !kNpcSkillSets[skin].monster) return false;
+    const NpcSkillSet& set = kNpcSkillSets[skin];
+    for (size_t i = 0; i < set.skill_count; ++i) if (NpcCombo::ShortName(set.skills[i]) == ability) { package = set.skills[i]; monster = set.monster; return true; }
+    const NpcDodgeSet& dodges = kNpcDodgeSets[skin];  // a dodge pill too, as MovePackage
+    for (size_t i = 0; i < dodges.count; ++i) if (NpcCombo::ShortName(dodges.dodges[i].ability) == ability) { package = dodges.dodges[i].ability; monster = set.monster; return true; }
+    return false;
+}
 Snapshot GetSnapshot() {
     Snapshot s{}; s.skin = skin_; s.chain = skin_;
     for (size_t i = 0; i < std::size(kNpcSkillSets); ++i) { std::string id = kNpcSkillSets[i].profile; s.entries.push_back({static_cast<int32_t>(i), id, std::wstring(id.begin(), id.end()), L""}); }
@@ -61,6 +87,11 @@ int32_t SkinForGrab(const std::wstring& boss_id, const std::wstring&) {
     for (size_t i = 0; i < std::size(kNpcSkillSets); ++i) if (GrabBoss::Same(std::string_view(kNpcSkillSets[i].profile), boss_id)) return static_cast<int32_t>(i);
     return -1;
 }
+bool GrabPreviewMonster(const std::wstring& boss_id, const std::wstring& source, std::string& monster) {
+    const int32_t row = SkinForGrab(boss_id, source);
+    monster = row >= 0 && kNpcSkillSets[row].monster ? kNpcSkillSets[row].monster : "";
+    return !monster.empty();
+}
 // Stand-in for SkillLabel: the name without "GA_<boss>_".
 std::wstring MoveLabel(const std::string& ability) {
     std::string name = NpcCombo::ShortName(ability);
@@ -76,10 +107,18 @@ void Attach(HWND child, HWND parent, int, int) { SetParent(child, parent); ShowW
 // As the hub: the page is at least its minimum and at least the visible area.
 void SetMinimum(HWND page, int, int height) {
     min_height_ = height; RECT r{}; GetClientRect(host_, &r);
-    SetWindowPos(page, nullptr, 0, 0, r.right, (std::max)(static_cast<LONG>(height), r.bottom), SWP_NOMOVE | SWP_NOZORDER);
+    SetWindowPos(page, nullptr, 0, 0, r.right, (std::max)(static_cast<LONG>(height), r.bottom), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 bool Notify(const wchar_t* text) { std::wprintf(L"notify: %ls\n", text); return true; }
+bool SetPreviewHole(const RECT*) { return false; }
+void ShowPage(Page) {}
+bool PreviewHoleSupported() { return false; }
 void Hide() {}
+}
+namespace UiCursor {
+bool hands_off_ = false;  // combo handsoff: the page's test switch (the real one keeps the hub off the mouse)
+void SetHandsOff(bool on) { hands_off_ = on; }
+bool HandsOff() { return hands_off_; }
 }
 namespace UiHotkeys {
 std::wstring Hint(Action) { return L"L3 + R3"; }
@@ -148,6 +187,7 @@ Snapshot GetSnapshot() {
     Snapshot s; s.options.enabled = true; s.options.variant = 0; s.variants = StubGrabs();
     return s;
 }
+std::string PreviewMontage(int32_t variant) { return variant >= 0 ? "/Stub/Grab_GEx_Montage.Grab_GEx_Montage" : ""; }
 }
 
 int CLSIDFor(const wchar_t* mime, CLSID* clsid) {
@@ -321,6 +361,17 @@ int wmain(int argc, wchar_t** argv) {
     const int dropped = static_cast<int>(now().chain.size()) - 1;
     click(ComboMenu::Probe::Pill(1));
     check(now().chain.size() == count + 2 && now().chain[static_cast<size_t>(dropped)].next == dropped + 1, "clicking a move appends it after the selected node, wired");
+    // 招式预览: the mouse resting on a move pill for 0.4 s asks for its preview (the boss blueprint and the move's
+    // package); its frame shows in a card by the pill; the mouse leaving the move hides it.
+    {
+        send(WM_MOUSEMOVE, ComboMenu::Probe::Pill(1)); ComboMenu::Tick();
+        check(preview_shown_.empty(), "招式预览: nothing at once");
+        Sleep(450); ComboMenu::Tick(); ComboMenu::Tick();
+        check(preview_shown_.find("/GA_") != std::string::npos, "招式预览: a pill the mouse rests on asks for its move's package after 0.4 s");
+        { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_preview"); shot(path); }
+        send(WM_MOUSEMOVE, {canvas.left + 4, canvas.bottom - 4}); ComboMenu::Tick();
+        check(preview_shown_.empty(), "招式预览: hidden once the mouse leaves the move");
+    }
 
     const POINT key_before = ComboMenu::Probe::Header(-1);
     empty = bare();
@@ -361,6 +412,30 @@ int wmain(int argc, wchar_t** argv) {
     type(L"skill");
     check(ComboMenu::Probe::SearchRows() > 0 && ComboMenu::Probe::SearchRows() < all_rows, "typing filters the search");
     { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_search"); shot(path); }
+    // 招式预览 in the search box: a move row picked with the keys, or under the mouse, shows its preview after 0.4 s in a
+    // card by the box (never over its list).
+    {
+        ComboMenu::Tick(); Sleep(450); ComboMenu::Tick();
+        check(preview_shown_.empty(), "搜索框招式预览: none for the row the box opens on");
+        const int first = ComboMenu::Probe::SearchSelected();
+        key_down(VK_DOWN); key_down(VK_UP);
+        check(ComboMenu::Probe::SearchSelected() == first, "搜索框: Down, Up is back on the first match");
+        ComboMenu::Tick(); Sleep(450); ComboMenu::Tick(); ComboMenu::Tick();
+        const std::string keyed = preview_shown_;
+        check(keyed.find("/GA_") != std::string::npos, "搜索框招式预览: the move row picked with the keys asks for its package after 0.4 s");
+        { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_searchpreview"); shot(path); }
+        RECT overlap{}; const RECT card = ComboMenu::Probe::PreviewCard(), box = ComboMenu::Probe::SearchBox();
+        check(card.right > card.left && !IntersectRect(&overlap, &card, &box), "搜索框招式预览: the card is by the box, not over it");
+        int other = -1;
+        for (int i = first + 1; i < static_cast<int>(ComboMenu::Probe::SearchRows()) && other < 0; ++i) if (ComboMenu::Probe::SearchRow(i).x >= 0) other = i;
+        if (other >= 0) {
+            send(WM_MOUSEMOVE, ComboMenu::Probe::SearchRow(other)); ComboMenu::Tick();
+            check(preview_shown_.empty(), "搜索框招式预览: the mouse on another row starts over");
+            Sleep(450); ComboMenu::Tick(); ComboMenu::Tick();
+            check(!preview_shown_.empty() && preview_shown_ != keyed, "搜索框招式预览: the row under the mouse shows its own move");
+            send(WM_MOUSEMOVE, {canvas.left + 4, canvas.bottom - 4}); ComboMenu::Tick();  // off the box and every move: no card over what comes next
+        }
+    }
     key_down(VK_RETURN);
     check(!ComboMenu::Probe::SearchOpen() && now().chain.size() == count + 4 && now().chain.back().type == NpcCombo::NodeType::Skill && now().chain.back().next == -1,
           "Enter adds the first match as a free node");
@@ -461,6 +536,46 @@ int wmain(int argc, wchar_t** argv) {
     check(!ComboMenu::Probe::Editing() && now().chain[static_cast<size_t>(speed_node)].speed == NpcCombo::kSpeedMax, "Esc drops what was typed");
     click(ComboMenu::Probe::Value(speed_node)); type(L"1.5"); click(ComboMenu::Probe::Header(speed_node));
     check(!ComboMenu::Probe::Editing() && now().chain[static_cast<size_t>(speed_node)].speed == 150, "a click elsewhere keeps what was typed");
+    {  // 曲线调节: the checkbox, 编辑曲线… and its window (drag a point, double-click adds one, right-click removes it)
+        click(ComboMenu::Probe::Toggle(speed_node));
+        check(now().chain[static_cast<size_t>(speed_node)].curve && now().chain[static_cast<size_t>(speed_node)].points.size() == 3 && !SpeedCurveWindow::Window(),
+              "曲线调节 ticked: a curve of three points, no window yet");
+        click(ComboMenu::Probe::Field(speed_node));
+        const HWND curve = SpeedCurveWindow::Window();
+        check(curve && SpeedCurveWindow::EditedNode() == speed_node, "编辑曲线… opens the curve window for that node");
+        if (curve) {
+            const auto csend = [&](UINT message, POINT p, WPARAM w = 0) { SendMessageW(curve, message, w, MAKELPARAM(p.x, p.y)); };
+            const POINT mid = SpeedCurveWindow::PointAt(1), up{mid.x + 40, mid.y - 60};
+            csend(WM_MOUSEMOVE, mid); csend(WM_LBUTTONDOWN, mid, MK_LBUTTON);
+            for (int i = 1; i <= 6; ++i) csend(WM_MOUSEMOVE, {mid.x + (up.x - mid.x) * i / 6, mid.y + (up.y - mid.y) * i / 6}, MK_LBUTTON);
+            csend(WM_LBUTTONUP, up);
+            const NpcCombo::Node dragged = now().chain[static_cast<size_t>(speed_node)];
+            check(dragged.points.size() == 3 && dragged.points[1].t > 50 && dragged.points[1].speed > 300 && dragged.points[1].speed % 5 == 0,
+                  "dragging the middle point right and up saves it later and faster (5 % steps)");
+            const RECT g = SpeedCurveWindow::Graph();
+            const POINT add{g.left + (g.right - g.left) / 5, (g.top + g.bottom) / 2};
+            csend(WM_MOUSEMOVE, add); csend(WM_LBUTTONDBLCLK, add, MK_LBUTTON); csend(WM_LBUTTONUP, add);
+            check(now().chain[static_cast<size_t>(speed_node)].points.size() == 4 && now().chain[static_cast<size_t>(speed_node)].points[1].t == 20, "a double-click adds a point at 20 %");
+            { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_curve");
+              RECT area{}; GetClientRect(curve, &area); HDC screen = GetDC(curve), dc = CreateCompatibleDC(screen);
+              HBITMAP bitmap = CreateCompatibleBitmap(screen, area.right, area.bottom); const HGDIOBJ old = SelectObject(dc, bitmap);
+              PrintWindow(curve, dc, PW_CLIENTONLY);
+              { Gdiplus::Bitmap image(bitmap, nullptr); CLSID png{}; if (CLSIDFor(L"image/png", &png)) image.Save(path.c_str(), &png, nullptr); }
+              SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(curve, screen); }
+            const POINT second = SpeedCurveWindow::PointAt(1);
+            csend(WM_MOUSEMOVE, second); csend(WM_RBUTTONUP, second);
+            const POINT first = SpeedCurveWindow::PointAt(0);
+            csend(WM_MOUSEMOVE, first); csend(WM_RBUTTONUP, first);
+            check(now().chain[static_cast<size_t>(speed_node)].points.size() == 3 && now().chain[static_cast<size_t>(speed_node)].points[0].t == 0,
+                  "a right-click removes a point; the ends stay");
+            shot([&] { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_curvenode"); return path; }());
+            SpeedCurveWindow::Close();
+            check(!SpeedCurveWindow::Window(), "the curve window closes");
+        }
+        click(ComboMenu::Probe::Toggle(speed_node));
+        check(!now().chain[static_cast<size_t>(speed_node)].curve && now().chain[static_cast<size_t>(speed_node)].points.size() == 3 && now().chain[static_cast<size_t>(speed_node)].speed == 150,
+              "曲线调节 off again: the one multiplier, the curve kept");
+    }
     // A move's 派生点: − / + by 0.05 s, typed in seconds (0: when it ends), at most 10 s.
     ComboMenu::Probe::Show(free_node);
     check(now().chain[static_cast<size_t>(free_node)].ms == 0, "a new move has no 派生点 (cut when it ends)");
@@ -500,7 +615,7 @@ int wmain(int argc, wchar_t** argv) {
     drag(ComboMenu::Probe::ModOut(free_node), ComboMenu::Probe::Header(free_node));
     check(mod(free_node, NpcCombo::kModSpeed) == speed_node && mod(free_node, NpcCombo::kModArmor) == armor_node, "an arrow onto a node that is not a modifier changes nothing");
     drag(ComboMenu::Probe::ModOut(free_node), bare());
-    check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 8, "an arrow dropped on empty canvas lists the modifiers a move may point at (加速, 霸体, 无敌, 无视防御, 允许中断, 伤害倍率, 强制受击)");
+    check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 9, "an arrow dropped on empty canvas lists the modifiers a move may point at (加速, 霸体, 无敌, 无视防御, 允许中断, 保持派生, 伤害倍率, 强制受击)");
     { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_modsearch"); shot(path); }
     key_down(VK_RETURN);
     { const NpcCombo::Config c = now(); check(c.chain.back().type == NpcCombo::NodeType::Speed && mod(free_node, NpcCombo::kModSpeed) == static_cast<int>(c.chain.size()) - 1, "picking 加速 adds one the move points at"); }
@@ -527,6 +642,19 @@ int wmain(int argc, wchar_t** argv) {
         check(c.chain.back().type == NpcCombo::NodeType::IgnoreGuard && mod(free_node, NpcCombo::kModIgnoreGuard) == guard_node && NpcCombo::IgnoreGuardFor(c, -1, free_node) &&
               mod(free_node, NpcCombo::kModArmor) == armor_node && mod(free_node, NpcCombo::kModInterrupt) == cut_node, "+ 无视防御 with a move selected: the move points at it, its other arrows stay");
         check(NpcCombo::Decode(NpcCombo::Encode(c)).chain[static_cast<size_t>(guard_node)].type == NpcCombo::NodeType::IgnoreGuard, "the page saves 无视防御 and reads it back");
+    }
+    // 保持派生: + 保持派生 with a move selected points the move at it (3 s); its − takes 0.1 s off.
+    ComboMenu::Probe::Show(free_node); click(ComboMenu::Probe::Header(free_node));
+    click(ComboMenu::Probe::Tool(31));
+    {
+        const int keep_node = static_cast<int>(now().chain.size()) - 1; const NpcCombo::Config c = now();
+        check(c.chain.back().type == NpcCombo::NodeType::KeepChain && c.chain.back().ms == NpcCombo::kKeepChainDefault && mod(free_node, NpcCombo::kModKeepChain) == keep_node &&
+              NpcCombo::KeepChainFor(c, -1, free_node) == NpcCombo::kKeepChainDefault && mod(free_node, NpcCombo::kModArmor) == armor_node &&
+              mod(free_node, NpcCombo::kModInterrupt) == cut_node, "+ 保持派生 with a move selected: the move points at it (3 s), its other arrows stay");
+        ComboMenu::Probe::Show(keep_node); click(ComboMenu::Probe::Minus(keep_node));
+        check(now().chain[static_cast<size_t>(keep_node)].ms == NpcCombo::kKeepChainDefault - NpcCombo::kKeepChainStep, "保持派生's − takes 0.1 s off its time");
+        check(NpcCombo::Decode(NpcCombo::Encode(now())).chain[static_cast<size_t>(keep_node)].ms == NpcCombo::kKeepChainDefault - NpcCombo::kKeepChainStep,
+              "the page saves 保持派生 with its time and reads it back");
     }
     // Every arrow ends in a head in its modifier's colour, just outside the card it points at, at 50 %, 100 % and 150 %,
     // and still over another card laid across it.
@@ -602,6 +730,17 @@ int wmain(int argc, wchar_t** argv) {
         check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == supported + (boss_grabs ? 1 : 0) + other_bosses.size(), "its field opens the same list again");
         key_down(VK_ESCAPE);
         check(now().chain[static_cast<size_t>(grab_node)].ability == id, "Esc keeps the grab picked");
+        // 不变身: the checkbox under the grab; saved as an "h:" mark.
+        click(ComboMenu::Probe::Toggle(grab_node));
+        check(now().chain[static_cast<size_t>(grab_node)].own_look && NpcCombo::Encode(now()).find(L"|h:" + std::to_wstring(grab_node)) != std::wstring::npos,
+              "不变身 ticked on the grab: kept as h:<node>");
+        { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_grabownlook"); shot(path); }
+        click(ComboMenu::Probe::Toggle(grab_node));
+        check(!now().chain[static_cast<size_t>(grab_node)].own_look && NpcCombo::Encode(now()).find(L"|h:") == std::wstring::npos, "不变身 off again");
+        // 投技预览: the mouse resting on the grab card asks for its executor montage.
+        send(WM_MOUSEMOVE, ComboMenu::Probe::Header(grab_node)); ComboMenu::Tick(); Sleep(450); ComboMenu::Tick(); ComboMenu::Tick();
+        check(preview_shown_.find("_Montage") != std::string::npos, "投技预览: the grab card shows its executor montage");
+        send(WM_MOUSEMOVE, {canvas.left + 4, canvas.bottom - 4}); ComboMenu::Tick();
     }
     // BOSS 技能: + BOSS 技能 wires a node after the selected move and opens the look list at once; a look picked
     // opens its moves; the node keeps both (X:look,GA,...) and takes a 派生点 like a move.
@@ -633,6 +772,31 @@ int wmain(int argc, wchar_t** argv) {
     check(ComboMenu::Probe::SearchOpen(), "its look field opens the look list again");
     key_down(VK_ESCAPE);
     { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_boss"); shot(path); }
+    // BOSS 援护: + BOSS 援护 wires a node after the selected move and opens the look list; a look picked opens its moves;
+    // the node is a move of the chain (a:look,GA,...) that takes modifiers and has no 派生点; removing it rejoins the wire.
+    {
+        const int before_next = now().chain[static_cast<size_t>(boss_node)].next;
+        ComboMenu::Probe::Show(boss_node); click(ComboMenu::Probe::Header(boss_node));
+        click(ComboMenu::Probe::Tool(32));
+        const int help = static_cast<int>(now().chain.size()) - 1;
+        check(now().chain.back().type == NpcCombo::NodeType::Assist && now().chain[static_cast<size_t>(boss_node)].next == help && ComboMenu::Probe::SearchOpen() &&
+              ComboMenu::Probe::SearchRows() == 1 + std::size(kNpcSkillSets) - [] { size_t none = 0; for (const NpcSkillSet& s : kNpcSkillSets) if (!s.skill_count) ++none; return none; }(),
+              "+ BOSS 援护 wires a node after the selected one and lists every look with moves");
+        key_down(VK_DOWN); key_down(VK_RETURN);
+        check(!now().chain[static_cast<size_t>(help)].boss.empty() && now().chain[static_cast<size_t>(help)].ability.empty() && ComboMenu::Probe::SearchOpen(), "援护: a look picked opens its moves");
+        key_down(VK_RETURN);
+        const NpcCombo::Node n = now().chain[static_cast<size_t>(help)];
+        check(!n.ability.empty() && NpcCombo::IsMove(n) && NpcCombo::TakesModifiers(n) && NpcCombo::CancelOf(now(), help) == 0 &&
+              NpcCombo::Encode(now()).find(L"|a:" + std::wstring(n.boss.begin(), n.boss.end()) + L",") != std::wstring::npos,
+              "援护: a move picked, saved as a:look,GA; it takes modifiers and has no 派生点");
+        ComboMenu::Probe::Show(help);
+        click(ComboMenu::Probe::Field(help));
+        check(ComboMenu::Probe::SearchOpen(), "援护's look field opens the look list again");
+        key_down(VK_ESCAPE);
+        { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_assist"); shot(path); }
+        click(ComboMenu::Probe::Header(help)); click(ComboMenu::Probe::Tool(5));
+        check(now().chain.size() == static_cast<size_t>(help) && now().chain[static_cast<size_t>(boss_node)].next == before_next, "removing the 援护 rejoins the wire");
+    }
     // 变身 / 变回主角: + 变身 wires a node after the selected move and lists every look at once (looks without moves
     // too); the look picked is kept (|M:look,...). + 变回主角 wires a node after it (|F:...). Neither takes modifiers.
     ComboMenu::Probe::Show(boss_node); click(ComboMenu::Probe::Header(boss_node));
@@ -1061,14 +1225,39 @@ int wmain(int argc, wchar_t** argv) {
         check(NpcCombo::GroupSteps(back, group_node) == NpcCombo::GroupSteps(now(), group_node) && back.chain[static_cast<size_t>(tp_node)].lift == NpcCombo::kTeleportLiftMax,
               "the frame and the teleport read back as saved");
     }
-    // Files: 文件 lists combos\*.combo; 另存为 takes a typed name and makes it the active file; picking default goes back.
+    // Files: 文件 lists combos\*.combo; 另存为 opens Windows' own Save As window, whose typed name becomes the active
+    // file; picking default goes back. The window is modal with its own loop on this thread: a thread timer finds it,
+    // posts the name to its file name box as the keyboard would, then OK (it is closed after 5 s otherwise).
     click(ComboMenu::Probe::Tool(14));
     check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 2 && NpcCombo::GetFiles().active == L"default", "文件 lists the one file (default.combo)");
     key_down(VK_ESCAPE);
-    click(ComboMenu::Probe::Tool(16));
-    for (const wchar_t c : std::wstring(L"测试2")) SendMessageW(page_, WM_CHAR, c, 0);
-    key_down(VK_RETURN);
-    check(NpcCombo::GetFiles().active == L"测试2" && NpcCombo::GetFiles().names.size() == 2, "另存为 writes the typed name and makes it the active file");
+    {
+        static int ticks; static bool typed; ticks = 0; typed = false;
+        const UINT_PTR timer = SetTimer(nullptr, 0, 30, [](HWND, UINT, UINT_PTR, DWORD) {
+            ++ticks;
+            HWND dialog = nullptr;
+            EnumThreadWindows(GetCurrentThreadId(), [](HWND w, LPARAM out) -> BOOL {
+                wchar_t type[32]{}; GetClassNameW(w, type, 32);
+                if (IsWindowVisible(w) && !wcscmp(type, L"#32770")) { *reinterpret_cast<HWND*>(out) = w; return FALSE; }
+                return TRUE; }, reinterpret_cast<LPARAM>(&dialog));
+            if (!dialog || typed) return;
+            HWND edit = nullptr;
+            EnumChildWindows(dialog, [](HWND w, LPARAM out) -> BOOL {
+                wchar_t type[32]{}, parent[32]{}; GetClassNameW(w, type, 32); GetClassNameW(GetParent(w), parent, 32);
+                if (IsWindowVisible(w) && !wcscmp(type, L"Edit") && !wcscmp(parent, L"ComboBox")) { *reinterpret_cast<HWND*>(out) = w; return FALSE; }
+                return TRUE; }, reinterpret_cast<LPARAM>(&edit));
+            if (!edit) { if (ticks > 160) PostMessageW(dialog, WM_CLOSE, 0, 0); return; }
+            typed = true;
+            SendMessageW(edit, EM_SETSEL, 0, -1);
+            for (const wchar_t* c = L"测试2"; *c; ++c) PostMessageW(edit, WM_CHAR, *c, 0);
+            PostMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+        });
+        click(ComboMenu::Probe::Tool(16));
+        KillTimer(nullptr, timer);
+        check(typed && NpcCombo::GetFiles().active == L"测试2" && NpcCombo::GetFiles().names.size() == 2 &&
+              GetFileAttributesW((combos + L"\\测试2.combo").c_str()) != INVALID_FILE_ATTRIBUTES,
+              "另存为 opens Windows' Save As window; the name typed there is written and becomes the active file");
+    }
     const std::wstring boss_text = NpcCombo::Encode(now());
     click(ComboMenu::Probe::Tool(14));
     check(ComboMenu::Probe::SearchRows() == 4, "文件 lists both, the active one first");

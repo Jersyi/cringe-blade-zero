@@ -48,11 +48,16 @@ Snapshot GetSnapshot();
 // skin -1: the hero's own chain (profile NpcCombo::kHeroProfile): its abilities named GA_*, as last read in game.
 struct SkinMoves { std::string profile; std::wstring name; std::vector<std::string> skills, dodges; std::vector<char> directions; };
 bool GetSkinMoves(int32_t skin, SkinMoves& moves);
+// Any thread, no engine calls: skin row `skin`'s boss blueprint and the package of its move `ability` (a short GA name),
+// for the move preview. false: no such look or move (the hero's own moves have none).
+bool MovePreviewSubject(int32_t skin, const std::string& ability, std::string& monster, std::string& package);
 std::wstring MoveLabel(const std::string& ability);
 // Any thread, no engine calls: the skin row (kProfiles) that plays a grab move's boss (MotianGrab::Variant boss_id and
 // source): of that boss's skins (GrabBoss::Key), the one whose blueprint or moves share the longest folder with the
 // grab ability (a P2 grab gets the P2 look), then the one named like the boss; -1 when no skin plays it.
 int32_t SkinForGrab(const std::wstring& boss_id, const std::wstring& source);
+// 招式预览 of a grab: the boss blueprint (package path) of the look that plays the grab's boss; false: no look does.
+bool GrabPreviewMonster(const std::wstring& boss_id, const std::wstring& source, std::string& monster);
 void OnGameThreadGuarded();
 // Game thread only. False means cleanup must be retried before travel/outfit changes.
 bool BeforeTravel();
@@ -67,5 +72,14 @@ bool OwnsAppearance();
 // assets, so unrelated NPC spawns retain the player display. Legacy unfinished
 // shared-edit ledgers still require verified release before an intersection.
 bool BeforeActorClassSpawn(ue::Object* actor_class);
+// GT only. Does an actor class's authored skinned mesh use a Skeleton the current NPC look still edits (a legacy
+// ledger, or one that cannot be told)? Nothing is released; BOSS 援护 logs it.
+bool ClassSharesEditedSkeleton(ue::Object* actor_class);
+// GT only. The hero's lock target as its targeting component holds it (16 bytes: FindTargetByHandler with the lock
+// kept), else the soft-lock handler's pick (the hero's own lock is never set or changed); enemy: the living enemy in it.
+bool HeroLockTarget(unsigned char (&target)[16], ue::Object*& enemy);
+// GT only. Actors shown with the hero that do not hang on it: a grab's boss body left on the spot (投技分身) and the
+// target it holds. 联机测试's puppet shows them too.
+void ShownWithHero(std::vector<ue::Object*>& out);
 bool HandleCommand(const char* verb, const char* arguments);
 }

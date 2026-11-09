@@ -4,24 +4,34 @@
 #include "debug_hub.h"
 #include "motian_grab.h"
 #include "test_dummy.h"
+#include "move_preview.h"
+#include "speed_curve_window.h"
 #include "grab_boss.h"
 #include "combo_weapons.h"
 #include "weapon_icons.h"
+#include "ui_cursor.h"
+#include "ui_host.h"
 #include "ui_hotkeys.h"
 #include "ui_i18n.h"
 #include "ui_layout.h"
 #include "ui_theme.h"
 #include <objidl.h>
+#include <shobjidl.h>
 #include <gdiplus.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdarg>
 #include <cwchar>
 #include <cwctype>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 // The page is laid out like a Blueprint graph, in the hub's own colours and fonts: the skin's moves by kind on top
 // (click to append, drag onto the canvas to place), then a canvas of nodes with exec pins and wires. Trigger nodes
@@ -31,22 +41,58 @@
 // pin to pin, the canvas pans and zooms, Tab / right-click searches.
 namespace ComboMenu {
 namespace {
+void (*log_)(const char*)=nullptr;
+void Logf(const char* format,...) {
+    if (!log_) return;
+    char line[700]{}; va_list args; va_start(args,format); _vsnprintf_s(line,sizeof(line),_TRUNCATE,format,args); va_end(args); log_(line);
+}
+volatile LONG test_curve_=0;  // combo curve: 1 open, 2 close (UI worker)
 using NpcCombo::Kind;
 using NpcCombo::Node;
 using NpcCombo::NodeType;
 using NpcCombo::Trigger;
 constexpr wchar_t kClass[]=L"PBZComboPage_v3";
-constexpr float kZooms[]={.5f,.625f,.75f,.875f,1.f,1.25f,1.5f};
+// Canvas zoom steps (the wheel moves one): far enough out that 显示全部 fits a chain of any size.
+constexpr float kZooms[]={.05f,.075f,.1f,.15f,.2f,.25f,.3f,.4f,.5f,.625f,.75f,.875f,1.f,1.25f,1.5f};
+constexpr int ZoomIndex(float zoom) { for (int i=0;i<static_cast<int>(std::size(kZooms));++i) if (kZooms[i]==zoom) return i; return 0; }
+constexpr int kZoomOne=ZoomIndex(1.f),kZoomOpen=ZoomIndex(.75f);  // 1:1; the opening view's smallest
+// Under this zoom a card is drawn as its body and title only (the overview), and the whole card is one target.
+constexpr float kOverviewZoom=.35f;
 // Node geometry in canvas units (96 dpi, zoom 1).
 constexpr int kHeader=28,kRow=24,kPad=8,kPin=6,kGrid=16,kMajor=128;
 enum class Button : int { Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage,
-                          Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, Count };
+                          Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirSet,
+                          Count };
 // The canvas tools, laid out right to left.
-constexpr Button kTools[]={Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::ForceHit,Button::Armor,Button::Damage,Button::Speed,Button::AddTrigger,Button::Branch,Button::Grab,Button::WeaponActions,Button::WeaponMove,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
+constexpr Button kTools[]={Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
+// Management stays above the canvas; creation tools belong to the right library.
+constexpr Button kCanvasTools[]={Button::File,Button::SaveFile,Button::SaveAs,Button::Arrange,Button::Frame,Button::Remove,Button::Clear};
+constexpr const wchar_t* kNodeCategories[]={L"起端与流程",L"动作与移动",L"战斗修饰",L"外观变身",L"BOSS 招式"};
+constexpr int NodeCategory(Button b) {
+    switch (b) {
+    case Button::AddTrigger: case Button::Branch: case Button::AirSet: case Button::WeaponActions: case Button::Interval: case Button::Group: return 0;
+    case Button::BossSkill: case Button::Assist: case Button::Grab: case Button::WeaponMove: case Button::AutoDodge: case Button::Teleport: case Button::Hook: return 1;
+    case Button::Speed: case Button::Trim: case Button::Weapon: case Button::Armor: case Button::Interrupt: case Button::Damage:
+    case Button::Invincible: case Button::ForceHit: case Button::IgnoreGuard: case Button::KeepChain: case Button::Air: return 2;
+    case Button::Look: case Button::HeroLook: case Button::KeepLook: return 3;
+    default: return -1;
+    }
+}
+constexpr bool LibraryComplete() {
+    for (Button b:kTools) {
+        int owners=NodeCategory(b)>=0?1:0;
+        for (Button action:kCanvasTools) if (action==b) ++owners;
+        if (owners!=1) return false;
+    }
+    return true;
+}
+static_assert(LibraryComplete(),"each tool belongs to exactly one library category or canvas action");
+
 enum class Part : int {
-    None, Button, Pill, Tab, StripLeft, StripRight, Canvas, Search, WeaponRow,
-    Node, NodeIn, NodeOut, NodeMinus, NodePlus, NodeValue, NodeField, NodeField2, NodeField3, NodeField4, NodeToggle, NodeToggle2, GroupResize, NodeRemove,
-    RouteField, RouteMinus, RoutePlus, RouteValue, RouteRemove, RouteAdd, RouteOut, ModOut, ModIn, RouteKeys, RouteMode, Header
+    None, Button, Pill, Tab, StripLeft, StripRight, Canvas, Search, WeaponRow, LibraryTab, NodeCategory,
+    Node, NodeIn, NodeOut, NodeMinus, NodePlus, NodeValue, NodeField, NodeField2, NodeField3, NodeField4, NodeToggle, NodeToggle2, NodeHoldMinus, NodeHoldPlus, NodeHoldValue, NodeTrimBar,
+    GroupResize, NodeRemove,
+    RouteField, RouteMinus, RoutePlus, RouteValue, RouteHoldMinus, RouteHoldPlus, RouteHoldValue, RouteRemove, RouteAdd, RouteOut, ModOut, ModIn, RouteKeys, RouteMode, Header
 };
 // sub: a branch's route row (-1 otherwise).
 struct Hit { Part part=Part::None; int index=-1; int sub=-1; bool operator==(const Hit& o) const { return part==o.part&&index==o.index&&sub==o.sub; } };
@@ -56,31 +102,35 @@ struct Tab { int kind=-1; RECT rect{}; size_t count=0; };  // kind -1: every mov
 // move's round pin, where its arrows to 加速 / 霸体 / 武器属性 start; mod_in: a modifier's round pin, where they end;
 // routes: a branch's rows, each with its own exec output.
 // A 自定义组合键 / 自定义按键 row has a second line: its keys and how they are pressed (has_keys).
-struct RouteShape { RECT field{},minus{},value{},plus{},remove{},keys{},mode{}; POINT out{}; bool has_keys=false; };
+// hminus / hvalue / hplus: a branch row's 按住 stepper (left of its pause).
+struct RouteShape { RECT field{},minus{},value{},plus{},remove{},keys{},mode{},hminus{},hvalue{},hplus{}; POINT out{}; bool has_keys=false; };
 struct Shape {
     RECT rect{},header{},remove{},minus{},value{},plus{},field{},field2{},field3{},field4{},toggle{},toggle2{},add{},resize{}; POINT in{},out{},mod_out{},mod_in{};
-    bool has_in=false,has_out=false,has_mod_out=false,has_mod_in=false; std::vector<RouteShape> routes;
+    RECT hminus{},hvalue{},hplus{};  // a trigger's 按住 stepper (has_hold)
+    bool has_in=false,has_out=false,has_mod_out=false,has_mod_in=false,has_hold=false; std::vector<RouteShape> routes;
 };
 // Arrow: from a node's round pin to a modifier; ArrowBack: from a modifier's pin to the node that points at it.
-enum class Drag { None, Pending, Node, Pan, Wire, WireBack, Arrow, ArrowBack, Pill, WeaponRow, Resize, Box };
-struct DragState { Drag mode=Drag::None; Hit hit; POINT start{},last{}; bool moved=false,right=false; int index=-1,sub=-1; };
+enum class Drag { None, Pending, Node, Pan, Wire, WireBack, Arrow, ArrowBack, Pill, WeaponRow, Resize, Box, Trim };
+struct DragState { Drag mode=Drag::None; Hit hit; POINT start{},last{}; bool moved=false,right=false; int index=-1,sub=-1; RECT trim_bar{}; int trim_clip=0; };
 // The search box (Tab, right-click, or a wire dropped on empty canvas): pick a node to add where it opened. In pick
 // mode (a trigger's or a route's button field) it lists the buttons and sets that field; on a 投技 node's field it
 // lists the grabs of the look's boss (GrabMove).
 // A BOSS 技能 node's fields list the looks (BossLook) and that look's moves (BossMove); a 变身 node's field lists every
 // look (BossLook too); the 文件 button lists the
-// .combo files (File) and 另存为 takes a name (SaveAs).
+// .combo files (File). 另存为 (and 保存 when the active file cannot be written) opens Windows' own Save As window.
 // A 武器派生 node's fields list the weapons (WeaponPick) and that weapon's abilities (WeaponSkill); a 处决 trigger's
 // weapon field lists the weapons too, 任意武器 first.
-enum class ItemKind { Move, Interval, AutoDodge, Trigger, Branch, Speed, Weapon, Armor, Interrupt, Grab, Button, GrabMove, BossSkill, BossLook, BossMove, File, SaveAs,
+enum class ItemKind { Move, Interval, AutoDodge, Trigger, Branch, Speed, Weapon, Armor, Interrupt, Grab, Button, GrabMove, BossSkill, BossLook, BossMove, File,
                       WeaponMove, Damage, WeaponPick, WeaponSkill, Group, Teleport, TeleportDist, TeleportLift, ComboKey, ComboMode, RawKey, Invincible,
-                      Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain, IgnoreGuard };
+                      Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain, IgnoreGuard, KeepChain, Assist, Hook, HookMode, Trim,
+                      HookDist, HookSpeed, Air, AirLift, AirHang, Launch, AirSet };
 struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; };
 struct SearchRow { bool header=false; size_t item=0; std::wstring text; };
 struct Search {
     bool open=false; RECT rect{},edit{},list{}; float x=0,y=0; int from=-1,into=-1,from_out=0,pick_node=-1,pick_route=-1,mod_from=-1,mode=0; // mode 1 files, 2 save-as
     int pick_part=0;  // a branch row's field (pick_route >= 0): 0 its button, 1 its keys, 2 how they are pressed
     std::wstring query; std::vector<Item> items; std::vector<SearchRow> rows; int selected=-1,scroll=0,hot=-1;
+    bool keyed=false;  // the selection was last moved with the keys (招式预览 follows it while the mouse is off the list)
 };
 
 HWND window_=nullptr;
@@ -96,8 +146,11 @@ std::vector<Pill> pills_;
 std::vector<Tab> tabs_;
 RECT buttons_[static_cast<int>(Button::Count)]{};
 RECT header_{},tabs_title_{},strip_{},strip_area_{},strip_left_{},strip_right_{},canvas_{},footer_{};
-int category_=-1,strip_scroll_=0;
-int height_=0,selected_=-1,zoom_index_=4;
+int category_=-1;
+RECT library_{},library_title_{},library_tabs_[2]{},node_categories_[5]{},library_list_{},library_page_label_{},library_section_{},library_category_title_{};
+int library_tab_=0,node_category_=0,library_pages_[6]{},library_page_count_=1,library_capacity_=1,library_items_=0;
+int LibrarySection() { return library_tab_==1?5:node_category_; }
+int height_=0,selected_=-1,zoom_index_=kZoomOne;
 // Several nodes selected at once (Ctrl / Shift + drag on bare canvas: 框选; Ctrl + click a node adds or drops it):
 // selected_ is one of them. Empty: selected_ alone. They are dragged together and removed together.
 std::vector<int> picked_;
@@ -106,10 +159,30 @@ bool framed_=false;
 bool dummy_present_=false;  // 测试木桩 stands (TestDummy snapshot, read every Tick)
 std::wstring dummy_status_;  // its last status, shown once as a notice
 Hit hot_,pressed_;
+// 招式预览: the move the mouse rests on (its look row and short GA name) and where it is on the page; after
+// kPreviewDelayMs the game thread plays it on its stage (MovePreview) and its frames show in a card by it.
+constexpr ULONGLONG kPreviewDelayMs=400;
+// Tests (HandleCommand "preview"): a move held as if the mouse rested on it.
+// node: as if the mouse rested on that canvas node ("combo preview node <n>"; -1: the skin's move).
+struct TestHover { bool on=false; int32_t skin=-1; std::string ability; int node=-1; } test_hover_;
+// Tests (combo scratch / combo zoom, from the console thread; the page applies them on its own thread): a chain shown
+// in place of the look's, in memory only (never saved, the chain file untouched), and the canvas zoom.
+SRWLOCK scratch_lock_=SRWLOCK_INIT; std::string scratch_ask_; bool scratch_asked_=false; int zoom_ask_=0;
+bool scratch_=false; ULONGLONG paint_logged_=0;
+// beside: the move is a row of the search box; the card goes by the box's side, not over its list.
+// node: the canvas node the move is (its 加速 plays in the preview; -1: a pill or a search row, at ×1); speed / curve:
+// what the preview was last asked to play at.
+struct PreviewHover { int32_t skin=-1; std::string ability; RECT anchor{}; ULONGLONG since=0; bool asked=false,none=false,beside=false;
+                      int node=-1; int speed=100; std::vector<NpcCombo::CurvePoint> curve; std::string monster,package;
+                      int trim_from=0,trim_to=0; };  // the 裁剪 part (ms of the montage; 0 / 0: all of it)
+PreviewHover preview_; MovePreview::Frame preview_frame_; RECT preview_rect_{};
+// The card's picture (page client) as last drawn; the hub's hole over it while the game draws the stage there (live).
+RECT preview_image_{},preview_hole_rect_{}; bool preview_hole_=false;
 DragState drag_;
 Search search_;
 // The 加速 multiplier being typed (node -1: none); fresh: the first key typed replaces the text.
-struct Edit { int node=-1; std::wstring text; bool fresh=true; } edit_;
+// hold: what is typed: -2 the node's own value, -1 a trigger's 按住 (seconds), else that branch row's 按住.
+struct Edit { int node=-1; std::wstring text; bool fresh=true; int hold=-2; } edit_;
 POINT cursor_{-1,-1};
 std::wstring hint_text_;
 UiI18n::Language language_=UiI18n::Language::SimplifiedChinese;
@@ -117,6 +190,11 @@ ULONGLONG next_=0;
 uint64_t run_serial_=0,weapon_serial_=0;
 UINT font_dpi_=0;
 std::map<int,HFONT> scaled_;
+// Every paint and hit test asks for every card's size (text layout) and most notes for its chain (a walk of every
+// trigger's wires): both are kept until the next change (Save, Invalidate and Layout drop them; another node count
+// measures again), so a chain of thousands of nodes stays quick.
+std::vector<SIZE> sizes_;
+std::vector<int> owners_;
 
 std::wstring Tr(const wchar_t* text) { return UiI18n::Translate(text?text:L""); }
 UiLayout::Metrics M() { return UiLayout::For(window_); }
@@ -124,6 +202,7 @@ HFONT Font(UiTheme::Font role) { return UiTheme::GetFont(role,window_); }
 float Zoom() { return kZooms[zoom_index_]; }
 float Dpi() { return M().S(1000)/1000.f; }
 float Scale() { return Zoom()*Dpi(); }
+bool Overview() { return Zoom()<kOverviewZoom; }
 void DropFonts() { for (auto& [key,font]:scaled_) DeleteObject(font); scaled_.clear(); }
 // The hub's fonts at the canvas zoom.
 HFONT Scaled(UiTheme::Font role) {
@@ -167,7 +246,19 @@ SIZE Extent(HDC dc,HFONT font,const std::wstring& text,int wrap=0) {
     return {area.right,(std::max)(static_cast<LONG>(metrics.tmHeight),area.bottom)};
 }
 // Canvas units a text needs at zoom 1.
-int Units(HDC dc,UiTheme::Font role,const std::wstring& text) { return static_cast<int>(std::ceil(Extent(dc,Font(role),text).cx/Dpi())); }
+// Text widths in canvas units, kept by font and text: a chain repeats its move names and notes, and measuring every
+// card is the cost of each re-layout (dropped when the DPI changes and on Layout: language, fonts).
+std::unordered_map<std::wstring,int> widths_; UINT widths_dpi_=0;
+int Units(HDC dc,UiTheme::Font role,const std::wstring& text) {
+    const UINT dpi=static_cast<UINT>(M().S(96));
+    if (dpi!=widths_dpi_) { widths_.clear(); widths_dpi_=dpi; }
+    std::wstring key; key.reserve(text.size()+1); key.push_back(static_cast<wchar_t>(L'A'+static_cast<int>(role))); key+=text;
+    if (const auto found=widths_.find(key); found!=widths_.end()) return found->second;
+    const int units=static_cast<int>(std::ceil(Extent(dc,Font(role),text).cx/Dpi()));
+    if (widths_.size()>50000) widths_.clear();
+    widths_.emplace(std::move(key),units);
+    return units;
+}
 COLORREF Paper() { return UiTheme::Mix(UiTheme::Base(),UiTheme::Panel(),72); }
 // One colour per kind, mixed from the theme so it stays readable in both themes.
 COLORREF KindColor(Kind kind) {
@@ -204,7 +295,7 @@ std::wstring StatusText(const std::wstring& status) {
     const size_t colon=status.find(L'：');
     return colon==std::wstring::npos?Tr(status.c_str()):Tr(status.substr(0,colon+1).c_str())+status.substr(colon+1);
 }
-void Save() { if (HasSkin()) { NpcCombo::Save(moves_.profile,config_); seen_generation_=NpcCombo::Generation(); } }
+void Save() { sizes_.clear(); owners_.clear(); if (scratch_) return; if (HasSkin()) { NpcCombo::Save(moves_.profile,config_); seen_generation_=NpcCombo::Generation(); } }
 // The looks a BOSS 技能 may take: every NPC look with moves (id, name), read once.
 const std::vector<std::pair<std::string,std::wstring>>& BossLooks() {
     static std::vector<std::pair<std::string,std::wstring>> looks;
@@ -224,11 +315,13 @@ std::wstring BossLookName(const std::string& id) {
 }
 int32_t BossLookRow(const std::string& id) { for (const NpcRetarget::Entry& e:NpcRetarget::GetSnapshot().entries) if (e.id==id) return e.index; return -1; }
 COLORREF BossColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(206,92,64),UiTheme::Text(),12); }
+// BOSS 援护: a boss of its own beside the hero.
+COLORREF AssistColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(214,158,52),UiTheme::Text(),12); }
 COLORREF WeaponColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(86,150,205),UiTheme::Text(),14); }
 // The weapon list on the canvas's right: one row per weapon (main weapons, then 杀器 under a header), scrolled with
 // the wheel; a row is clicked (a 武器派生 node after the selected one) or dragged onto the canvas / a node.
 struct WeaponRow { RECT rect{}; std::string id; bool shaqi=false,header=false; std::wstring name; int image=-1; };
-std::vector<WeaponRow> weapon_rows_; RECT weapons_{},weapons_title_{}; int weapon_scroll_=0;
+std::vector<WeaponRow> weapon_rows_; RECT weapons_{},weapons_title_{};
 bool IsShaqiId(const std::string& id) { return ComboWeapons::IsShaqi(id); }
 std::wstring WeaponName(const std::string& id) {
     const std::wstring wide(id.begin(),id.end());
@@ -266,6 +359,7 @@ std::wstring WeaponMoveText(const std::string& weapon,const std::string& ability
 std::wstring DamageText(int percent) { wchar_t text[24]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,L"%d%%",percent); return text; }
 // A 处决 / 简易处决 trigger: whose executions it takes (any weapon or one).
 bool ExecutionTrigger(const Node& node) { return node.type==NodeType::Trigger&&NpcCombo::WeaponTrigger(node.trigger); }
+// A 武器派生修改, or a 空中派生 (one with air_set: its rows take the presses made in the air, no weapon).
 bool WeaponActionsNode(const Node& node) { return node.type==NodeType::WeaponActions; }
 // A 自定义组合键 / 自定义按键 trigger: its keys (field2) and how they are pressed (field3); 自定义按键 also whether its
 // keys' game actions are swallowed (toggle2).
@@ -430,14 +524,31 @@ KeySpec PickedKeys(int node,int route,int part) {
 constexpr int kKeyWindowPresets[]={200,300,400,500,700,1000,1500};
 std::wstring ExecutionWeaponText(const Node& node) { return Tr(L"武器：")+(node.weapon.empty()?Tr(L"任意武器"):WeaponName(node.weapon)); }
 // A 武器派生修改's weapon field.
-std::wstring ActionsWeaponText(const Node& node) { return node.weapon.empty()?Tr(L"选择武器"):Tr(L"武器：")+WeaponName(node.weapon); }
-void Invalidate() { if (window_) InvalidateRect(window_,nullptr,FALSE); }
+std::wstring ActionsWeaponText(const Node& node) {
+    if (node.air_set) return Tr(L"主角在空中时");
+    return node.weapon.empty()?Tr(L"选择武器"):Tr(L"武器：")+WeaponName(node.weapon);
+}
+void Invalidate() { sizes_.clear(); owners_.clear(); if (window_) InvalidateRect(window_,nullptr,FALSE); }
+// The trigger whose chain reaches node `index` (NpcCombo::TriggerOf for every node at once; -1: none).
+int ChainOf(size_t index) {
+    if (owners_.size()!=config_.chain.size()) {
+        owners_.assign(config_.chain.size(),-1);
+        for (size_t t=0;t<config_.chain.size();++t) {
+            if (!NpcCombo::StartsChain(config_.chain[t])) continue;
+            if (owners_[t]<0) owners_[t]=static_cast<int>(t);
+            for (const size_t i:NpcCombo::Order(config_,static_cast<int>(t))) if (owners_[i]<0) owners_[i]=static_cast<int>(t);
+        }
+    }
+    return index<owners_.size()?owners_[index]:-1;
+}
 void Layout();
+void CloseCurve(const char* why);
 void ScrollStrip(int delta);
 const Node* At(int index) { return index>=0&&static_cast<size_t>(index)<config_.chain.size()?&config_.chain[static_cast<size_t>(index)]:nullptr; }
 bool IsKey(int index) { const Node* n=At(index); return n&&n->type==NodeType::Trigger&&n->trigger==static_cast<int>(Trigger::NpcKey); }
 // 预输入: the chain's fixed setting card (never removed, no pins).
 bool IsPreInputAt(int index) { const Node* n=At(index); return n&&NpcCombo::IsPreInput(*n); }
+bool IsSettingAt(int index) { const Node* n=At(index); return n&&NpcCombo::IsSetting(*n); }
 std::wstring PreInputText(int ms) { return ms>0?Seconds(ms/1000.0):Tr(L"不清除"); }
 // ---- 组合 frames ------------------------------------------------------------------------------------
 // A 组合 is a frame on the canvas: the nodes in it (Node::group) play one after another as one move of the chain. Its
@@ -448,7 +559,7 @@ int FrameOf(int index) { const Node* n=At(index); return n?n->group:-1; }
 bool Wired(size_t index) {
     int at=static_cast<int>(index);
     for (int depth=0;at>=0&&depth<=NpcCombo::kGroupDepthMax+1;++depth) {
-        if (NpcCombo::TriggerOf(config_,static_cast<size_t>(at))>=0) return true;
+        if (ChainOf(static_cast<size_t>(at))>=0) return true;
         at=FrameOf(at);
     }
     return false;
@@ -561,11 +672,13 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Armor: return Tr(L"霸体");
     case NodeType::Invincible: return Tr(L"无敌");
     case NodeType::IgnoreGuard: return Tr(L"无视防御");
+    case NodeType::KeepChain: return Tr(L"保持派生");
     case NodeType::KeepLook: return Tr(L"保留变身");
     case NodeType::ForceHit: return Tr(L"强制受击");
     case NodeType::Interrupt: return Tr(L"允许中断");
     case NodeType::Grab: return Tr(L"投技");
     case NodeType::BossSkill: return Tr(L"BOSS 技能");
+    case NodeType::Assist: return Tr(L"BOSS 援护");
     case NodeType::WeaponMove: return Tr(L"武器派生");
     case NodeType::Damage: return Tr(L"伤害倍率");
     case NodeType::Teleport: return Tr(L"瞬移");
@@ -573,7 +686,11 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Look: return Tr(L"变身");
     case NodeType::HeroLook: return Tr(L"变回主角");
     case NodeType::PreInput: return Tr(L"预输入");
-    case NodeType::WeaponActions: return Tr(L"武器派生修改");
+    case NodeType::WeaponActions: return Tr(node.air_set?L"空中派生":L"武器派生修改");
+    case NodeType::Hook: return Tr(L"钩子");
+    case NodeType::Trim: return Tr(L"裁剪");
+    case NodeType::Air: return Tr(L"滞空");
+    case NodeType::AirDefault: return Tr(L"空中释放");
     default: return MoveText(node.ability);
     }
 }
@@ -588,10 +705,62 @@ std::wstring CardTitle(size_t index) {
     if (const int step=StepNumber(index)) title=std::to_wstring(step)+L". "+title;
     return title;
 }
+// 按住: "点按" (any press) or how long the button must be held.
+std::wstring HoldText(int ms) {
+    if (NpcCombo::ClampHold(ms)<=0) return Tr(L"点按");
+    wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"按住 %.1f s").c_str(),NpcCombo::ClampHold(ms)/1000.0); return text;
+}
+// 裁剪: the length of the BOSS 技能 it cuts (s; 0 until a preview or a cast tells it).
+float TrimClip(size_t index) {
+    const Node* source=At(NpcCombo::TrimmedBy(config_,static_cast<int>(index)));
+    return source?NpcCombo::Clip(source->ability):0.f;
+}
+std::wstring TrimEndText(const Node& node) { return node.trim_to>0?Seconds(NpcCombo::ClampTrim(node.trim_to)/1000.0):Tr(L"放完"); }
+// The part that plays, on the move's length (a start past the length: all of it, as the game plays it).
+std::wstring TrimBarText(size_t index) {
+    const float clip=TrimClip(index);
+    if (!(clip>0)) return Tr(NpcCombo::TrimmedBy(config_,static_cast<int>(index))<0?L"连上 BOSS 技能后显示它的长度":L"招式长度：悬停预览或放一次后显示");
+    NpcCombo::TrimRange r=NpcCombo::TrimOf(config_.chain[index]); if (r.from>=clip) r={};
+    wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"%.2f–%.2f s（共 %.2f s）").c_str(),r.from,r.from+NpcCombo::TrimSpan(r,clip),static_cast<double>(clip));
+    return text;
+}
+// 钩子 modes: 0 勾过来, 1 勾过去, 2 自动 (the target's guard picks it when it plays).
+std::wstring HookModeText(int mode) {
+    return Tr(mode==2?L"自动：未破防勾过去，破防勾过来":mode==1?L"勾过去：把自己拉到目标处":L"勾过来：把目标拉到身前");
+}
+int HookModeOf(const Node& node) { return node.hook_auto?2:node.hook_self?1:0; }
+Node NewHook() { Node node=NpcCombo::HookNode(0,0); NpcCombo::SetHookAuto(node); return node; }
+// 钩子's reach (shown in metres) and speed (a multiplier), with a few values to pick.
+std::wstring HookDistText(int cm) { wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"最远 %.1f 米").c_str(),NpcCombo::ClampHookDist(cm)/100.0); return text; }
+std::wstring HookSpeedText(int percent) { wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"钩子速度 ×%.2f").c_str(),NpcCombo::ClampHookSpeed(percent)/100.0); return text; }
+constexpr int kHookDistPresets[]={500,1000,1500,2000,3000},kHookSpeedPresets[]={50,75,100,150,200,300};
+// 滞空 / 空中释放: field 1 the hero's lift, 2 its hang, 3 the enemies' lift, 4 theirs hang (routes -1 .. -4); lifts in
+// metres, hangs in percent of the gravity taken away. 强制受击 击飞: field 2 its height.
+bool AirNode(const Node& node) { return node.type==NodeType::Air||node.type==NodeType::AirDefault; }
+bool AirHangRoute(int route) { return route==-2||route==-4; }
+int& AirValue(Node& node,int route) { return route==-2?node.air_hang:route==-3?node.air_foe_lift:route==-4?node.air_foe_hang:node.air_lift; }
+int AirValueOf(const Node& node,int route) { return AirValue(const_cast<Node&>(node),route); }
+std::wstring AirText(int route,int value) {
+    wchar_t text[64]{};
+    if (AirHangRoute(route)) _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(route==-2?L"自身滞空 %d%%":L"敌人滞空 %d%%").c_str(),NpcCombo::ClampAirHang(value));
+    else _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(route==-1?L"自身升高 %.1f 米":L"敌人升高 %.1f 米").c_str(),NpcCombo::ClampAirLift(value)/100.0);
+    return text;
+}
+std::wstring LaunchText(int cm) { wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"击飞高度 %.1f 米").c_str(),NpcCombo::ClampLaunch(cm)/100.0); return text; }
+bool LaunchShown(const Node& node) { return node.type==NodeType::ForceHit&&node.hit==static_cast<int>(NpcCombo::HitKind::Launch); }
+constexpr int kAirLiftPresets[]={0,50,100,150,200,300,500,800},kAirHangPresets[]={0,25,50,70,85,100},kLaunchPresets[]={100,200,300,500,800,1200};
 std::wstring PauseText(int ms) {
     if (ms<=0) return Tr(L"直接按");
     wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"停 %.1f s 后").c_str(),ms/1000.0); return text;
 }
+// A 按住 / pause value box as wide as the widest value it can show (no "…", no width change while stepping), and a
+// − value + stepper around such a box, in canvas units.
+int HoldValueUnits(HDC dc,UiTheme::Font font) { return (std::max)(Units(dc,font,HoldText(NpcCombo::kHoldMax)),Units(dc,font,Tr(L"点按")))+16; }
+int PauseValueUnits(HDC dc,UiTheme::Font font) { return (std::max)(Units(dc,font,PauseText(NpcCombo::kPauseMax)),Units(dc,font,Tr(L"直接按")))+16; }
+int StepperUnits(int value) { return 2*(kRow-4)+8+value; }
+int TriggerHoldUnits(HDC dc) { return StepperUnits((std::max)(62,HoldValueUnits(dc,UiTheme::Font::Strong))); }
+int RouteHoldUnits(HDC dc) { return (std::max)(84,HoldValueUnits(dc,UiTheme::Font::Small)); }
+int RoutePauseUnits(HDC dc) { return (std::max)(96,PauseValueUnits(dc,UiTheme::Font::Small)); }
 std::wstring SpeedText(int percent) { wchar_t text[24]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,L"×%.2f",percent/100.0); return text; }
 // The node an exec wire comes into `index` from (-1: none).
 int Feeder(int index) {
@@ -599,7 +768,7 @@ int Feeder(int index) {
     return -1;
 }
 // A move's speed in percent (its own 加速 nodes, else its chain's).
-int MoveSpeed(size_t index) { return NpcCombo::SpeedFor(config_,NpcCombo::TriggerOf(config_,index),static_cast<int>(index)); }
+int MoveSpeed(size_t index) { return NpcCombo::SpeedFor(config_,ChainOf(index),static_cast<int>(index)); }
 // What an interval does to the move before it, once that move has played once.
 std::wstring IntervalNote(size_t index) {
     if (!Wired(index)) return Tr(L"未接入派生链");
@@ -634,6 +803,15 @@ std::wstring ModifierNote(size_t index) {
         if (from.triggers) return Tr(L"整条链的 BOSS 技能放完不变回");
         wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招 BOSS 技能放完不变回").c_str(),from.nodes); return text;
     }
+    if (node.type==NodeType::Trim) {
+        if (!from.nodes) return Tr(L"未连接：从 BOSS 技能拉箭头到这里");
+        const NpcCombo::TrimRange r=NpcCombo::TrimOf(node); const float clip=TrimClip(index);
+        if (node.trim_to>0&&node.trim_to<=node.trim_from) return Tr(L"结束不晚于开始：放到这一招结尾");
+        if (clip>0&&r.from>=clip) { wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"开始晚于这一招的长度 %.2f s：整招照常播放").c_str(),static_cast<double>(clip)); return text; }
+        if (clip>0) return Tr(L"拖动两端裁剪 · 数值上滚轮微调");
+        if (!r.on) return Tr(L"从头放到结尾：调开始或结束来裁剪");
+        wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招 BOSS 技能只播放这一段").c_str(),from.nodes); return text;
+    }
     if (!from.nodes) return Tr(node.type==NodeType::Weapon?L"未连接：从起端节点拉箭头到这里":L"未连接：从起端节点或招式拉箭头到这里");
     if (node.type==NodeType::Weapon) return Tr(L"这条链的 Boss 招式伤害 × 主武器强度");
     if (node.type==NodeType::Damage) {
@@ -647,9 +825,17 @@ std::wstring ModifierNote(size_t index) {
         else _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招打中的敌人被强制%s").c_str(),from.nodes,kind.c_str());
         return text;
     }
+    if (node.type==NodeType::Air) {
+        if (from.triggers) return Tr(L"整条链：主角和打中的敌人按这里升高、滞空");
+        wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招：主角和打中的敌人按这里升高、滞空").c_str(),from.nodes); return text;
+    }
     if (node.type==NodeType::IgnoreGuard) {
         if (from.triggers) return Tr(L"整条链无视防御：敌人格挡、弹反不了");
         wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招无视防御").c_str(),from.nodes); return text;
+    }
+    if (node.type==NodeType::KeepChain) {
+        if (from.triggers) return Tr(L"整条链：闪避、移动等任何动作都不打断派生，按这个时间等下一次按键");
+        wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招后：任何动作都不打断派生").c_str(),from.nodes); return text;
     }
     if (node.type==NodeType::Invincible) {
         if (from.triggers) return Tr(L"整条链无敌：招式中不会被打到");
@@ -694,7 +880,7 @@ std::wstring GrabNote(const Node& node) {
     const MotianGrab::Variant* v=NodeGrab(node);
     if (!v) return Tr(L"所选投技已不可用，请重新选择");
     // The hero takes the look of the grab's boss for it (none when no look plays that boss).
-    const std::wstring look=Tr(NpcRetarget::SkinForGrab(v->boss_id,v->source)>=0?L"投时变身为该 Boss":L"这个 Boss 没有外观，不变身");
+    const std::wstring look=Tr(node.own_look?L"不变身":NpcRetarget::SkinForGrab(v->boss_id,v->source)>=0?L"投时变身为该 Boss":L"这个 Boss 没有外观，不变身");
     const MotianGrab::Snapshot& grab=GrabState();
     if (grab.chain_variant==v->index) return Tr(grab.chain_prepared?L"已预载":L"预载中")+L" · "+look;
     return look+L" · "+Tr(L"不受投技页设置影响");
@@ -704,6 +890,7 @@ std::wstring NodeNote(size_t index) {
     const bool wired=Wired(index);
     switch (node.type) {
     case NodeType::Teleport: return wired?Tr(L"瞬身到锁定目标面前（未锁定：最近的敌人）"):Tr(L"未连接");
+    case NodeType::Hook: return wired?Tr(L"钩向瞄准处：锁定目标、准星下的敌人，或地面和墙壁（飞过去）"):Tr(L"未连接");
     case NodeType::Group: {
         const size_t steps=NpcCombo::GroupSteps(config_,static_cast<int>(index)).size();
         if (!steps) return Tr(L"把节点拖进框里：按顺序直接连续释放");
@@ -712,20 +899,24 @@ std::wstring NodeNote(size_t index) {
     case NodeType::Interval: return IntervalNote(index);
     case NodeType::AutoDodge: return moves_.dodges.empty()?Tr(L"这个外观没有闪避"):wired?Tr(L"按摇杆方向选 Boss 闪避"):Tr(L"未连接");
     case NodeType::Trigger: return {};
-    case NodeType::Branch: return Tr(L"上一招后按哪个键，接哪一招");
-    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: return ModifierNote(index);
+    case NodeType::Branch: return Tr(L"上一招后按哪个键（点按或按住），接哪一招");
+    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: case NodeType::KeepChain: case NodeType::Trim: case NodeType::Air: return ModifierNote(index);
     case NodeType::WeaponMove: {
         if (!wired) return Tr(L"未连接");
         return Tr(L"拿这把武器放这一招，放完换回");
     }
     case NodeType::Grab: return wired?GrabNote(node):GrabNote(node)+L" · "+Tr(L"未连接");
     case NodeType::BossSkill: return wired?Tr(L"瞬身变身放这一招，放完变回"):Tr(L"未连接");
+    case NodeType::Assist: return wired?Tr(L"Boss 瞬移到目标身前放这一招，主角照常行动"):Tr(L"未连接");
     case NodeType::Look:
         if (node.boss.empty()) return Tr(L"选择要变成的 Boss");
         return wired?Tr(L"瞬身变成这个 Boss，派生链结束后保持"):Tr(L"未连接");
     case NodeType::HeroLook: return wired?Tr(L"瞬身变回主角，派生链结束后保持"):Tr(L"未连接");
     case NodeType::PreInput: return Tr(node.ms>0?L"招式中提前按的键保留这么久，没接上就清除":L"提前按的键一直保留到接上招式");
-    case NodeType::WeaponActions: return Tr(node.weapon.empty()?L"先选择武器":L"拿这把武器时，下面的动作改放连接的招式");
+    case NodeType::AirDefault: return Tr(node.on?L"空中放出、没连滞空的招式按这里升高、滞空":L"已关闭：空中放招不额外升高、滞空");
+    case NodeType::WeaponActions:
+        if (node.air_set) return Tr(L"主角在空中按下面的键时，改放连接的招式");
+        return Tr(node.weapon.empty()?L"先选择武器":L"拿这把武器时，下面的动作改放连接的招式");
     default: break;
     }
     if (node.ability.empty()||!MoveOfSkin(node.ability)) return Tr(L"不属于当前外观");
@@ -737,13 +928,15 @@ std::wstring NodeNote(size_t index) {
     if (!wired) note+=L" · "+Tr(L"未连接");
     return note;
 }
-// Width and height in canvas units.
-SIZE NodeSize(HDC dc,size_t index) {
+// Width and height in canvas units (measured: NodeSize keeps them).
+SIZE MeasureNode(HDC dc,size_t index) {
     const Node& node=config_.chain[index];
     if (node.type==NodeType::Trigger) {
         const bool key=node.trigger==static_cast<int>(Trigger::NpcKey),execution=ExecutionTrigger(node);
         int field=(key?KeyUnits(dc):Units(dc,UiTheme::Font::Body,ButtonLabel(node.trigger)))+100;
         if (execution) field=(std::max)(field,Units(dc,UiTheme::Font::Body,ExecutionWeaponText(node)+L"  ▾")+60);
+        // The 按住 row: its label, then its stepper with the whole value in view.
+        const int hold=10+Units(dc,UiTheme::Font::Small,Tr(L"按住多久才触发"))+6+TriggerHoldUnits(dc)+10;
         if (KeysTrigger(node)) {
             // The keys as icons: the card grows with them (up to six keys of any kind).
             const bool recording=record_.node==static_cast<int>(index)&&record_.route==-1;
@@ -753,13 +946,13 @@ SIZE NodeSize(HDC dc,size_t index) {
             // The keys field is the row less 26 units each side and 7 px inside: icons need that much more.
             field=(std::max)(field,(std::max)(keys+(icons>0?70:60),Units(dc,UiTheme::Font::Body,KeysModeText(node)+L"  ▾")+60));
             field=(std::max)(field,Units(dc,UiTheme::Font::Body,ThenText(node,then_recording)+L"  ▾")+60);  // 继续派生
-            return {std::clamp(field,300,icons>0?900:480),kHeader+kRow*(RawTrigger(node)?7:6)+kPad};
+            return {std::clamp((std::max)(field,hold),300,(std::max)(icons>0?900:480,hold)),kHeader+kRow*(RawTrigger(node)?8:7)+kPad};  // + 按住
         }
-        return {std::clamp(field,240,350),kHeader+kRow*(key?2:execution?4:3)+kPad};
+        return {std::clamp((std::max)(field,hold),260,(std::max)(350,hold)),kHeader+kRow*(key?3:execution?5:4)+kPad};  // + 按住
     }
     if (node.type==NodeType::Branch) {
         // A row each; a 自定义组合键 / 自定义按键 row two (its keys under it).
-        int lines=0; int wide=380; bool icons=false;
+        int lines=0; int wide=500; bool icons=false;  // a row: its button, 按住, pause, x
         for (size_t r=0;r<node.routes.size();++r) {
             const NpcCombo::Route& route=node.routes[r];
             lines+=NpcCombo::KeysRoute(route)?2:1;
@@ -772,7 +965,9 @@ SIZE NodeSize(HDC dc,size_t index) {
             const int mode_units=Units(dc,UiTheme::Font::Small,RouteModeText(route)+L"  ▾");
             wide=(std::max)(wide,(std::max)((keys_units+16)*20/11,(mode_units+16)*20/9)+66);
         }
-        return {std::clamp(wide,380,icons?960:560),kHeader+kRow*(lines+2)+kPad};
+        // A row: its button, its 按住 and pause steppers (each value whole), x, its output.
+        const int row=10+132+8+StepperUnits(RouteHoldUnits(dc))+8+StepperUnits(RoutePauseUnits(dc))+8+(kRow-4)+30;
+        return {std::clamp((std::max)(wide,row),500,(std::max)(icons?960:660,row)),kHeader+kRow*(lines+2)+kPad};
     }
     if (node.type==NodeType::WeaponActions) {
         // The weapon, the reset time, a note, a row per action (its field, x, its own output), then "+ 添加动作".
@@ -783,11 +978,26 @@ SIZE NodeSize(HDC dc,size_t index) {
     }
     if (node.type==NodeType::Group) return {NpcCombo::ClampGroupW(node.w),NpcCombo::ClampGroupH(node.h)};
     const int title=Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,note=Units(dc,UiTheme::Font::Small,NodeNote(index))+34;
+    if (node.type==NodeType::Hook) {  // its mode, its reach, its speed, a note, its 派生点
+        int field=0; for (int mode=0;mode<3;++mode) field=(std::max)(field,Units(dc,UiTheme::Font::Body,HookModeText(mode)+L"  ▾")+60);
+        field=(std::max)(field,(std::max)(Units(dc,UiTheme::Font::Body,HookDistText(NpcCombo::kHookDistMax)+L"  ▾"),Units(dc,UiTheme::Font::Body,HookSpeedText(NpcCombo::kHookSpeedMax)+L"  ▾"))+60);
+        return {std::clamp((std::max)((std::max)(title,field),note),300,520),kHeader+kRow*5+kPad};
+    }
     if (node.type==NodeType::Teleport) {
         const int fields=Units(dc,UiTheme::Font::Body,DistText(NpcCombo::kTeleportDistMax)+L"  ▾")+60;
         return {std::clamp((std::max)((std::max)(title,fields),note),280,420),kHeader+kRow*4+kPad};
     }
-    if (node.type==NodeType::Speed||node.type==NodeType::Damage) return {std::clamp((std::max)(title,note),200,340),kHeader+kRow*2+kPad};
+    if (node.type==NodeType::Trim) {  // 开始于, 结束于 (steppers), the part on the move's length, a note
+        const int labels=(std::max)(Units(dc,UiTheme::Font::Small,Tr(L"开始于")),Units(dc,UiTheme::Font::Small,Tr(L"结束于")))+150;
+        const int bar=Units(dc,UiTheme::Font::Small,TrimBarText(index))+40;
+        return {std::clamp((std::max)((std::max)(title,note),(std::max)(labels,bar)),300,460),kHeader+kRow*5+kPad};
+    }
+    if (node.type==NodeType::Speed) {
+        const int curve=Units(dc,UiTheme::Font::Small,Tr(L"曲线调节"))+Units(dc,UiTheme::Font::Small,Tr(L"编辑曲线…"))+80;
+        return {std::clamp((std::max)((std::max)(title,note),curve),240,360),kHeader+kRow*3+kPad};
+    }
+    if (node.type==NodeType::Damage) return {std::clamp((std::max)(title,note),200,340),kHeader+kRow*2+kPad};
+    if (node.type==NodeType::KeepChain) return {std::clamp((std::max)(title,note),220,420),kHeader+kRow*2+kPad};
     if (node.type==NodeType::WeaponMove) {
         const int weapon=Units(dc,UiTheme::Font::Body,(node.weapon.empty()?Tr(L"选择武器"):WeaponName(node.weapon))+L"  ▾")+60;
         const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):WeaponMoveText(node.weapon,node.ability))+L"  ▾")+60;
@@ -797,25 +1007,45 @@ SIZE NodeSize(HDC dc,size_t index) {
     if (node.type==NodeType::BossSkill) {
         const int look=Units(dc,UiTheme::Font::Body,(node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss))+L"  ▾")+60;
         const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):MoveText(node.ability))+L"  ▾")+60;
-        return {std::clamp((std::max)((std::max)(title,look),move),280,420),kHeader+kRow*3+kPad};
+        return {std::clamp((std::max)((std::max)(title,look),move),280,420),kHeader+kRow*4+kPad};  // + 不变身
+    }
+    if (node.type==NodeType::Assist) {  // its look, its move, a note
+        const int look=Units(dc,UiTheme::Font::Body,(node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss))+L"  ▾")+60;
+        const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):MoveText(node.ability))+L"  ▾")+60;
+        return {std::clamp((std::max)((std::max)(title,look),(std::max)(move,note)),280,460),kHeader+kRow*3+kPad};
     }
     if (node.type==NodeType::Look) {
         const int field=Units(dc,UiTheme::Font::Body,(node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss))+L"  ▾")+60;
         return {std::clamp((std::max)((std::max)(title,note),field),260,420),kHeader+kRow*2+kPad};
     }
     if (node.type==NodeType::HeroLook) return {std::clamp((std::max)(title,note),240,380),kHeader+kRow+kPad};
-    if (node.type==NodeType::ForceHit) {
-        const int field=Units(dc,UiTheme::Font::Body,Tr(NpcCombo::HitKindLabel(node.hit))+L"  ▾")+60;
-        return {std::clamp((std::max)((std::max)(title,note),field),240,400),kHeader+kRow*2+kPad};
+    if (node.type==NodeType::ForceHit) {  // its kind, 击飞's height, a note
+        int field=Units(dc,UiTheme::Font::Body,Tr(NpcCombo::HitKindLabel(node.hit))+L"  ▾")+60;
+        if (LaunchShown(node)) field=(std::max)(field,Units(dc,UiTheme::Font::Body,LaunchText(NpcCombo::kLaunchMax)+L"  ▾")+60);
+        return {std::clamp((std::max)((std::max)(title,note),field),240,400),kHeader+kRow*(LaunchShown(node)?3:2)+kPad};
+    }
+    if (AirNode(node)) {  // 空中释放: its switch; then the four values and a note
+        int field=0;
+        for (const int route:{-1,-2,-3,-4}) field=(std::max)(field,Units(dc,UiTheme::Font::Body,AirText(route,AirHangRoute(route)?100:NpcCombo::kAirLiftMax)+L"  ▾")+60);
+        if (node.type==NodeType::AirDefault) field=(std::max)(field,Units(dc,UiTheme::Font::Small,Tr(L"启用"))+60);
+        return {std::clamp((std::max)((std::max)(title,note),field),260,440),kHeader+kRow*(node.type==NodeType::AirDefault?6:5)+kPad};
     }
     if (node.type==NodeType::Grab) {
         const int field=Units(dc,UiTheme::Font::Body,GrabField(node)+L"  ▾")+40;
-        return {std::clamp((std::max)((std::max)(title,note),field),260,420),kHeader+kRow*2+kPad};
+        return {std::clamp((std::max)((std::max)(title,note),field),260,420),kHeader+kRow*3+kPad};  // + 不变身
     }
     if (node.type==NodeType::Weapon) return {std::clamp((std::max)((std::max)(title,note),Units(dc,UiTheme::Font::Small,WeaponNote())+24),230,360),kHeader+kRow*2+kPad};
     if (node.type==NodeType::Interval) return {std::clamp((std::max)(title,note),190,320),kHeader+kRow*2+kPad};
     if (node.type==NodeType::PreInput) return {std::clamp((std::max)(title,note),230,420),kHeader+kRow*2+kPad};
     return {std::clamp((std::max)(title,note),250,340),kHeader+kRow*2+kPad};  // a move: its note, then its 派生点
+}
+SIZE NodeSize(HDC dc,size_t index) {
+    if (index>=config_.chain.size()) return {0,0};
+    if (config_.chain[index].type==NodeType::Group) return MeasureNode(dc,index);  // its own w / h, resized live
+    if (sizes_.size()!=config_.chain.size()) sizes_.assign(config_.chain.size(),SIZE{-1,-1});
+    SIZE& size=sizes_[index];
+    if (size.cx<0) size=MeasureNode(dc,index);
+    return size;
 }
 
 // ---- canvas <-> screen ---------------------------------------------------------------------------
@@ -834,12 +1064,12 @@ Shape NodeShape(HDC dc,size_t index) {
     Shape s; s.rect=Box(node.x,node.y,NodeSize(dc,index));
     const int mid=(s.rect.top*2+Px(kHeader))/2;
     s.header={s.rect.left,s.rect.top,s.rect.right,s.rect.top+Px(kHeader)};
-    const bool modifier=NpcCombo::IsModifier(node),move=node.type==NodeType::Skill||node.type==NodeType::AutoDodge,setting=NpcCombo::IsPreInput(node);
+    const bool modifier=NpcCombo::IsModifier(node),move=node.type==NodeType::Skill||node.type==NodeType::AutoDodge,setting=NpcCombo::IsSetting(node);
     s.has_in=!NpcCombo::StartsChain(node)&&!modifier&&!setting; s.has_out=!NpcCombo::HasRows(node)&&!modifier&&!setting;
     s.in={s.rect.left+Px(13),mid}; s.out={s.rect.right-Px(13),mid};
     // Round pins: a trigger's arrow pin sits where an exec input would, a move's just under its exec input; a
     // modifier's (where arrows end) where an exec output would.
-    s.has_mod_out=NpcCombo::StartsChain(node)||move||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||node.type==NodeType::Teleport||node.type==NodeType::Group||
+    s.has_mod_out=NpcCombo::StartsChain(node)||move||NpcCombo::PicksBossMove(node)||node.type==NodeType::WeaponMove||node.type==NodeType::Hook||node.type==NodeType::Teleport||node.type==NodeType::Group||
         node.type==NodeType::Grab;
     if (s.has_mod_out) { const RECT line=Row(s.rect,0); s.mod_out=NpcCombo::StartsChain(node)?s.in:POINT{s.rect.left+Px(13),(line.top+line.bottom)/2}; }
     s.has_mod_in=modifier; s.mod_in=s.out;
@@ -851,20 +1081,47 @@ Shape NodeShape(HDC dc,size_t index) {
         s.minus={line.right-Px(110),line.top,line.right-Px(110)+b,line.bottom}; s.plus={line.right-b,line.top,line.right,line.bottom};
         s.value={s.minus.right+Px(4),line.top,s.plus.left-Px(4),line.bottom};
     };
-    if (node.type==NodeType::Interval||setting) {
+    if (node.type==NodeType::Interval||NpcCombo::IsPreInput(node)) {
         const RECT line=Row(s.rect,0); const int b=line.bottom-line.top;
         s.minus={line.left,line.top,line.left+b,line.bottom}; s.plus={line.right-b,line.top,line.right,line.bottom};
         s.value={s.minus.right+Px(4),line.top,s.plus.left-Px(4),line.bottom};
-    } else if (node.type==NodeType::Speed||node.type==NodeType::Damage) {
+    } else if (node.type==NodeType::Speed) {
+        // Row 0: the multiplier (a stepper), or under 曲线调节 the curve's picture (a click opens its window); row 1: the
+        // 曲线调节 checkbox and 编辑曲线…; row 2: the note.
+        const RECT line=Row(s.rect,0); const int b=line.bottom-line.top;
+        if (node.curve) s.field2=line;
+        else {
+            s.minus={line.left,line.top,line.left+b,line.bottom}; s.plus={line.right-b,line.top,line.right,line.bottom};
+            s.value={s.minus.right+Px(4),line.top,s.plus.left-Px(4),line.bottom};
+        }
+        const RECT row=Row(s.rect,1); const int split=row.left+(row.right-row.left)*11/20;
+        s.toggle={row.left,row.top,split,row.bottom}; s.field={split+Px(6),row.top,row.right,row.bottom};
+    } else if (node.type==NodeType::Trim) {
+        // Row 0: 开始于 (a stepper); row 1: 结束于 (a stepper, as a trigger's 按住); row 2: the part on the move's length;
+        // row 3: range times (clear of the handles); row 4: the note.
+        const auto trim_row=[&](int row,RECT& minus,RECT& value,RECT& plus){
+            const RECT line=Row(s.rect,row); const int b=line.bottom-line.top;
+            minus={line.right-Px(124),line.top,line.right-Px(124)+b,line.bottom}; plus={line.right-b,line.top,line.right,line.bottom};
+            value={minus.right+Px(4),line.top,plus.left-Px(4),line.bottom};
+        };
+        trim_row(0,s.minus,s.value,s.plus); trim_row(1,s.hminus,s.hvalue,s.hplus); s.has_hold=true;
+        s.field2=Row(s.rect,2);
+    } else if (node.type==NodeType::Damage||node.type==NodeType::KeepChain) {
         const RECT line=Row(s.rect,0); const int b=line.bottom-line.top;
         s.minus={line.left,line.top,line.left+b,line.bottom}; s.plus={line.right-b,line.top,line.right,line.bottom};
         s.value={s.minus.right+Px(4),line.top,s.plus.left-Px(4),line.bottom};
     } else if (node.type==NodeType::BossSkill) {
         s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26);
         stepper(2);  // its 派生点
+        s.toggle=Row(s.rect,3);  // 不变身
+    } else if (node.type==NodeType::Assist) {
+        s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26);  // its look, its move; then a note (no 派生点: the hero is free)
     } else if (node.type==NodeType::WeaponMove) {
         s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26);  // the weapon, its ability; then a note and the 派生点
         stepper(3);
+    } else if (node.type==NodeType::Hook) {
+        s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26); s.field3=Row(s.rect,2,26);  // its mode, reach, speed; then a note and the 派生点
+        stepper(4);
     } else if (node.type==NodeType::Teleport) {
         s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26);  // distance, height; then a note and the 派生点
         stepper(3);
@@ -872,8 +1129,14 @@ Shape NodeShape(HDC dc,size_t index) {
         stepper(0);  // its 派生点 under the header; the nodes below; the size handle in the corner
         const int h=Px(16);
         s.resize={s.rect.right-h,s.rect.bottom-h,s.rect.right,s.rect.bottom};
+    } else if (node.type==NodeType::Air) {
+        s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26); s.field3=Row(s.rect,2,26); s.field4=Row(s.rect,3,26);  // then a note
+    } else if (node.type==NodeType::AirDefault) {
+        s.toggle=Row(s.rect,0); s.field=Row(s.rect,1); s.field2=Row(s.rect,2); s.field3=Row(s.rect,3); s.field4=Row(s.rect,4);  // then a note
     } else if (node.type==NodeType::Grab||node.type==NodeType::Look||node.type==NodeType::ForceHit) {
         s.field=Row(s.rect,0,26);
+        if (LaunchShown(node)) s.field2=Row(s.rect,1,26);  // 击飞's height
+        if (node.type==NodeType::Grab) s.toggle=Row(s.rect,2);  // 不变身
     } else if (node.type==NodeType::Trigger) {
         s.field=Row(s.rect,0,26);
         stepper(1);
@@ -882,6 +1145,12 @@ Shape NodeShape(HDC dc,size_t index) {
         if (KeysTrigger(node)) { s.field2=Row(s.rect,3,26); s.field3=Row(s.rect,4,26); }  // its keys; in order or together
         if (RawTrigger(node)) s.toggle2=Row(s.rect,5);  // 吞掉
         if (KeysTrigger(node)) s.field4=Row(s.rect,RawTrigger(node)?6:5,26);  // 继续派生
+        // 按住: the last row, a stepper as the reset time's.
+        const int hold_row=node.trigger==static_cast<int>(Trigger::NpcKey)?2:KeysTrigger(node)?(RawTrigger(node)?7:6):ExecutionTrigger(node)?4:3;
+        const RECT line=Row(s.rect,hold_row); const int b=line.bottom-line.top;
+        const int hold_w=Px(TriggerHoldUnits(dc));
+        s.hminus={line.right-hold_w,line.top,line.right-hold_w+b,line.bottom}; s.hplus={line.right-b,line.top,line.right,line.bottom};
+        s.hvalue={s.hminus.right+Px(4),line.top,s.hplus.left-Px(4),line.bottom}; s.has_hold=true;
     } else if (node.type==NodeType::WeaponActions) {
         // The weapon, the reset time, a note, then a row per action (its field, x, its own output) and "+ 添加动作".
         s.field=Row(s.rect,0,26);
@@ -898,15 +1167,19 @@ Shape NodeShape(HDC dc,size_t index) {
         s.add={add.left,add.top,add.left+Px(132),add.bottom};
     } else if (node.type==NodeType::Branch) {
         // Rows: the note, one per route (button field, pause stepper, x, its own output; a 自定义组合键 / 自定义按键
-        // row's keys and mode on a line under it), then "+ 添加按键".
+        // row's keys and mode on a line under it), then "+ 添加按键". The 按住 and pause boxes fit their widest values.
+        const int hold_v=RouteHoldUnits(dc),pause_v=RoutePauseUnits(dc);
         int at=1;
         for (size_t k=0;k<node.routes.size();++k) {
             RouteShape route; const RECT line=Row(s.rect,at++); const int b=line.bottom-line.top,right=s.rect.right-Px(30);
             route.field={line.left,line.top,line.left+Px(132),line.bottom};
             route.remove={right-b,line.top,right,line.bottom};
             route.plus={route.remove.left-Px(8)-b,line.top,route.remove.left-Px(8),line.bottom};
-            route.value={route.plus.left-Px(4)-Px(96),line.top,route.plus.left-Px(4),line.bottom};
+            route.value={route.plus.left-Px(4)-Px(pause_v),line.top,route.plus.left-Px(4),line.bottom};
             route.minus={route.value.left-Px(4)-b,line.top,route.value.left-Px(4),line.bottom};
+            route.hplus={route.minus.left-Px(8)-b,line.top,route.minus.left-Px(8),line.bottom};
+            route.hvalue={route.hplus.left-Px(4)-Px(hold_v),line.top,route.hplus.left-Px(4),line.bottom};
+            route.hminus={route.hvalue.left-Px(4)-b,line.top,route.hvalue.left-Px(4),line.bottom};
             route.out={s.rect.right-Px(13),(line.top+line.bottom)/2};
             if (NpcCombo::KeysRoute(node.routes[k])) {
                 const RECT keys=Row(s.rect,at++); const int split=keys.left+Px(16)+(right-keys.left-Px(16))*11/20;
@@ -959,7 +1232,8 @@ POINT FreeSpot(HDC dc,int x,int y,SIZE size,int skip=-1) {
 }
 bool Room() {
     if (config_.chain.size()<NpcCombo::kMaxNodes) return true;
-    DebugHub::Notify(Tr(L"画布最多 64 个节点。").c_str()); return false;
+    wchar_t text[160]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"节点已有 %zu 个，到了防止文件损坏的保护上限。").c_str(),NpcCombo::kMaxNodes);
+    DebugHub::Notify(text); return false;
 }
 void OpenSearch(POINT at,int from=-1,int into=-1,int from_out=0);
 void OpenPicker(int node,int route,int part=0);
@@ -1012,22 +1286,93 @@ int Place(Node node,float x,float y,int from=-1,int into=-1,int from_out=0) {
     return index;
 }
 void RemoveSelected() {
+    CloseCurve("nodes removed");
     std::vector<int> gone=Selection();
     if (gone.size()>1) {
         // The whole selection, last index first (the 按键 and 预输入 nodes stay).
         size_t kept=0;
-        gone.erase(std::remove_if(gone.begin(),gone.end(),[&](int i){ const bool keep=IsKey(i)||IsPreInputAt(i); kept+=keep?1:0; return keep; }),gone.end());
+        gone.erase(std::remove_if(gone.begin(),gone.end(),[&](int i){ const bool keep=IsKey(i)||IsSettingAt(i); kept+=keep?1:0; return keep; }),gone.end());
         std::sort(gone.rbegin(),gone.rend());
         for (const int i:gone) NpcCombo::Remove(config_,static_cast<size_t>(i));
         wchar_t text[160]{};
-        _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(kept?L"已删除 %zu 个节点（「按键」「预输入」节点保留）":L"已删除 %zu 个节点").c_str(),gone.size());
+        _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(kept?L"已删除 %zu 个节点（「按键」「预输入」「空中释放」节点保留）":L"已删除 %zu 个节点").c_str(),gone.size());
         DebugHub::Notify(text);
         picked_.clear(); Select(-1); Save(); Invalidate(); return;
     }
     if (!At(selected_)) return;
     if (IsKey(selected_)) { DebugHub::Notify(Tr(L"「按键」节点不能删除；断开它的连线即可停用。").c_str()); return; }
     if (IsPreInputAt(selected_)) { DebugHub::Notify(Tr(L"「预输入」节点不能删除；时间设为 0 即一直保留。").c_str()); return; }
+    if (IsSettingAt(selected_)) { DebugHub::Notify(Tr(L"「空中释放」节点不能删除；不需要时把它关闭。").c_str()); return; }
     NpcCombo::Remove(config_,static_cast<size_t>(selected_)); picked_.clear(); Select(-1); Save(); Invalidate();
+}
+// 编辑曲线…: the node's curve in its own window (曲线调节 turns on with it). The window reads the node back every
+// tick and writes it (saved when a drag or click is over); it closes when the node goes (removed, another chain or
+// file loaded).
+void OpenCurve(int index) {
+    if (!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::Speed) return;
+    Node& node=config_.chain[static_cast<size_t>(index)];
+    if (!node.curve||node.points.size()<2) { node.curve=true; if (node.points.size()<2) node.points=NpcCombo::DefaultCurve(node.speed); Save(); Layout(); }
+    const std::string profile=moves_.profile;
+    SpeedCurveWindow::Host host;
+    host.read=[index,profile](std::vector<NpcCombo::CurvePoint>& points,bool& on,int& speed,std::wstring& title) {
+        if (moves_.profile!=profile||!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::Speed) return false;
+        const Node& n=config_.chain[static_cast<size_t>(index)];
+        points=n.points; on=n.curve; speed=n.speed;
+        const NpcCombo::Pointers from=NpcCombo::PointersTo(config_,index);
+        wchar_t text[96]{};
+        if (from.triggers) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%s",Tr(L"整条链").c_str());
+        else _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招").c_str(),from.nodes);
+        title=text; return true;
+    };
+    host.write=[index,profile](const std::vector<NpcCombo::CurvePoint>& points,bool on,bool commit) {
+        if (moves_.profile!=profile||!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::Speed) return;
+        Node& n=config_.chain[static_cast<size_t>(index)];
+        const bool relayout=n.curve!=on;
+        n.points=NpcCombo::CleanCurve(points); n.curve=on;
+        if (commit) Save();
+        if (relayout) Layout();
+        Invalidate();
+    };
+    SpeedCurveWindow::Open(window_,index,std::move(host));
+}
+// The curve window goes with its node (a removal shifts the indexes; another chain or file replaces them).
+void CloseCurve(const char* why) { if (SpeedCurveWindow::EditedNode()>=0) SpeedCurveWindow::Close(why); }
+// combo curve: the first 加速 node's window opened as a click on it does (曲线调节 turns on with it), or a test curve
+// (never saved) when the chain has none; where it sits. combo curve close puts that node's 曲线调节 and points back.
+struct CurveTest { int node=-1; std::string profile; bool curve=false; std::vector<NpcCombo::CurvePoint> points; } curve_test_;
+void TestCurve(bool close) {
+    if (close) {
+        SpeedCurveWindow::Close("test closed it");
+        const CurveTest t=curve_test_; curve_test_={};
+        if (t.node>=0&&moves_.profile==t.profile&&At(t.node)&&config_.chain[static_cast<size_t>(t.node)].type==NodeType::Speed) {
+            Node& n=config_.chain[static_cast<size_t>(t.node)];
+            if (n.curve!=t.curve||n.points.size()!=t.points.size()) { n.curve=t.curve; n.points=t.points; Save(); Layout(); Invalidate(); }
+            Logf("COMBO_TEST curve closed; node %d put back (curve %d, %zu points)",t.node,t.curve?1:0,t.points.size());
+        } else Logf("COMBO_TEST curve closed");
+        return;
+    }
+    if (!window_||!IsWindowVisible(window_)) { Logf("COMBO_TEST curve refused: the 招式派生 page is not shown"); return; }
+    int node=-1;
+    for (size_t i=0;i<config_.chain.size();++i) if (config_.chain[i].type==NodeType::Speed) { node=static_cast<int>(i); break; }
+    if (node>=0) {
+        if (curve_test_.node!=node) { const Node& n=config_.chain[static_cast<size_t>(node)]; curve_test_={node,moves_.profile,n.curve,n.points}; }
+        OpenCurve(node);
+    }
+    else {
+        static std::vector<NpcCombo::CurvePoint> points; static bool on=true;
+        if (points.empty()) points={{0,100},{40,250},{100,100}};
+        SpeedCurveWindow::Host host;
+        host.read=[](std::vector<NpcCombo::CurvePoint>& p,bool& o,int& speed,std::wstring& title) { p=points; o=on; speed=100; title=L"测试"; return true; };
+        host.write=[](const std::vector<NpcCombo::CurvePoint>& p,bool o,bool) { points=NpcCombo::CleanCurve(p); on=o; };
+        SpeedCurveWindow::Open(window_,100000,std::move(host));
+    }
+    const HWND curve=SpeedCurveWindow::Window(),parent=curve?GetParent(curve):nullptr,game=UiHost::Game();
+    RECT r{},page{}; if (curve) GetWindowRect(curve,&r); GetWindowRect(window_,&page);
+    const LONG_PTR style=curve?GetWindowLongPtrW(curve,GWL_STYLE):0;
+    Logf("COMBO_TEST curve node=%d window=%p child=%d parent=%p parentHoldsPage=%d parentOnGame=%d visible=%d rect=%ld,%ld %ldx%ld page=%ld,%ld %ldx%ld",
+         node,static_cast<void*>(curve),(style&WS_CHILD)?1:0,static_cast<void*>(parent),parent&&IsChild(parent,window_)?1:0,
+         parent&&GetParent(parent)==game?1:0,curve&&IsWindowVisible(curve)?1:0,r.left,r.top,r.right-r.left,r.bottom-r.top,
+         page.left,page.top,page.right-page.left,page.bottom-page.top);
 }
 // One step up (dir 1) or down (-1) of a node's value: an interval, a trigger's reset time, a 加速's speed, a move's
 // 派生点, or the pause of a branch's route `route`.
@@ -1037,21 +1382,58 @@ void Nudge(int index,int dir,int route=-1) {
     dir=dir>0?1:-1;
     if (node.type==NodeType::Interval) node.ms=NpcCombo::ClampInterval(node.ms+dir*NpcCombo::kIntervalStep);
     else if (node.type==NodeType::PreInput) node.ms=NpcCombo::ClampPreInput(node.ms+dir*NpcCombo::kPreInputStep);
+    else if (node.type==NodeType::KeepChain) node.ms=NpcCombo::ClampKeepChain(node.ms+dir*NpcCombo::kKeepChainStep);
     else if (NpcCombo::StartsChain(node)) node.ms=NpcCombo::ClampReset(node.ms+dir*NpcCombo::kResetStep);
     else if (node.type==NodeType::Speed) node.speed=NpcCombo::ClampSpeed(node.speed+dir*NpcCombo::kSpeedStep);
     else if (node.type==NodeType::Damage) node.speed=NpcCombo::ClampDamage(node.speed+dir*NpcCombo::kDamageStep);
-    else if (node.type==NodeType::Skill||node.type==NodeType::AutoDodge||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||node.type==NodeType::Teleport||node.type==NodeType::Group)
+    else if (node.type==NodeType::Trim) {
+        // 开始于: never at or past a set end, nor past the move's length once it is known.
+        int from=NpcCombo::ClampTrim(node.trim_from+dir*NpcCombo::kTrimStep);
+        if (node.trim_to>node.trim_from&&from>=node.trim_to) from=(std::max)(0,node.trim_to-NpcCombo::kTrimStep);
+        const int clip=static_cast<int>(std::lround(TrimClip(static_cast<size_t>(index))*1000));
+        if (clip>0) from=(std::min)(from,(std::max)(0,clip-NpcCombo::kTrimStep));
+        node.trim_from=from;
+    }
+    else if (node.type==NodeType::Skill||node.type==NodeType::AutoDodge||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||node.type==NodeType::Hook||node.type==NodeType::Teleport||
+             node.type==NodeType::Group)
         node.ms=NpcCombo::ClampCancel(node.ms+dir*NpcCombo::kCancelStep);
     else if (node.type==NodeType::Branch&&route>=0&&static_cast<size_t>(route)<node.routes.size())
         node.routes[static_cast<size_t>(route)].pause_ms=NpcCombo::ClampPause(node.routes[static_cast<size_t>(route)].pause_ms+dir*NpcCombo::kPauseStep);
     else return;
     Save(); Invalidate();
 }
+// A 按住 of node `index`: row -1 a trigger's own, else that branch row's (null: none there).
+int* HoldOf(int index,int row) {
+    if (!At(index)) return nullptr;
+    Node& node=config_.chain[static_cast<size_t>(index)];
+    if (row<0) return node.type==NodeType::Trigger?&node.hold_ms:node.type==NodeType::Trim?&node.trim_to:nullptr;  // a 裁剪's 结束于
+    return node.type==NodeType::Branch&&static_cast<size_t>(row)<node.routes.size()?&node.routes[static_cast<size_t>(row)].hold_ms:nullptr;
+}
+void NudgeHold(int index,int dir,int row) {
+    int* hold=HoldOf(index,row); if (!hold||!dir) return;
+    if (config_.chain[static_cast<size_t>(index)].type==NodeType::Trim) {
+        // 结束于: 放完 (0) is the move's end. A step down from it ends a step before the move's length (a second after
+        // the start while the length is not known); a step up to the length is 放完 again.
+        const int from=NpcCombo::ClampTrim(config_.chain[static_cast<size_t>(index)].trim_from);
+        const int clip=static_cast<int>(std::lround(TrimClip(static_cast<size_t>(index))*1000));
+        int to=0;
+        if (*hold<=from) {
+            if (dir>0&&*hold==0) return;  // already 放完
+            to=dir>0?from+NpcCombo::kTrimStep:clip>from+NpcCombo::kTrimStep?clip-NpcCombo::kTrimStep:from+1000;
+        } else {
+            to=*hold+(dir>0?1:-1)*NpcCombo::kTrimStep;
+            if (clip>0&&to>=clip) to=0; else if (to<=from) to=from+NpcCombo::kTrimStep;
+        }
+        *hold=NpcCombo::ClampTrim(to);
+    } else *hold=NpcCombo::ClampHold(*hold+(dir>0?1:-1)*NpcCombo::kHoldStep);
+    Save(); Invalidate();
+}
 // A value typed in: a 加速's multiplier (×0.50–×10.00) or a move's 派生点 in seconds (0–10; 0: when it ends). A
 // click on the value starts it (the text selected), Enter / a click elsewhere keeps it (clamped), Esc drops it.
 bool Typed(const Node& node) {
     return node.type==NodeType::Speed||node.type==NodeType::Damage||node.type==NodeType::Skill||node.type==NodeType::AutoDodge||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||
-           node.type==NodeType::Teleport||node.type==NodeType::Group||node.type==NodeType::PreInput;
+           node.type==NodeType::Hook||node.type==NodeType::Teleport||node.type==NodeType::Group||node.type==NodeType::PreInput||node.type==NodeType::KeepChain||
+           node.type==NodeType::Trim;
 }
 void BeginEdit(int index) {
     if (!At(index)||!Typed(config_.chain[static_cast<size_t>(index)])) return;
@@ -1059,13 +1441,35 @@ void BeginEdit(int index) {
     wchar_t text[16]{};
     if (node.type==NodeType::Damage) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%d",NpcCombo::ClampDamage(node.speed));
     else if (node.type==NodeType::PreInput) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampPreInput(node.ms)/1000.0);
+    else if (node.type==NodeType::KeepChain) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampKeepChain(node.ms)/1000.0);
+    else if (node.type==NodeType::Trim) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampTrim(node.trim_from)/1000.0);
     else _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",node.type==NodeType::Speed?NpcCombo::ClampSpeed(node.speed)/100.0:NpcCombo::ClampCancel(node.ms)/1000.0);
     edit_={index,text,true}; SetFocus(window_); Invalidate();
+}
+// A 按住 typed in seconds (0-5; 0: any press).
+void BeginHoldEdit(int index,int row) {
+    const int* hold=HoldOf(index,row); if (!hold) return;
+    wchar_t text[16]{};
+    if (config_.chain[static_cast<size_t>(index)].type==NodeType::Trim) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampTrim(*hold)/1000.0);  // 结束于
+    else _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.1f",NpcCombo::ClampHold(*hold)/1000.0);
+    edit_={index,text,true,row}; SetFocus(window_); Invalidate();
 }
 void CancelEdit() { if (edit_.node>=0) { edit_={}; Invalidate(); } }
 void CommitEdit() {
     if (edit_.node<0) return;
     const Edit done=edit_; edit_={};
+    if (done.hold>-2) {
+        int* hold=HoldOf(done.node,done.hold);
+        wchar_t* end=nullptr; const double value=done.text.empty()?-1:std::wcstod(done.text.c_str(),&end);
+        if (hold&&end&&end!=done.text.c_str()&&value>=0) {
+            const int ms=static_cast<int>(std::lround(value*1000));
+            const bool trim=config_.chain[static_cast<size_t>(done.node)].type==NodeType::Trim;  // a 裁剪's 结束于
+            *hold=trim?NpcCombo::ClampTrim(ms):NpcCombo::ClampHold(ms);
+            if (*hold!=ms) DebugHub::Notify(Tr(trim?L"裁剪时间在 0 到 60 秒之间，已调整。":L"按住时间在 0 到 5 秒之间，已调整。").c_str());
+            Save();
+        }
+        Invalidate(); return;
+    }
     if (Node* node=At(done.node)?&config_.chain[static_cast<size_t>(done.node)]:nullptr; node&&Typed(*node)&&!done.text.empty()) {
         wchar_t* end=nullptr; const double value=std::wcstod(done.text.c_str(),&end);
         if (end&&end!=done.text.c_str()&&node->type==NodeType::Damage&&value>=0) {
@@ -1082,6 +1486,16 @@ void CommitEdit() {
             const int ms=static_cast<int>(std::lround(value*1000));
             node->ms=NpcCombo::ClampPreInput(ms);
             if (node->ms!=ms) DebugHub::Notify(Tr(L"预输入在 0 到 5 秒之间，已调整。").c_str());
+            Save();
+        } else if (end&&end!=done.text.c_str()&&node->type==NodeType::KeepChain&&value>=0) {
+            const int ms=static_cast<int>(std::lround(value*1000));
+            node->ms=NpcCombo::ClampKeepChain(ms);
+            if (node->ms!=ms) DebugHub::Notify(Tr(L"保持派生在 0.5 到 30 秒之间，已调整。").c_str());
+            Save();
+        } else if (end&&end!=done.text.c_str()&&node->type==NodeType::Trim&&value>=0) {
+            const int ms=static_cast<int>(std::lround(value*1000));
+            node->trim_from=NpcCombo::ClampTrim(ms);
+            if (node->trim_from!=ms) DebugHub::Notify(Tr(L"裁剪时间在 0 到 60 秒之间，已调整。").c_str());
             Save();
         } else if (end&&end!=done.text.c_str()&&node->type!=NodeType::Speed&&node->type!=NodeType::Damage&&value>=0) {
             const int ms=static_cast<int>(std::lround(value*1000));
@@ -1117,8 +1531,14 @@ void AddRoute(int index) {
     if (!At(index)||!NpcCombo::HasRows(config_.chain[static_cast<size_t>(index)])) return;
     Node& node=config_.chain[static_cast<size_t>(index)];
     const bool actions=WeaponActionsNode(node);
-    if (node.routes.size()>=NpcCombo::kMaxRoutes) { DebugHub::Notify(Tr(actions?L"武器派生修改最多 6 行。":L"按键分支最多 6 行。").c_str()); return; }
+    if (node.routes.size()>=NpcCombo::kMaxRoutes) {
+        DebugHub::Notify(Tr(node.air_set?L"空中派生最多 6 行。":actions?L"武器派生修改最多 6 行。":L"按键分支最多 6 行。").c_str()); return; }
     NpcCombo::Route route;
+    if (node.air_set) {
+        for (const Trigger t:{Trigger::Light,Trigger::Heavy,Trigger::Shachi,Trigger::CombatArt,Trigger::NpcKey,Trigger::Special,Trigger::Jump,Trigger::AnyDodge,Trigger::Stance})
+            if (std::none_of(node.routes.begin(),node.routes.end(),[t](const NpcCombo::Route& r){return r.button==static_cast<int>(t);})) { route.button=static_cast<int>(t); break; }
+        node.routes.push_back(route); Save(); Invalidate(); return;
+    }
     if (actions) {
         for (const Trigger t:{Trigger::PerfectDodge,Trigger::Execution,Trigger::SimpleExecution,Trigger::Stance,Trigger::DeflectDash,Trigger::Light,Trigger::Heavy,Trigger::Special,
                               Trigger::CombatArt,Trigger::Shachi,Trigger::Jump,Trigger::AnyDodge})
@@ -1133,7 +1553,9 @@ void RemoveRoute(int index,int route) {
     if (!At(index)||!NpcCombo::HasRows(config_.chain[static_cast<size_t>(index)])) return;
     Node& node=config_.chain[static_cast<size_t>(index)];
     if (route<0||static_cast<size_t>(route)>=node.routes.size()) return;
-    if (node.routes.size()<=1) { DebugHub::Notify(Tr(WeaponActionsNode(node)?L"武器派生修改至少保留一行；不要的话删掉整个节点。":L"按键分支至少保留一行；不要的话删掉整个节点。").c_str()); return; }
+    if (node.routes.size()<=1) {
+        DebugHub::Notify(Tr(node.air_set?L"空中派生至少保留一行；不要的话删掉整个节点。":WeaponActionsNode(node)?L"武器派生修改至少保留一行；不要的话删掉整个节点。":
+                            L"按键分支至少保留一行；不要的话删掉整个节点。").c_str()); return; }
     if (record_.node==index&&record_.route>=0) record_={};  // the recorded row may move
     node.routes.erase(node.routes.begin()+route); Save(); Invalidate();
 }
@@ -1174,12 +1596,13 @@ void AddModifier(NodeType type) {
 // Canvas pixels from its top to just under the floating tool bar.
 float ToolsBottom() {
     LONG bottom=canvas_.top;
-    for (const Button b:kTools)
+    for (const Button b:kCanvasTools)
         bottom=(std::max)(bottom,buttons_[static_cast<int>(b)].bottom);
     return static_cast<float>(bottom-canvas_.top+M().S(14));
 }
-// everything: every node in view (largest zoom up to 1:1 that fits, centred; the top first when even 50 % is too
-// tall). Otherwise the opening view: the width fitted at 75 % or more, from the top-left, under the tool bar.
+// everything: every node in view (largest zoom up to 1:1 that fits, centred; the top first when even the smallest
+// zoom is too tall). Otherwise the opening view: the width fitted at 75 % or more, from the top-left, under the tool
+// bar.
 void Frame(bool everything=true) {
     if (!window_||config_.chain.empty()) return;
     const HDC dc=GetDC(window_);
@@ -1192,13 +1615,13 @@ void Frame(bool everything=true) {
     ReleaseDC(window_,dc);
     const float w=static_cast<float>(canvas_.right-canvas_.left-M().S(48)),h=static_cast<float>(canvas_.bottom-canvas_.top)-ToolsBottom()-M().S(16);
     if (!everything) {
-        zoom_index_=2;
-        for (int i=4;i>=2;--i) if ((all.right-all.left)*kZooms[i]*Dpi()<=w) { zoom_index_=i; break; }
+        zoom_index_=kZoomOpen;
+        for (int i=kZoomOne;i>=kZoomOpen;--i) if ((all.right-all.left)*kZooms[i]*Dpi()<=w) { zoom_index_=i; break; }
         pan_x_=M().S(20)-all.left*Scale(); pan_y_=ToolsBottom()-all.top*Scale();
         Invalidate(); return;
     }
     zoom_index_=0;
-    for (int i=4;i>=0;--i) if ((all.right-all.left)*kZooms[i]*Dpi()<=w&&(all.bottom-all.top)*kZooms[i]*Dpi()<=h) { zoom_index_=i; break; }
+    for (int i=kZoomOne;i>=0;--i) if ((all.right-all.left)*kZooms[i]*Dpi()<=w&&(all.bottom-all.top)*kZooms[i]*Dpi()<=h) { zoom_index_=i; break; }
     pan_x_=(canvas_.right-canvas_.left)/2.f-(all.left+all.right)/2.f*Scale();
     pan_y_=ToolsBottom()+h/2.f-(all.top+all.bottom)/2.f*Scale();
     if ((all.bottom-all.top)*Scale()>h) pan_y_=ToolsBottom()-all.top*Scale();
@@ -1226,25 +1649,36 @@ void Arrange() {
         bottom=(std::max)(bottom,y+static_cast<int>(s.cy));
     };
     const auto new_row=[&](int at) { x=at; y=bottom+row_gap; row_h=0; };
-    const auto walk=[&](auto&& self,int i,int indent) -> void {
-        if (i<0||i>=count||placed[static_cast<size_t>(i)]) return;
-        const auto mods=config_.chain[static_cast<size_t>(i)].mods;
-        for (const int m:mods) if (m>=0&&m<count&&!placed[static_cast<size_t>(m)]&&NpcCombo::IsModifier(config_.chain[static_cast<size_t>(m)])) place(static_cast<size_t>(m),indent);
-        place(static_cast<size_t>(i),indent);
-        const Node& node=config_.chain[static_cast<size_t>(i)];
-        if (!NpcCombo::HasRows(node)) { self(self,node.next,indent); return; }
-        const int right=node.x+static_cast<int>(NodeSize(dc,static_cast<size_t>(i)).cx)+gap;
-        const std::vector<NpcCombo::Route> routes=node.routes;
-        for (size_t r=0;r<routes.size();++r) {
-            const int to=routes[r].next;
-            if (to<0||to>=count||placed[static_cast<size_t>(to)]) continue;
-            int at=indent;
-            if (r>0) { at=right+300<width?right:indent; new_row(at); }
-            self(self,to,at);
+    // Depth first with a stack of its own: a straight run goes on in a loop; a branch's first route goes on along the
+    // row, each other one (once those before it are laid out) on a new row from the branch's right edge.
+    struct Step { int node; int indent; bool row; };
+    std::vector<Step> steps;
+    const auto walk=[&](int start,int start_indent) {
+        steps.clear(); steps.push_back({start,start_indent,false});
+        while (!steps.empty()) {
+            const Step step=steps.back(); steps.pop_back();
+            if (step.node<0||step.node>=count||placed[static_cast<size_t>(step.node)]) continue;
+            if (step.row) new_row(step.indent);
+            for (int i=step.node;i>=0&&i<count&&!placed[static_cast<size_t>(i)];) {
+                const auto mods=config_.chain[static_cast<size_t>(i)].mods;
+                for (const int m:mods) if (m>=0&&m<count&&!placed[static_cast<size_t>(m)]&&NpcCombo::IsModifier(config_.chain[static_cast<size_t>(m)])) place(static_cast<size_t>(m),step.indent);
+                place(static_cast<size_t>(i),step.indent);
+                const Node& node=config_.chain[static_cast<size_t>(i)];
+                if (!NpcCombo::HasRows(node)) { i=node.next; continue; }
+                const int right=node.x+static_cast<int>(NodeSize(dc,static_cast<size_t>(i)).cx)+gap;
+                for (size_t r=node.routes.size();r-->0;)  // last first: the first route comes off the stack first
+                    steps.push_back({node.routes[r].next,r>0?(right+300<width?right:step.indent):step.indent,r>0});
+                break;
+            }
         }
     };
     // 预输入 (the chain's setting) first, on a row of its own at the top-left.
-    if (const int pre=NpcCombo::PreInputNode(config_); pre>=0&&!placed[static_cast<size_t>(pre)]) { place(static_cast<size_t>(pre),24); x=24; y=bottom+row_gap; row_h=0; }
+    {   // 空中释放 beside it
+        const int pre=NpcCombo::PreInputNode(config_),air=NpcCombo::AirDefaultNode(config_); bool any=false;
+        if (pre>=0&&!placed[static_cast<size_t>(pre)]) { place(static_cast<size_t>(pre),24); any=true; }
+        if (air>=0&&!placed[static_cast<size_t>(air)]) { place(static_cast<size_t>(air),24); any=true; }
+        if (any) { x=24; y=bottom+row_gap; row_h=0; }
+    }
     std::vector<int> triggers;
     const int key=NpcCombo::KeyTrigger(config_); if (key>=0) triggers.push_back(key);
     for (int i=0;i<count;++i) if (NpcCombo::StartsChain(config_.chain[static_cast<size_t>(i)])&&i!=key) triggers.push_back(i);
@@ -1252,7 +1686,7 @@ void Arrange() {
     for (const int t:triggers) {
         if (!first) { x=24; y=bottom+row_gap*2; row_h=0; }
         first=false;
-        walk(walk,t,24);
+        walk(t,24);
     }
     bool free_row=false;
     for (int i=0;i<count;++i) if (!placed[static_cast<size_t>(i)]) {
@@ -1287,13 +1721,19 @@ void SearchItems() {
         add({ItemKind::Invincible,Tr(L"无敌"),flow});
         add({ItemKind::IgnoreGuard,Tr(L"无视防御"),flow});
         add({ItemKind::Interrupt,Tr(L"允许中断"),flow});
+        add({ItemKind::KeepChain,Tr(L"保持派生"),flow});
         add({ItemKind::Damage,Tr(L"伤害倍率"),flow});
         if (At(search_.mod_from)&&NpcCombo::StartsChain(config_.chain[static_cast<size_t>(search_.mod_from)])) add({ItemKind::Weapon,Tr(L"武器属性"),flow});
         if (At(search_.mod_from)) {
             const NodeType from=config_.chain[static_cast<size_t>(search_.mod_from)].type;
             if (NpcCombo::StartsChain(config_.chain[static_cast<size_t>(search_.mod_from)])||from==NodeType::BossSkill||from==NodeType::Group) add({ItemKind::KeepLook,Tr(L"保留变身"),flow});
+            if (from==NodeType::BossSkill) add({ItemKind::Trim,Tr(L"裁剪"),flow});  // a part of its own montage
         }
         add({ItemKind::ForceHit,Tr(L"强制受击"),flow});
+        if (At(search_.mod_from)) {
+            const Node& from=config_.chain[static_cast<size_t>(search_.mod_from)];
+            if (NpcCombo::StartsChain(from)||NpcCombo::TakesAir(from)||from.type==NodeType::Group) add({ItemKind::Air,Tr(L"滞空"),flow});
+        }
         return;
     }
     if (search_.mode==1) {
@@ -1302,7 +1742,6 @@ void SearchItems() {
         for (const std::wstring& name:files_.names) if (name!=files_.active) add({ItemKind::File,name,Tr(L"combos 文件夹")});
         return;
     }
-    if (search_.mode==2) return;  // save-as: SearchFilter builds its one row from the typed name
     if (search_.mode==3) {
         // 派生表: the game's, the hero's, then the looks with a chain in the file, then the others.
         const NpcRetarget::Snapshot snapshot=NpcRetarget::GetSnapshot();
@@ -1324,7 +1763,7 @@ void SearchItems() {
         for (const auto& [id,name]:AllLooks()) { Item item{ItemKind::BossLook,name,Tr(L"变成这个 Boss")}; item.ability=id; add(item); }
         return;
     }
-    if (search_.pick_node>=0&&At(search_.pick_node)&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::BossSkill) {
+    if (search_.pick_node>=0&&At(search_.pick_node)&&NpcCombo::PicksBossMove(config_.chain[static_cast<size_t>(search_.pick_node)])) {
         const Node& node=config_.chain[static_cast<size_t>(search_.pick_node)];
         if (search_.pick_route==-2) {
             // That look's moves.
@@ -1341,8 +1780,10 @@ void SearchItems() {
             for (const auto& [id,shaqi]:ListedWeapons()) { Item item{ItemKind::WeaponPick,WeaponName(id),Tr(shaqi?L"影之武装":L"武器")}; item.ability=id; add(item); }
             return;
         }
-        const std::wstring group=Tr(L"改哪个动作");
-        for (const Trigger t:NpcCombo::kTriggerOrder) if (NpcCombo::ValidWeaponAction(static_cast<int>(t))) {
+        const bool air=config_.chain[static_cast<size_t>(search_.pick_node)].air_set;
+        const std::wstring group=Tr(air?L"在空中按哪个键":L"改哪个动作");
+        if (air) { Item item{ItemKind::Button,ButtonLabel(static_cast<int>(Trigger::NpcKey)),group}; item.trigger=static_cast<int>(Trigger::NpcKey); add(item); }
+        for (const Trigger t:NpcCombo::kTriggerOrder) if (air?NpcCombo::ValidAirAction(static_cast<int>(t)):NpcCombo::ValidWeaponAction(static_cast<int>(t))) {
             Item item{ItemKind::Button,ButtonLabel(static_cast<int>(t)),group}; item.trigger=static_cast<int>(t); add(item);
         }
         return;
@@ -1366,6 +1807,26 @@ void SearchItems() {
             }
             return;
         }
+    }
+    if (search_.pick_node>=0&&At(search_.pick_node)&&(AirNode(config_.chain[static_cast<size_t>(search_.pick_node)])||
+                                                      (LaunchShown(config_.chain[static_cast<size_t>(search_.pick_node)])&&search_.pick_route==-2))) {
+        // A 滞空 / 空中释放 value (route -1 .. -4) or 击飞's height: a few values, or the number typed (lifts and heights
+        // in metres, hangs in percent).
+        const Node& node=config_.chain[static_cast<size_t>(search_.pick_node)];
+        const bool launch=node.type==NodeType::ForceHit,hang=!launch&&AirHangRoute(search_.pick_route);
+        const ItemKind kind=launch?ItemKind::Launch:hang?ItemKind::AirHang:ItemKind::AirLift;
+        const auto text=[&](int v){ return launch?LaunchText(v):AirText(search_.pick_route,v); };
+        const std::wstring group=Tr(launch?L"击飞高度":hang?L"滞空强度（重力减少）":L"升高");
+        wchar_t* end=nullptr; const double typed=search_.query.empty()?-1:std::wcstod(search_.query.c_str(),&end);
+        if (!search_.query.empty()&&end&&!*end&&typed>=0) {
+            const int value=static_cast<int>(std::lround(hang?typed:typed*100));
+            Item item{kind,Tr(L"自定义：")+text(value),Tr(L"输入的数值")}; item.trigger=std::clamp(value,0,1000000); add(item);
+            search_.items.back().keys=Lower(search_.query);
+        }
+        const std::vector<int> presets=launch?std::vector<int>(std::begin(kLaunchPresets),std::end(kLaunchPresets)):
+                                       hang?std::vector<int>(std::begin(kAirHangPresets),std::end(kAirHangPresets)):std::vector<int>(std::begin(kAirLiftPresets),std::end(kAirLiftPresets));
+        for (const int v:presets) { Item item{kind,text(v),group}; item.trigger=v; add(item); }
+        return;
     }
     if (search_.pick_node>=0&&At(search_.pick_node)&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::ForceHit) {
         // A 强制受击 node's hit reaction.
@@ -1436,6 +1897,29 @@ void SearchItems() {
         }
         return;
     }
+    if (search_.pick_node>=0&&At(search_.pick_node)&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::Hook) {
+        // A 钩子's mode (route -1: the target pulled over, or the hero pulled to it), its reach (-2, metres) or its
+        // speed (-3, a multiplier): a few values, or the number typed.
+        if (search_.pick_route==-2||search_.pick_route==-3) {
+            const bool speed=search_.pick_route==-3;
+            const std::wstring group=Tr(speed?L"钩子速度":L"钩子最远距离");
+            wchar_t* end=nullptr; const double typed=search_.query.empty()?-1:std::wcstod(search_.query.c_str(),&end);
+            if (!search_.query.empty()&&end&&!*end&&typed>0) {
+                // Metres for the reach; a multiplier for the speed (a number above 5 is read as percent).
+                const int value=speed?static_cast<int>(std::lround(typed<=5?typed*100:typed)):static_cast<int>(std::lround(typed*100));
+                Item item{speed?ItemKind::HookSpeed:ItemKind::HookDist,Tr(L"自定义：")+(speed?HookSpeedText(value):HookDistText(value)),Tr(L"输入的数值")};
+                item.trigger=std::clamp(value,0,1000000); add(item);
+                search_.items.back().keys=Lower(search_.query);
+            }
+            for (const int v:speed?std::vector<int>(std::begin(kHookSpeedPresets),std::end(kHookSpeedPresets)):std::vector<int>(std::begin(kHookDistPresets),std::end(kHookDistPresets))) {
+                Item item{speed?ItemKind::HookSpeed:ItemKind::HookDist,speed?HookSpeedText(v):HookDistText(v),group}; item.trigger=v; add(item);
+            }
+            return;
+        }
+        const std::wstring group=Tr(L"钩子");
+        for (const int mode:{2,0,1}) { Item item{ItemKind::HookMode,HookModeText(mode),group}; item.trigger=mode; add(item); }
+        return;
+    }
     if (search_.pick_node>=0&&At(search_.pick_node)&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::Teleport) {
         // A 瞬移 node's distance (route -1) or height (-2): a few values, or the number typed.
         const bool lift=search_.pick_route==-2;
@@ -1484,17 +1968,23 @@ void SearchItems() {
     add({ItemKind::IgnoreGuard,Tr(L"无视防御"),flow});
     add({ItemKind::KeepLook,Tr(L"保留变身"),flow});
     add({ItemKind::ForceHit,Tr(L"强制受击"),flow});
+    add({ItemKind::Air,Tr(L"滞空"),flow});
     add({ItemKind::Interrupt,Tr(L"允许中断"),flow});
+    add({ItemKind::KeepChain,Tr(L"保持派生"),flow});
     add({ItemKind::Weapon,Tr(L"武器属性"),flow});
     add({ItemKind::Grab,Tr(L"投技"),flow});
     add({ItemKind::BossSkill,Tr(L"BOSS 技能"),flow});
+    add({ItemKind::Assist,Tr(L"BOSS 援护"),flow});
     add({ItemKind::Look,Tr(L"变身"),flow});
     add({ItemKind::HeroLook,Tr(L"变回主角"),flow});
     add({ItemKind::WeaponMove,Tr(L"武器派生"),flow});
     add({ItemKind::WeaponActions,Tr(L"武器派生修改"),flow});
+    add({ItemKind::AirSet,Tr(L"空中派生"),flow});
     add({ItemKind::Damage,Tr(L"伤害倍率"),flow});
+    add({ItemKind::Trim,Tr(L"裁剪"),flow});
     add({ItemKind::Group,Tr(L"组合"),flow});
     add({ItemKind::Teleport,Tr(L"瞬移"),flow});
+    add({ItemKind::Hook,Tr(L"钩子"),flow});
     if (!moves_.dodges.empty()) add({ItemKind::AutoDodge,Tr(L"按摇杆方向闪避"),flow});
     for (const Trigger t:NpcCombo::kTriggerOrder) { Item item{ItemKind::Trigger,Tr(NpcCombo::TriggerLabel(t)),buttons}; item.trigger=static_cast<int>(t); add(item); }
     if (NpcCombo::KeyTrigger(config_)<0) { Item item{ItemKind::Trigger,Tr(L"NPC 技能键"),buttons}; item.trigger=0; add(item); }
@@ -1509,15 +1999,6 @@ void SearchItems() {
 // Rows that match the query: a header per group, then its items.
 void SearchFilter() {
     search_.rows.clear();
-    if (search_.mode==2) {
-        // Save-as: the typed name is the one row.
-        search_.items.clear();
-        Item item{ItemKind::SaveAs,search_.query.empty()?Tr(L"（输入文件名）"):search_.query+L".combo",{}}; item.keys=search_.query;
-        search_.items.push_back(item);
-        search_.rows.push_back({true,0,Tr(L"另存为：输入文件名后回车")});
-        search_.rows.push_back({false,0,item.label});
-        search_.selected=1; search_.scroll=0; return;
-    }
     const bool teleport_pick=search_.pick_node>=0&&At(search_.pick_node)&&(config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::Teleport||
                              PickedKeys(search_.pick_node,search_.pick_route,search_.pick_part).what==2);
     if (teleport_pick) SearchItems();  // a typed number is a row of its own
@@ -1534,9 +2015,9 @@ void SearchFilter() {
     // A picker starts on the button the field has now.
     if (search_.pick_node>=0&&query.empty()&&At(search_.pick_node)) {
         const Node& node=config_.chain[static_cast<size_t>(search_.pick_node)];
-        if (node.type==NodeType::BossSkill||node.type==NodeType::Look||node.type==NodeType::WeaponMove||(ExecutionTrigger(node)&&search_.pick_route==-2)||
+        if (NpcCombo::PicksBossMove(node)||node.type==NodeType::Look||node.type==NodeType::WeaponMove||(ExecutionTrigger(node)&&search_.pick_route==-2)||
             (WeaponActionsNode(node)&&search_.pick_route<0)) {
-            const std::string& want=node.type==NodeType::BossSkill?(search_.pick_route==-2?node.ability:node.boss):node.type==NodeType::Look?node.boss:
+            const std::string& want=NpcCombo::PicksBossMove(node)?(search_.pick_route==-2?node.ability:node.boss):node.type==NodeType::Look?node.boss:
                                     node.type==NodeType::WeaponMove?(search_.pick_route==-2?node.ability:node.weapon):node.weapon;
             for (size_t r=0;r<search_.rows.size();++r) if (!search_.rows[r].header&&search_.items[search_.rows[r].item].ability==want) { search_.selected=static_cast<int>(r); break; }
             search_.scroll=0; return;
@@ -1544,6 +2025,11 @@ void SearchFilter() {
         if (const KeySpec spec=PickedKeys(search_.pick_node,search_.pick_route,search_.pick_part); spec.keys) {
             // The keys' list starts on its first key; the mode's on what the node (or row) has now.
             const int want=spec.what==2?(*spec.chord?0:NpcCombo::ClampKeyWindow(*spec.window)):spec.raw?-4:static_cast<int>(Trigger::Light);
+            for (size_t r=0;r<search_.rows.size();++r) if (!search_.rows[r].header&&search_.items[search_.rows[r].item].trigger==want) { search_.selected=static_cast<int>(r); break; }
+            search_.scroll=0; return;
+        }
+        if (AirNode(node)||(LaunchShown(node)&&search_.pick_route==-2)) {
+            const int want=AirNode(node)?AirValueOf(node,search_.pick_route):NpcCombo::ClampLaunch(node.launch);
             for (size_t r=0;r<search_.rows.size();++r) if (!search_.rows[r].header&&search_.items[search_.rows[r].item].trigger==want) { search_.selected=static_cast<int>(r); break; }
             search_.scroll=0; return;
         }
@@ -1585,7 +2071,7 @@ void SearchEnsureVisible();
 void OpenSearch(POINT at,int from,int into,int from_out) {
     if (!HasSkin()) return;
     CommitEdit();
-    search_.open=true; search_.query.clear(); search_.from=from; search_.into=into; search_.from_out=from_out; search_.hot=-1;
+    search_.open=true; search_.query.clear(); search_.from=from; search_.into=into; search_.from_out=from_out; search_.hot=-1; search_.keyed=false;
     search_.pick_node=-1; search_.pick_route=-1; search_.pick_part=0; search_.mod_from=-1; search_.mode=0;
     search_.x=ToCanvasX(at.x); search_.y=ToCanvasY(at.y);
     SearchItems(); SearchFilter(); SearchLayout();
@@ -1604,7 +2090,7 @@ void OpenPicker(int node,int route,int part) {
     search_.pick_node=node; search_.pick_route=route; search_.pick_part=route>=0?part:0;
     SearchItems(); SearchFilter(); SearchLayout(); SearchEnsureVisible(); Invalidate();
 }
-// The 文件 button's list (mode 1) and 另存为's name box (mode 2), under the toolbar.
+// The 文件 button's list (mode 1), under the toolbar.
 void OpenFileSearch(int mode) {
     const RECT canvas=canvas_;
     OpenSearch({canvas.right-M().S(330),canvas.top+M().S(8)},-1,-1,0);
@@ -1616,7 +2102,7 @@ void OpenFiles() { OpenFileSearch(1); }
 // The 派生表 list under the header, on the one edited now.
 void OpenChainSearch() {
     CommitEdit();
-    search_.open=true; search_.query.clear(); search_.from=-1; search_.into=-1; search_.from_out=0; search_.hot=-1;
+    search_.open=true; search_.query.clear(); search_.from=-1; search_.into=-1; search_.from_out=0; search_.hot=-1; search_.keyed=false;
     search_.pick_node=-1; search_.pick_route=-1; search_.pick_part=0; search_.mod_from=-1; search_.mode=3;
     search_.x=ToCanvasX(header_.left); search_.y=ToCanvasY(canvas_.top+M().S(8));
     SearchItems(); SearchFilter();
@@ -1624,7 +2110,50 @@ void OpenChainSearch() {
         if (!search_.rows[r].header&&search_.items[search_.rows[r].item].trigger==pinned_) { search_.selected=static_cast<int>(r); break; }
     SearchLayout(); SearchEnsureVisible(); SetFocus(window_); Invalidate();
 }
-void OpenSaveAs() { OpenFileSearch(2); }
+void CloseSearch() { if (search_.open) { search_.open=false; Invalidate(); } }
+// Windows' own Save As window, opened in combos\ on the active file's name with the .combo type. The page's search box
+// never got typed names (the hub's dialog navigation takes the page's WM_CHAR), the system window does. Modal to the
+// game window (no clicks reach the game or the hub while it is open), with its own message loop on this thread; it has
+// a caption, so the activation guard lets it take focus, and the game is active again when it closes.
+// Empty: cancelled, or no dialog.
+std::wstring AskSavePath() {
+    const HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
+    std::wstring picked;
+    IFileSaveDialog* dialog=nullptr;
+    if ((SUCCEEDED(com)||com==RPC_E_CHANGED_MODE)&&SUCCEEDED(CoCreateInstance(CLSID_FileSaveDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))) {
+        const std::wstring kind=Tr(L"派生文件")+L" (*.combo)";
+        const COMDLG_FILTERSPEC types[]={{kind.c_str(),L"*.combo"}};
+        dialog->SetFileTypes(1,types); dialog->SetFileTypeIndex(1); dialog->SetDefaultExtension(L"combo");
+        FILEOPENDIALOGOPTIONS options=0; dialog->GetOptions(&options);
+        dialog->SetOptions(options|FOS_OVERWRITEPROMPT|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST|FOS_NOCHANGEDIR|FOS_STRICTFILETYPES);
+        dialog->SetTitle(Tr(L"另存为").c_str());
+        const NpcCombo::Files files=NpcCombo::GetFiles();
+        if (!files.active.empty()) dialog->SetFileName(files.active.c_str());
+        IShellItem* folder=nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(NpcCombo::Folder().c_str(),nullptr,IID_PPV_ARGS(&folder)))) { dialog->SetFolder(folder); folder->Release(); }
+        IShellItem* result=nullptr;
+        if (SUCCEEDED(dialog->Show(window_?GetAncestor(window_,GA_ROOT):nullptr))&&SUCCEEDED(dialog->GetResult(&result))) {
+            wchar_t* path=nullptr;
+            if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH,&path))&&path) { picked=path; CoTaskMemFree(path); }
+            result->Release();
+        }
+        dialog->Release();
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
+    return picked;
+}
+void OpenSaveAs() {
+    CloseSearch(); CommitEdit(); Save();
+    const std::wstring path=AskSavePath();
+    if (path.empty()) return;
+    std::wstring name;
+    switch (NpcCombo::SaveToPath(path,name)) {
+    case NpcCombo::SavedTo::Folder: DebugHub::Notify((Tr(L"已另存为：")+name+L".combo").c_str()); break;
+    case NpcCombo::SavedTo::Copy: DebugHub::Notify((Tr(L"已另存一份到：")+path+Tr(L"（不在 combos 文件夹，当前文件不变）")).c_str()); break;
+    default: DebugHub::Notify(Tr(L"文件名无效或无法写入，未保存").c_str()); break;
+    }
+    seen_generation_=NpcCombo::Generation(); Refresh(true);
+}
 // The modifiers an arrow from node `from`'s round pin, dropped on empty canvas, may point at.
 void OpenModSearch(POINT at,int from) {
     OpenSearch(at,-1,-1,0);
@@ -1632,7 +2161,6 @@ void OpenModSearch(POINT at,int from) {
     search_.mod_from=from;
     SearchItems(); SearchFilter(); SearchLayout(); Invalidate();
 }
-void CloseSearch() { if (search_.open) { search_.open=false; Invalidate(); } }
 void SearchEnsureVisible() {
     const int visible=SearchVisible();
     if (search_.selected<search_.scroll) search_.scroll=search_.selected;
@@ -1648,7 +2176,7 @@ void SearchMove(int step) {
         if (r==0||r==static_cast<int>(search_.rows.size())-1) { step=-step; }
     }
     if (!search_.rows[static_cast<size_t>(r)].header) search_.selected=r;
-    SearchEnsureVisible(); Invalidate();
+    search_.keyed=true; SearchEnsureVisible(); Invalidate();
 }
 // Adds the picked row's node where the search opened (wired when it came from a wire), or sets the picked button.
 // 自定义按键 recording: on until Esc, a left click, the page hidden or six keys.
@@ -1699,16 +2227,11 @@ void SearchPick(int row) {
         DebugHub::Notify((pinned_==kFollowGame?Tr(L"派生表跟随当前外观：")+Tr(moves_.name.c_str()):Tr(L"正在编辑派生表：")+Tr(moves_.name.c_str())).c_str());
         return;
     }
-    if (item.kind==ItemKind::SaveAs) {
-        if (NpcCombo::SaveAs(item.keys)) DebugHub::Notify((Tr(L"已另存为：")+item.keys+L".combo").c_str());
-        else DebugHub::Notify(Tr(L"文件名无效或无法写入，未保存").c_str());
-        Refresh(true); return;
-    }
     if (item.kind==ItemKind::BossLook&&At(pick)&&config_.chain[static_cast<size_t>(pick)].type==NodeType::Look) {
         config_.chain[static_cast<size_t>(pick)].boss=item.ability; Select(pick); Save(); Layout(); Invalidate(); return;
     }
     if (item.kind==ItemKind::BossLook||item.kind==ItemKind::BossMove) {
-        if (!At(pick)||config_.chain[static_cast<size_t>(pick)].type!=NodeType::BossSkill) return;
+        if (!At(pick)||!NpcCombo::PicksBossMove(config_.chain[static_cast<size_t>(pick)])) return;
         Node& target=config_.chain[static_cast<size_t>(pick)];
         if (item.kind==ItemKind::BossMove) { target.ability=item.ability; Select(pick); Save(); Invalidate(); return; }
         if (target.boss!=item.ability) { target.boss=item.ability; target.ability.clear(); }
@@ -1726,6 +2249,38 @@ void SearchPick(int row) {
         Select(pick); Save(); Layout();
         if (target.ability.empty()) OpenPicker(pick,-2);  // then its ability
         Invalidate(); return;
+    }
+    if (item.kind==ItemKind::HookMode) {
+        if (!At(pick)||config_.chain[static_cast<size_t>(pick)].type!=NodeType::Hook) return;
+        if (item.trigger==2) NpcCombo::SetHookAuto(config_.chain[static_cast<size_t>(pick)]);
+        else NpcCombo::SetHookMode(config_.chain[static_cast<size_t>(pick)],item.trigger==1);
+        Select(pick); Save(); Layout(); Invalidate(); return;
+    }
+    if (item.kind==ItemKind::AirLift||item.kind==ItemKind::AirHang||item.kind==ItemKind::Launch) {
+        if (!At(pick)) return;
+        Node& target=config_.chain[static_cast<size_t>(pick)];
+        if (item.kind==ItemKind::Launch) {
+            if (target.type!=NodeType::ForceHit) return;
+            const int value=NpcCombo::ClampLaunch(item.trigger);
+            if (value!=item.trigger) DebugHub::Notify(Tr(L"击飞高度在 0 到 15 米之间，已调整。").c_str());
+            target.launch=value;
+        } else {
+            if (!AirNode(target)) return;
+            const bool hang=item.kind==ItemKind::AirHang;
+            const int value=hang?NpcCombo::ClampAirHang(item.trigger):NpcCombo::ClampAirLift(item.trigger);
+            if (value!=item.trigger) DebugHub::Notify(Tr(hang?L"滞空强度在 0% 到 100% 之间，已调整。":L"升高在 0 到 10 米之间，已调整。").c_str());
+            AirValue(target,search_.pick_route)=value;
+        }
+        Select(pick); Save(); Layout(); Invalidate(); return;
+    }
+    if (item.kind==ItemKind::HookDist||item.kind==ItemKind::HookSpeed) {
+        if (!At(pick)||config_.chain[static_cast<size_t>(pick)].type!=NodeType::Hook) return;
+        Node& target=config_.chain[static_cast<size_t>(pick)];
+        const bool speed=item.kind==ItemKind::HookSpeed;
+        const int value=speed?NpcCombo::ClampHookSpeed(item.trigger):NpcCombo::ClampHookDist(item.trigger);
+        if (value!=item.trigger) DebugHub::Notify(Tr(speed?L"钩子速度在 ×0.50 到 ×3.00 之间，已调整。":L"钩子最远距离在 3 到 30 米之间，已调整。").c_str());
+        (speed?target.hook_speed:target.hook_dist)=value;
+        Select(pick); Save(); Layout(); Invalidate(); return;
     }
     if (item.kind==ItemKind::TeleportDist||item.kind==ItemKind::TeleportLift) {
         if (!At(pick)||config_.chain[static_cast<size_t>(pick)].type!=NodeType::Teleport) return;
@@ -1808,24 +2363,30 @@ void SearchPick(int row) {
     case ItemKind::Armor: node=NpcCombo::ModifierNode(NodeType::Armor,0,0); break;
     case ItemKind::Invincible: node=NpcCombo::ModifierNode(NodeType::Invincible,0,0); break;
     case ItemKind::IgnoreGuard: node=NpcCombo::ModifierNode(NodeType::IgnoreGuard,0,0); break;
+    case ItemKind::KeepChain: node=NpcCombo::ModifierNode(NodeType::KeepChain,0,0); break;
     case ItemKind::KeepLook: node=NpcCombo::ModifierNode(NodeType::KeepLook,0,0); break;
     case ItemKind::ForceHit: node=NpcCombo::ModifierNode(NodeType::ForceHit,0,0); break;
+    case ItemKind::Air: node=NpcCombo::ModifierNode(NodeType::Air,0,0); break;
     case ItemKind::Interrupt: node=NpcCombo::ModifierNode(NodeType::Interrupt,0,0); break;
     case ItemKind::Grab: node.type=NodeType::Grab; break;
     case ItemKind::BossSkill: node.type=NodeType::BossSkill; break;
+    case ItemKind::Assist: node.type=NodeType::Assist; break;
     case ItemKind::Look: node.type=NodeType::Look; break;
     case ItemKind::HeroLook: node.type=NodeType::HeroLook; break;
     case ItemKind::WeaponMove: node.type=NodeType::WeaponMove; break;
     case ItemKind::Damage: node=NpcCombo::ModifierNode(NodeType::Damage,0,0); break;
+    case ItemKind::Trim: node=NpcCombo::ModifierNode(NodeType::Trim,0,0); break;
     case ItemKind::Group: node.type=NodeType::Group; node.w=NpcCombo::kGroupNewW; node.h=NpcCombo::kGroupNewH; break;
     case ItemKind::Teleport: node.type=NodeType::Teleport; break;
+    case ItemKind::Hook: node=NewHook(); break;
     case ItemKind::WeaponActions: node=NpcCombo::WeaponActionsNode(0,0); break;
+    case ItemKind::AirSet: node=NpcCombo::AirSetNode(0,0); break;
     default: node.type=NodeType::Skill; node.ability=item.ability; break;
     }
     const bool exec=!NpcCombo::StartsChain(node)&&!NpcCombo::IsModifier(node);
     const int index=Place(node,x,y,exec?from:-1,exec?into:-1,from_out);
     if (index>=0&&mod_from>=0&&NpcCombo::LinkModifier(config_,mod_from,index)) { Save(); Invalidate(); }
-    if (index>=0&&(node.type==NodeType::WeaponMove||node.type==NodeType::Grab||node.type==NodeType::Look||WeaponActionsNode(node))) OpenPicker(index,-1);  // its weapon / grab / look at once
+    if (index>=0&&(node.type==NodeType::WeaponMove||node.type==NodeType::Grab||node.type==NodeType::Look||node.type==NodeType::Assist||(WeaponActionsNode(node)&&!node.air_set))) OpenPicker(index,-1);  // its weapon / grab / look at once
     if (index>=0&&KeysTrigger(node)) OpenPicker(index,-2);  // a 组合键: its keys at once
 }
 int SearchRowAt(POINT p) {
@@ -1855,8 +2416,10 @@ void PressButton(Button button) {
     case Button::Armor: AddModifier(NodeType::Armor); return;
     case Button::Invincible: AddModifier(NodeType::Invincible); return;
     case Button::IgnoreGuard: AddModifier(NodeType::IgnoreGuard); return;
+    case Button::KeepChain: AddModifier(NodeType::KeepChain); return;
     case Button::KeepLook: AddModifier(NodeType::KeepLook); return;
     case Button::ForceHit: AddModifier(NodeType::ForceHit); return;
+    case Button::Air: AddModifier(NodeType::Air); return;
     case Button::Interrupt: AddModifier(NodeType::Interrupt); return;
     case Button::Grab: {
         // A 投技 after the selected move; its grab is picked at once.
@@ -1867,6 +2430,12 @@ void PressButton(Button button) {
     case Button::BossSkill: {
         // A BOSS 技能 after the selected move; its look is picked at once, then its move.
         const size_t before=config_.chain.size(); Node node; node.type=NodeType::BossSkill; Append(node);
+        if (config_.chain.size()>before) OpenPicker(static_cast<int>(config_.chain.size())-1,-1);
+        return;
+    }
+    case Button::Assist: {
+        // A BOSS 援护 after the selected move; its look is picked at once, then its move.
+        const size_t before=config_.chain.size(); Node node; node.type=NodeType::Assist; Append(node);
         if (config_.chain.size()>before) OpenPicker(static_cast<int>(config_.chain.size())-1,-1);
         return;
     }
@@ -1884,19 +2453,24 @@ void PressButton(Button button) {
         return;
     }
     case Button::Damage: AddModifier(NodeType::Damage); return;
+    case Button::Trim: AddModifier(NodeType::Trim); return;  // linked to the selected BOSS 技能
     case Button::Group: { Node node; node.type=NodeType::Group; node.w=NpcCombo::kGroupNewW; node.h=NpcCombo::kGroupNewH; Append(node); return; }
     case Button::Teleport: { Node node; node.type=NodeType::Teleport; Append(node); return; }
+    case Button::Hook: Append(NewHook()); return;  // 自动 first; its field switches it
     case Button::AutoDodge: {  // 按摇杆方向闪避: the look's dodge the stick points to when it plays (back when centred)
         if (moves_.dodges.empty()) { DebugHub::Notify(Tr(L"这个外观没有自己的闪避；按摇杆方向闪避只用于有闪避的 Boss 外观").c_str()); return; }
         Node node; node.type=NodeType::AutoDodge; Append(node); return;
     }
     case Button::File: OpenFiles(); return;
-    case Button::SaveFile:
+    case Button::SaveFile:  // the active file again; no active file, or it cannot be written: Windows' Save As window
         if (HasSkin()) NpcCombo::Save(moves_.profile,config_);
-        DebugHub::Notify(NpcCombo::SaveFile()?(Tr(L"已保存：")+files_.active+L".combo").c_str():StatusText(NpcCombo::GetFiles().status).c_str());
+        files_=NpcCombo::GetFiles();
+        if (files_.active.empty()||!NpcCombo::SaveFile()) { DebugHub::Notify(StatusText(NpcCombo::GetFiles().status).c_str()); OpenSaveAs(); return; }
+        DebugHub::Notify((Tr(L"已保存：")+files_.active+L".combo").c_str());
         seen_generation_=NpcCombo::Generation(); return;
     case Button::SaveAs: OpenSaveAs(); return;
     case Button::AddTrigger: AddTrigger(); return;
+    case Button::AirSet: AddStart(NpcCombo::AirSetNode(24,24)); return;  // a 空中派生 below everything
     case Button::WeaponActions: {
         // A 武器派生修改 below everything; its weapon is picked at once.
         const int index=AddStart(NpcCombo::WeaponActionsNode(24,24));
@@ -1910,7 +2484,7 @@ void PressButton(Button button) {
         // Everything but the NPC key node, which stays unwired where it is.
         const int key=NpcCombo::KeyTrigger(config_);
         Node keep=key>=0?config_.chain[static_cast<size_t>(key)]:NpcCombo::TriggerNode(Trigger::NpcKey,24,24);
-        keep.next=-1; keep.mods.fill(-1); config_.chain.assign(1,keep); Select(-1); Save(); break;
+        keep.next=-1; keep.mods.fill(-1); config_.chain.assign(1,keep); CloseCurve("chain cleared"); Select(-1); Save(); break;
     }
     default: break;
     }
@@ -1948,32 +2522,61 @@ void Click(const Hit& hit) {
     case Part::Button: PressButton(static_cast<Button>(hit.index)); return;
     case Part::Header: if (search_.open&&search_.mode==3) CloseSearch(); else OpenChainSearch(); return;
     case Part::Pill: if (hit.index>=0&&static_cast<size_t>(hit.index)<pills_.size()) { Node node; node.ability=pills_[static_cast<size_t>(hit.index)].ability; Append(node); } return;
-    case Part::Tab: if (hit.index>=0&&static_cast<size_t>(hit.index)<tabs_.size()) { category_=tabs_[static_cast<size_t>(hit.index)].kind; strip_scroll_=0; Layout(); } return;
-    case Part::StripLeft: ScrollStrip(-(strip_area_.right-strip_area_.left)*2/3); return;
-    case Part::StripRight: ScrollStrip((strip_area_.right-strip_area_.left)*2/3); return;
+    case Part::LibraryTab: if (hit.index>=0&&hit.index<2) { library_tab_=hit.index; hot_={}; Layout(); } return;
+    case Part::NodeCategory: if (hit.index>=0&&hit.index<5) { node_category_=hit.index; hot_={}; Layout(); } return;
+    case Part::Tab: if (hit.index>=0&&static_cast<size_t>(hit.index)<tabs_.size()) { category_=tabs_[static_cast<size_t>(hit.index)].kind; library_pages_[4]=0; Layout(); } return;
+    case Part::StripLeft: ScrollStrip(-1); return;
+    case Part::StripRight: ScrollStrip(1); return;
     case Part::NodeValue: Select(hit.index); if (At(hit.index)&&Typed(config_.chain[static_cast<size_t>(hit.index)])) BeginEdit(hit.index); break;
     case Part::Node: case Part::NodeIn: case Part::NodeOut: case Part::ModOut: case Part::ModIn: case Part::RouteOut: case Part::RouteValue: Select(hit.index); break;
     case Part::NodeMinus: Select(hit.index); Nudge(hit.index,-1); break;
     case Part::NodePlus: Select(hit.index); Nudge(hit.index,1); break;
     case Part::RouteMinus: Select(hit.index); Nudge(hit.index,-1,hit.sub); break;
+    case Part::NodeHoldMinus: Select(hit.index); NudgeHold(hit.index,-1,-1); break;
+    case Part::NodeHoldPlus: Select(hit.index); NudgeHold(hit.index,1,-1); break;
+    case Part::NodeHoldValue: Select(hit.index); BeginHoldEdit(hit.index,-1); break;
+    case Part::RouteHoldMinus: Select(hit.index); NudgeHold(hit.index,-1,hit.sub); break;
+    case Part::RouteHoldPlus: Select(hit.index); NudgeHold(hit.index,1,hit.sub); break;
+    case Part::RouteHoldValue: Select(hit.index); BeginHoldEdit(hit.index,hit.sub); break;
     case Part::RoutePlus: Select(hit.index); Nudge(hit.index,1,hit.sub); break;
     case Part::RouteRemove: Select(hit.index); RemoveRoute(hit.index,hit.sub); break;
     case Part::RouteAdd: Select(hit.index); AddRoute(hit.index); break;
     case Part::RouteField: Select(hit.index); OpenPicker(hit.index,hit.sub); return;
     case Part::RouteKeys: Select(hit.index); OpenPicker(hit.index,hit.sub,1); return;
     case Part::RouteMode: Select(hit.index); OpenPicker(hit.index,hit.sub,2); return;
-    case Part::NodeField: Select(hit.index); if (!IsKey(hit.index)) OpenPicker(hit.index,-1); return;
+    case Part::NodeField: Select(hit.index); if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::Speed) { OpenCurve(hit.index); return; }
+        if (!IsKey(hit.index)) OpenPicker(hit.index,-1); return;
     case Part::NodeField2: {
         Select(hit.index);
         const Node* n=At(hit.index);
-        if (n&&((n->type==NodeType::BossSkill&&!n->boss.empty())||(n->type==NodeType::WeaponMove&&!n->weapon.empty())||ExecutionTrigger(*n)||KeysTrigger(*n)||
-                 n->type==NodeType::Teleport)) OpenPicker(hit.index,-2);
+        if (n&&n->type==NodeType::Speed) { OpenCurve(hit.index); return; }
+        if (n&&((NpcCombo::PicksBossMove(*n)&&!n->boss.empty())||(n->type==NodeType::WeaponMove&&!n->weapon.empty())||ExecutionTrigger(*n)||KeysTrigger(*n)||
+                 n->type==NodeType::Teleport||n->type==NodeType::Hook||AirNode(*n)||LaunchShown(*n))) OpenPicker(hit.index,-2);
         return;
     }
-    case Part::NodeField3: Select(hit.index); if (At(hit.index)&&KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])) OpenPicker(hit.index,-3); return;
-    case Part::NodeField4: Select(hit.index); if (At(hit.index)&&KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])) OpenPicker(hit.index,-4); return;
+    case Part::NodeField3: Select(hit.index);
+        if (At(hit.index)&&(KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])||config_.chain[static_cast<size_t>(hit.index)].type==NodeType::Hook||
+                            AirNode(config_.chain[static_cast<size_t>(hit.index)]))) OpenPicker(hit.index,-3);
+        return;
+    case Part::NodeField4: Select(hit.index);
+        if (At(hit.index)&&(KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])||AirNode(config_.chain[static_cast<size_t>(hit.index)]))) OpenPicker(hit.index,-4);
+        return;
     case Part::WeaponRow: AddWeaponNode(hit.index); return;
-    case Part::NodeToggle: if (At(hit.index)) { Select(hit.index); config_.chain[static_cast<size_t>(hit.index)].on=!config_.chain[static_cast<size_t>(hit.index)].on; Save(); } break;
+    case Part::NodeToggle:
+        if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::AirDefault) {  // 空中释放 on / off
+            Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)]; n.on=!n.on;
+            DebugHub::Notify(Tr(n.on?L"空中释放已打开：空中放出的招式按它升高、滞空":L"空中释放已关闭：空中放出的招式照常下落").c_str());
+            Save(); Layout(); break;
+        }
+        if (At(hit.index)&&NpcCombo::TakesOwnLook(config_.chain[static_cast<size_t>(hit.index)])) {
+            Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)]; n.own_look=!n.own_look; Save(); Layout(); break;
+        }
+        if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::Speed) {
+            Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)];
+            n.curve=!n.curve; if (n.curve&&n.points.size()<2) n.points=NpcCombo::DefaultCurve(n.speed);
+            Save(); Layout(); break;
+        }
+        if (At(hit.index)) { Select(hit.index); config_.chain[static_cast<size_t>(hit.index)].on=!config_.chain[static_cast<size_t>(hit.index)].on; Save(); } break;
     case Part::NodeToggle2:
         if (At(hit.index)&&RawTrigger(config_.chain[static_cast<size_t>(hit.index)])) {
             Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)]; n.swallow=!n.swallow; Save();
@@ -1999,18 +2602,24 @@ std::wstring ButtonText(Button button) {
     case Button::Armor: return Tr(L"+ 霸体");
     case Button::Invincible: return Tr(L"+ 无敌");
     case Button::IgnoreGuard: return Tr(L"+ 无视防御");
+    case Button::KeepChain: return Tr(L"+ 保持派生");
     case Button::KeepLook: return Tr(L"+ 保留变身");
     case Button::ForceHit: return Tr(L"+ 强制受击");
+    case Button::Air: return Tr(L"+ 滞空");
     case Button::Interrupt: return Tr(L"+ 允许中断");
     case Button::Grab: return Tr(L"+ 投技");
     case Button::BossSkill: return Tr(L"+ BOSS 技能");
+    case Button::Assist: return Tr(L"+ BOSS 援护");
     case Button::Look: return Tr(L"+ 变身");
     case Button::HeroLook: return Tr(L"+ 变回主角");
     case Button::WeaponMove: return Tr(L"+ 武器派生");
     case Button::WeaponActions: return Tr(L"+ 武器派生修改");
+    case Button::AirSet: return Tr(L"+ 空中派生");
     case Button::Damage: return Tr(L"+ 伤害倍率");
+    case Button::Trim: return Tr(L"+ 裁剪");
     case Button::Group: return Tr(L"+ 组合");
     case Button::Teleport: return Tr(L"+ 瞬移");
+    case Button::Hook: return Tr(L"+ 钩子");
     case Button::AutoDodge: return Tr(L"+ 按摇杆方向闪避");
     case Button::File: return Tr(L"文件：")+(files_.active.empty()?std::wstring(L"-"):files_.active)+L" ▾";
     case Button::SaveFile: return Tr(L"保存");
@@ -2031,12 +2640,14 @@ std::wstring TabText(const Tab& tab) {
 // Top to bottom: the skin and the chain switch, the kind tabs, one horizontal strip of the tab's moves, then the
 // canvas taking every pixel that is left (the hub gives the page at least the visible height), then one status line.
 void Layout() {
+    sizes_.clear(); owners_.clear(); widths_.clear();
     if (!window_) return;
     RECT client{}; GetClientRect(window_,&client);
-    const auto m=M(); const int pad=m.Margin(),gap=m.S(8),width=(std::max)(m.S(420),static_cast<int>(client.right));
+    const auto m=M(); const int pad=m.Margin(),gap=m.S(8),width=(std::max)(m.S(720),static_cast<int>(client.right));
     const int right=width-pad;
     const HDC dc=GetDC(window_);
     const HFONT body=Font(UiTheme::Font::Body),strong=Font(UiTheme::Font::Strong),small_font=Font(UiTheme::Font::Small);
+    for (RECT& button:buttons_) button={};
     int y=m.S(12);
     const int row=m.S(32);
     const auto button_w=[&](Button b){ return static_cast<int>(Extent(dc,b==Button::Toggle?strong:small_font,ButtonText(b)).cx)+m.S(b==Button::Toggle?28:20); };
@@ -2050,88 +2661,89 @@ void Layout() {
     header_={pad,y,dummy_right-dummy_w-gap,y+row};
     header_.right=(std::min)(header_.right,pad+static_cast<LONG>(Extent(dc,HasSkin()?strong:body,HeaderText()).cx)+m.S(20));
     y+=row+m.S(10);
-    // Kind tabs (全部 first).
-    std::vector<std::pair<Kind,std::string>> all;
-    if (HasSkin()) {
-        for (const std::string& d:moves_.dodges) all.push_back({Kind::Dodge,d});
-        for (const std::string& s:moves_.skills) all.push_back({NpcCombo::Classify(s),s});
-    }
-    tabs_.clear();
-    const int tab_h=m.S(28);
-    tabs_title_={pad,y,pad+static_cast<int>(Extent(dc,strong,Tr(L"Boss 招式")).cx)+m.S(14),y+tab_h};
-    int tx=tabs_title_.right;
-    std::vector<Tab> wanted{{-1,{},all.size()}};
-    for (int k=0;k<static_cast<int>(Kind::Count);++k) {
-        const size_t count=static_cast<size_t>(std::count_if(all.begin(),all.end(),[k](const auto& a){return static_cast<int>(a.first)==k;}));
-        if (count) wanted.push_back({k,{},count});
-    }
-    if (category_>=0&&std::none_of(wanted.begin(),wanted.end(),[](const Tab& t){return t.kind==category_;})) { category_=-1; strip_scroll_=0; }
-    if (HasSkin()) for (Tab tab:wanted) {
-        const int w=static_cast<int>(Extent(dc,small_font,TabText(tab)).cx)+m.S(22);
-        if (tx+w>right&&tx>tabs_title_.right) { tx=tabs_title_.right; y+=tab_h+m.S(6); }
-        tab.rect={tx,y,tx+w,y+tab_h}; tabs_.push_back(tab); tx+=w+m.S(6);
-    }
-    y+=tab_h+m.S(8);
-    // The tab's moves in one row, scrolled sideways (wheel, or the arrows when they do not fit).
-    const int strip_h=m.S(34);
-    strip_={pad,y,right,y+strip_h};
-    pills_.clear();
-    int total=0;
-    std::vector<std::pair<int,int>> spans;
-    for (const auto& [kind,ability]:all) {
-        if (category_>=0&&static_cast<int>(kind)!=category_) continue;
-        const int w=static_cast<int>(Extent(dc,body,MoveText(ability)).cx)+m.S(24);
-        spans.push_back({total,w}); pills_.push_back({{},ability,kind}); total+=w+m.S(6);
-    }
-    total=(std::max)(0,total-m.S(6));
-    const int arrow=m.S(30);
-    strip_area_=strip_; strip_left_={}; strip_right_={};
-    if (total>strip_.right-strip_.left) {
-        strip_left_={strip_.left,strip_.top,strip_.left+arrow,strip_.bottom};
-        strip_right_={strip_.right-arrow,strip_.top,strip_.right,strip_.bottom};
-        strip_area_={strip_left_.right+m.S(6),strip_.top,strip_right_.left-m.S(6),strip_.bottom};
-    }
-    strip_scroll_=std::clamp(strip_scroll_,0,(std::max)(0,total-static_cast<int>(strip_area_.right-strip_area_.left)));
-    for (size_t i=0;i<pills_.size();++i) {
-        const int x=strip_area_.left+spans[i].first-strip_scroll_;
-        pills_[i].rect={x,strip_.top+m.S(2),x+spans[i].second,strip_.bottom-m.S(2)};
-    }
-    y=strip_.bottom+m.S(10);
-    // The canvas: everything above the status line.
-    const int footer_h=m.S(24),min_canvas=m.S(320);
-    canvas_={pad,y,right,(std::max)(y+min_canvas,static_cast<int>(client.bottom)-m.S(10)-footer_h-m.S(6))};
+    const int footer_h=m.S(24),min_canvas=m.S(460),panel=m.S(264);
+    canvas_={pad,y,right-panel-gap,(std::max)(y+min_canvas,static_cast<int>(client.bottom)-m.S(10)-footer_h-m.S(6))};
+    library_={canvas_.right+gap,y,right,canvas_.bottom};
     footer_={pad,canvas_.bottom+m.S(6),right,canvas_.bottom+m.S(6)+footer_h};
-    // The weapon list: a column on the canvas's right, when the canvas keeps room beside it (a narrow page adds a
-    // weapon with + 武器派生 and the node's weapon field instead).
-    weapon_rows_.clear(); weapons_={}; weapons_title_={};
-    const int panel=m.S(176),row_h=m.S(30);
-    if (HasSkin()&&right-pad-panel-gap>=m.S(440)) {
-        weapons_={right-panel,canvas_.top,right,canvas_.bottom}; canvas_.right=weapons_.left-gap;
-        weapons_title_={weapons_.left+m.S(10),weapons_.top+m.S(6),weapons_.right-m.S(8),weapons_.top+m.S(30)};
-        std::vector<WeaponRow> rows; bool shaqi_header=false;
-        for (const auto& [id,shaqi]:ListedWeapons()) {
-            if (shaqi&&!shaqi_header) { shaqi_header=true; WeaponRow h; h.header=true; h.name=Tr(L"影之武装"); rows.push_back(h); }
-            WeaponRow r; r.id=id; r.shaqi=shaqi; r.name=WeaponName(id);
-            const std::wstring wide(id.begin(),id.end()); r.image=WeaponIcons::Find(wide.c_str(),shaqi).image; rows.push_back(r);
+    library_title_={library_.left+m.S(12),y+m.S(8),right-m.S(12),y+m.S(32)};
+    const int left=library_.left+m.S(10),edge=right-m.S(10),half=(edge-left-gap)/2;
+    int ly=library_title_.bottom+m.S(6);
+    for (int i=0;i<2;++i) library_tabs_[i]={left+i*(half+gap),ly,left+i*(half+gap)+half,ly+m.S(32)};
+    ly+=m.S(44);
+    library_category_title_={};
+    for (RECT& rect:node_categories_) rect={};
+    if (library_tab_==0) {
+        library_category_title_={left,ly,edge,ly+m.S(18)}; ly+=m.S(24);
+        for (int i=0;i<5;++i) {
+            const int x=left+(i%2)*(half+gap),top=ly+(i/2)*m.S(32);
+            node_categories_[i]={x,top,i==4?edge:x+half,top+m.S(26)};
         }
-        const int top=weapons_title_.bottom+m.S(4),visible=static_cast<int>(weapons_.bottom)-m.S(6)-top;
-        weapon_scroll_=std::clamp(weapon_scroll_,0,(std::max)(0,static_cast<int>(rows.size())*row_h-visible));
-        for (size_t i=0;i<rows.size();++i) {
-            const int ry=top+static_cast<int>(i)*row_h-weapon_scroll_;
-            rows[i].rect={weapons_.left+m.S(6),ry,weapons_.right-m.S(6),ry+row_h-m.S(2)};
-        }
-        weapon_rows_=std::move(rows);
+        ly+=3*m.S(32)+m.S(4);
     }
-    // Canvas tools: a floating bar in the canvas's top-left corner (wrapping when the canvas is narrow).
-    {
-        // The first row leaves the zoom label room; the rows under it take the canvas's width.
-        const int tool_h=m.S(28),inset=m.S(10),first=canvas_.right-m.S(110),rest=canvas_.right-inset;
-        int x=canvas_.left+inset,top=canvas_.top+inset;
-        for (auto b=std::rbegin(kTools);b!=std::rend(kTools);++b) {
-            const int w=button_w(*b),limit=top==canvas_.top+inset?first:rest;
-            if (x+w>limit&&x>canvas_.left+inset) { x=canvas_.left+inset; top+=tool_h+m.S(6); }
-            buttons_[static_cast<int>(*b)]={x,top,x+w,top+tool_h}; x+=w+m.S(6);
+    tabs_.clear(); pills_.clear(); weapon_rows_.clear(); weapons_={}; weapons_title_={}; tabs_title_={};
+    const int pager_y=library_.bottom-m.S(38);
+    strip_left_={left,pager_y,left+m.S(32),pager_y+m.S(28)};
+    strip_right_={edge-m.S(32),pager_y,edge,pager_y+m.S(28)};
+    library_page_label_={strip_left_.right+m.S(4),pager_y,strip_right_.left-m.S(4),pager_y+m.S(28)};
+    std::vector<std::pair<Kind,std::string>> all;
+    if (HasSkin()&&LibrarySection()==4) {
+        for (const std::string& d:moves_.dodges) all.push_back({Kind::Dodge,d});
+        for (const std::string& ability:moves_.skills) all.push_back({NpcCombo::Classify(ability),ability});
+        std::vector<Tab> wanted{{-1,{},all.size()}};
+        for (int k=0;k<static_cast<int>(Kind::Count);++k) {
+            const size_t count=static_cast<size_t>(std::count_if(all.begin(),all.end(),[k](const auto& a){return static_cast<int>(a.first)==k;}));
+            if (count) wanted.push_back({k,{},count});
         }
+        if (category_>=0&&std::none_of(wanted.begin(),wanted.end(),[](const Tab& t){return t.kind==category_;})) category_=-1;
+        const int tab_w=(edge-left-m.S(6))/2;
+        for (size_t i=0;i<wanted.size();++i) {
+            const int x=left+static_cast<int>(i%2)*(tab_w+m.S(6)),top=ly+static_cast<int>(i/2)*m.S(28);
+            wanted[i].rect={x,top,x+tab_w,top+m.S(24)};
+        }
+        ly+=static_cast<int>((wanted.size()+1)/2)*m.S(28)+m.S(6); tabs_=std::move(wanted);
+        for (const auto& [kind,ability]:all) if (category_<0||static_cast<int>(kind)==category_) pills_.push_back({{},ability,kind});
+    }
+    library_section_={left,ly,edge,ly+m.S(24)}; ly+=m.S(30);
+    library_list_={left,ly,edge,pager_y-m.S(8)};
+    strip_={}; strip_area_={};
+    const int row_h=m.S(34);
+    library_capacity_=(std::max)(1,static_cast<int>((library_list_.bottom-library_list_.top)/row_h));
+    std::vector<Button> creation;
+    if (HasSkin()) for (auto b=std::rbegin(kTools);b!=std::rend(kTools);++b)
+        if (NodeCategory(*b)==LibrarySection()) creation.push_back(*b);
+    if (HasSkin()&&LibrarySection()==5) {
+        for (const auto& [id,shaqi]:ListedWeapons()) {
+            WeaponRow r; r.id=id; r.shaqi=shaqi; r.name=WeaponName(id);
+            if (shaqi) r.name=Tr(L"影之武装")+L" · "+r.name;
+            const std::wstring wide(id.begin(),id.end()); r.image=WeaponIcons::Find(wide.c_str(),shaqi).image;
+            weapon_rows_.push_back(r);
+        }
+    }
+    const size_t count=LibrarySection()==4?pills_.size():LibrarySection()==5?weapon_rows_.size():creation.size();
+    library_items_=static_cast<int>(count);
+    library_page_count_=(std::max)(1,(static_cast<int>(count)+library_capacity_-1)/library_capacity_);
+    int& page=library_pages_[LibrarySection()]; page=std::clamp(page,0,library_page_count_-1);
+    const size_t first=static_cast<size_t>(page*library_capacity_),last=(std::min)(count,first+library_capacity_);
+    for (size_t i=first;i<last;++i) {
+        const int top=ly+static_cast<int>(i-first)*row_h;
+        const RECT rect{left,top,edge,top+row_h-m.S(4)};
+        if (LibrarySection()==4) pills_[i].rect=rect;
+        else if (LibrarySection()==5) weapon_rows_[i].rect=rect;
+        else buttons_[static_cast<int>(creation[i])]=rect;
+    }
+    if (LibrarySection()==4) { strip_=library_list_; strip_area_=library_list_; }
+    if (LibrarySection()==5) {
+        weapons_=library_list_;
+        weapons_title_={left,ly-m.S(4),edge,ly-m.S(4)};  // no repeated heading inside the list
+    }
+    // Compact management row only; node creation lives entirely in the library.
+    const int tool_h=m.S(28),inset=m.S(10),first_limit=canvas_.right-m.S(100),rest=canvas_.right-inset;
+    int x=canvas_.left+inset,top=canvas_.top+inset;
+    for (Button b:kCanvasTools) {
+        const int w=(std::min)(button_w(b),static_cast<int>(canvas_.right-canvas_.left-2*inset));
+        const int limit=top==canvas_.top+inset?first_limit:rest;
+        if (x+w>limit&&x>canvas_.left+inset) { x=canvas_.left+inset; top+=tool_h+m.S(6); }
+        buttons_[static_cast<int>(b)]={x,top,x+w,top+tool_h}; x+=w+m.S(6);
     }
     const int minimum=y+min_canvas+m.S(6)+footer_h+m.S(10);
     const std::wstring key=UiHotkeys::Hint(UiHotkeys::Action::NpcSkill);
@@ -2140,10 +2752,46 @@ void Layout() {
     hint_text_=hint;
     ReleaseDC(window_,dc);
     if (search_.open) SearchLayout();
-    if (minimum!=height_) { height_=minimum; DebugHub::SetMinimum(window_,m.S(460),height_); }
+    if (minimum!=height_) { height_=minimum; DebugHub::SetMinimum(window_,m.S(720),height_); }
     Invalidate();
 }
-void ScrollStrip(int delta) { strip_scroll_+=delta; Layout(); }
+void ScrollStrip(int delta) { library_pages_[LibrarySection()]=std::clamp(library_pages_[LibrarySection()]+delta,0,library_page_count_-1); hot_={}; Layout(); }
+
+// The two range handles use the same inset for paint, picking and dragging.
+int TrimLength(int index) { return NpcCombo::ClampTrim(static_cast<int>(std::lround(TrimClip(static_cast<size_t>(index))*1000))); }
+void TrimBounds(const Node& node,int clip,int& from,int& to) {
+    from=NpcCombo::ClampTrim(node.trim_from);
+    if (from>=clip) { from=0; to=clip; return; }
+    to=node.trim_to>from?(std::min)(node.trim_to,clip):clip;
+    if (to<=from) to=clip;
+}
+RECT TrimTrack(RECT bar) { InflateRect(&bar,-Px(6),0); return bar; }
+bool UpdateTrimDrag(POINT p) {
+    if (drag_.mode!=Drag::Trim||!At(drag_.index)||drag_.trim_clip<=0) return false;
+    Node& node=config_.chain[static_cast<size_t>(drag_.index)];
+    const RECT bar=drag_.trim_bar; const int clip=drag_.trim_clip,step=(std::min)(NpcCombo::kTrimStep,clip);
+    int from=0,to=0; TrimBounds(node,clip,from,to);
+    const double t=std::clamp(double(p.x-bar.left)/(std::max)(1L,bar.right-bar.left),0.0,1.0);
+    const int ms=t>=1?clip:static_cast<int>(std::lround(t*clip/NpcCombo::kTrimStep))*NpcCombo::kTrimStep;
+    if (drag_.sub==0) from=std::clamp(ms,0,(std::max)(0,to-step));
+    else to=std::clamp(ms,(std::min)(clip,from+step),clip);
+    const int end=to>=clip?0:to;
+    const bool changed=node.trim_from!=from||node.trim_to!=end;
+    node.trim_from=from; node.trim_to=end; drag_.moved|=changed; drag_.last=p; Invalidate(); return changed;
+}
+bool PrepareTrimDrag(int index,POINT p) {
+    if (!At(index)||At(index)->type!=NodeType::Trim) return false;
+    const int clip=TrimLength(index); if (clip<=0) return false;
+    const HDC dc=GetDC(window_); const RECT bar=TrimTrack(NodeShape(dc,static_cast<size_t>(index)).field2); ReleaseDC(window_,dc);
+    if (bar.right<=bar.left) return false;
+    int from=0,to=0; TrimBounds(*At(index),clip,from,to);
+    const double start=bar.left+double(bar.right-bar.left)*from/clip,end=bar.left+double(bar.right-bar.left)*to/clip;
+    drag_={}; drag_.mode=Drag::Trim; drag_.index=index; drag_.start=drag_.last=p; drag_.trim_bar=bar; drag_.trim_clip=clip;
+    drag_.sub=std::fabs(p.x-start)<std::fabs(p.x-end)?0:1;
+    hot_={Part::NodeTrimBar,index}; Select(index);
+    if ((std::min)(std::fabs(p.x-start),std::fabs(p.x-end))>Px(8)) UpdateTrimDrag(p);
+    return true;
+}
 
 // ---- hit testing ---------------------------------------------------------------------------------
 bool Near(POINT a,POINT b,int r) { return (a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)<=r*r; }
@@ -2154,10 +2802,12 @@ Hit HitTest(POINT p) {
     if (in(buttons_[static_cast<int>(Button::Toast)])) return {Part::Button,static_cast<int>(Button::Toast)};
     if (in(buttons_[static_cast<int>(Button::Dummy)])) return {Part::Button,static_cast<int>(Button::Dummy)};
     if (in(header_)) return {Part::Header,-1};
+    for (int i=0;i<2;++i) if (in(library_tabs_[i])) return {Part::LibraryTab,i};
+    for (int i=0;i<5;++i) if (in(node_categories_[i])) return {Part::NodeCategory,i};
     if (HasSkin()) for (const Button b:kTools) if (in(buttons_[static_cast<int>(b)])) return {Part::Button,static_cast<int>(b)};
     for (size_t i=0;i<tabs_.size();++i) if (in(tabs_[i].rect)) return {Part::Tab,static_cast<int>(i)};
-    if (in(strip_left_)) return {Part::StripLeft,-1};
-    if (in(strip_right_)) return {Part::StripRight,-1};
+    if (library_pages_[LibrarySection()]>0&&in(strip_left_)) return {Part::StripLeft,-1};
+    if (library_pages_[LibrarySection()]+1<library_page_count_&&in(strip_right_)) return {Part::StripRight,-1};
     if (in(strip_area_)) for (size_t i=0;i<pills_.size();++i) if (in(pills_[i].rect)) return {Part::Pill,static_cast<int>(i)};
     if (HasSkin()&&in(weapons_)) {
         const int top=weapons_title_.bottom+M().S(4);
@@ -2188,28 +2838,46 @@ Hit HitTest(POINT p) {
             else if (p.y<Row(s.rect,0).bottom+Px(3)) hit={Part::Node,i};
             continue;
         }
+        if (Overview()) { if (in(s.rect)) hit={Part::Node,i}; continue; }  // far out: the whole card (move, select)
         int route_out=-1;
         for (size_t r=0;r<s.routes.size();++r) if (Near(p,s.routes[r].out,pin)) { route_out=static_cast<int>(r); break; }
-        const bool stepper=node.type==NodeType::Interval||node.type==NodeType::Trigger||node.type==NodeType::Speed||node.type==NodeType::Damage||node.type==NodeType::Skill||
+        const bool stepper=node.type==NodeType::Interval||node.type==NodeType::Trigger||node.type==NodeType::Speed||node.type==NodeType::Damage||node.type==NodeType::KeepChain||node.type==NodeType::Skill||
                            node.type==NodeType::AutoDodge||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||node.type==NodeType::Teleport||node.type==NodeType::PreInput||
-                           node.type==NodeType::WeaponActions;
+                           node.type==NodeType::WeaponActions||node.type==NodeType::Hook||node.type==NodeType::Trim;
         if (route_out>=0) hit={Part::RouteOut,i,route_out};
         else if (s.has_out&&Near(p,s.out,pin)) hit={Part::NodeOut,i};
         else if (s.has_in&&Near(p,s.in,pin)) hit={Part::NodeIn,i};
         else if (s.has_mod_out&&Near(p,s.mod_out,pin)) hit={Part::ModOut,i};
         else if (s.has_mod_in&&Near(p,s.mod_in,pin)) hit={Part::ModIn,i};
         else if (!in(s.rect)) continue;
-        else if ((IsPicked(i)||hot_.index==i)&&!IsKey(i)&&!IsPreInputAt(i)&&in(s.remove)) hit={Part::NodeRemove,i};
+        else if ((IsPicked(i)||hot_.index==i)&&!IsKey(i)&&!IsSettingAt(i)&&in(s.remove)) hit={Part::NodeRemove,i};
         else if (stepper&&in(s.minus)) hit={Part::NodeMinus,i};
         else if (stepper&&in(s.plus)) hit={Part::NodePlus,i};
         else if (stepper&&in(s.value)) hit={Part::NodeValue,i};
+        else if (s.has_hold&&in(s.hminus)) hit={Part::NodeHoldMinus,i};
+        else if (s.has_hold&&in(s.hplus)) hit={Part::NodeHoldPlus,i};
+        else if (s.has_hold&&in(s.hvalue)) hit={Part::NodeHoldValue,i};
+        else if (node.type==NodeType::Trim&&in(s.field2)) hit={Part::NodeTrimBar,i};
         else if (node.type==NodeType::Trigger&&!IsKey(i)&&in(s.field)) hit={Part::NodeField,i};
+        else if (node.type==NodeType::Hook&&in(s.field)) hit={Part::NodeField,i};
+        else if (node.type==NodeType::Hook&&in(s.field2)) hit={Part::NodeField2,i};
+        else if (node.type==NodeType::Hook&&in(s.field3)) hit={Part::NodeField3,i};
+        else if (node.type==NodeType::Speed&&in(s.toggle)) hit={Part::NodeToggle,i};
+        else if (NpcCombo::TakesOwnLook(node)&&in(s.toggle)) hit={Part::NodeToggle,i};
+        else if (node.type==NodeType::Speed&&in(s.field)) hit={Part::NodeField,i};
+        else if (node.type==NodeType::Speed&&node.curve&&in(s.field2)) hit={Part::NodeField2,i};
         else if (node.type==NodeType::Grab&&in(s.field)) hit={Part::NodeField,i};
-        else if (node.type==NodeType::WeaponActions&&in(s.field)) hit={Part::NodeField,i};
+        else if (node.type==NodeType::WeaponActions&&!node.air_set&&in(s.field)) hit={Part::NodeField,i};  // 空中派生: no weapon
         else if (node.type==NodeType::Look&&in(s.field)) hit={Part::NodeField,i};
         else if (node.type==NodeType::ForceHit&&in(s.field)) hit={Part::NodeField,i};
-        else if (node.type==NodeType::BossSkill&&in(s.field)) hit={Part::NodeField,i};
-        else if (node.type==NodeType::BossSkill&&in(s.field2)) hit={Part::NodeField2,i};
+        else if (LaunchShown(node)&&in(s.field2)) hit={Part::NodeField2,i};
+        else if (node.type==NodeType::AirDefault&&in(s.toggle)) hit={Part::NodeToggle,i};
+        else if (AirNode(node)&&in(s.field)) hit={Part::NodeField,i};
+        else if (AirNode(node)&&in(s.field2)) hit={Part::NodeField2,i};
+        else if (AirNode(node)&&in(s.field3)) hit={Part::NodeField3,i};
+        else if (AirNode(node)&&in(s.field4)) hit={Part::NodeField4,i};
+        else if (NpcCombo::PicksBossMove(node)&&in(s.field)) hit={Part::NodeField,i};
+        else if (NpcCombo::PicksBossMove(node)&&in(s.field2)) hit={Part::NodeField2,i};
         else if (node.type==NodeType::WeaponMove&&in(s.field)) hit={Part::NodeField,i};
         else if (node.type==NodeType::WeaponMove&&in(s.field2)) hit={Part::NodeField2,i};
         else if (node.type==NodeType::Teleport&&in(s.field)) hit={Part::NodeField,i};
@@ -2228,6 +2896,9 @@ Hit HitTest(POINT p) {
                 else if (in(route.minus)) hit={Part::RouteMinus,i,row};
                 else if (in(route.plus)) hit={Part::RoutePlus,i,row};
                 else if (in(route.value)) hit={Part::RouteValue,i,row};
+                else if (in(route.hminus)) hit={Part::RouteHoldMinus,i,row};
+                else if (in(route.hplus)) hit={Part::RouteHoldPlus,i,row};
+                else if (in(route.hvalue)) hit={Part::RouteHoldValue,i,row};
                 else if (in(route.remove)) hit={Part::RouteRemove,i,row};
                 else if (route.has_keys&&in(route.keys)) hit={Part::RouteKeys,i,row};
                 else if (route.has_keys&&in(route.mode)) hit={Part::RouteMode,i,row};
@@ -2265,9 +2936,17 @@ template<class Draw> void Buffered(HWND window,HDC printed,Draw draw) {
 }
 void DrawButton(HDC dc,Gdiplus::Graphics& graphics,Button button,bool on=false,bool enabled=true) {
     const RECT& rect=buttons_[static_cast<int>(button)];
+    if (rect.right<=rect.left||rect.bottom<=rect.top) return;
     const auto m=M(); const bool hot=enabled&&hot_==Hit{Part::Button,static_cast<int>(button)},down=hot&&pressed_==hot_;
     const COLORREF paper=Paper(),accent=UiTheme::Accent();
     COLORREF fill=on?UiTheme::Mix(paper,accent,40):UiTheme::Mix(paper,UiTheme::Base(),45),edge=on?accent:UiTheme::Mix(UiTheme::Border(),paper,35);
+    if (NodeCategory(button)>=0) {
+        const COLORREF row_fill=UiTheme::Mix(UiTheme::Base(),accent,hot?(down?20:12):4);
+        Rounded(graphics,rect,static_cast<float>(m.S(5)),row_fill,255,hot?accent:UiTheme::Mix(UiTheme::Border(),UiTheme::Base(),55),255);
+        RECT label=rect; label.left+=m.S(12); label.right-=m.S(10);
+        Label(dc,ButtonText(button),label,Font(UiTheme::Font::Small),enabled?UiTheme::Text():UiTheme::MutedText(),DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        return;
+    }
     if (hot) fill=UiTheme::Mix(fill,UiTheme::Text(),down?16:8);
     Rounded(graphics,rect,static_cast<float>(m.S(8)),fill,255,edge,255);
     Label(dc,ButtonText(button),rect,Font(button==Button::Toggle?UiTheme::Font::Strong:UiTheme::Font::Small),enabled?UiTheme::Text():UiTheme::MutedText(),DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
@@ -2293,10 +2972,13 @@ COLORREF ModColor(NodeType type) {
     if (type==NodeType::Armor) return UiTheme::Mix(RGB(200,96,70),UiTheme::Text(),15);
     if (type==NodeType::Invincible) return UiTheme::Mix(RGB(232,196,84),UiTheme::Text(),12);
     if (type==NodeType::IgnoreGuard) return UiTheme::Mix(RGB(120,150,240),UiTheme::Text(),15);
+    if (type==NodeType::KeepChain) return UiTheme::Mix(RGB(64,176,214),UiTheme::Text(),15);
     if (type==NodeType::KeepLook) return UiTheme::Mix(RGB(168,120,232),UiTheme::Text(),15);
     if (type==NodeType::ForceHit) return UiTheme::Mix(RGB(236,128,48),UiTheme::Text(),15);
     if (type==NodeType::Interrupt) return UiTheme::Mix(RGB(70,190,150),UiTheme::Text(),15);
     if (type==NodeType::Damage) return UiTheme::Mix(RGB(226,72,112),UiTheme::Text(),15);
+    if (type==NodeType::Trim) return UiTheme::Mix(RGB(172,196,64),UiTheme::Text(),15);
+    if (type==NodeType::Air) return UiTheme::Mix(RGB(80,176,236),UiTheme::Text(),15);
     return UiTheme::AccentBlue();
 }
 COLORREF GrabColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(190,104,170),UiTheme::Text(),15); }
@@ -2382,6 +3064,46 @@ void StepperAt(HDC dc,Gdiplus::Graphics& graphics,const RECT& minus,const RECT& 
     Rounded(graphics,value_rect,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),accent,value_hot?16:4),255,UiTheme::Mix(UiTheme::Border(),UiTheme::Base(),20),255);
     Label(dc,value,value_rect,Scaled(font),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
 }
+// A checkbox row in a card: the box, then its words (muted while off).
+void CheckRow(HDC dc,Gdiplus::Graphics& graphics,const RECT& row,bool on,bool hot,const std::wstring& words) {
+    const COLORREF text=UiTheme::Text(),accent=UiTheme::Accent();
+    const int box=row.bottom-row.top-Px(4);
+    const RECT check{row.left,row.top+Px(2),row.left+box,row.top+Px(2)+box};
+    Rounded(graphics,check,static_cast<float>(Px(4)),on?accent:UiTheme::Mix(UiTheme::Base(),text,hot?15:5),255,on?accent:UiTheme::Border(),255);
+    if (on) {
+        Gdiplus::Pen tick(Argb(UiTheme::Base()),(std::max)(1.5f,2.f*Zoom()));
+        const float x=static_cast<float>(check.left),y=static_cast<float>(check.top),w=static_cast<float>(box);
+        Gdiplus::PointF points[3]={{x+w*.22f,y+w*.52f},{x+w*.42f,y+w*.72f},{x+w*.78f,y+w*.3f}};
+        graphics.DrawLines(&tick,points,3);
+    }
+    RECT label{check.right+Px(6),row.top,row.right,row.bottom};
+    Label(dc,words,label,Scaled(UiTheme::Font::Small),on?text:UiTheme::MutedText(),DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+}
+// A 加速's curve in its card (曲线调节): the curve over the row against ×1, its mean pace on the right.
+void DrawCurveField(HDC dc,Gdiplus::Graphics& graphics,const RECT& rect,const Node& node,bool hot,bool open) {
+    const COLORREF hue=ModColor(NodeType::Speed),text=UiTheme::Text();
+    Rounded(graphics,rect,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,hot?24:8),255,open?UiTheme::Accent():UiTheme::Mix(UiTheme::Border(),hue,30),255,open?1.6f:1.f);
+    const std::wstring mean=SpeedText(static_cast<int>(std::lround(NpcCombo::CurveMeanSpeed(node.points))));
+    const HDC measure=dc; const SIZE size=Extent(measure,Scaled(UiTheme::Font::Small),mean);
+    RECT plot=rect; InflateRect(&plot,-Px(5),-Px(3)); plot.right-=size.cx+Px(8);
+    RECT words=rect; words.left=plot.right+Px(4); words.right-=Px(6);
+    Label(dc,mean,words,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
+    if (plot.right-plot.left<Px(20)) return;
+    // log scale over the curve's own range (and ×1), so its shape shows in the small row
+    double lo=100,hi=100;
+    for (const NpcCombo::CurvePoint& p:node.points) { lo=(std::min)(lo,static_cast<double>(p.speed)); hi=(std::max)(hi,static_cast<double>(p.speed)); }
+    const double log_lo=std::log(lo/1.15),log_hi=std::log(hi*1.15);
+    const auto y_of=[&](double percent) {
+        const double f=(std::log((std::max)(percent,1.0))-log_lo)/(std::max)(1e-6,log_hi-log_lo);
+        return static_cast<float>(plot.bottom-std::clamp(f,0.0,1.0)*(plot.bottom-plot.top));
+    };
+    Gdiplus::Pen unit(Argb(UiTheme::Mix(UiTheme::Base(),text,30)),1.f);
+    graphics.DrawLine(&unit,static_cast<float>(plot.left),y_of(100),static_cast<float>(plot.right),y_of(100));
+    Gdiplus::PointF line[49];
+    for (int k=0;k<49;++k) line[k]={static_cast<float>(plot.left+(plot.right-plot.left)*k/48.0),y_of(NpcCombo::CurveSpeed(node.points,k/48.0))};
+    Gdiplus::Pen pen(Argb(hue),(std::max)(1.4f,1.8f*Zoom())); pen.SetLineJoin(Gdiplus::LineJoinRound);
+    graphics.DrawLines(&pen,line,49);
+}
 void Stepper(HDC dc,Gdiplus::Graphics& graphics,const Shape& s,int index,const std::wstring& value) {
     StepperAt(dc,graphics,s.minus,s.value,s.plus,value,Hit{Part::NodeMinus,index},Hit{Part::NodePlus,index},Hit{Part::NodeValue,index});
 }
@@ -2415,6 +3137,61 @@ void DrawSearch(HDC dc,Gdiplus::Graphics& graphics) {
     RestoreDC(dc,saved);
     if (search_.rows.empty()) Label(dc,Tr(L"没有匹配的项"),search_.list,Font(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
 }
+// A card's colour, as its own drawing picks it (the overview's).
+COLORREF NodeHue(const Node& node) {
+    if (NpcCombo::IsModifier(node)) return ModColor(node.type);
+    switch (node.type) {
+    case NodeType::Trigger: return TriggerColor(node.trigger);
+    case NodeType::Interval: return UiTheme::Mix(UiTheme::AccentBlue(),UiTheme::MutedText(),40);
+    case NodeType::PreInput: case NodeType::AirDefault: return UiTheme::Mix(UiTheme::Accent(),UiTheme::MutedText(),30);
+    case NodeType::Branch: return BranchColor();
+    case NodeType::WeaponMove: case NodeType::WeaponActions: case NodeType::Hook: return WeaponColor();
+    case NodeType::Teleport: case NodeType::HeroLook: return TeleportColor();
+    case NodeType::Assist: return AssistColor();
+    case NodeType::BossSkill: case NodeType::Look: return BossColor();
+    case NodeType::Grab: return GrabColor();
+    case NodeType::Group: return GroupColor();
+    case NodeType::AutoDodge: return KindColor(Kind::Dodge);
+    default: return KindColor(KindOf(node.ability));
+    }
+}
+// Far out (under kOverviewZoom): a card is its tinted body and, while it is big enough to read, its title in the
+// page's small font.
+void OverviewCard(HDC dc,Gdiplus::Graphics& graphics,const Shape& s,COLORREF hue,const std::wstring& title,bool selected,bool playing,bool dim) {
+    const auto m=M(); const COLORREF panel=UiTheme::Panel();
+    const COLORREF edge=playing?UiTheme::AccentBlue():selected?UiTheme::Accent():UiTheme::Mix(UiTheme::Border(),hue,40);
+    if (s.rect.bottom-s.rect.top<m.S(18)) {  // too small for a title: a flat box (GDI, quick for thousands)
+        const HGDIOBJ old=SelectObject(dc,GetStockObject(DC_BRUSH));
+        SetDCBrushColor(dc,UiTheme::Mix(UiTheme::Mix(panel,hue,dim?26:52),UiTheme::Base(),dim?30:0)); FillRect(dc,&s.rect,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        if (selected||playing) { SetDCBrushColor(dc,edge); FrameRect(dc,&s.rect,static_cast<HBRUSH>(GetStockObject(DC_BRUSH))); }
+        SelectObject(dc,old); return;
+    }
+    Rounded(graphics,s.rect,static_cast<float>(Px(8)),UiTheme::Mix(panel,hue,dim?26:52),dim?200:255,edge,255,selected||playing?2.f:1.f);
+    if (s.rect.bottom-s.rect.top>=m.S(18)&&s.rect.right-s.rect.left>=m.S(36)) {
+        RECT r=s.rect; InflateRect(&r,-m.S(4),0);
+        Label(dc,title,r,Font(UiTheme::Font::Small),dim?UiTheme::MutedText():UiTheme::Text(),DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+    }
+}
+// A 裁剪's part on its move's length: the whole move a track, the part that plays filled, the times over it.
+void TrimBar(HDC dc,Gdiplus::Graphics& graphics,const RECT& bar,size_t index,bool on) {
+    const COLORREF hue=ModColor(NodeType::Trim);
+    const float clip=TrimClip(index);
+    Rounded(graphics,bar,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,8),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);
+    if (clip>0) {
+        NpcCombo::TrimRange r=NpcCombo::TrimOf(config_.chain[index]); if (r.from>=clip) r={};  // as the game plays it
+        const double from=r.from,to=r.from+NpcCombo::TrimSpan(r,clip);
+        const RECT track=TrimTrack(bar); const LONG w=track.right-track.left;
+        RECT part{track.left+static_cast<LONG>(std::lround(w*from/clip)),bar.top+Px(3),track.left+static_cast<LONG>(std::lround(w*to/clip)),bar.bottom-Px(3)};
+        if (part.right-part.left<Px(2)) part.right=part.left+Px(2);
+        Rounded(graphics,part,static_cast<float>(Px(3)),hue,on?130:65,0,0);
+        for (LONG x:{part.left,part.right}) {
+            RECT handle{x-Px(4),bar.top+Px(2),x+Px(4),bar.bottom-Px(2)};
+            Rounded(graphics,handle,static_cast<float>(Px(2)),UiTheme::Mix(hue,UiTheme::Text(),30),255,UiTheme::Base(),255);
+        }
+    }
+    RECT inner=bar; InflateRect(&inner,-Px(7),0);
+    if (!(clip>0)) Label(dc,TrimBarText(index),inner,Scaled(UiTheme::Font::Small),UiTheme::MutedText(),DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+}
 void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
     const auto m=M(); const COLORREF base=UiTheme::Base(),border=UiTheme::Border(),text=UiTheme::Text(),muted=UiTheme::MutedText(),accent=UiTheme::Accent();
     Rounded(graphics,canvas_,static_cast<float>(m.S(10)),base,255,0,0);
@@ -2423,17 +3200,20 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
     Gdiplus::GraphicsPath clip; RoundedPath(clip,static_cast<float>(canvas_.left),static_cast<float>(canvas_.top),static_cast<float>(canvas_.right-canvas_.left),static_cast<float>(canvas_.bottom-canvas_.top),static_cast<float>(m.S(10)));
     graphics.SetClip(&clip);
     // Grid: minor lines every 16 units, major every 128, as in the Blueprint editor, in the theme's border colour.
+    // Far out a major line every 8 (they stay 12 px or more apart); the lines counted, not summed, so they stay put.
     {
         const float step=kGrid*Scale();
-        const float x0=canvas_.left+std::fmod(pan_x_,step)-step,y0=canvas_.top+std::fmod(pan_y_,step)-step;
+        const long every=kMajor*Scale()<12.f?kMajor*8L:static_cast<long>(kMajor);
         Gdiplus::Pen minor(Argb(UiTheme::Mix(base,border,16)),1.f),major(Argb(UiTheme::Mix(base,border,45)),1.f);
-        for (float x=x0;x<canvas_.right;x+=step) {
-            const long u=std::lround((x-canvas_.left-pan_x_)/Scale());
-            if (step>=6||u%kMajor==0) graphics.DrawLine(u%kMajor==0?&major:&minor,x,static_cast<float>(canvas_.top),x,static_cast<float>(canvas_.bottom));
+        for (long k=static_cast<long>(std::floor(-pan_x_/step))-1;;++k) {
+            const float x=canvas_.left+pan_x_+static_cast<float>(k)*step; if (x>=canvas_.right) break;
+            const bool big=(k*kGrid)%every==0;
+            if (step>=6||big) graphics.DrawLine(big?&major:&minor,x,static_cast<float>(canvas_.top),x,static_cast<float>(canvas_.bottom));
         }
-        for (float y=y0;y<canvas_.bottom;y+=step) {
-            const long u=std::lround((y-canvas_.top-pan_y_)/Scale());
-            if (step>=6||u%kMajor==0) graphics.DrawLine(u%kMajor==0?&major:&minor,static_cast<float>(canvas_.left),y,static_cast<float>(canvas_.right),y);
+        for (long k=static_cast<long>(std::floor(-pan_y_/step))-1;;++k) {
+            const float y=canvas_.top+pan_y_+static_cast<float>(k)*step; if (y>=canvas_.bottom) break;
+            const bool big=(k*kGrid)%every==0;
+            if (step>=6||big) graphics.DrawLine(big?&major:&minor,static_cast<float>(canvas_.left),y,static_cast<float>(canvas_.right),y);
         }
     }
     // Which nodes play: reached from a trigger that is on; a modifier when a node pointing at it does.
@@ -2442,7 +3222,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
     for (size_t t=0;t<count;++t) {
         const Node& n=config_.chain[t];
         if (!NpcCombo::StartsChain(n)) continue;
-        live[t]=WeaponActionsNode(n)?n.on&&!n.weapon.empty():n.on||IsKey(static_cast<int>(t));
+        live[t]=WeaponActionsNode(n)?n.on&&(n.air_set||!n.weapon.empty()):n.on||IsKey(static_cast<int>(t));
         if (live[t]) for (const size_t i:NpcCombo::Order(config_,static_cast<int>(t))) live[i]=true;
     }
     for (size_t i=0;i<count;++i) {
@@ -2463,10 +3243,15 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
     std::vector<Shape> shapes; shapes.reserve(count);
     for (size_t i=0;i<count;++i) shapes.push_back(NodeShape(dc,i));
     const std::vector<size_t> order=PaintOrder();
+    // Only what reaches the canvas is drawn (a chain of thousands of nodes stays quick).
+    const auto visible=[&](const RECT& r){ RECT overlap{}; return IntersectRect(&overlap,&r,&canvas_)!=FALSE; };
+    const auto span=[](POINT a,POINT b,int pad){ return RECT{(std::min)(a.x,b.x)-pad,(std::min)(a.y,b.y)-pad,(std::max)(a.x,b.x)+pad,(std::max)(a.y,b.y)+pad}; };
+    const bool overview=Overview();
     // 组合 frames under everything: a tinted body, the header with its pins, its 派生点, the size handle.
     for (const size_t i:order) {
         const Node& node=config_.chain[i]; if (node.type!=NodeType::Group) continue;
         const Shape& s=shapes[i]; const int index=static_cast<int>(i);
+        if (!visible(s.rect)) continue;
         const bool selected=IsPicked(index),hot=hot_.index==index&&hot_.part>=Part::Node&&hot_.part<=Part::NodeRemove;
         const COLORREF hue=GroupColor(),panel=UiTheme::Panel();
         const float radius=static_cast<float>(Px(10));
@@ -2510,25 +3295,44 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             const int mod=NpcCombo::ModOf(config_,static_cast<int>(i),slot);
             if (mod<0||!shapes[i].has_mod_out) continue;
             const Shape& target=shapes[static_cast<size_t>(mod)];
-            Arrow(graphics,shapes[i].mod_out,ArrowTip(shapes[i].mod_out,target.rect,target.mod_in),ModColor(config_.chain[static_cast<size_t>(mod)].type),live[i]?235:140,wire_w,part);
+            const POINT tip=ArrowTip(shapes[i].mod_out,target.rect,target.mod_in);
+            if (!visible(span(shapes[i].mod_out,tip,Px(16)))) continue;
+            Arrow(graphics,shapes[i].mod_out,tip,ModColor(config_.chain[static_cast<size_t>(mod)].type),live[i]?235:140,wire_w,part);
         }
     };
-    arrows(ArrowPart::Shaft);
+    const HGDIOBJ old_pen=SelectObject(dc,GetStockObject(DC_PEN));
+    const auto flat_line=[&](POINT a,POINT b,COLORREF color){ SetDCPenColor(dc,color); MoveToEx(dc,a.x,a.y,nullptr); LineTo(dc,b.x,b.y); };
+    if (overview) {
+        for (size_t i=0;i<count;++i) for (int slot=0;slot<NpcCombo::kModSlots;++slot) {
+            const int mod=NpcCombo::ModOf(config_,static_cast<int>(i),slot);
+            if (mod<0||!shapes[i].has_mod_out) continue;
+            const POINT from_mid{(shapes[i].rect.left+shapes[i].rect.right)/2,(shapes[i].rect.top+shapes[i].rect.bottom)/2};
+            const RECT& to_rect=shapes[static_cast<size_t>(mod)].rect; const POINT to_mid{(to_rect.left+to_rect.right)/2,(to_rect.top+to_rect.bottom)/2};
+            if (visible(span(from_mid,to_mid,2))) flat_line(from_mid,to_mid,UiTheme::Mix(base,ModColor(config_.chain[static_cast<size_t>(mod)].type),live[i]?70:35));
+        }
+    } else arrows(ArrowPart::Shaft);
     for (size_t i=0;i<count;++i) {
         const Node& n=config_.chain[i];
         for (size_t o=0;o<NpcCombo::OutCount(n);++o) {
             const int next=NpcCombo::OutOf(n,o); if (next<0||static_cast<size_t>(next)>=count) continue;
             const POINT from=NpcCombo::HasRows(n)&&o<shapes[i].routes.size()?shapes[i].routes[o].out:shapes[i].out;
+            const POINT into=shapes[static_cast<size_t>(next)].in;
+            if (overview) { if (visible(span(from,into,2))) flat_line(from,into,UiTheme::Mix(base,live[i]&&live[static_cast<size_t>(next)]?text:muted,live[i]?70:40)); continue; }
+            // The curve stays inside its control points' box.
+            const int reach=Px(kPin)+static_cast<int>((std::max)(static_cast<float>(Px(50)),std::fabs(static_cast<float>(into.x-from.x))*.5f))+Px(4);
+            if (!visible(span(from,into,reach))) continue;
             const bool on=live[i]&&live[static_cast<size_t>(next)];
-            Wire(graphics,from,shapes[static_cast<size_t>(next)].in,on?text:muted,on?230:150,wire_w);
+            Wire(graphics,from,into,on?text:muted,on?230:150,wire_w);
         }
     }
     for (const size_t i:order) {
         const Node& node=config_.chain[i]; const Shape& s=shapes[i]; const int index=static_cast<int>(i);
         if (node.type==NodeType::Group) continue;  // drawn above, under everything
+        if (!visible(s.rect)) continue;
         const bool selected=IsPicked(index),playing=run_.running&&run_.profile==moves_.profile&&run_.node==index;
         const bool hot=hot_.index==index&&hot_.part>=Part::Node&&hot_.part<=Part::NodeRemove;
         const bool removable=!IsKey(index);
+        if (overview) { OverviewCard(dc,graphics,s,NodeHue(node),CardTitle(i),selected,playing,NpcCombo::IsModifier(node)?!pointed[i]:!live[i]); continue; }
         switch (node.type) {
         case NodeType::Trigger: {
             const bool key=IsKey(index);
@@ -2543,6 +3347,14 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             RECT label=Row(s.rect,1); label.right=s.minus.left-Px(6);
             Label(dc,Tr(L"无按键多久后重置"),label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             Stepper(dc,graphics,s,index,Seconds(NpcCombo::ClampReset(node.ms)/1000.0));
+            if (s.has_hold) {  // 按住: how long the button is held before the chain starts
+                RECT hold_label{s.rect.left+Px(10),s.hminus.top,s.hminus.left-Px(6),s.hminus.bottom};
+                Label(dc,Tr(L"按住多久才触发"),hold_label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+                const bool editing=edit_.node==index&&edit_.hold==-1,caret=(GetTickCount64()/530)%2==0;
+                StepperAt(dc,graphics,s.hminus,s.hvalue,s.hplus,editing?edit_.text+(caret?L"▏":L" ")+L" s":HoldText(node.hold_ms),
+                          Hit{Part::NodeHoldMinus,index},Hit{Part::NodeHoldPlus,index},Hit{Part::NodeHoldValue,index});
+                if (editing) Rounded(graphics,s.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            }
             if (!key) {
                 const int box=s.toggle.bottom-s.toggle.top-Px(4);
                 const RECT check{s.toggle.left,s.toggle.top+Px(2),s.toggle.left+box,s.toggle.top+Px(2)+box};
@@ -2614,7 +3426,8 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             const bool field_hot=hot_==Hit{Part::NodeField,index};
             Rounded(graphics,s.field,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);
             RECT inner=s.field; InflateRect(&inner,-Px(7),0);
-            Label(dc,ActionsWeaponText(node)+L"  ▾",inner,Scaled(UiTheme::Font::Body),node.weapon.empty()?muted:text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            Label(dc,ActionsWeaponText(node)+(node.air_set?L"":L"  ▾"),inner,Scaled(UiTheme::Font::Body),node.weapon.empty()&&!node.air_set?muted:text,
+                  DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             RECT label=Row(s.rect,1); label.right=s.minus.left-Px(6);
             Label(dc,Tr(L"无按键多久后重置"),label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             Stepper(dc,graphics,s,index,Seconds(NpcCombo::ClampReset(node.ms)/1000.0));
@@ -2647,6 +3460,12 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                 RECT inner=rs.field; InflateRect(&inner,-Px(6),0);
                 Label(dc,ButtonLabel(route.button)+L" ▾",inner,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
                 StepperAt(dc,graphics,rs.minus,rs.value,rs.plus,PauseText(route.pause_ms),Hit{Part::RouteMinus,index,row},Hit{Part::RoutePlus,index,row},Hit{Part::RouteValue,index,row},UiTheme::Font::Small);
+                {  // 按住: a tap, or how long the button is held for this row
+                    const bool editing=edit_.node==index&&edit_.hold==row,caret=(GetTickCount64()/530)%2==0;
+                    StepperAt(dc,graphics,rs.hminus,rs.hvalue,rs.hplus,editing?edit_.text+(caret?L"▏":L" ")+L" s":HoldText(route.hold_ms),Hit{Part::RouteHoldMinus,index,row},
+                              Hit{Part::RouteHoldPlus,index,row},Hit{Part::RouteHoldValue,index,row},UiTheme::Font::Small);
+                    if (editing) Rounded(graphics,rs.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+                }
                 const bool remove_hot=hot_==Hit{Part::RouteRemove,index,row};
                 Rounded(graphics,rs.remove,static_cast<float>(Px(5)),remove_hot?UiTheme::Danger():UiTheme::Mix(UiTheme::Base(),UiTheme::Danger(),12),255,UiTheme::Mix(UiTheme::Border(),UiTheme::Danger(),30),255);
                 Label(dc,L"×",rs.remove,Scaled(UiTheme::Font::Small),remove_hot?RGB(255,255,255):text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
@@ -2671,11 +3490,32 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
         }
         case NodeType::Speed: {
             Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
-            const bool editing=edit_.node==index;
-            const bool caret=(GetTickCount64()/530)%2==0;
-            Stepper(dc,graphics,s,index,editing?L"×"+edit_.text+(caret?L"▏":L" "):SpeedText(NpcCombo::ClampSpeed(node.speed)));
-            if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
-            Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            const COLORREF hue=ModColor(node.type);
+            if (node.curve) DrawCurveField(dc,graphics,s.field2,node,hot_==Hit{Part::NodeField2,index},SpeedCurveWindow::EditedNode()==index);
+            else {
+                const bool editing=edit_.node==index;
+                const bool caret=(GetTickCount64()/530)%2==0;
+                Stepper(dc,graphics,s,index,editing?L"×"+edit_.text+(caret?L"▏":L" "):SpeedText(NpcCombo::ClampSpeed(node.speed)));
+                if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            }
+            {  // 曲线调节 checkbox, 编辑曲线…
+                const int box=s.toggle.bottom-s.toggle.top-Px(4);
+                const RECT check{s.toggle.left,s.toggle.top+Px(2),s.toggle.left+box,s.toggle.top+Px(2)+box};
+                const bool toggle_hot=hot_==Hit{Part::NodeToggle,index};
+                Rounded(graphics,check,static_cast<float>(Px(4)),node.curve?accent:UiTheme::Mix(UiTheme::Base(),text,toggle_hot?15:5),255,node.curve?accent:UiTheme::Border(),255);
+                if (node.curve) {
+                    Gdiplus::Pen tick(Argb(UiTheme::Base()),(std::max)(1.5f,2.f*Zoom()));
+                    const float x=static_cast<float>(check.left),y=static_cast<float>(check.top),w=static_cast<float>(box);
+                    Gdiplus::PointF points[3]={{x+w*.22f,y+w*.52f},{x+w*.42f,y+w*.72f},{x+w*.78f,y+w*.3f}};
+                    graphics.DrawLines(&tick,points,3);
+                }
+                RECT word{check.right+Px(6),s.toggle.top,s.toggle.right,s.toggle.bottom};
+                Label(dc,Tr(L"曲线调节"),word,Scaled(UiTheme::Font::Small),node.curve?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+                const bool edit_hot=hot_==Hit{Part::NodeField,index};
+                Rounded(graphics,s.field,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,edit_hot?30:10),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);
+                Label(dc,Tr(L"编辑曲线…"),s.field,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+            }
+            Label(dc,NodeNote(i),Row(s.rect,2),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
         }
         case NodeType::Damage: {
@@ -2685,6 +3525,33 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             Stepper(dc,graphics,s,index,editing?edit_.text+(caret?L"▏":L" ")+L"%":DamageText(NpcCombo::ClampDamage(node.speed)));
             if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            break;
+        }
+        case NodeType::Trim: {  // the part of the BOSS 技能 pointing at it that plays
+            Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            const bool caret=(GetTickCount64()/530)%2==0;
+            const bool editing_from=edit_.node==index&&edit_.hold==-2,editing_to=edit_.node==index&&edit_.hold==-1;
+            RECT from_label=Row(s.rect,0); from_label.right=s.minus.left-Px(6);
+            Label(dc,Tr(L"开始于"),from_label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            Stepper(dc,graphics,s,index,editing_from?edit_.text+(caret?L"▏":L" ")+L" s":Seconds(NpcCombo::ClampTrim(node.trim_from)/1000.0));
+            if (editing_from) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            RECT to_label{s.rect.left+Px(10),s.hminus.top,s.hminus.left-Px(6),s.hminus.bottom};
+            Label(dc,Tr(L"结束于"),to_label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            StepperAt(dc,graphics,s.hminus,s.hvalue,s.hplus,editing_to?edit_.text+(caret?L"▏":L" ")+L" s":TrimEndText(node),
+                      Hit{Part::NodeHoldMinus,index},Hit{Part::NodeHoldPlus,index},Hit{Part::NodeHoldValue,index});
+            if (editing_to) Rounded(graphics,s.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            TrimBar(dc,graphics,s.field2,i,pointed[i]);
+            if (TrimClip(i)>0) Label(dc,TrimBarText(i),Row(s.rect,3),Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+            Label(dc,NodeNote(i),Row(s.rect,4),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            break;
+        }
+        case NodeType::KeepChain: {  // its own wait for the next press (in place of the trigger's reset time)
+            Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            const bool editing=edit_.node==index;
+            const bool caret=(GetTickCount64()/530)%2==0;
+            Stepper(dc,graphics,s,index,editing?edit_.text+(caret?L"▏":L" ")+L" s":Seconds(NpcCombo::ClampKeepChain(node.ms)/1000.0));
+            if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
         }
         case NodeType::WeaponMove: {
@@ -2699,6 +3566,27 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             field(s.field2,Part::NodeField2,node.ability.empty()?Tr(L"选择招式"):WeaponMoveText(node.weapon,node.ability),!node.ability.empty());
             Label(dc,NodeNote(i),Row(s.rect,2,26),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             RECT label=Row(s.rect,3); label.right=s.minus.left-Px(6);
+            Label(dc,Tr(L"多久后可接下一招"),label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            const bool editing=edit_.node==index,caret=(GetTickCount64()/530)%2==0;
+            const int cancel=NpcCombo::ClampCancel(node.ms);
+            Stepper(dc,graphics,s,index,editing?edit_.text+(caret?L"▏":L" ")+L" s":cancel?Seconds(cancel/1000.0):Tr(L"放完"));
+            if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            break;
+        }
+        case NodeType::Hook: {  // its mode, its reach, its speed, a note, its 派生点
+            const COLORREF hue=WeaponColor();
+            Card(dc,graphics,s,hue,CardTitle(i),selected,playing,!live[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            const auto field=[&](const RECT& r,Part part,const std::wstring& label){
+                const bool field_hot=hot_==Hit{part,index};
+                Rounded(graphics,r,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);
+                RECT inner=r; InflateRect(&inner,-Px(7),0);
+                Label(dc,label+L"  ▾",inner,Scaled(UiTheme::Font::Body),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            };
+            field(s.field,Part::NodeField,HookModeText(HookModeOf(node)));
+            field(s.field2,Part::NodeField2,HookDistText(node.hook_dist));
+            field(s.field3,Part::NodeField3,HookSpeedText(node.hook_speed));
+            Label(dc,NodeNote(i),Row(s.rect,3,26),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            RECT label=Row(s.rect,4); label.right=s.minus.left-Px(6);
             Label(dc,Tr(L"多久后可接下一招"),label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             const bool editing=edit_.node==index,caret=(GetTickCount64()/530)%2==0;
             const int cancel=NpcCombo::ClampCancel(node.ms);
@@ -2725,6 +3613,19 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
             break;
         }
+        case NodeType::Assist: {
+            Card(dc,graphics,s,AssistColor(),CardTitle(i),selected,playing,!live[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            const auto field=[&](const RECT& r,Part part,const std::wstring& label,bool on){
+                const bool field_hot=hot_==Hit{part,index};
+                Rounded(graphics,r,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),AssistColor(),field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),AssistColor(),30),255);
+                RECT inner=r; InflateRect(&inner,-Px(7),0);
+                Label(dc,label+L"  ▾",inner,Scaled(UiTheme::Font::Body),on?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            };
+            field(s.field,Part::NodeField,node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss),!node.boss.empty());
+            field(s.field2,Part::NodeField2,node.ability.empty()?Tr(L"选择招式"):MoveText(node.ability),!node.ability.empty());
+            Label(dc,NodeNote(i),Row(s.rect,2),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            break;
+        }
         case NodeType::BossSkill: {
             Card(dc,graphics,s,BossColor(),CardTitle(i),selected,playing,!live[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
             const auto field=[&](const RECT& r,Part part,const std::wstring& label,bool on){
@@ -2741,6 +3642,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             const int cancel=NpcCombo::ClampCancel(node.ms);
             Stepper(dc,graphics,s,index,editing?edit_.text+(caret?L"▏":L" ")+L" s":cancel?Seconds(cancel/1000.0):Tr(L"放完"));
             if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+            CheckRow(dc,graphics,s.toggle,node.own_look,hot_==Hit{Part::NodeToggle,index},Tr(node.own_look?L"不变身：动作套到当前外观上":L"不变身（动作套到主角）"));
             break;
         }
         case NodeType::Look: {
@@ -2753,13 +3655,29 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
         }
-        case NodeType::ForceHit: {
-            Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
-            const bool field_hot=hot_==Hit{Part::NodeField,index};
-            Rounded(graphics,s.field,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),ModColor(node.type),field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),ModColor(node.type),30),255);
-            RECT inner=s.field; InflateRect(&inner,-Px(7),0);
-            Label(dc,Tr(NpcCombo::HitKindLabel(node.hit))+L"  ▾",inner,Scaled(UiTheme::Font::Body),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
-            Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        case NodeType::ForceHit: case NodeType::Air: case NodeType::AirDefault: {
+            // 强制受击: its kind (and 击飞's height); 滞空: its four values; 空中释放 (the chain's setting): its switch, then them.
+            const bool setting=node.type==NodeType::AirDefault;
+            const COLORREF hue=setting?UiTheme::Mix(UiTheme::Accent(),muted,30):ModColor(node.type);
+            if (setting) Card(dc,graphics,s,hue,CardTitle(i),selected,false,!node.on,false,false);
+            else Card(dc,graphics,s,hue,CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            const auto field=[&](const RECT& r,Part part,const std::wstring& label){
+                const bool field_hot=hot_==Hit{part,index};
+                Rounded(graphics,r,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);
+                RECT inner=r; InflateRect(&inner,-Px(7),0);
+                Label(dc,label+L"  ▾",inner,Scaled(UiTheme::Font::Body),setting&&!node.on?muted:text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            };
+            int note_row=1;
+            if (node.type==NodeType::ForceHit) {
+                field(s.field,Part::NodeField,Tr(NpcCombo::HitKindLabel(node.hit)));
+                if (LaunchShown(node)) { field(s.field2,Part::NodeField2,LaunchText(node.launch)); note_row=2; }
+            } else {
+                if (setting) CheckRow(dc,graphics,s.toggle,node.on,hot_==Hit{Part::NodeToggle,index},Tr(L"启用"));
+                field(s.field,Part::NodeField,AirText(-1,node.air_lift)); field(s.field2,Part::NodeField2,AirText(-2,node.air_hang));
+                field(s.field3,Part::NodeField3,AirText(-3,node.air_foe_lift)); field(s.field4,Part::NodeField4,AirText(-4,node.air_foe_hang));
+                note_row=setting?5:4;
+            }
+            Label(dc,NodeNote(i),Row(s.rect,note_row),Scaled(UiTheme::Font::Small),setting||pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
         }
         case NodeType::HeroLook:
@@ -2776,6 +3694,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                 Label(dc,GrabField(node)+L"  ▾",inner,Scaled(UiTheme::Font::Body),NodeGrab(node)?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             }
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            CheckRow(dc,graphics,s.toggle,node.own_look,hot_==Hit{Part::NodeToggle,index},Tr(node.own_look?L"不变身：动作套到当前外观上":L"不变身（动作套到主角）"));
             break;
         case NodeType::Armor: case NodeType::Interrupt: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::IgnoreGuard:
             Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
@@ -2805,8 +3724,9 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
         if (s.has_mod_in) ModPin(graphics,s.mod_in,pointed[i],hot_==Hit{Part::ModIn,index},ModColor(node.type));
         if (s.has_out) ExecPin(graphics,s.out,node.next>=0,hot_==Hit{Part::NodeOut,index},live[i]?text:muted);
     }
+    SelectObject(dc,old_pen);
     // Arrow heads over every card: an arrow never ends under a node.
-    arrows(ArrowPart::Head);
+    if (!overview) arrows(ArrowPart::Head);
     // The wire or arrow being drawn.
     if ((drag_.mode==Drag::Wire||drag_.mode==Drag::WireBack||drag_.mode==Drag::Arrow||drag_.mode==Drag::ArrowBack)&&drag_.moved&&At(drag_.index)) {
         const Shape& s=shapes[static_cast<size_t>(drag_.index)];
@@ -2837,6 +3757,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
     RestoreDC(dc,saved);
     Rounded(graphics,canvas_,static_cast<float>(m.S(10)),0,0,UiTheme::Mix(border,base,20),255);
 }
+void DrawPreview(HDC dc,Gdiplus::Graphics& graphics,const RECT& client);
 void Paint(HDC printed=nullptr) {
     // Laid out and framed on the first paint, when the page has its real size (not the size it was created at).
     if (HasSkin()&&canvas_.right>canvas_.left) {
@@ -2854,12 +3775,36 @@ void Paint(HDC printed=nullptr) {
         DrawButton(dc,graphics,Button::Toggle,config_.enabled,HasSkin());
         DrawButton(dc,graphics,Button::Toast,NpcCombo::ShowToast(),true);
         DrawButton(dc,graphics,Button::Dummy,dummy_present_,true);
-        Label(dc,Tr(L"Boss 招式"),tabs_title_,strong,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT);
+        Rounded(graphics,library_,static_cast<float>(m.S(10)),UiTheme::Base(),255,UiTheme::Border(),255);
+        Label(dc,Tr(L"添加到画布"),library_title_,strong,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT);
+        RECT tab_group=library_tabs_[0]; tab_group.right=library_tabs_[1].right; InflateRect(&tab_group,m.S(3),m.S(3));
+        Rounded(graphics,tab_group,static_cast<float>(m.S(8)),UiTheme::Mix(paper,UiTheme::Base(),65),255,UiTheme::Border(),255);
+        for (int i=0;i<2;++i) {
+            const RECT& rect=library_tabs_[i]; const bool on=library_tab_==i,hot=hot_==Hit{Part::LibraryTab,i};
+            Rounded(graphics,rect,static_cast<float>(m.S(6)),on?accent:UiTheme::Mix(paper,accent,hot?16:0),on||hot?255:0,0,0);
+            Label(dc,Tr(i==0?L"节点列表":L"武器列表"),rect,strong,on?UiTheme::Base():hot?text:muted,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+        }
+        if (library_tab_==0) Label(dc,Tr(L"节点分类"),library_category_title_,small_font,muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT);
+        for (int i=0;i<5;++i) {
+            const RECT& rect=node_categories_[i]; if (rect.right<=rect.left) continue;
+            const bool on=node_category_==i,hot=hot_==Hit{Part::NodeCategory,i};
+            Rounded(graphics,rect,static_cast<float>(m.S(4)),UiTheme::Mix(UiTheme::Base(),accent,on?20:hot?10:0),255,0,0);
+            if (on) { RECT mark{rect.left,rect.top+m.S(5),rect.left+m.S(3),rect.bottom-m.S(5)}; Rounded(graphics,mark,1.f,accent,255,0,0); }
+            RECT label=rect; label.left+=m.S(10); label.right-=m.S(4);
+            Label(dc,Tr(kNodeCategories[i]),label,small_font,on?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        }
+        RECT section=library_section_,count=section; count.left=count.right-m.S(70); section.right=count.left-m.S(4);
+        Label(dc,Tr(library_tab_==1?L"武器列表":kNodeCategories[node_category_]),section,small_font,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        wchar_t total[48]{}; _snwprintf_s(total,_countof(total),_TRUNCATE,Tr(L"共 %d 项").c_str(),library_items_);
+        Label(dc,total,count,small_font,muted,DT_SINGLELINE|DT_VCENTER|DT_RIGHT|DT_END_ELLIPSIS);
+        wchar_t page_text[64]{};
+        _snwprintf_s(page_text,_countof(page_text),_TRUNCATE,Tr(L"第 %d / %d 页").c_str(),library_pages_[LibrarySection()]+1,library_page_count_);
+        Label(dc,page_text,library_page_label_,small_font,text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
         for (size_t i=0;i<tabs_.size();++i) {
             const Tab& tab=tabs_[i]; const bool on=tab.kind==category_,hot=hot_==Hit{Part::Tab,static_cast<int>(i)};
             const COLORREF hue=tab.kind<0?accent:KindColor(static_cast<Kind>(tab.kind));
             Rounded(graphics,tab.rect,static_cast<float>(m.S(14)),UiTheme::Mix(paper,hue,on?38:hot?18:6),255,on?hue:UiTheme::Mix(UiTheme::Border(),paper,30),255,on?1.5f:1.f);
-            Label(dc,TabText(tab),tab.rect,on?Font(UiTheme::Font::Strong):small_font,on?text:UiTheme::Mix(hue,text,35),DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+            Label(dc,TabText(tab),tab.rect,on?Font(UiTheme::Font::Strong):small_font,on?text:UiTheme::Mix(hue,text,35),DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
         }
         if (!HasSkin()) Label(dc,Tr(L"没有外观，没有可列出的招式。"),strip_,small_font,muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT);
         {
@@ -2868,21 +3813,31 @@ void Paint(HDC printed=nullptr) {
             graphics.SetClip(Gdiplus::Rect(strip_area_.left,strip_area_.top,strip_area_.right-strip_area_.left,strip_area_.bottom-strip_area_.top));
             for (size_t i=0;i<pills_.size();++i) {
                 const Pill& pill=pills_[i];
-                if (pill.rect.right<strip_area_.left||pill.rect.left>strip_area_.right) continue;
+                if (pill.rect.right<=pill.rect.left||pill.rect.bottom<strip_area_.top||pill.rect.top>strip_area_.bottom) continue;
                 const bool hot=hot_==Hit{Part::Pill,static_cast<int>(i)};
                 const COLORREF hue=KindColor(pill.kind);
-                Rounded(graphics,pill.rect,static_cast<float>(m.S(15)),UiTheme::Mix(paper,hue,hot?30:14),255,UiTheme::Mix(paper,hue,hot?90:55),255);
+                Rounded(graphics,pill.rect,static_cast<float>(m.S(5)),UiTheme::Mix(paper,hue,hot?25:10),255,UiTheme::Mix(paper,hue,hot?90:40),255);
                 RECT inner=pill.rect; InflateRect(&inner,-m.S(10),0);
-                Label(dc,MoveText(pill.ability),inner,body,text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+                Label(dc,MoveText(pill.ability),inner,small_font,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             }
             graphics.ResetClip(); RestoreDC(dc,saved);
         }
         for (const auto& [rect,glyph,part]:{std::tuple{strip_left_,L"◀",Part::StripLeft},std::tuple{strip_right_,L"▶",Part::StripRight}}) {
             if (rect.right<=rect.left) continue;
-            Rounded(graphics,rect,static_cast<float>(m.S(8)),UiTheme::Mix(paper,UiTheme::Base(),hot_.part==part?20:45),255,UiTheme::Mix(UiTheme::Border(),paper,35),255);
-            Label(dc,glyph,rect,small_font,text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+            const bool enabled=part==Part::StripLeft?library_pages_[LibrarySection()]>0:library_pages_[LibrarySection()]+1<library_page_count_;
+            Rounded(graphics,rect,static_cast<float>(m.S(6)),UiTheme::Mix(paper,accent,enabled&&hot_.part==part?18:0),enabled?255:100,enabled?UiTheme::Border():UiTheme::Base(),255);
+            Label(dc,glyph,rect,small_font,enabled?text:UiTheme::Mix(muted,UiTheme::Base(),50),DT_SINGLELINE|DT_VCENTER|DT_CENTER);
         }
-        if (HasSkin()) DrawCanvas(dc,graphics);
+        if (HasSkin()) {
+            LARGE_INTEGER hz{},t0{},t1{}; QueryPerformanceFrequency(&hz); QueryPerformanceCounter(&t0);
+            DrawCanvas(dc,graphics);
+            QueryPerformanceCounter(&t1);
+            if (scratch_&&GetTickCount64()>=paint_logged_+1000) {  // a test chain shown: the canvas's paint time
+                paint_logged_=GetTickCount64();
+                Logf("COMBO_PAINT nodes=%zu zoom=%d%% overview=%d canvas=%.1f ms",config_.chain.size(),static_cast<int>(std::lround(Zoom()*100)),Overview()?1:0,
+                     (t1.QuadPart-t0.QuadPart)*1000.0/hz.QuadPart);
+            }
+        }
         else {
             Rounded(graphics,canvas_,static_cast<float>(m.S(10)),UiTheme::Base(),255,UiTheme::Border(),255);
             Label(dc,Tr(L"套用外观后可以编排。"),canvas_,small_font,muted,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
@@ -2897,7 +3852,7 @@ void Paint(HDC printed=nullptr) {
             graphics.SetClip(Gdiplus::Rect(weapons_.left,top,weapons_.right-weapons_.left,weapons_.bottom-m.S(4)-top));
             for (size_t i=0;i<weapon_rows_.size();++i) {
                 const WeaponRow& row=weapon_rows_[i];
-                if (row.rect.bottom<top||row.rect.top>weapons_.bottom) continue;
+                if (row.rect.right<=row.rect.left||row.rect.bottom<top||row.rect.top>weapons_.bottom) continue;
                 if (row.header) { Label(dc,row.name,row.rect,small_font,muted,DT_SINGLELINE|DT_BOTTOM|DT_LEFT); continue; }
                 const bool hot=hot_==Hit{Part::WeaponRow,static_cast<int>(i)};
                 if (hot) Rounded(graphics,row.rect,static_cast<float>(m.S(6)),UiTheme::Mix(UiTheme::Base(),WeaponColor(),22),255,UiTheme::Mix(UiTheme::Border(),WeaponColor(),40),255);
@@ -2909,7 +3864,7 @@ void Paint(HDC printed=nullptr) {
             }
             graphics.ResetClip(); RestoreDC(dc,saved);
         }
-        const bool any=At(selected_)&&!IsKey(selected_)&&!IsPreInputAt(selected_);
+        const bool any=At(selected_)&&!IsKey(selected_)&&!IsSettingAt(selected_);
         if (HasSkin()) for (const Button b:kTools) DrawButton(dc,graphics,b,false,b==Button::AutoDodge?!moves_.dodges.empty():b!=Button::Remove||any);
         if (search_.open) DrawSearch(dc,graphics);
         // A move being dragged from the strip.
@@ -2936,6 +3891,7 @@ void Paint(HDC printed=nullptr) {
             Label(dc,note,{footer_.left,footer_.top,footer_.left+used,footer_.bottom},small_font,run_.running?accent:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
         }
         Label(dc,hint_text_,{footer_.left+used,footer_.top,footer_.right,footer_.bottom},small_font,muted,DT_SINGLELINE|DT_VCENTER|DT_RIGHT|DT_END_ELLIPSIS);
+        DrawPreview(dc,graphics,client);  // 招式预览, over everything
     });
 }
 
@@ -2954,13 +3910,13 @@ void Refresh(bool force) {
     if (snapshot.chain!=game_chain_) { game_chain_=snapshot.chain; Layout(); }
     const int32_t want=pinned_==kFollowGame?snapshot.chain:pinned_;
     if (force||want!=skin_) {
-        skin_=want; Select(-1); drag_={}; search_.open=false; edit_={}; picked_.clear();
+        skin_=want; scratch_=false; Select(-1); drag_={}; search_.open=false; edit_={}; picked_.clear();
         if (!NpcRetarget::GetSkinMoves(skin_,moves_)) moves_={};
-        config_=HasSkin()?NpcCombo::Load(moves_.profile):NpcCombo::Config{};
+        config_=HasSkin()?NpcCombo::Load(moves_.profile):NpcCombo::Config{}; CloseCurve("another chain shown");
         seen_generation_=NpcCombo::Generation(); framed_=false; Layout();
-    } else if (HasSkin()&&NpcCombo::Generation()!=seen_generation_) {
+    } else if (HasSkin()&&!scratch_&&NpcCombo::Generation()!=seen_generation_) {
         // The file changed (another file picked, or edited on disk): the chain as it is now.
-        seen_generation_=NpcCombo::Generation(); config_=NpcCombo::Load(moves_.profile); Select(-1); Layout();
+        seen_generation_=NpcCombo::Generation(); config_=NpcCombo::Load(moves_.profile); CloseCurve("the chain file changed"); Select(-1); Layout();
     }
     if (skin_==-1&&GetTickCount64()>=hero_check_) {
         // The hero's moves are read in game every few seconds.
@@ -2985,6 +3941,7 @@ std::vector<int> DragMovers() {
 void DragMove(POINT p) {
     cursor_=p;
     if (drag_.mode==Drag::None) return;
+    if (drag_.mode==Drag::Trim) { if (drag_.moved||Moved(p)) UpdateTrimDrag(p); return; }
     if (!drag_.moved&&!Moved(p)) return;
     drag_.moved=true;
     // Whole canvas units moved since the press, so slow drags are not lost to rounding.
@@ -3029,6 +3986,7 @@ void DragMove(POINT p) {
     Invalidate();
 }
 void DragEnd(POINT p) {
+    if (drag_.mode==Drag::Trim&&Moved(p)) UpdateTrimDrag(p);
     const DragState done=drag_; drag_={};
     if (GetCapture()==window_) ReleaseCapture();
     if (!done.moved) {
@@ -3039,6 +3997,7 @@ void DragEnd(POINT p) {
         Invalidate(); return;
     }
     switch (done.mode) {
+    case Drag::Trim: Save(); Invalidate(); break;
     case Drag::Node: {
         const HDC dc=GetDC(window_);
         drag_.index=done.index; const std::vector<int> movers=DragMovers(); drag_.index=-1;
@@ -3134,10 +4093,13 @@ void PressAt(POINT p,bool alt,WPARAM keys=0) {
     SetFocus(window_);
     const Hit hit=HitTest(p);
     if (search_.open&&hit.part!=Part::Search) { CloseSearch(); return; }  // a click outside closes the search
-    if (edit_.node>=0&&!(hit.part==Part::NodeValue&&hit.index==edit_.node)) CommitEdit();  // a click elsewhere keeps the typed value
+    const bool same_value=hit.index==edit_.node&&((hit.part==Part::NodeValue&&edit_.hold==-2)||(hit.part==Part::NodeHoldValue&&edit_.hold==-1)||
+                                                  (hit.part==Part::RouteHoldValue&&edit_.hold>=0&&hit.sub==edit_.hold));
+    if (edit_.node>=0&&!same_value) CommitEdit();  // a click elsewhere keeps the typed value
     pressed_=hit;
     switch (hit.part) {
     case Part::Search: SearchPick(hit.index); return;
+    case Part::NodeTrimBar: if (PrepareTrimDrag(hit.index,p)) SetCapture(window_); break;
     case Part::Pill: BeginDrag(Drag::Pill,hit,p,hit.index); break;
     case Part::WeaponRow: BeginDrag(Drag::WeaponRow,hit,p,hit.index); break;
     case Part::NodeOut: if (alt) BreakPin(hit); else { BeginDrag(Drag::Wire,hit,p,hit.index); Select(hit.index); } break;
@@ -3168,6 +4130,14 @@ bool SearchKey(WPARAM key) {
     default: return true;  // every other key belongs to the search box while it is open
     }
 }
+bool WheelValue(const Hit& hit,int steps) {
+    if (hit.part==Part::NodeValue||hit.part==Part::NodeMinus||hit.part==Part::NodePlus) Nudge(hit.index,steps);
+    else if (hit.part==Part::NodeHoldValue||hit.part==Part::NodeHoldMinus||hit.part==Part::NodeHoldPlus) NudgeHold(hit.index,steps,-1);
+    else if (hit.part==Part::RouteValue||hit.part==Part::RouteMinus||hit.part==Part::RoutePlus) Nudge(hit.index,steps,hit.sub);
+    else if (hit.part==Part::RouteHoldValue||hit.part==Part::RouteHoldMinus||hit.part==Part::RouteHoldPlus) NudgeHold(hit.index,steps,hit.sub);
+    else return false;
+    return true;
+}
 LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
     switch (message) {
     case WM_ERASEBKGND: return 1;
@@ -3181,7 +4151,7 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
         cursor_=p;
         const Hit hit=HitTest(p);
         if (!(hit==hot_)) { hot_=hit; Invalidate(); }
-        if (search_.open) { const int row=SearchRowAt(p); if (row!=search_.hot) { search_.hot=row; Invalidate(); } }
+        if (search_.open) { const int row=SearchRowAt(p); if (row!=search_.hot) { search_.hot=row; if (row>=0) search_.keyed=false; Invalidate(); } }
         TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,window,0}; TrackMouseEvent(&track);
         return 0;
     }
@@ -3189,6 +4159,7 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
     case WM_SETCURSOR:
         if (LOWORD(lparam)==HTCLIENT) {
             const Part part=hot_.part;
+            if (drag_.mode==Drag::Trim||part==Part::NodeTrimBar) { SetCursor(LoadCursorW(nullptr,IDC_SIZEWE)); return TRUE; }
             if (drag_.mode==Drag::Resize||part==Part::GroupResize) { SetCursor(LoadCursorW(nullptr,IDC_SIZENWSE)); return TRUE; }
             if (drag_.mode==Drag::Box) { SetCursor(LoadCursorW(nullptr,IDC_CROSS)); return TRUE; }
             if (drag_.mode==Drag::Pan||drag_.mode==Drag::Node) { SetCursor(LoadCursorW(nullptr,IDC_SIZEALL)); return TRUE; }
@@ -3212,21 +4183,18 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
         return 0;
     }
     case WM_RBUTTONUP: case WM_MBUTTONUP: if (drag_.mode==Drag::Pan) DragEnd({GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)}); return 0;
-    case WM_CAPTURECHANGED: if (drag_.mode!=Drag::None&&reinterpret_cast<HWND>(lparam)!=window) { drag_={}; Invalidate(); } return 0;
+    case WM_CAPTURECHANGED: if (drag_.mode!=Drag::None&&reinterpret_cast<HWND>(lparam)!=window) { const bool save=drag_.mode==Drag::Trim&&drag_.moved; drag_={}; if (save) Save(); Invalidate(); } return 0;
     case WM_MOUSEWHEEL: {
         POINT p{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)}; ScreenToClient(window,&p);
         const int steps=GET_WHEEL_DELTA_WPARAM(wparam)>0?1:-1;
         if (search_.open&&PtInRect(&search_.rect,p)) {
             search_.scroll=std::clamp(search_.scroll-steps*3,0,(std::max)(0,static_cast<int>(search_.rows.size())-SearchVisible())); Invalidate(); return 0;
         }
-        if (PtInRect(&strip_,p)&&strip_left_.right>strip_left_.left) { ScrollStrip(steps>0?-M().S(160):M().S(160)); return 0; }
-        if (HasSkin()&&PtInRect(&weapons_,p)) { weapon_scroll_-=steps*M().S(90); Layout(); Invalidate(); return 0; }
+        if (PtInRect(&library_,p)) { ScrollStrip(-steps); return 0; }
         if (!HasSkin()||!PtInRect(&canvas_,p)) break;  // the hub scrolls the page
         const Hit hit=HitTest(p);
         CommitEdit();
-        if (hit.part==Part::NodeValue||hit.part==Part::NodeMinus||hit.part==Part::NodePlus) Nudge(hit.index,steps);
-        else if (hit.part==Part::RouteValue||hit.part==Part::RouteMinus||hit.part==Part::RoutePlus) Nudge(hit.index,steps,hit.sub);
-        else ZoomAt(p,steps);
+        if (!WheelValue(hit,steps)) ZoomAt(p,steps);
         return 0;
     }
     case WM_GETDLGCODE: return DLGC_WANTARROWS|DLGC_WANTTAB|DLGC_WANTCHARS|(search_.open||edit_.node>=0||record_.node>=0?DLGC_WANTALLKEYS:0);
@@ -3268,12 +4236,299 @@ HWND CreatePage(HWND parent) {
         window_=CreateWindowExW(0,kClass,L"招式派生",WS_CHILD|WS_TABSTOP,0,0,800,650,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
         if (!window_) return nullptr;
         language_=UiI18n::GetLanguage();
-        DebugHub::Attach(window_,parent,460,600);
+        DebugHub::Attach(window_,parent,720,600);
     }
     Refresh(true); return window_;
 }
+namespace {
+// A move row of the open search box: the one under the mouse, else the one picked with the keys. 招式 rows are this
+// page's look's moves; a BOSS 技能 / 援护 node's 招式 rows are its look's.
+// 投技 previews: a grab stands in the preview's look row as kGrabSkin with "grab:<variant id>" for its move.
+constexpr int32_t kGrabSkin=-100;
+const char kGrabPrefix[]="grab:";
+bool SearchMoveRow(int32_t& skin,std::string& ability,RECT& anchor) {
+    const int row=search_.hot>=0?search_.hot:(search_.keyed?search_.selected:-1);
+    if (row<0||static_cast<size_t>(row)>=search_.rows.size()||search_.rows[static_cast<size_t>(row)].header) return false;
+    const size_t index=search_.rows[static_cast<size_t>(row)].item;
+    if (index>=search_.items.size()||search_.items[index].ability.empty()) return false;
+    const Item& item=search_.items[index];
+    if (item.kind==ItemKind::Move) skin=skin_;
+    else if (item.kind==ItemKind::BossMove&&At(search_.pick_node)) skin=BossLookRow(config_.chain[static_cast<size_t>(search_.pick_node)].boss);
+    else if (item.kind==ItemKind::GrabMove) skin=kGrabSkin;  // a 投技 node's list of grabs
+    else return false;
+    const int row_h=M().S(26),top=search_.list.top+(row-search_.scroll)*row_h;
+    if (row<search_.scroll||top+row_h>search_.list.bottom) return false;  // scrolled out of the list
+    ability=skin==kGrabSkin?kGrabPrefix+item.ability:item.ability; anchor={search_.list.left,top,search_.list.right,top+row_h};
+    return skin>=0||skin==kGrabSkin;
+}
+// The move under the mouse: a pill of the strip (this page's look) or a move card (a BOSS 技能 / 援护 card: its own look),
+// or a move row of the search box (beside).
+// The move a 加速 node speeds up, for its preview: the first move pointing at it, else the first move of a trigger
+// pointing at it (-1: none).
+int MoveUnderSpeed(int speed_node) {
+    const auto move=[&](int i){ const Node* n=At(i); return n&&((n->type==NodeType::Skill&&!n->ability.empty())||(NpcCombo::PicksBossMove(*n)&&!n->ability.empty()&&!n->boss.empty())); };
+    for (size_t i=0;i<config_.chain.size();++i) if (config_.chain[i].mods[NpcCombo::kModSpeed]==speed_node&&move(static_cast<int>(i))) return static_cast<int>(i);
+    for (size_t i=0;i<config_.chain.size();++i)
+        if (config_.chain[i].mods[NpcCombo::kModSpeed]==speed_node&&NpcCombo::StartsChain(config_.chain[i])&&move(config_.chain[i].next)) return config_.chain[i].next;
+    return -1;
+}
+bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int& index) {
+    beside=false; index=-1;
+    if (test_hover_.on&&test_hover_.node>=0) {  // a BOSS 技能 card, or a 裁剪 card (its move)
+        const Node* hovered=At(test_hover_.node);
+        const int source=hovered&&hovered->type==NodeType::Trim?NpcCombo::TrimmedBy(config_,test_hover_.node):test_hover_.node;
+        const Node* n=At(source); if (!n||!NpcCombo::PicksBossMove(*n)||n->ability.empty()||n->boss.empty()) return false;
+        skin=BossLookRow(n->boss); ability=n->ability; index=source;
+        const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(test_hover_.node)).rect; ReleaseDC(window_,dc);
+        return skin>=0;
+    }
+    if (test_hover_.on) {
+        const LONG mid=(canvas_.left+canvas_.right)/2;
+        skin=test_hover_.skin; ability=test_hover_.ability; anchor={mid-60,canvas_.top+M().S(8),mid+60,canvas_.top+M().S(40)};
+        return true;
+    }
+    if ((drag_.mode!=Drag::None&&drag_.mode!=Drag::Trim)||edit_.node>=0||record_.node>=0) return false;
+    if (search_.open) { beside=true; return SearchMoveRow(skin,ability,anchor); }
+    if (hot_.part==Part::Pill&&hot_.index>=0&&static_cast<size_t>(hot_.index)<pills_.size()) {
+        skin=skin_; ability=pills_[static_cast<size_t>(hot_.index)].ability; anchor=pills_[static_cast<size_t>(hot_.index)].rect; return skin>=0&&!ability.empty(); }
+    // A 加速 card (or its open curve window's node) shows the move it speeds up, at its speed.
+    const bool on_speed=hot_.index>=0&&At(hot_.index)&&config_.chain[static_cast<size_t>(hot_.index)].type==NodeType::Speed&&
+                        (hot_.part==Part::Node||hot_.part==Part::NodeField2||hot_.part==Part::NodeValue);
+    if (on_speed||(SpeedCurveWindow::EditedNode()>=0&&hot_.part==Part::None&&At(SpeedCurveWindow::EditedNode()))) {
+        const int from=on_speed?hot_.index:SpeedCurveWindow::EditedNode(),move=MoveUnderSpeed(from);
+        const Node* n=At(move); if (!n) return false;
+        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss); ability=n->ability; index=move;
+        const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(from)).rect; ReleaseDC(window_,dc);
+        return skin>=0;
+    }
+    // A 裁剪 card (its steppers too) shows the BOSS 技能 it cuts, only its part, as the chain plays it.
+    if (hot_.index>=0&&At(hot_.index)&&config_.chain[static_cast<size_t>(hot_.index)].type==NodeType::Trim&&hot_.part>=Part::Node&&hot_.part<=Part::NodeTrimBar) {
+        const int source=NpcCombo::TrimmedBy(config_,hot_.index);
+        const Node* n=At(source); if (!n||n->ability.empty()||n->boss.empty()) return false;
+        skin=BossLookRow(n->boss); ability=n->ability; index=source;
+        const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
+        return skin>=0;
+    }
+    if (hot_.part!=Part::Node||!At(hot_.index)) return false;
+    const Node& node=config_.chain[static_cast<size_t>(hot_.index)];
+    index=hot_.index;
+    if (node.type==NodeType::Grab&&!node.ability.empty()) {  // 投技: its grab
+        skin=kGrabSkin; ability=kGrabPrefix+node.ability;
+        const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
+        return true;
+    }
+    if (node.type==NodeType::Skill&&!node.ability.empty()) { skin=skin_; ability=node.ability; }
+    else if (NpcCombo::PicksBossMove(node)&&!node.ability.empty()&&!node.boss.empty()) { skin=BossLookRow(node.boss); ability=node.ability; }
+    else return false;
+    const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
+    return skin>=0;
+}
+void HidePreview() {
+    if (preview_.asked) { MovePreview::Hide(); Invalidate(); }
+    if (preview_hole_) { DebugHub::SetPreviewHole(nullptr); preview_hole_=false; preview_hole_rect_={}; }
+    preview_={}; preview_frame_={}; preview_image_={};
+}
+// 实时预览: tells the game where the card's picture is (game client pixels) and, once the game draws the stage there
+// itself (Frame::live), cuts the hub's hole over it. Without a hub that can have one: no place, read-back frames.
+void SyncLiveView() {
+    RECT screen{},client{};
+    const bool want=preview_.asked&&!IsRectEmpty(&preview_image_)&&DebugHub::PreviewHoleSupported();
+    if (want) {
+        screen=preview_image_; MapWindowPoints(window_,nullptr,reinterpret_cast<POINT*>(&screen),2);
+        const RECT game=UiHost::ClientScreen(); client=screen; OffsetRect(&client,-game.left,-game.top);
+    }
+    MovePreview::Place(client);
+    const bool hole=want&&preview_frame_.live;
+    if (hole!=preview_hole_||(hole&&!EqualRect(&screen,&preview_hole_rect_))) {
+        DebugHub::SetPreviewHole(hole?&screen:nullptr); preview_hole_=hole; preview_hole_rect_=hole?screen:RECT{};
+    }
+}
+void UpdatePreview() {
+    int32_t skin=-1; std::string ability; RECT anchor{}; bool beside=false; int index=-1;
+    if (!HoverMove(skin,ability,anchor,beside,index)) { if (preview_.asked||preview_.since) HidePreview(); return; }
+    const ULONGLONG now=GetTickCount64();
+    if (skin!=preview_.skin||ability!=preview_.ability) { HidePreview(); preview_.skin=skin; preview_.ability=ability; preview_.since=now; }
+    // The move's 加速 (its curve too), as the chain plays it: a change goes to the playing preview at once.
+    // Its 裁剪 too: only that part plays, the 加速 (and its curve) over it.
+    int speed=100,trim_from=0,trim_to=0; std::vector<NpcCombo::CurvePoint> curve;
+    if (index>=0) {
+        const int trigger=NpcCombo::TriggerOf(config_,static_cast<size_t>(index));
+        const Node* mod=NpcCombo::SpeedNodeFor(config_,trigger,index);
+        if (NpcCombo::CurveOn(mod)) curve=mod->points; else speed=NpcCombo::SpeedFor(config_,trigger,index);
+        const NpcCombo::TrimRange trim=NpcCombo::TrimFor(config_,index);
+        if (trim.on) { trim_from=static_cast<int>(std::lround(trim.from*1000)); trim_to=static_cast<int>(std::lround(trim.to*1000)); }
+    }
+    const bool changed=speed!=preview_.speed||trim_from!=preview_.trim_from||trim_to!=preview_.trim_to||curve.size()!=preview_.curve.size()||
+                       !std::equal(curve.begin(),curve.end(),preview_.curve.begin(),[](const NpcCombo::CurvePoint& a,const NpcCombo::CurvePoint& b){ return a.t==b.t&&a.speed==b.speed; });
+    preview_.node=index; preview_.speed=speed; preview_.curve=curve; preview_.trim_from=trim_from; preview_.trim_to=trim_to;
+    if (!EqualRect(&anchor,&preview_.anchor)||beside!=preview_.beside) { preview_.anchor=anchor; preview_.beside=beside; if (preview_.asked) Invalidate(); }
+    if (!preview_.asked&&!preview_.none&&now>=preview_.since+kPreviewDelayMs) {
+        std::string monster,package;
+        if (skin==kGrabSkin) {
+            // 投技: the boss of the look that plays the grab, playing the grab's executor montage (no target to grab).
+            const MotianGrab::Variant* v=NodeGrab([&]{ Node n; n.ability=ability.substr(std::strlen(kGrabPrefix)); return n; }());
+            if (!v||!NpcRetarget::GrabPreviewMonster(v->boss_id,v->source,monster)||(package=MotianGrab::PreviewMontage(v->index)).empty()) { preview_.none=true; return; }
+        } else if (!NpcRetarget::MovePreviewSubject(skin,ability,monster,package)) { preview_.none=true; return; }  // the hero's moves: none
+        MovePreview::Show(monster,package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to); preview_.asked=true; preview_.monster=monster; preview_.package=package; preview_frame_={}; Invalidate();
+    } else if (preview_.asked&&changed&&!preview_.monster.empty()) {
+        MovePreview::Show(preview_.monster,preview_.package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to); Invalidate();
+    }
+    if (preview_.asked&&MovePreview::Latest(preview_frame_,preview_frame_.serial)) InvalidateRect(window_,&preview_rect_,FALSE);
+    SyncLiveView();
+}
+// The card: the stage's picture (or what it is doing), the move's name under it; under its pill / card, or over it
+// when there is no room below. For a search box row: by the box, on its side with more room (smaller, down to half
+// size, to fit there), level with the row.
+void DrawPreview(HDC dc,Gdiplus::Graphics& graphics,const RECT& client) {
+    if (!preview_.asked) return;
+    const auto m=M();
+    const bool beside=preview_.beside&&search_.open;
+    const int pad=m.S(6),caption=m.S(24),gap=m.S(6);
+    const RECT& box=search_.rect;
+    const int right_room=static_cast<int>(client.right)-gap-(static_cast<int>(box.right)+gap),left_room=static_cast<int>(box.left)-gap-(static_cast<int>(client.left)+gap);
+    double fit=1;
+    if (beside) fit=std::clamp(double((std::max)(right_room,left_room)-pad*2)/m.S(MovePreview::kWidth),0.5,1.0);
+    const int w=static_cast<int>(m.S(MovePreview::kWidth)*fit),h=static_cast<int>(m.S(MovePreview::kHeight)*fit);
+    const int cw=w+pad*2,ch=h+pad*2+caption;
+    const RECT& a=preview_.anchor;
+    int left=(a.left+a.right)/2-cw/2; left=(std::max)(static_cast<int>(client.left)+gap,(std::min)(left,static_cast<int>(client.right)-cw-gap));
+    int top=a.bottom+gap; if (top+ch>client.bottom-gap) top=(std::max)(static_cast<int>(client.top)+gap,static_cast<int>(a.top)-gap-ch);
+    if (beside) {
+        left=right_room>=cw||right_room>=left_room?static_cast<int>(box.right)+gap:static_cast<int>(box.left)-gap-cw;
+        left=(std::max)(static_cast<int>(client.left)+gap,(std::min)(left,static_cast<int>(client.right)-cw-gap));
+        top=(a.top+a.bottom)/2-ch/2;
+        top=(std::max)(static_cast<int>(client.top)+gap,(std::min)(top,static_cast<int>(client.bottom)-ch-gap));
+    }
+    const RECT card{left,top,left+cw,top+ch};
+    Rounded(graphics,card,static_cast<float>(m.S(10)),UiTheme::Base(),250,UiTheme::Mix(UiTheme::Border(),UiTheme::Accent(),35),255,1.5f);
+    const RECT image{card.left+pad,card.top+pad,card.left+pad+w,card.top+pad+h};
+    preview_image_=image;
+    const bool picture=preview_frame_.pixels.size()==static_cast<size_t>(MovePreview::kWidth)*MovePreview::kHeight;
+    if (preview_frame_.live) {
+        // The game draws the stage here itself, under the hub's hole (SyncLiveView): only a dark fill until the hole is cut.
+        Rounded(graphics,image,1.0f,RGB(16,16,18),255,RGB(16,16,18),0);
+    } else if (picture) {
+        Gdiplus::Bitmap bitmap(MovePreview::kWidth,MovePreview::kHeight,MovePreview::kWidth*4,PixelFormat32bppRGB,reinterpret_cast<BYTE*>(preview_frame_.pixels.data()));
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+        graphics.DrawImage(&bitmap,static_cast<INT>(image.left),static_cast<INT>(image.top),static_cast<INT>(w),static_cast<INT>(h));
+    } else {
+        Rounded(graphics,image,static_cast<float>(m.S(6)),UiTheme::Mix(UiTheme::Base(),RGB(128,128,128),35),255,UiTheme::Border(),0);
+        Label(dc,preview_frame_.status.empty()?Tr(L"正在载入招式…"):Tr(preview_frame_.status.c_str()),image,Font(UiTheme::Font::Small),UiTheme::MutedText(),DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+    }
+    RECT name{card.left+pad,image.bottom,card.right-pad,card.bottom};
+    std::wstring pace;
+    if (preview_.curve.size()>=2) pace=Tr(L"曲线")+L" "+SpeedText(static_cast<int>(std::lround(NpcCombo::CurveMeanSpeed(preview_.curve))));
+    else if (preview_.speed!=100) pace=SpeedText(preview_.speed);
+    if (preview_.trim_from>0||preview_.trim_to>0) {  // 裁剪: the part that plays
+        wchar_t part[64]{};
+        if (preview_.trim_to>0) _snwprintf_s(part,_countof(part),_TRUNCATE,Tr(L"裁剪 %.2f–%.2f s").c_str(),preview_.trim_from/1000.0,preview_.trim_to/1000.0);
+        else _snwprintf_s(part,_countof(part),_TRUNCATE,Tr(L"裁剪 %.2f s 起").c_str(),preview_.trim_from/1000.0);
+        pace=pace.empty()?std::wstring(part):std::wstring(part)+L" · "+pace;
+    }
+    if (!pace.empty()) {
+        const SIZE size=Extent(dc,Font(UiTheme::Font::Small),pace);
+        RECT right=name; right.left=right.right-size.cx; name.right=right.left-m.S(8);
+        Label(dc,pace,right,Font(UiTheme::Font::Small),UiTheme::Accent(),DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
+    }
+    std::wstring title=MoveText(preview_.ability);
+    if (preview_.skin==kGrabSkin) {
+        Node n; n.ability=preview_.ability.substr(std::strlen(kGrabPrefix));
+        const MotianGrab::Variant* v=NodeGrab(n);
+        title=Tr(L"投技")+L" · "+(v?v->name+L"（"+v->boss_name+L"）":Tr(L"（无效招式）"));
+    }
+    Label(dc,title,name,Font(UiTheme::Font::Small),UiTheme::Text(),DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+    preview_rect_=card;
+}
+double Ms(const LARGE_INTEGER& a,const LARGE_INTEGER& b) { LARGE_INTEGER hz{}; QueryPerformanceFrequency(&hz); return (b.QuadPart-a.QuadPart)*1000.0/hz.QuadPart; }
+// combo scratch / combo zoom (see scratch_lock_), on the page's thread. "big <n>": n moves in a row under the key, a
+// 加速 on every 10th, laid out by 整理; its layout and hit test times go to the log.
+void ApplyScratch() {
+    AcquireSRWLockExclusive(&scratch_lock_);
+    const bool asked=scratch_asked_; const std::string ask=scratch_ask_; const int zoom=zoom_ask_; scratch_asked_=false; zoom_ask_=0;
+    ReleaseSRWLockExclusive(&scratch_lock_);
+    if (asked&&HasSkin()) {
+        CloseCurve("a test chain shown"); Select(-1); drag_={}; search_.open=false; edit_={}; picked_.clear();
+        if (ask=="off") {
+            scratch_=false; config_=NpcCombo::Load(moves_.profile); seen_generation_=NpcCombo::Generation();
+            Logf("COMBO_SCRATCH off: the look's chain again");
+        } else {
+            if (ask.rfind("big ",0)==0) {
+                const int moves=std::clamp(std::atoi(ask.c_str()+4),1,static_cast<int>(NpcCombo::kMaxNodes)-200);
+                NpcCombo::Config big=NpcCombo::Decode(L"E1");
+                int last=NpcCombo::KeyTrigger(big);
+                for (int i=0;i<moves&&last>=0;++i) {
+                    Node n; n.type=NodeType::Skill; n.ability=moves_.skills.empty()?"GA_Test":moves_.skills[static_cast<size_t>(i)%moves_.skills.size()];
+                    const int added=NpcCombo::InsertAfter(big,last,n); if (added<0) break;
+                    last=added;
+                    if (i%10==0) { big.chain.push_back(NpcCombo::ModifierNode(NodeType::Speed,0,0)); NpcCombo::LinkModifier(big,added,static_cast<int>(big.chain.size())-1); }
+                }
+                big.placed=false;
+                config_=big;
+            } else config_=NpcCombo::Decode(std::wstring(ask.begin(),ask.end()));
+            scratch_=true;
+            Logf("COMBO_SCRATCH on: %zu nodes, in memory only (never saved)",config_.chain.size());
+        }
+        Layout();
+        if (canvas_.right>canvas_.left) {
+            LARGE_INTEGER t0{},t1{},t2{},t3{},t4{};
+            QueryPerformanceCounter(&t0); if (!config_.placed) Arrange(); QueryPerformanceCounter(&t1);
+            Frame(false); framed_=true;
+            const HDC dc=GetDC(window_);
+            const auto shapes=[&]{ size_t sum=0; for (size_t i=0;i<config_.chain.size();++i) sum+=static_cast<size_t>(NodeShape(dc,i).rect.right); return sum; };
+            sizes_.clear(); owners_.clear(); widths_.clear();
+            QueryPerformanceCounter(&t2); size_t sum=shapes(); QueryPerformanceCounter(&t3);
+            sizes_.clear(); owners_.clear(); sum+=shapes(); QueryPerformanceCounter(&t4);
+            LARGE_INTEGER t5{}; sum+=shapes(); QueryPerformanceCounter(&t5);
+            ReleaseDC(window_,dc);
+            Logf("COMBO_SCRATCH layout %.1f ms; every card's shape: %.1f ms measuring all text, %.1f ms re-measured (widths kept), %.2f ms with the sizes kept (%zu)",
+                 Ms(t0,t1),Ms(t2,t3),Ms(t3,t4),Ms(t4,t5),sum%10);
+        }
+        Invalidate();
+    }
+    if (zoom<0&&HasSkin()) { Frame(); Logf("COMBO_SCRATCH frame all: zoom %d%%",static_cast<int>(std::lround(Zoom()*100))); }
+    else if (zoom>0) {
+        for (int i=0;i<static_cast<int>(std::size(kZooms));++i) if (std::lround(kZooms[i]*100)==zoom) zoom_index_=i;
+        Logf("COMBO_SCRATCH zoom %d%%",static_cast<int>(std::lround(Zoom()*100))); Invalidate();
+    }
+}
+}  // namespace
+bool HandleCommand(const char* arguments) {
+    char verb[32]{},first[160]{}; int skill=0;
+    const int read=sscanf_s(arguments?arguments:"","%31s %159s %d",verb,static_cast<unsigned>(sizeof(verb)),first,static_cast<unsigned>(sizeof(first)),&skill);
+    if (read>=1&&!std::strcmp(verb,"menu")) { DebugHub::ShowPage(DebugHub::Page::Combo); return true; }
+    if (read>=2&&!std::strcmp(verb,"handsoff")) { UiCursor::SetHandsOff(!std::strcmp(first,"on")); return true; }
+    if (read>=1&&!std::strcmp(verb,"curve")) { InterlockedExchange(&test_curve_,read>=2&&!std::strcmp(first,"close")?2:1); return true; }
+    if (read>=2&&!std::strcmp(verb,"scratch")) {  // combo scratch <Encode text> | big <n> | off
+        std::string rest=std::strstr(arguments,"scratch")+7;
+        while (!rest.empty()&&std::isspace(static_cast<unsigned char>(rest.front()))) rest.erase(rest.begin());
+        while (!rest.empty()&&std::isspace(static_cast<unsigned char>(rest.back()))) rest.pop_back();
+        AcquireSRWLockExclusive(&scratch_lock_); scratch_ask_=rest; scratch_asked_=true; ReleaseSRWLockExclusive(&scratch_lock_); return true;
+    }
+    if (read>=2&&!std::strcmp(verb,"zoom")) {  // combo zoom <percent> | all (显示全部)
+        AcquireSRWLockExclusive(&scratch_lock_); zoom_ask_=!std::strcmp(first,"all")?-1:std::atoi(first); ReleaseSRWLockExclusive(&scratch_lock_); return true;
+    }
+    if (read<2||std::strcmp(verb,"preview")) return false;
+    if (!std::strcmp(first,"off")) { test_hover_={}; return true; }
+    if (!std::strcmp(first,"node")) { if (read<3) return false; test_hover_={true,-1,{},skill}; return true; }  // combo preview node <n>
+    const int32_t skin=static_cast<int32_t>(std::strtol(first,nullptr,10));
+    NpcRetarget::SkinMoves look;
+    if (read<3||!NpcRetarget::GetSkinMoves(skin,look)||skill<1||static_cast<size_t>(skill)>look.skills.size()) return false;
+    test_hover_={true,skin,look.skills[static_cast<size_t>(skill-1)]};
+    return true;
+}
+void SetLogger(void (*log)(const char*)) { log_=log; }
 void Tick() {
-    if (!window_||!IsWindowVisible(window_)) { if (record_.node>=0) record_={}; return; }
+    if (const LONG curve=InterlockedExchange(&test_curve_,0)) TestCurve(curve==2);
+    SpeedCurveWindow::Tick(window_);  // closes itself when the page is hidden
+    static int curve_shown=-1;  // the node whose curve window was open at the last tick (COMBO_CURVE lines)
+    if (const int now=SpeedCurveWindow::EditedNode(); now!=curve_shown) {
+        if (now>=0) Logf("COMBO_CURVE window open node=%d",now);
+        else Logf("COMBO_CURVE window closed node=%d: %s",curve_shown,SpeedCurveWindow::LastClose());
+        curve_shown=now;
+    }
+    if (!window_||!IsWindowVisible(window_)) { if (record_.node>=0) record_={}; if (preview_.asked||preview_.since) HidePreview(); return; }
+    ApplyScratch();
+    UpdatePreview();
     if (record_.node>=0) {  // a pad press joins the recorded keys (every worker tick)
         const UiHotkeys::PadLevel level=UiHotkeys::CurrentPad();
         const unsigned pad=NpcCombo::PadCodeBits(level.buttons,level.stick);  // buttons, then the left stick's way (上推 / 下推 ...)
@@ -3384,6 +4639,14 @@ void Put(int node,int below) {
 }
 void Show(int node) { if (!At(node)) return; const Node& n=config_.chain[static_cast<size_t>(node)]; pan_x_=M().S(60)-n.x*Scale(); pan_y_=ToolsBottom()+M().S(20)-n.y*Scale(); Invalidate(); }
 size_t SearchRows() { return search_.rows.size(); }
+int SearchSelected() { return search_.selected; }
+POINT SearchRow(int row) {
+    const int row_h=M().S(26),top=search_.list.top+(row-search_.scroll)*row_h;
+    if (row<search_.scroll||top+row_h>search_.list.bottom||static_cast<size_t>(row)>=search_.rows.size()||search_.rows[static_cast<size_t>(row)].header) return {-1,-1};
+    return {(search_.list.left+search_.list.right)/2,top+row_h/2};
+}
+RECT SearchBox() { return search_.open?search_.rect:RECT{}; }
+RECT PreviewCard() { return preview_.asked?preview_rect_:RECT{}; }
 POINT WeaponRowOf(const char* id) {
     const int top=weapons_title_.bottom+M().S(4);
     for (const WeaponRow& row:weapon_rows_)
@@ -3397,14 +4660,34 @@ POINT Field4(int node) { return Middle(ShapeOf(node).field4); }
 POINT Header() { return Middle(header_); }
 std::string EditedProfile() { return moves_.profile; }
 POINT Toggle2(int node) { return Middle(ShapeOf(node).toggle2); }
+POINT Toggle(int node) { return Middle(ShapeOf(node).toggle); }
 int RecordingNode() { return record_.node; }
 int RecordingRoute() { return record_.node>=0?record_.route:-1; }
-void ScrollWeapons(int pixels) { weapon_scroll_+=pixels; Layout(); Invalidate(); }
+void ScrollWeapons(int pixels) { library_tab_=1; Layout(); ScrollStrip(pixels>0?1:-1); }
+void Library(int tab,int category) { library_tab_=std::clamp(tab,0,1); node_category_=std::clamp(category,0,4); Layout(); }
+RECT LibraryBox() { return library_; }
+RECT LibraryTabBox(int tab) { return tab>=0&&tab<2?library_tabs_[tab]:RECT{}; }
+RECT LibraryCategoryBox(int category) { return category>=0&&category<5?node_categories_[category]:RECT{}; }
+void LibraryTurn(int delta) { ScrollStrip(delta); }
+int LibraryPage() { return library_pages_[LibrarySection()]; }
+int LibraryPageCount() { return library_page_count_; }
+int ToolCategory(int button) { return NodeCategory(static_cast<Button>(button)); }
+RECT ToolBox(int button) { return button>=0&&button<static_cast<int>(Button::Count)?buttons_[button]:RECT{}; }
+void TrimPreviewAt(int node) { hot_={Part::NodeTrimBar,node}; UpdatePreview(); preview_.since=GetTickCount64()-kPreviewDelayMs; UpdatePreview(); }
+RECT TrimBarBox(int node) { return ShapeOf(node).field2; }
+POINT HoldValuePoint(int node) { return Middle(ShapeOf(node).hvalue); }
+bool ValueWheel(POINT p,int direction) { return WheelValue(HitTest(p),direction); }
+bool TrimBegin(int node,POINT p) { return HitTest(p)==Hit{Part::NodeTrimBar,node}&&PrepareTrimDrag(node,p); }
+void TrimMove(POINT p) { DragMove(p); }
+void TrimEnd(POINT p) { DragEnd(p); }
+int TrimValue(int node,bool end) { return At(node)?(end?At(node)->trim_to:At(node)->trim_from):-1; }
 POINT Resize(int node) { return Middle(ShapeOf(node).resize); }
 // An empty point in a frame's body (left, a little under the middle).
 POINT Body(int node) { const RECT r=ShapeOf(node).rect; return {r.left+(r.right-r.left)/6,r.top+(r.bottom-r.top)*11/20}; }
 }
 void Shutdown() {
+    SpeedCurveWindow::Close();
+    HidePreview();
     if (window_) DestroyWindow(window_);
     window_=nullptr; pills_.clear(); tabs_.clear(); skin_=-1; pinned_=kFollowGame; game_chain_=-1; moves_={}; config_={}; search_={}; DropFonts();
 }

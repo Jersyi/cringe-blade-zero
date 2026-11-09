@@ -10,6 +10,9 @@
 namespace UiCursor {
 namespace {
 std::atomic<bool> open_{false}, hold_{false};
+// Tests (combo handsoff on): the hub shows without touching the real mouse: no cursor shown or set, no capture
+// released, no clip to the game window, the raw mouse left as it is (the test driver runs the game in the background).
+std::atomic<bool> hands_off_{false};
 LONG hooks_ready_ = 0;
 int forced_ = 0;
 HWND subclass_hwnd_ = nullptr;
@@ -226,7 +229,38 @@ BOOL WINAPI GetHook(LPPOINT point) {
     }
     return real_get_ ? real_get_(point) : FALSE;
 }
+// Is the foreground window this process's (the game or a hub window)?
+bool OwnForeground() {
+    const HWND foreground = GetForegroundWindow(); if (!foreground) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(foreground, &pid); return pid == GetCurrentProcessId();
+}
+// A clip on the game's window (its client or window rect, a few pixels either way).
+bool GameClip(const RECT& clip) {
+    const HWND game = UiHost::Game(); if (!game) return false;
+    RECT box{}; if (!GetWindowRect(game, &box)) return false;
+    InflateRect(&box, 16, 16);
+    const bool whole = clip.left <= GetSystemMetrics(SM_XVIRTUALSCREEN) && clip.top <= GetSystemMetrics(SM_YVIRTUALSCREEN) &&
+                       clip.right >= GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) &&
+                       clip.bottom >= GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return !whole && clip.left >= box.left && clip.top >= box.top && clip.right <= box.right && clip.bottom <= box.bottom;
+}
+std::atomic<int> clip_releases_{0};
+// The game in the background never keeps the real cursor inside its window: a clip the game set while it was active
+// and did not lift (the hub open and the game paused when another window took the foreground: the user's mouse stayed
+// caught, 11-08) is lifted, and the game's own clip calls while it is in the background lift the clip instead. Only a
+// clip on the game's own window is touched; another program's is left alone.
+void ReleaseBackgroundClip() {
+    if (OwnForeground()) return;
+    RECT clip{}; if (!GetClipCursor(&clip) || !GameClip(clip)) return;
+    if (real_clip_) real_clip_(nullptr); else ClipCursor(nullptr);
+    if (log_ && clip_releases_.fetch_add(1, std::memory_order_relaxed) < 5) {
+        char line[200]{};
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "UI_CURSOR the game is in the background: its cursor clip %ld,%ld-%ld,%ld lifted", clip.left, clip.top, clip.right, clip.bottom);
+        log_(line);
+    }
+}
 BOOL WINAPI ClipHook(const RECT* rect) {
+    if (rect && !OwnForeground()) return real_clip_ ? real_clip_(nullptr) : FALSE;  // the game in the background: no clip
     if (Captured()) {
         const RECT screen = UiHost::ClientScreen();
         if (screen.right > screen.left && real_clip_) return real_clip_(&screen);
@@ -328,6 +362,11 @@ void SubclassGame() {
 }
 }
 void SetLogger(void (*log)(const char*)) { log_ = log; }
+bool HandsOff() { return hands_off_.load(std::memory_order_relaxed); }
+void SetHandsOff(bool on) {
+    hands_off_.store(on, std::memory_order_relaxed);
+    if (log_) log_(on ? "UI_CURSOR hands off: the hub leaves the real mouse alone (test)" : "UI_CURSOR hands off ended");
+}
 void Sync(bool open) {
     worker_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     EnsureHooks();
@@ -341,6 +380,8 @@ void AfterTick() {
     }
     EnsureHooks();
     SubclassGame();
+    ReleaseBackgroundClip();
+    if (open_.load(std::memory_order_relaxed) && hands_off_.load(std::memory_order_relaxed)) return;
     if (open_.load(std::memory_order_relaxed)) {
         CURSORINFO info{sizeof(info)};
         if (forced_ < 8 && (!GetCursorInfo(&info) || !(info.flags & CURSOR_SHOWING))) {
@@ -355,7 +396,7 @@ void AfterTick() {
         // and swallowed checkbox / button clicks and scroll-bar drags.
         if (const HWND capture = GetCapture(); capture && !ForeignCapture(capture)) ReleaseCapture();
         const RECT screen = UiHost::ClientScreen();
-        if (screen.right > screen.left) {
+        if (screen.right > screen.left && OwnForeground()) {  // never while another program has the foreground
             if (real_clip_) real_clip_(&screen);
             else ClipCursor(&screen);
         }

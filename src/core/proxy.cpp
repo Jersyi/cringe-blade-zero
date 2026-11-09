@@ -32,10 +32,15 @@
 #include "boss_ai.h"
 #include "boss_ai_menu.h"
 #include "test_dummy.h"
+#include "boss_assist.h"
+#include "move_preview.h"
 #include "entry_focus.h"
 #include "npc_retarget.h"
 #include "npc_menu.h"
 #include "combo_menu.h"
+#include "net_steam.h"
+#include "net_puppet.h"
+#include "net_page.h"
 #include "air_skills.h"
 #include "air_skills_menu.h"
 #include "motian_grab.h"
@@ -215,8 +220,13 @@ void DispatchGameThread() {
     BossRush::OnGameThreadGuarded();
     BossAI::OnGameThreadGuarded();
     if (!BossRush::IsTransitioning()) TestDummy::OnGameThreadGuarded();  // 测试木桩 (招式派生 page)
+    if (!BossRush::IsTransitioning()) BossAssist::OnGameThreadGuarded();  // BOSS 援护
+    if (!BossRush::IsTransitioning()) MovePreview::OnGameThreadGuarded();  // 招式预览 (招式派生 page)
+    NetSteam::OnGameThreadGuarded();                                          // 联机测试: Steam room and messages
+    NetPuppet::OnGameThreadGuarded(BossRush::IsTransitioning());              // 联机测试: the puppet
     DebugSupplement::OnGameThreadGuarded();
-    HubPause::OnGameThread(BossRush::IsTransitioning());
+    // A 招式预览 needs the world running; it holds the hero and the enemies still itself (MovePreview::HoldsGameplay).
+    HubPause::OnGameThread(BossRush::IsTransitioning() || MovePreview::NeedsWorld() || DebugSupplement::NeedsWorld());
     TitleControl::OnGameThread();
     if (!BossRush::IsTransitioning() && groom_faults < GameThread::kMaxFaults && !GuardedGroomTick()) { ++groom_faults; ReportGroomFault(); }
 }
@@ -272,6 +282,8 @@ void PollCommand(HairControls& controls) {
     else if (!std::strcmp(text, "supplement")) ok = DebugSupplement::HandleCommand(text, argument);
     else if (!std::strcmp(text, "boss") || !std::strcmp(text, "rush")) ok = BossRush::HandleCommand(text, argument);
     else if (!std::strcmp(text, "title")) ok = TitleControl::HandleCommand(text, argument);
+    else if (!std::strcmp(text, "combo")) ok = ComboMenu::HandleCommand(argument);  // tests: the 招式派生 page
+    else if (!std::strcmp(text, "net")) ok = NetPage::HandleCommand(argument);        // 联机测试
     else if (strcmp(text, "status")) ok = false;
     wchar_t status[320]{}, outfit[200]{}; GroomForce::Status(status, 320); GroomForce::OutfitStatus(outfit, 200);
     char line[768]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "COMMAND %s ok=%d hair=0x%lx force=%ls outfit=%ls", text, ok ? 1 : 0, controls.Status(), status, outfit);
@@ -351,6 +363,10 @@ DWORD WINAPI Worker(void*) {
     GrabExtras::SetSkinDisplay(&NpcRetarget::GrabDisplay);
     BossAI::Initialize(&LogLine);
     TestDummy::Initialize(&LogLine);
+    BossAssist::Initialize(&LogLine);
+    MovePreview::Initialize(&LogLine);
+    NetSteam::Initialize(&LogLine);
+    NetPuppet::Initialize(&LogLine);
     BossRush::Initialize(&LogLine, directory.c_str());
     CharacterSwap::Initialize(&LogLine, &ReleaseNpcForOutfit);
     NpcRetarget::Initialize(&LogLine, &ReleasePlayerAppearanceForNpc);
@@ -364,6 +380,7 @@ DWORD WINAPI Worker(void*) {
     DebugSupplement::Initialize(&LogLine, std::wstring(executable, static_cast<size_t>(filename - executable)).c_str());
     UiHost::GuardActivation(&LogLine);
     UiCursor::SetLogger(&LogLine);
+    ComboMenu::SetLogger(&LogLine);
     DebugHub::Initialize();
     UiLoadBanner::Initialize(&LogLine);
     BossMenu::Initialize();
@@ -413,9 +430,10 @@ DWORD WINAPI Worker(void*) {
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
     // The supplement page exists only with the supplement container; the hub lists registered pages only.
     if (DebugSupplement::Present()) DebugHub::Register(DebugHub::Page::Supplement, L"调试补充", &SupplementMenu::CreatePage);
+    DebugHub::Register(DebugHub::Page::Online, L"联机测试", &NetPage::CreatePage);
     DebugHub::Register(DebugHub::Page::Donate, L"Donate", &DonatePage::CreatePage);
-    Log(DebugSupplement::Present() ? "DEBUG_HUB registered 12 embedded pages (supplement present); hotkeys toggle the host"
-                                   : "DEBUG_HUB registered 11 embedded pages; hotkeys toggle the host");
+    Log(DebugSupplement::Present() ? "DEBUG_HUB registered 13 embedded pages (supplement present); hotkeys toggle the host"
+                                   : "DEBUG_HUB registered 12 embedded pages; hotkeys toggle the host");
     bool hook_attempted = false,ready = false,timeout_logged = false;
     // The 11-04 game update removed the native debug menu (DebugObj.js, BP_CollectHelp, PBZ.DebugMenu.Enable,
     // GM_* bodies), so the two debug switches are no longer written; the tools need only the game-thread hook.
@@ -440,6 +458,7 @@ DWORD WINAPI Worker(void*) {
         WeaponPresetsMenu::Tick();
         SupplementMenu::Tick();
         DonatePage::Tick();
+        NetPage::Tick();
         EntryFocus::Poll();
         controls.Tick();
         if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25); continue; }
@@ -457,7 +476,7 @@ DWORD WINAPI Worker(void*) {
         }
         Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25);
     }
-    WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown(); DonatePage::Shutdown(); ComboMenu::Shutdown();
+    WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown(); DonatePage::Shutdown(); NetPage::Shutdown(); ComboMenu::Shutdown();
     SkillToast::Shutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
     UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
     return 0;

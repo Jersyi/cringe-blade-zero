@@ -12,7 +12,7 @@ namespace NpcCombo {
 namespace {
 SRWLOCK lock_ = SRWLOCK_INIT;
 std::map<std::string, Config> configs_;
-std::map<std::string, float> lengths_;
+std::map<std::string, float> lengths_, clips_;
 volatile LONG64 generation_ = 1;
 Run run_;
 WeaponInfo weapon_;
@@ -105,9 +105,9 @@ bool ReadCombo(const std::wstring& name, ComboFile::Set& set, std::string& why) 
     return ComboFile::Unpack(bytes, set, why);
 }
 // Written beside, then moved over the old file, so a reader never sees half a file.
-bool WriteCombo(const std::wstring& name, const ComboFile::Set& set) {
+bool WritePath(const std::wstring& path, const ComboFile::Set& set) {
     const std::vector<uint8_t> bytes = ComboFile::Pack(set);
-    const std::wstring path = PathOf(name), temp = path + L".tmp";
+    const std::wstring temp = path + L".tmp";
     const HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD wrote = 0;
@@ -115,6 +115,27 @@ bool WriteCombo(const std::wstring& name, const ComboFile::Set& set) {
     CloseHandle(file);
     if (!ok || !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileW(temp.c_str()); return false; }
     return true;
+}
+bool WriteCombo(const std::wstring& name, const ComboFile::Set& set) { return WritePath(PathOf(name), set); }
+std::wstring FullFolder(const std::wstring& folder) {
+    wchar_t full[MAX_PATH * 2]{};
+    const DWORD size = GetFullPathNameW(folder.c_str(), static_cast<DWORD>(std::size(full)), full, nullptr);
+    std::wstring out = size && size < std::size(full) ? std::wstring(full, size) : folder;
+    while (out.size() > 3 && (out.back() == L'\\' || out.back() == L'/')) out.pop_back();
+    return out;
+}
+// One directory: by volume and file id (8.3 short names such as ADMINI~1, case and junctions all agree), else by path.
+bool SameFolder(const std::wstring& a, const std::wstring& b) {
+    const auto id = [](const std::wstring& path, BY_HANDLE_FILE_INFORMATION& info) {
+        const HANDLE h = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        const bool ok = GetFileInformationByHandle(h, &info) != FALSE;
+        CloseHandle(h);
+        return ok;
+    };
+    BY_HANDLE_FILE_INFORMATION x{}, y{};
+    if (id(a, x) && id(b, y)) return x.dwVolumeSerialNumber == y.dwVolumeSerialNumber && x.nFileIndexHigh == y.nFileIndexHigh && x.nFileIndexLow == y.nFileIndexLow;
+    return !_wcsicmp(FullFolder(a).c_str(), FullFolder(b).c_str());
 }
 void Changed() { configs_.clear(); InterlockedIncrement64(&generation_); ++store_.serial; }
 constexpr wchar_t kShowToast[] = L"ShowToast";
@@ -161,7 +182,7 @@ bool WriteActive() {
     return ok;
 }
 bool ValidName(const std::wstring& name) {
-    if (name.empty() || name.size() > 40 || name == L"." || name == L"..") return false;
+    if (name.empty() || name.size() > 120 || name == L"." || name == L"..") return false;
     for (const wchar_t c : name) if (c < 32 || wcschr(L"\\/:*?\"<>|", c)) return false;
     return true;
 }
@@ -225,6 +246,26 @@ bool SaveAs(const std::wstring& name) {
     ReleaseSRWLockExclusive(&lock_);
     return ok;
 }
+SavedTo SaveToPath(const std::wstring& path, std::wstring& name) {
+    name.clear();
+    const size_t slash = path.find_last_of(L"\\/"), ext = wcslen(kExtension);
+    const std::wstring file = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    const bool has_ext = file.size() > ext && !_wcsicmp(file.c_str() + file.size() - ext, kExtension);
+    const std::wstring stem = has_ext ? file.substr(0, file.size() - ext) : file;
+    const std::wstring folder = slash == std::wstring::npos ? L"." : slash == 2 && path[1] == L':' ? path.substr(0, 3) : path.substr(0, slash);
+    if (SameFolder(folder, Folder())) {
+        if (!SaveAs(stem)) return SavedTo::Failed;
+        name = stem; return SavedTo::Folder;
+    }
+    // Elsewhere: only the folder's files are listed and watched, so the set is copied there and the active file stays.
+    const std::wstring target = has_ext ? path : path + kExtension;
+    AcquireSRWLockExclusive(&lock_); Ready();
+    const bool ok = !stem.empty() && WritePath(target, store_.set);
+    if (ok) Log("NPC_COMBO file copy path=%s from=%s profiles=%zu (outside the combos folder; the active file stays)", Utf8(target).c_str(), Utf8(store_.active).c_str(), store_.set.size());
+    else { store_.status = L"保存失败：" + target; ++store_.serial; Log("NPC_COMBO file copy failed path=%s", Utf8(target).c_str()); }
+    ReleaseSRWLockExclusive(&lock_);
+    return ok ? SavedTo::Copy : SavedTo::Failed;
+}
 bool Poll() {
     AcquireSRWLockExclusive(&lock_); Ready();
     bool reloaded = false;
@@ -266,6 +307,7 @@ Config Load(const std::string& profile) {
     }
     // 预输入: every chain has its fixed node (older files have none; a chain saved without one gets it too).
     if (PreInputNode(config) < 0) { EnsurePreInput(config); configs_[profile] = config; }
+    if (AirDefaultNode(config) < 0) { EnsureAirDefault(config); configs_[profile] = config; }  // 空中释放, likewise
     ReleaseSRWLockExclusive(&lock_);
     return config;
 }
@@ -297,6 +339,15 @@ Run GetRun() { AcquireSRWLockShared(&lock_); Run copy = run_; ReleaseSRWLockShar
 void RecordLength(const std::string& ability, float seconds) {
     if (!(seconds > 0)) return;
     AcquireSRWLockExclusive(&lock_); lengths_[ability] = seconds; ReleaseSRWLockExclusive(&lock_);
+}
+void RecordClip(const std::string& ability, float seconds) {
+    if (!(seconds > 0) || ability.empty()) return;
+    AcquireSRWLockExclusive(&lock_); clips_[ability] = seconds; ReleaseSRWLockExclusive(&lock_);
+}
+float Clip(const std::string& ability) {
+    AcquireSRWLockShared(&lock_);
+    const auto found = clips_.find(ability); const float value = found == clips_.end() ? 0.f : found->second;
+    ReleaseSRWLockShared(&lock_); return value;
 }
 float Length(const std::string& ability) {
     AcquireSRWLockShared(&lock_);

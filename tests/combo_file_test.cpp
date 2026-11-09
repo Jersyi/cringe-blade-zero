@@ -74,8 +74,8 @@ int wmain() {
           "first run: the ini's chains move into combos\\default.combo");
     Check(FirstMove(motian) == "GA_MoTian_Skill_01" && FirstMove(NpcCombo::Load("Hero")) == "GA_Hero_Heavy",
           "the migrated chains load (an NPC look's and the hero's)");
-    Check(NpcCombo::Load("YuZan").chain.size() == 2 && NpcCombo::KeyTrigger(NpcCombo::Load("YuZan")) >= 0 && NpcCombo::PreInputMs(NpcCombo::Load("YuZan")) == NpcCombo::kPreInputDefault &&
-          NpcCombo::PreInputNode(NpcCombo::Load("YuZan")) >= 0, "a look without a chain starts with the key node and its 0.3 s pre-input node");
+    Check(NpcCombo::Load("YuZan").chain.size() == 3 && NpcCombo::AirDefaultNode(NpcCombo::Load("YuZan")) >= 0 && NpcCombo::KeyTrigger(NpcCombo::Load("YuZan")) >= 0 && NpcCombo::PreInputMs(NpcCombo::Load("YuZan")) == NpcCombo::kPreInputDefault &&
+          NpcCombo::PreInputNode(NpcCombo::Load("YuZan")) >= 0, "a look without a chain starts with the key node, its 0.3 s pre-input node and its 空中释放 node");
     NpcCombo::Config edited = motian; for (NpcCombo::Node& n : edited.chain) if (n.type == NpcCombo::NodeType::Skill) n.ability = "GA_MoTian_Skill_02";
     NpcCombo::Save("MoTian", edited);
     Set on_disk;
@@ -91,6 +91,17 @@ int wmain() {
     Check(!NpcCombo::SelectFile(L"broken") && NpcCombo::GetFiles().active == L"进攻" && !NpcCombo::GetFiles().status.empty() &&
           FirstMove(NpcCombo::Load("MoTian")) == "GA_MoTian_Skill_03", "a bad file is skipped: the loaded set stays, the status says why");
     Check(!NpcCombo::SaveAs(L"a/b") && !NpcCombo::SaveAs(L""), "bad file names are refused");
+    // 另存为's Windows dialog hands a path: in the folder (any spelling) a save-as by name, elsewhere a copy.
+    std::wstring saved_name;
+    wchar_t long_root[MAX_PATH * 2]{};  // %TEMP% comes with the 8.3 short name (ADMINI~1); a dialog hands the long one
+    if (!GetLongPathNameW(root.c_str(), long_root, MAX_PATH * 2)) wcscpy_s(long_root, root.c_str());
+    Check(NpcCombo::SaveToPath(std::wstring(long_root) + L"\\combos\\..\\combos\\进攻.combo", saved_name) == NpcCombo::SavedTo::Folder && saved_name == L"进攻" &&
+          NpcCombo::GetFiles().active == L"进攻" && NpcCombo::GetFiles().names.size() == 3, "a dialog path in the combos folder is a save-as by its name");
+    Set copied;
+    Check(NpcCombo::SaveToPath(root + L"\\copy", saved_name) == NpcCombo::SavedTo::Copy && saved_name.empty() && NpcCombo::GetFiles().active == L"进攻" &&
+          ComboFile::Unpack(ReadAll(root + L"\\copy.combo"), copied, why) && copied["MoTian"].find(L"GA_MoTian_Skill_03") != std::wstring::npos,
+          "a path outside the folder gets a copy (.combo added) and the active file stays");
+    DeleteFileW((root + L"\\copy.combo").c_str());
     // Another program writes the active file: read again by Poll.
     Sleep(50);
     Set outside; outside["MoTian"] = L"E1|T:1,1200,1,10,20,1|S:GA_MoTian_Skill_09,200,40,-1";

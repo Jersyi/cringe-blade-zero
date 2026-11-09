@@ -22,7 +22,8 @@ constexpr const char* kClasses[] = {
 // The game's own AI.DisableAction + Health_Min lock. The tag alone does not stop a mob's SGameAI (round 29: the mob
 // still walked up and attacked), so HoldAI stops the AI itself; the effect stays for its health lock.
 constexpr const char* kEffect = "/PBZCombatAsset/Prototypes/GameplayEffects/GE_AIDisableActionAndLockhealth.GE_AIDisableActionAndLockhealth_C";
-constexpr double kDistance = 350.0;  // cm in front of the hero
+constexpr double kDistance = 350.0;  // cm in front of the hero (the page); tests may ask for another
+volatile double distance_ = kDistance;
 constexpr ULONGLONG kCheckMs = 250, kEffectWaitMs = 5000;
 constexpr DWORD kMaxFaults = 3;
 
@@ -175,7 +176,8 @@ bool Spawn() {
     for (const char* path : kClasses) if ((cls = LoadClass(path))) { class_used_ = path; break; }
     if (!cls) return Fail(L"小怪蓝图加载失败，未召唤测试木桩", "no mob class loaded");
     if (!NpcRetarget::BeforeActorClassSpawn(cls)) return Fail(L"NPC 外观尚未恢复，未召唤可能共享骨架的小怪", "npc look holds a shared skeleton");
-    // kDistance in front of the hero on the hero's floor, facing the hero.
+    // distance_ in front of the hero on the hero's floor, facing the hero.
+    const double distance = distance_;
     Call where(context.pawn, "K2_GetActorLocation"), ahead(context.pawn, "GetActorForwardVector");
     if (!where.Invoke() || !ahead.Invoke()) return Fail(L"读不到主角位置，未召唤测试木桩", "hero location");
     const Vector at = where.Get<Vector>("ReturnValue"), forward = ahead.Get<Vector>("ReturnValue");
@@ -191,7 +193,7 @@ bool Spawn() {
         if (offset >= 0) { const float v = ue::At<float>(capsule, offset); if (v > 1 && v < 2000) mob_half = v; }
     }
     Transform transform;
-    transform.translation[0] = at.x + fx * kDistance; transform.translation[1] = at.y + fy * kDistance;
+    transform.translation[0] = at.x + fx * distance; transform.translation[1] = at.y + fy * distance;
     transform.translation[2] = at.z - hero_half + mob_half + 5.0;
     const double yaw = std::atan2(-fy, -fx);
     transform.rotation[2] = std::sin(yaw / 2); transform.rotation[3] = std::cos(yaw / 2);
@@ -205,7 +207,7 @@ bool Spawn() {
     effect_on_ = effect_failed_logged_ = refill_failed_logged_ = dead_logged_ = ai_missing_logged_ = ai_stuck_logged_ = false; refills_ = 0; ai_stops_ = 0;
     spawned_at_ = GetTickCount64(); next_check_ = 0;
     Logf("TEST_DUMMY spawned class=%s actor=%s at=(%.0f,%.0f,%.0f) %.0fcm in front of the hero, facing it",
-         class_used_, NameText(actor).c_str(), transform.translation[0], transform.translation[1], transform.translation[2], kDistance);
+         class_used_, NameText(actor).c_str(), transform.translation[0], transform.translation[1], transform.translation[2], distance);
     Status(L"测试木桩已召唤在主角面前：不移动、不攻击、锁血");
     HoldAI(spawned_at_);  // before its first frame of AI
     Publish(); return true;
@@ -263,7 +265,7 @@ void Tick() {
 }
 
 void Initialize(Logger logger) { logger_ = logger; }
-void Request(bool spawn) { InterlockedExchange(&request_, spawn ? 1 : 2); AcquireSRWLockExclusive(&lock_); snapshot_.busy = true; ReleaseSRWLockExclusive(&lock_); }
+void Request(bool spawn, double distance) { if (spawn) distance_ = distance; InterlockedExchange(&request_, spawn ? 1 : 2); AcquireSRWLockExclusive(&lock_); snapshot_.busy = true; ReleaseSRWLockExclusive(&lock_); }
 Snapshot GetSnapshot() { AcquireSRWLockShared(&lock_); Snapshot copy = snapshot_; ReleaseSRWLockShared(&lock_); return copy; }
 void OnGameThreadGuarded() {
     __try { Tick(); }

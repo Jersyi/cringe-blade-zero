@@ -54,6 +54,7 @@ void SetEnabled(bool enabled) {
 }
 void Sync(bool open) { open_.store(open, std::memory_order_relaxed); }
 bool Holding() { return holding_.load(std::memory_order_relaxed); }
+bool Wanted() { return open_.load(std::memory_order_relaxed) && enabled_.load(std::memory_order_relaxed); }
 void OnGameThread(bool hold_off) {
     const bool want = open_.load(std::memory_order_relaxed) && enabled_.load(std::memory_order_relaxed) && !hold_off;
     Object* world = CurrentWorld();

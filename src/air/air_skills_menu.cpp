@@ -107,7 +107,11 @@ void Refresh() {
     const std::wstring guard_state=UiI18n::Translate(!state.options.reward_guard_dodge?L"奖励关闭":state.last_guard_dodge_verified?L"已归零":state.guard_dodge_known?L"未通过":L"尚无奖励读回");
     _snwprintf_s(guard,_countof(guard),_TRUNCATE,guard_format.c_str(),guard_state.c_str(),
         state.guard_dodge_effects_before,state.guard_dodge_effects_after,state.guard_dodge_resets,state.guard_dodge_failures);
-    UiI18n::SetText(summary_,(std::wstring(text)+guard).c_str());
+    wchar_t attacks[180]{};
+    const std::wstring attacks_format=UiI18n::Translate(L"\r\nJC 空中普攻重置：%s；累计成功 %u / 未通过 %u");
+    const std::wstring attacks_state=UiI18n::Translate(state.last_air_attack_reset_verified?L"已归零":state.air_attack_reset_failures?L"未通过":L"尚无奖励读回");
+    _snwprintf_s(attacks,_countof(attacks),_TRUNCATE,attacks_format.c_str(),attacks_state.c_str(),state.air_attack_resets,state.air_attack_reset_failures);
+    UiI18n::SetText(summary_,(std::wstring(text)+guard+attacks).c_str());
     const LRESULT selection=SendMessageW(skills_,LB_GETCURSEL,0,0),top=SendMessageW(skills_,LB_GETTOPINDEX,0,0);
     SendMessageW(skills_,WM_SETREDRAW,FALSE,0); SendMessageW(skills_,LB_RESETCONTENT,0,0);
     if (state.skills.empty()) UiI18n::AddString(skills_,LB_ADDSTRING,0,L"当前未识别到战技/杀气技能实例；不开启时不扫描主角。");
@@ -159,8 +163,8 @@ void Layout() {
     const int two=2*m.Line()+m.S(14);
     UiLayout::Place(status_,x,y,width,two); y+=two+gap;
     UiLayout::Place(jc_gate_,x,y,width,two); y+=two+gap;
-    // The summary keeps eight lines; the skill list takes the remaining height.
-    const int summary=8*m.Line()+m.S(14),minimum_skills=m.S(170);
+    // Keep the reward readbacks visible; the skill list takes the remaining height.
+    const int summary=10*m.Line()+m.S(14),minimum_skills=m.S(170);
     UiLayout::Place(summary_,x,y,width,summary); y+=summary+gap*2;
     UiLayout::Place(skills_label_,x,y,width,m.Section()); y+=m.Section()+gap/2;
     const int skills=(std::max)(minimum_skills,static_cast<int>(client.bottom)-margin-y);

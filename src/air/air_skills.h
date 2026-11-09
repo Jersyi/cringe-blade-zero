@@ -41,6 +41,8 @@ struct Snapshot {
     uint32_t scanned_input_assets = 0, scanned_input_actions = 0, scanned_ability_specs = 0;
     uint32_t bounces = 0, cooldown_restores = 0;
     uint32_t jump_cancels=0;
+    bool last_air_attack_reset_verified=false;
+    uint32_t air_attack_resets=0,air_attack_reset_failures=0;
     uint32_t jump_edges=0,scanned_pawns=0,enemy_ai_rejected=0,enemy_team_rejected=0,enemy_health_rejected=0;
     float nearest_enemy_surface=-1;
     int32_t jump_priority=0;
