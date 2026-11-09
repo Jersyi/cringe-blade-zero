@@ -12,6 +12,12 @@
 !*.def
 !docs/title.jpg
 !docs/donate.jpg
+!docs/BUILD.md
+!docs/GAME_UPDATES.md
+!docs/PAK_WORKFLOW.md
+!scripts/update_port.py
+!scripts/make_mount_pak.py
+!scripts/requirements-port.txt
 !installer/install.ps1
 !installer/Install.bat
 !src/env_check/known_exes.cmake

@@ -206,10 +206,19 @@ src/
 └─ triggers_only/ 精简版 version.dll
 tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点 / NPC 姿势 / 补充页目录测试
 installer/        一键安装（Install.bat 启动 install.ps1；打包时填入 Steam 版与 WeGame 版 PBZ.exe 的大小与 SHA-256）
-docs/             README 图片（标题图、爱发电卡片）
+docs/             编译、更新适配、独立 pak 指南，以及 README 图片
+scripts/          公开的 EXE 适配工具、空 pak 挂载入口制作工具
 ```
 
 每个 `src/` 子目录都是头文件搜索路径，源码里直接写 `#include "ue_runtime.h"`。
+
+## 开发文档
+
+- [编译、测试与打包](docs/BUILD.md)：构建依赖、测试、Steam / WeGame 通用包和安装回滚。
+- [游戏更新适配](docs/GAME_UPDATES.md)：地址定位、字节核对、两端差异、资源表和验证流程。
+- [独立 pak 制作与使用](docs/PAK_WORKFLOW.md)：三件套挂载、自制资源 Cook、补充容器重组和 DLL 接入。
+
+公开辅助工具在 `scripts/`；游戏 EXE、资源包、密钥及本地分析缓存不随文档上传。
 
 ## 更新日志
 
