@@ -218,7 +218,7 @@ scripts/          公开的 EXE 适配工具、空 pak 挂载入口制作工具
 - [游戏更新适配](docs/GAME_UPDATES.md)：地址定位、字节核对、两端差异、资源表和验证流程。
 - [独立 pak 制作与使用](docs/PAK_WORKFLOW.md)：三件套挂载、自制资源 Cook、补充容器重组和 DLL 接入。
 
-公开辅助工具在 `scripts/`；游戏 EXE、资源包、密钥及本地分析缓存不随文档上传。
+公开辅助工具在 `scripts/`；[资源解包密钥](docs/PAK_WORKFLOW.md#解包密钥)已记录在独立 pak 指南中。游戏 EXE、资源包及本地分析缓存不随文档上传。
 
 ## 更新日志
 
