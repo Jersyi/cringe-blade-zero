@@ -23,7 +23,7 @@ MOD 完全免费，不打赏也可以使用全部功能。喜欢的话可以在[
 
 ## 功能
 
-[完整功能与全部节点手册（Markdown）](docs/USER_MANUAL.md) · [中文 PDF 下载](https://github.com/Jersyi/cringe-blade-zero/releases/latest/download/%E8%B1%AA%E4%B9%8B%E5%88%83MOD%E5%8A%9F%E8%83%BD%E4%B8%8E%E8%8A%82%E7%82%B9%E6%89%8B%E5%86%8C.pdf)
+[完整功能与全部节点手册（Markdown）](docs/USER_MANUAL.md) · [中文 PDF 下载](https://github.com/Jersyi/cringe-blade-zero/releases/latest/download/CringeBladeZero_Manual_ZH.pdf)
 
 PDF 共 61 页，含 34 张节点与变体实图、6 张 UI 图、30 类节点逐项说明、sampleCombo、连线/计时规则及全部调试补充卡片索引。界面图由真实自绘控件离线渲染。PDF 也包含在最新版安装包内。
 
