@@ -749,13 +749,13 @@ std::wstring HoldText(int ms) {
 // A shared trim follows the playing linked skill, then selection/preview, then
 // its first owner. The displayed source identifies which montage length is used.
 int TrimSource(size_t index){
-    const auto linked=[&](int source){return At(source)&&At(source)->type==NodeType::BossSkill&&NpcCombo::ModOf(config_,source,NpcCombo::kModTrim)==static_cast<int>(index);};
+    const auto linked=[&](int source){return At(source)&&NpcCombo::TakesTrim(*At(source))&&NpcCombo::ModOf(config_,source,NpcCombo::kModTrim)==static_cast<int>(index);};
     if(run_.running&&run_.profile==moves_.profile&&linked(run_.node))return run_.node;
     if(linked(selected_))return selected_;
     if(linked(preview_.node))return preview_.node;
     return NpcCombo::TrimmedBy(config_,static_cast<int>(index));
 }
-float TrimClip(size_t index) {const Node* source=At(TrimSource(index));return source?NpcCombo::Clip(source->ability):0.f;}
+float TrimClip(size_t index) {const Node* source=At(TrimSource(index));return source?NpcCombo::Clip(NpcCombo::DurationKey(*source,moves_.profile)):0.f;}
 std::wstring TrimEndText(const Node& node) { return node.trim_to>0?Seconds(NpcCombo::ClampTrim(node.trim_to)/1000.0):Tr(L"放完"); }
 std::wstring TrimSourceText(size_t index){
     const Node* source=At(TrimSource(index));if(!source)return Tr(L"未连接技能");
@@ -831,13 +831,13 @@ std::wstring ModifierNote(size_t index) {
         wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招 BOSS 技能放完不变回").c_str(),from.nodes); return text;
     }
     if (node.type==NodeType::Trim) {
-        if (!from.nodes) return Tr(L"未连接：从 BOSS 技能拉箭头到这里");
+        if (!from.nodes) return Tr(L"未连接：从技能、武器派生或闪避拉箭头到这里");
         const NpcCombo::TrimRange r=NpcCombo::TrimOf(node); const float clip=TrimClip(index);
         if (node.trim_to>0&&node.trim_to<=node.trim_from) return Tr(L"结束不晚于开始：放到这一招结尾");
         if (clip>0&&r.from>=clip) { wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"开始晚于这一招的长度 %.2f s：整招照常播放").c_str(),static_cast<double>(clip)); return text; }
         if (clip>0) return Tr(L"右键增删停留点 · 预览按住空格");
         if (!r.on) return Tr(L"从头放到结尾：调开始或结束来裁剪");
-        wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招 BOSS 技能只播放这一段").c_str(),from.nodes); return text;
+        wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招技能只播放这一段").c_str(),from.nodes); return text;
     }
     if (!from.nodes) return Tr(node.type==NodeType::Weapon?L"未连接：从起端节点拉箭头到这里":L"未连接：从起端节点或招式拉箭头到这里");
     if (node.type==NodeType::Weapon) return Tr(L"这条链的 Boss 招式伤害 × 主武器强度");
@@ -950,14 +950,12 @@ std::wstring NodeNote(size_t index) {
     if (node.ability.empty()||!MoveOfSkin(node.ability)) return Tr(L"不属于当前外观");
     std::wstring note=Tr(NpcCombo::KindLabel(KindOf(node.ability)));
     const int speed=MoveSpeed(index);
-    const float lasts=NpcCombo::Length(node.ability);
-    if (lasts>0) note+=L" · "+Seconds(lasts*100.0/speed);
     if (speed!=100) note+=L" · "+SpeedText(speed);
     if (!wired) note+=L" · "+Tr(L"未连接");
     return note;
 }
 // Width and height in canvas units (measured: NodeSize keeps them).
-SIZE MeasureNode(HDC dc,size_t index) {
+SIZE MeasureNodeBody(HDC dc,size_t index) {
     ++canvas_cache_.measurements;
     const Node& node=config_.chain[index];
     if (node.type==NodeType::Trigger) {
@@ -1069,6 +1067,23 @@ SIZE MeasureNode(HDC dc,size_t index) {
     if (node.type==NodeType::Interval) return {std::clamp((std::max)(title,note),190,320),kHeader+kRow*2+kPad};
     if (node.type==NodeType::PreInput) return {std::clamp((std::max)(title,note),230,420),kHeader+kRow*2+kPad};
     return {std::clamp((std::max)(title,note),250,340),kHeader+kRow*2+kPad};  // a move: its note, then its 派生点
+}
+std::wstring AnimationDuration(size_t index) {
+    const Node& node=config_.chain[index];
+    std::string key=NpcCombo::DurationKey(node,moves_.profile);
+    if(node.type==NodeType::Grab){const auto* grab=NodeGrab(node);if(grab){key=MotianGrab::PreviewMontage(grab->index);const auto slash=key.find_last_of('/');if(slash!=std::string::npos)key=key.substr(slash+1);key=key.substr(0,key.find('.'));}}
+    const float length=NpcCombo::Clip(key);
+    if(!(length>0))return Tr(L"动画时长：待读取（播放或预览后显示）");
+    auto trim=NpcCombo::TrimFor(config_,static_cast<int>(index));if(trim.from>=length)trim={};
+    std::wstring text=Tr(L"动画 ")+Seconds(length);
+    if(trim.on)text+=Tr(L" · 裁后 ")+Seconds(NpcCombo::TrimSpan(trim,length));
+    if(node.type==NodeType::AutoDodge||node.hook_auto)text+=Tr(L" · 最近一次");
+    return text;
+}
+SIZE MeasureNode(HDC dc,size_t index) {
+    SIZE size=MeasureNodeBody(dc,index);
+    if(NpcCombo::HasAnimation(config_.chain[index])){size.cy+=kRow;size.cx=(std::max)(size.cx,340L);}
+    return size;
 }
 SIZE NodeSize(HDC dc,size_t index) {
     if (index>=config_.chain.size()) return {0,0};
@@ -1809,7 +1824,7 @@ void SearchItems() {
         if (At(search_.mod_from)) {
             const NodeType from=config_.chain[static_cast<size_t>(search_.mod_from)].type;
             if (NpcCombo::StartsChain(config_.chain[static_cast<size_t>(search_.mod_from)])||from==NodeType::BossSkill||from==NodeType::Group) add({ItemKind::KeepLook,Tr(L"保留变身"),flow});
-            if (from==NodeType::BossSkill) add({ItemKind::Trim,Tr(L"裁剪"),flow});  // a part of its own montage
+            if (NpcCombo::TakesTrim(config_.chain[static_cast<size_t>(search_.mod_from)])) add({ItemKind::Trim,Tr(L"裁剪"),flow});  // a part of its own montage
         }
         add({ItemKind::ForceHit,Tr(L"强制受击"),flow});
         if (At(search_.mod_from)) {
@@ -3872,6 +3887,10 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             break;
         }
         }
+        if(NpcCombo::HasAnimation(node)){
+            RECT duration{s.rect.left+Px(10),s.rect.bottom-Px(kPad+kRow),s.rect.right-Px(10),s.rect.bottom-Px(kPad)};
+            Label(dc,AnimationDuration(i),duration,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        }
         if (s.has_in) ExecPin(graphics,s.in,fed[i],hot_==Hit{Part::NodeIn,index},live[i]?text:muted);
         if (s.has_mod_out) ModPin(graphics,s.mod_out,modded[i],hot_==Hit{Part::ModOut,index},UiTheme::AccentBlue());
         if (s.has_mod_in) ModPin(graphics,s.mod_in,pointed[i],hot_==Hit{Part::ModIn,index},ModColor(node.type));
@@ -4448,8 +4467,8 @@ bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int&
         const Node* hovered=At(test_hover_.node);
         const int source=hovered&&hovered->type==NodeType::Trim?NpcCombo::TrimmedBy(config_,test_hover_.node):
             hovered&&(hovered->type==NodeType::BoneTransform||hovered->type==NodeType::Speed)?MoveUnderSpeed(test_hover_.node):test_hover_.node;
-        const Node* n=At(source); if (!n||!NpcCombo::PicksBossMove(*n)||n->ability.empty()||n->boss.empty()) return false;
-        skin=BossLookRow(n->boss); ability=n->ability; index=source;
+        const Node* n=At(source); if (!n||n->ability.empty()||(n->type!=NodeType::Skill&&!NpcCombo::PicksBossMove(*n))) return false;
+        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss); ability=n->ability; index=source;
         const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(test_hover_.node)).rect; ReleaseDC(window_,dc);
         return skin>=0;
     }
@@ -4475,8 +4494,8 @@ bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int&
     // A 裁剪 card (its steppers too) shows the BOSS 技能 it cuts, only its part, as the chain plays it.
     if (hot_.index>=0&&At(hot_.index)&&config_.chain[static_cast<size_t>(hot_.index)].type==NodeType::Trim&&hot_.part>=Part::Node&&hot_.part<=Part::NodeTrimBar) {
         const int source=NpcCombo::TrimmedBy(config_,hot_.index);
-        const Node* n=At(source); if (!n||n->ability.empty()||n->boss.empty()) return false;
-        skin=BossLookRow(n->boss); ability=n->ability; index=source;
+        const Node* n=At(source); if (!n||n->ability.empty()) return false;
+        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss); ability=n->ability; index=source;
         const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
         return skin>=0;
     }
@@ -4728,6 +4747,7 @@ void RefreshData(){Refresh(false);}
 void PickNodes(const std::vector<int>& nodes){picked_.clear();for(int node:nodes)if(At(node))picked_.push_back(node);selected_=picked_.empty()?-1:picked_.back();}
 bool ClipboardShortcut(int key){return ClipboardKey(key,true);}
 size_t ClipboardCount(){return node_clipboard_.size();}
+std::wstring AnimationDurationText(int index){return At(index)?AnimationDuration(static_cast<size_t>(index)):L"";}
 std::wstring TrimDurationText(int index){return At(index)?TrimBarText(static_cast<size_t>(index)):L"";}
 std::wstring TrimSourceLabel(int index){return At(index)?TrimSourceText(static_cast<size_t>(index)):L"";}
 // Hidden-host performance fixtures only; never saved or sent to the game.

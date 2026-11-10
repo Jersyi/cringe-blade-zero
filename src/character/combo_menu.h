@@ -30,6 +30,7 @@ void RefreshData(); // explicit hidden-host driver for the same production refre
 void PickNodes(const std::vector<int>& nodes);
 bool ClipboardShortcut(int key);
 size_t ClipboardCount();
+std::wstring AnimationDurationText(int node);
 std::wstring TrimDurationText(int node);
 std::wstring TrimSourceLabel(int node);
 void PerformanceFixture(int count);

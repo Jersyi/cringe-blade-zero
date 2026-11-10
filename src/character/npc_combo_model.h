@@ -564,6 +564,16 @@ inline int SlotOf(NodeType type) {
 inline bool TakesAir(const Node& node) {
     return node.type == NodeType::Skill || node.type == NodeType::BossSkill || node.type == NodeType::WeaponMove || node.type == NodeType::AutoDodge;
 }
+// Independent animations played by the hero share the trim clock and cleanup path.
+inline bool TakesTrim(const Node& node) { return TakesAir(node); }
+inline bool HasAnimation(const Node& node) {
+    return TakesTrim(node)||node.type==NodeType::Grab||node.type==NodeType::Assist||node.type==NodeType::Hook;
+}
+inline std::string DurationKey(const Node& node,const std::string& profile) {
+    if(node.type==NodeType::AutoDodge)return "@dodge:"+profile;
+    if(node.type==NodeType::Hook&&node.hook_auto)return "@hook:auto:"+profile;
+    return node.ability;
+}
 // May node `from` point at modifier `mod`: a trigger may point at any; a move at 加速 / 霸体 / 允许中断 / 伤害倍率 / 无敌 /
 // 强制受击 / 无视防御 / 保持派生;
 // 保留变身 only a trigger, a BOSS 技能 or a frame (the BOSS 技能 it holds).
@@ -572,7 +582,7 @@ inline bool ModifierFits(const std::vector<Node>& chain, int from, int mod) {
     const Node& source = chain[static_cast<size_t>(from)]; const Node& target = chain[static_cast<size_t>(mod)];
     if (!IsModifier(target)) return false;
     if (target.type == NodeType::KeepLook) return StartsChain(source) || source.type == NodeType::BossSkill || source.type == NodeType::Group;
-    if (target.type == NodeType::Trim) return source.type == NodeType::BossSkill;  // its own montage's part
+    if (target.type == NodeType::Trim) return TakesTrim(source);  // its own montage's part
     if (target.type == NodeType::Air) return StartsChain(source) || TakesAir(source) || source.type == NodeType::Group;
     if (source.type == NodeType::Grab) return target.type == NodeType::Interrupt;
     return StartsChain(source) ||
@@ -1178,7 +1188,7 @@ inline TrimRange TrimOf(const Node& trim) {
     r.holds=TrimHolds(trim.trim_holds);r.on = r.from > 0 || r.to > 0 || !r.holds.empty(); return r;
 }
 inline TrimRange TrimFor(const Config& config, int index) {
-    if (index < 0 || static_cast<size_t>(index) >= config.chain.size() || config.chain[static_cast<size_t>(index)].type != NodeType::BossSkill) return {};
+    if (index < 0 || static_cast<size_t>(index) >= config.chain.size() || !TakesTrim(config.chain[static_cast<size_t>(index)])) return {};
     const int mod = ModOf(config, index, kModTrim);
     return mod >= 0 ? TrimOf(config.chain[static_cast<size_t>(mod)]) : TrimRange{};
 }
@@ -1194,7 +1204,7 @@ inline double TrimProgress(const TrimRange& r, double position, double length) {
 }
 // The first BOSS 技能 pointing at a 裁剪 node (-1: none).
 inline int TrimmedBy(const Config& config, int trim) {
-    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].type == NodeType::BossSkill && ModOf(config, static_cast<int>(i), kModTrim) == trim) return static_cast<int>(i);
+    for (size_t i = 0; i < config.chain.size(); ++i) if (TakesTrim(config.chain[i]) && ModOf(config, static_cast<int>(i), kModTrim) == trim) return static_cast<int>(i);
     return -1;
 }
 // ---- 组合 ----

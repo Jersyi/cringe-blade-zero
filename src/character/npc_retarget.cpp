@@ -7002,7 +7002,7 @@ void RateComboMove(const Context& context,ULONGLONG now) {
     combo_.rated=montage;combo_.rated_anim=Id(anim);
     const bool first=!combo_.first_rated;combo_.first_rated=true;
     const double full=length.Get<float>("ReturnValue"),now_rate=rate.Get<float>("ReturnValue");
-    if(first&&node->type==NpcCombo::NodeType::BossSkill)NpcCombo::RecordClip(node->ability,static_cast<float>(full));
+    if(first&&NpcCombo::HasAnimation(*node))NpcCombo::RecordClip(NpcCombo::DurationKey(*node,ComboProfile()),static_cast<float>(full));
     if(trim.on&&first){
         charge_points_={};trim_={combo_.playing,montage,trim,full,false};trim_.anim=Id(anim);trim_.rate=now_rate>0?now_rate:1.0;
         const bool inside=trim.from>0&&trim.from<full,later=inside&&trim_jump_mode_==1;
@@ -7021,7 +7021,7 @@ void RateComboMove(const Context& context,ULONGLONG now) {
     const double part=trim.on?NpcCombo::TrimSpan(trim,full):0,seconds=part>0?part:full;  // the part's length paces the 加速
     const double scale=Offset(montage,"RateScale")>=0?Property<float>(montage,"RateScale"):1.0;
     const double lasts=NpcCombo::Lasts(seconds,now_rate,scale);
-    if(first&&node->type==NpcCombo::NodeType::Skill)NpcCombo::RecordLength(node->ability,static_cast<float>(lasts));
+    if(first&&NpcCombo::HasAnimation(*node))NpcCombo::RecordLength(NpcCombo::DurationKey(*node,ComboProfile()),static_cast<float>(NpcCombo::Lasts(full,now_rate,scale)));
     if(curve){  // 曲线调节: the curve sets the pace through the move (no stretching to fill an interval)
         speed_.node=combo_.playing;speed_.speed=NpcCombo::SpeedFor(combo_.config,combo_.trigger,combo_.playing);speed_.curve_montage=nullptr;
         std::string shape;for(const NpcCombo::CurvePoint& p:speed_node->points)shape+=(shape.empty()?"":" ")+std::to_string(p.t)+"%:x"+std::to_string(p.speed/100.0).substr(0,4);

@@ -342,6 +342,31 @@ int wmain(int argc,wchar_t** argv) {
     check(TrimDurationText(trim_index).find(L"待读取")!=std::wstring::npos&&TrimSourceLabel(trim_index).find(L"UnknownLength")!=std::wstring::npos,"shared trim follows running source and never borrows another move length");
     NpcCombo::RecordClip(second.ability,6.0f);check(TrimDurationText(trim_index).find(L"5.50 s")!=std::wstring::npos,"new source length refreshes kept duration immediately");
     NpcCombo::Publish(moves.profile,false,-1,L"");RefreshData();PickNodes({boss_index});check(TrimDurationText(trim_index).find(L"3.50 s")!=std::wstring::npos,"shared trim follows selected linked move after playback ends");
+    check(AnimationDurationText(boss_index).find(L"4.00 s")!=std::wstring::npos,"boss node displays original animation duration");
+    check(AnimationDurationText(boss_index).find(L"3.50 s")!=std::wstring::npos,"boss node displays trimmed animation duration");
+    duration.chain[boss_index].type=NpcCombo::NodeType::Skill;duration.chain[boss_index].boss.clear();
+    NpcCombo::Save(moves.profile,duration);RefreshData();TrimPreviewAt(trim_index);
+    check(preview_from_==500&&preview_to_==0,"current-character skill preview receives its trim");
+    check(TrimDurationText(trim_index).find(L"3.50 s")!=std::wstring::npos,"current-character skill trim displays duration");
+    // Exercise the actual round-pin drag -> popup -> create-and-connect path.
+    SetWindowPos(page_,nullptr,0,0,1440,900,SWP_NOZORDER|SWP_NOACTIVATE);
+    for(const auto type:{NpcCombo::NodeType::Skill,NpcCombo::NodeType::BossSkill,NpcCombo::NodeType::WeaponMove,NpcCombo::NodeType::AutoDodge}){
+        NpcCombo::Config popup;NpcCombo::Node source;source.type=type;source.ability=moves.skills.front();source.boss=moves.profile;source.weapon="Long";source.x=80;source.y=100;
+        popup.chain.push_back(source);NpcCombo::EnsureKey(popup);NpcCombo::EnsurePreInput(popup);NpcCombo::EnsureAirDefault(popup);
+        for(size_t i=1;i<popup.chain.size();++i){popup.chain[i].x=2400;popup.chain[i].y=200+static_cast<int>(i)*300;}
+        NpcCombo::Save(moves.profile,popup);RefreshData();ZoomTo(100);Show(0);
+        const POINT start=ModOut(0);const RECT canvas=Canvas();const POINT drop{canvas.left+520,canvas.top+300};
+        SendMessageW(page_,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(start.x,start.y));
+        SendMessageW(page_,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(drop.x,drop.y));
+        SendMessageW(page_,WM_LBUTTONUP,0,MAKELPARAM(drop.x,drop.y));
+        check(SearchOpen(),"round pin opens modifier popup");HWND input=SearchInput();
+        SendMessageW(input,WM_SETTEXT,0,reinterpret_cast<LPARAM>(L"裁剪"));
+        check(SearchRows()>0,"trim is listed for every supported skill type");
+        SendMessageW(input,WM_KEYDOWN,VK_RETURN,0);
+        const auto saved=NpcCombo::Load(moves.profile);const int popup_trim=NpcCombo::ModOf(saved,0,NpcCombo::kModTrim);
+        check(popup_trim>=0&&saved.chain[static_cast<size_t>(popup_trim)].type==NpcCombo::NodeType::Trim,"popup creates and connects trim");
+        check(NpcCombo::ModOf(NpcCombo::Decode(NpcCombo::Encode(saved)),0,NpcCombo::kModTrim)==popup_trim,"popup trim link survives persistence");
+    }
     // Foreground changes by the user are permitted; this process must never own it.
     DWORD foreground_pid=0; GetWindowThreadProcessId(GetForegroundWindow(),&foreground_pid);
     check(foreground_pid!=GetCurrentProcessId(),"test never takes foreground");

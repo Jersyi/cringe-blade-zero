@@ -1101,9 +1101,15 @@ int main() {
         tc.chain.push_back({NodeType::Skill, "GA_Hero"});                             // 4
         tc.chain[0].next = 1;
         Check(IsModifier(tc.chain[2]) && SlotOf(NodeType::Trim) == kModTrim && NoMods()[kModTrim] == -1 && Node{}.mods[kModTrim] == -1, "a 裁剪 is a modifier in its own slot; new nodes point cursor_at none");
-        Check(LinkModifier(tc, 1, 2) && LinkModifier(tc, 1, 3) && !LinkModifier(tc, 4, 2) && !LinkModifier(tc, 0, 2), "only a BOSS 技能 points cursor_at a 裁剪");
+        Check(LinkModifier(tc, 1, 2) && LinkModifier(tc, 1, 3) && LinkModifier(tc, 4, 2) && !LinkModifier(tc, 0, 2), "hero and boss skills accept trim; triggers do not");
+        for(const auto type:{NodeType::Skill,NodeType::BossSkill,NodeType::WeaponMove,NodeType::AutoDodge}){
+            Config copy=tc;copy.chain[1].type=type;copy.chain[1].weapon="Long";
+            Check(LinkModifier(copy,1,2)&&TrimFor(copy,1).on,"all independent skill types accept trim");
+            Check(TrimFor(Decode(Encode(copy)),1).on,"expanded trim persists through save/load");
+        }
+        Check(!TakesTrim(Node{NodeType::Grab})&&!TakesTrim(Node{NodeType::Assist}),"paired grabs and independent assists retain separate lifecycles");
         const TrimRange r = TrimFor(tc, 1);
-        Check(r.on && r.from == 1.2 && r.to == 2.4 && SpeedFor(tc, 0, 1) == kSpeedNew && TrimmedBy(tc, 2) == 1 && !TrimFor(tc, 4).on, "its range and its 加速 both reach the move");
+        Check(r.on && r.from == 1.2 && r.to == 2.4 && SpeedFor(tc, 0, 1) == kSpeedNew && TrimmedBy(tc, 2) == 1 && TrimFor(tc, 4).on, "its range and its 加速 both reach the move");
         Check(std::fabs(TrimSpan(r, 3.0) - 1.2) < 1e-9 && std::fabs(TrimSpan(r, 2.0) - 0.8) < 1e-9 && std::fabs(TrimProgress(r, 1.8, 3.0) - 0.5) < 1e-9 && TrimProgress(r, 0.5, 3.0) == 0,
               "the span ends cursor_at the montage's end when that comes first; a curve runs over the part");
         Node open = trim; open.trim_to = 0; Node trim_late = trim; trim_late.trim_to = 1000;

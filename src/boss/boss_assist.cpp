@@ -43,7 +43,7 @@ struct Slot {
     Object* ability = nullptr; std::string ability_name;
     Object* enemy = nullptr; Name enemy_name{}; LockTarget target{}; bool lock_known = false;
     Phase phase = Phase::Idle; ULONGLONG phase_at = 0, next_try = 0, born = 0;
-    int32_t handle = 0; bool seen_active = false; uint32_t tries = 0, ai_stops = 0;
+    int32_t handle = 0; bool seen_active = false, duration_recorded = false; uint32_t tries = 0, ai_stops = 0;
     Vector land{}; Mods mods; float dilation = 1;
 };
 
@@ -468,6 +468,11 @@ void Start(const Job& job) {
     s.phase = Phase::Casting; s.phase_at = GetTickCount64(); s.next_try = 0; Aim(s);
 }
 void TickSlot(Slot& s, ULONGLONG now) {
+    if(!s.duration_recorded&&s.phase==Phase::Casting&&SameBoss(s)){
+        if(Object* mesh=Property(s.boss,"Mesh")){Call instance(mesh,"GetAnimInstance");
+            if(instance.Invoke()){Object* anim=instance.Get<Object*>("ReturnValue");if(ue::Alive(anim)){Call montage(anim,"GetCurrentActiveMontage");
+                if(montage.Invoke()){Object* clip=montage.Get<Object*>("ReturnValue");if(ue::Alive(clip)){Call length(clip,"GetPlayLength");if(length.Invoke()&&length.Get<float>("ReturnValue")>0){NpcCombo::RecordClip(s.ability_name.substr(0,s.ability_name.find('.')),length.Get<float>("ReturnValue"));s.duration_recorded=true;}}}}}}
+    }
     if (s.phase == Phase::Idle) return;
     if (s.phase != Phase::Leaving && !SameBoss(s)) { Logf("BOSS_ASSIST slot=%zu boss gone (destroyed by the game) phase=%d", SlotIndex(s), static_cast<int>(s.phase)); s = Slot{}; return; }
     if (s.phase == Phase::Leaving) { if (now >= s.phase_at + kLeaveMs) Finish(s); return; }
@@ -826,6 +831,7 @@ bool PlayClip(Slot& s) {
     Call play(anim, "Montage_Play");
     const bool ok = play.Set("MontageToPlay", preview_clip_).Set("InPlayRate", 1.0f).Set("ReturnValueType", uint8_t{0}).Set("InTimeToStartMontageAt", 0.0f)
                         .Set("bStopAllMontages", true).Invoke() && play.Get<float>("ReturnValue") > 0;
+    if(ok){Call length(preview_clip_,"GetPlayLength");if(length.Invoke())NpcCombo::RecordClip(s.ability_name.substr(0,s.ability_name.find('.')),length.Get<float>("ReturnValue"));}
     if (!ok && (++preview_clip_tries_ == 1 || preview_clip_tries_ == 20)) Logf("BOSS_ASSIST preview clip %s did not play (try %u)", Text(preview_clip_).c_str(), preview_clip_tries_);
     return ok;
 }
