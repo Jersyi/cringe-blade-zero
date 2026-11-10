@@ -159,6 +159,11 @@ add_executable(combo_library_test tests/combo_library_test.cpp src/character/com
 pbz_settings(combo_library_test)
 target_link_libraries(combo_library_test PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
 
+add_executable(manual_ui_export tests/manual_ui_export.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+    src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
+pbz_settings(manual_ui_export)
+target_link_libraries(manual_ui_export PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
+
 add_executable(combo_canvas_perf_test tests/combo_canvas_perf_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_canvas_perf_test)

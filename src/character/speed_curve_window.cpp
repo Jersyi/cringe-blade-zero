@@ -137,12 +137,12 @@ void RoundRect(Gdiplus::Graphics& g, const RECT& r, float radius, COLORREF fill,
     if (edge_a) { Gdiplus::Pen p(Argb(edge, edge_a), width); g.DrawPath(&p, &path); }
 }
 
-void Paint() {
-    PAINTSTRUCT ps{}; const HDC target = BeginPaint(window_, &ps);
+void Paint(HDC print = nullptr) {
+    PAINTSTRUCT ps{}; const HDC target = print ? print : BeginPaint(window_, &ps);
     const RECT client = Client();
     const int w = (std::max)(1L, client.right), h = (std::max)(1L, client.bottom);
     {
-    UiPaintBuffer::Frame buffer(window_,target,w,h,&ps.rcPaint);
+    UiPaintBuffer::Frame buffer(window_,target,w,h,print ? nullptr : &ps.rcPaint);
     const HDC surface=buffer.dc();
     const COLORREF panel = UiTheme::Panel(), base = UiTheme::Base(), text = UiTheme::Text(), muted = UiTheme::MutedText(), accent = UiTheme::Accent(),
                    border = UiTheme::Border();
@@ -244,7 +244,7 @@ void Paint() {
         g.DrawRectangle(&frame, 0, 0, w - 1, h - 1);
     }
     }
-    EndPaint(window_, &ps);
+    if (!print) EndPaint(window_, &ps);
 }
 
 void Hover(POINT p) {
@@ -305,6 +305,7 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         break;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: Paint(); return 0;
+    case WM_PRINTCLIENT: Paint(reinterpret_cast<HDC>(wparam)); return 0;
     case WM_MOUSEMOVE: {
         const POINT p{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         if (drag_ >= 0) { mouse_ = p; DragTo(p, (wparam & MK_SHIFT) != 0); return 0; }

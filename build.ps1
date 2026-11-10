@@ -79,12 +79,22 @@ $files = [ordered]@{
     "$name/docs/WEAPON_DERIVATIONS.md" = Join-Path $projectRoot 'docs\WEAPON_DERIVATIONS.md'
     "$name/docs/ANIMATION_PRESETS.md" = Join-Path $projectRoot 'docs\ANIMATION_PRESETS.md'
     "$name/docs/SOFT_BONES.md" = Join-Path $projectRoot 'docs\SOFT_BONES.md'
+    "$name/docs/USER_MANUAL.md" = Join-Path $projectRoot 'docs\USER_MANUAL.md'
+    "$name/docs/BUILD.md" = Join-Path $projectRoot 'docs\BUILD.md'
+    "$name/docs/GAME_UPDATES.md" = Join-Path $projectRoot 'docs\GAME_UPDATES.md'
+    "$name/docs/PAK_WORKFLOW.md" = Join-Path $projectRoot 'docs\PAK_WORKFLOW.md'
     "$name/Install.bat"               = Join-Path $projectRoot 'installer\Install.bat'
     "$name/samples/sampleCombo.combo" = Join-Path $projectRoot 'samples\sampleCombo.combo'
 }
 # The manual is added when present; the first release build may precede PDF authoring.
+foreach ($picture in Get-ChildItem -LiteralPath (Join-Path $projectRoot 'docs\manual_images') -Filter '*.png' -File) {
+    $files["$name/docs/manual_images/$($picture.Name)"] = $picture.FullName
+}
 $manual = Join-Path $projectRoot 'output\pdf\CringeBladeZero_Manual_ZH.pdf'
-if (Test-Path -LiteralPath $manual -PathType Leaf) { $files["$name/CringeBladeZero_Manual_ZH.pdf"] = $manual }
+if (Test-Path -LiteralPath $manual -PathType Leaf) {
+    $files["$name/CringeBladeZero_Manual_ZH.pdf"] = $manual
+    $readme += "`r`n完整功能、全部节点和示例使用说明：CringeBladeZero_Manual_ZH.pdf（中文 PDF）。`r`n"
+}
 # The installer checks the game against the builds proxy.cpp accepts: Steam (kExeBytes, kSha256), WeGame (kWeGame...).
 $proxy = Get-Content -LiteralPath (Join-Path $projectRoot 'src\core\proxy.cpp') -Raw
 $exeBuilds = foreach ($build in @(@('Steam', ''), @('WeGame', 'WeGame'))) {

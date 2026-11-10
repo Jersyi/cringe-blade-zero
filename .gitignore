@@ -37,6 +37,8 @@ combos/
 !tests/installer_sample_test.ps1
 !scripts/build_manual.py
 !docs/USER_MANUAL.md
+!docs/manual_images/*.png
+!docs/manual_images/nodes.json
 !docs/ANIMATION_PRESETS.md
 !docs/WEAPON_DERIVATIONS.md
 !THIRD_PARTY_NOTICES.md
