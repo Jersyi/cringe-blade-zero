@@ -90,10 +90,10 @@ $files = [ordered]@{
 foreach ($picture in Get-ChildItem -LiteralPath (Join-Path $projectRoot 'docs\manual_images') -Filter '*.png' -File) {
     $files["$name/docs/manual_images/$($picture.Name)"] = $picture.FullName
 }
-$manual = Join-Path $projectRoot 'output\pdf\CringeBladeZero_Manual_ZH.pdf'
+$manual = Join-Path $projectRoot 'output\pdf\豪之刃MOD功能与节点手册.pdf'
 if (Test-Path -LiteralPath $manual -PathType Leaf) {
-    $files["$name/CringeBladeZero_Manual_ZH.pdf"] = $manual
-    $readme += "`r`n完整功能、全部节点和示例使用说明：CringeBladeZero_Manual_ZH.pdf（中文 PDF）。`r`n"
+    $files["$name/豪之刃MOD功能与节点手册.pdf"] = $manual
+    $readme += "`r`n完整功能、全部节点和示例使用说明：豪之刃MOD功能与节点手册.pdf（中文 PDF）。`r`n"
 }
 # The installer checks the game against the builds proxy.cpp accepts: Steam (kExeBytes, kSha256), WeGame (kWeGame...).
 $proxy = Get-Content -LiteralPath (Join-Path $projectRoot 'src\core\proxy.cpp') -Raw

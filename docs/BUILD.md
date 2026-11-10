@@ -4,7 +4,7 @@
 
 ## 准备构建环境
 
-玩家手册源文件为 `docs/USER_MANUAL.md`。可在安装 ReportLab 的 Python 环境中运行 `python scripts/build_manual.py`，默认使用 Windows 微软雅黑字体，输出 `output/pdf/CringeBladeZero_Manual_ZH.pdf` 和覆盖检查 JSON；生成器会核对全部 30 类节点及调试补充卡片。正式打包前渲染 PDF 检查分页和中文显示。`build.ps1 -Package` 会在该 PDF 存在时将其纳入 ZIP；Markdown 和明确公开的 `samples/sampleCombo.combo` 始终纳入，其他玩家文件不会打包。
+玩家手册源文件为 `docs/USER_MANUAL.md`。可在安装 ReportLab 的 Python 环境中运行 `python scripts/build_manual.py`，默认使用 Windows 微软雅黑字体，输出 `output/pdf/豪之刃MOD功能与节点手册.pdf` 和覆盖检查 JSON；生成器会核对全部 30 类节点及调试补充卡片。正式打包前渲染 PDF 检查分页和中文显示。`build.ps1 -Package` 会在该 PDF 存在时将其纳入 ZIP；Markdown 和明确公开的 `samples/sampleCombo.combo` 始终纳入，其他玩家文件不会打包。
 
 安装器隔离测试运行 `powershell -NoProfile -ExecutionPolicy Bypass -File tests/installer_sample_test.ps1`；发布示例解包检查运行 `build/Release/sample_combo_test.exe samples/sampleCombo.combo`。前者使用独立临时目录及假 DLL，不操作游戏安装。
 
@@ -98,7 +98,7 @@ ZIP 使用同一套 Steam / WeGame DLL，包含以下内容：
 | `Install.bat`、`install.ps1` | 安装、卸载和检查入口 |
 | `README.txt`、`CHANGELOG.md` | 玩家说明和更新记录 |
 | `samples/sampleCombo.combo` | 作者授权公开的示例；完整安装或安装器选项 5 安装 |
-| `CringeBladeZero_Manual_ZH.pdf`、`docs/` | 图文手册、构建/适配/资源说明及界面图片 |
+| `豪之刃MOD功能与节点手册.pdf`、`docs/` | 图文手册、构建/适配/资源说明及界面图片 |
 | `THIRD_PARTY_NOTICES.md`、`licenses/` | 署名与许可证状态说明 |
 
 完整版和精简版二选一安装。安装器的两端 EXE 大小和 SHA256 从 `src/core/proxy.cpp` 自动填入；`EnvCheck` 的版本表也由 CMake 从同一文件生成，不要另抄一套版本常量。

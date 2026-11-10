@@ -215,7 +215,7 @@ def supplement_cards():
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--output',type=Path,default=ROOT/'output/pdf/CringeBladeZero_Manual_ZH.pdf')
+    parser.add_argument('--output',type=Path,default=ROOT/'output/pdf/豪之刃MOD功能与节点手册.pdf')
     parser.add_argument('--font-dir',type=Path,default=Path('C:/Windows/Fonts'))
     args=parser.parse_args();initialize_fonts(args.font_dir)
     source=ROOT/'docs/USER_MANUAL.md';text=source.read_text(encoding='utf-8-sig')
