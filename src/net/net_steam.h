@@ -9,7 +9,7 @@
 // - Lobby: friends-only, two members. Invites go through the Steam overlay or straight to a friend who plays the game;
 //   joining takes an invite (GameLobbyJoinRequested_t), a friend's lobby, a room number, or Steam's +connect_lobby.
 // - Messages: ISteamNetworkingMessages to the other lobby member. Channel 0 reliable (hello, ping, the hero's parts),
-//   channel 1 unreliable (the hero's state and pose, 30 a second). Protocol 3 (older builds: incompatible).
+//   channel 1 unreliable (the hero's state and pose, 30 a second). Protocol 8 (older builds: incompatible).
 // - Callbacks are registered with SteamAPI_RegisterCallback (the game itself runs SteamAPI_RunCallbacks; never
 //   ManualDispatch). They arrive on whatever thread the game runs them on and are only queued there; everything else
 //   runs on the game thread. NET_* log lines record each step for the two-PC test.

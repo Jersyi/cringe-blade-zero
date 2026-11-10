@@ -1,0 +1,18 @@
+UUEPBS license review / source attribution
+Reviewed 2026-11-09
+Author/maintainer: XTGMods
+Project: https://github.com/XTGMods/UUEPBS
+Revision: 7c54929929086413afbd12070962f0d499e90c7e
+Source: https://github.com/XTGMods/UUEPBS/blob/7c54929929086413afbd12070962f0d499e90c7e/README.md#credits
+
+No license for UUEPBS itself was found in the repository at this revision.
+The README's MIT notice is specifically for Dear ImGui, copyright
+(c) 2014-2025 Omar Cornut. It does not grant a license to UUEPBS itself.
+
+The PBZ body editor references the published feature design, with original
+PBZ implementation. No UUEPBS code or assets are included in this package.
+This file records license status; it is not a substitute license or a grant
+of rights by XTGMods. No project license text has been invented or relabeled.
+
+If the author supplies a license for direct reuse, include that complete
+license and applicable author/third-party notices with the integrated code.

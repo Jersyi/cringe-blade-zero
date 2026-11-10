@@ -16,6 +16,7 @@ using ue::Array; using ue::Call; using ue::Name; using ue::Object;
 
 // Every blueprint with serialized GroomComponent templates (usage/groom_component_refs.json).
 constexpr const char* kDonors[] = {
+    "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_Yuu",
     "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_Hun", "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_Hun_Climax",
     "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_Young_Hun", "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_ZuoShang",
     "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_ZuoShang_White", "/HuaShira/Animation/Seqs/ActorForSeqs/BP_Seq_ZuoShang_LongTi",
@@ -546,6 +547,27 @@ void Deactivate() {
 }
 
 void Initialize(Logger logger, ExternalAppearanceOwned external_owned) { log_ = logger; external_owned_ = external_owned; }
+std::vector<Object*> MirrorTemplates(Object* mesh) {
+    std::vector<Object*> found;if(!ue::Alive(mesh))return found;
+    const int32_t binding=Off("/Script/HairStrandsCore.GroomComponent","BindingAsset"),
+        target=Off("/Script/HairStrandsCore.GroomBindingAsset","TargetSkeletalMesh"),
+        asset=Off("/Script/HairStrandsCore.GroomComponent","GroomAsset");
+    if(binding<0||target<0||asset<0)return found;
+    const auto add=[&](Object* o){if(!ue::Alive(o)||ue::ClassOf(o)!=GroomClass())return;
+        Object* b=ue::At<Object*>(o,binding),*a=ue::At<Object*>(o,asset);
+        if(!ue::Alive(b)||!ue::Alive(a)||ue::At<Object*>(b,target)!=mesh)return;
+        for(Object* old:found)if(ue::At<Object*>(old,asset)==a&&ue::At<Object*>(old,binding)==b)return;
+        found.push_back(o);};
+    // Prefer templates already selected by the current appearance; never collect unrelated variants.
+    ue::ForEachObject([&](Object* o){if(ue::IsTemplate(o))add(o);return true;});
+    if(!found.empty())return found;
+    if(donors_.empty())for(const char* p:kDonors)donors_.push_back(Donor{p});
+    const auto tokens=Tokens(Text(mesh));
+    for(Donor& d:donors_){std::string path(d.path);const auto keys=Tokens(path.substr(path.find_last_of('/')+1));
+        bool match=!keys.empty();for(const auto& key:keys)if(std::find(tokens.begin(),tokens.end(),key)==tokens.end())match=false;
+        if(match&&LoadDonor(d)){for(Object* o:d.templates)add(o);if(!found.empty())break;}}
+    return found;
+}
 void Request(Command command) { InterlockedExchange(&request_, command); }
 bool Ready() { return InterlockedCompareExchange(&ready_, 0, 0) != 0; }
 bool Active() { return InterlockedCompareExchange(&active_, 0, 0) != 0; }

@@ -52,6 +52,7 @@ struct Plan {
     std::vector<std::array<double,4>> rest_align,rest_turn;std::vector<uint8_t> rest_set,rest_mode;
     std::vector<Transform> target_rest_cs; // the target's pose while the source holds its rest pose
     double weapon_scale=1; // target / source body size (WeaponScale), applied to weapons and the grip offset
+    std::vector<uint8_t> authored_follow; // selected IK targets retain authored travel during their own montage
     std::vector<int32_t> follow;std::vector<Transform> follow_rel; // SetFollowers; empty when none
     std::vector<uint8_t> foreign_keep; // per target bone: keeps its translation under a foreign montage (root, pelvis); empty = none
     // per target bone: its source bone's translation retarget mode on the source skeleton (kScaled,
@@ -401,7 +402,10 @@ inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache
     // IK copies take their FK bone's final transform (after rest turns and the hand contact).
     if(plan.follow.size()==plan.target.size()&&cache.moved.size()==plan.target.size())for(size_t t=0;t<plan.target.size();++t){
         const int32_t p=plan.target[t].parent,f=plan.follow[t];cache.moved[t]=0;
-        if(f>=0){if(!NpcGripMath::ComposeMount(plan.follow_rel[t],cache.target_cs[static_cast<size_t>(f)],cache.target_cs[t])){why="ik-follow-compose-invalid";return false;}
+        if(f>=0){Transform followed;
+            if(!NpcGripMath::ComposeMount(plan.follow_rel[t],cache.target_cs[static_cast<size_t>(f)],followed)){why="ik-follow-compose-invalid";return false;}
+            const double authored=own&&plan.authored_follow.size()==n&&plan.authored_follow[t]?foreign:0;
+            detail::Blend(followed,cache.target_cs[t],authored,cache.target_cs[t]);
             if(p<0)cache.target_local[t]=cache.target_cs[t];else if(!NpcGripMath::RelativeNativeSafe(cache.target_cs[t],cache.target_cs[static_cast<size_t>(p)],cache.target_local[t])){why="ik-follow-local-invalid";return false;}
             cache.moved[t]=1;}
         else if(p>=0&&cache.moved[static_cast<size_t>(p)]){if(!NpcGripMath::ComposeMount(cache.target_local[t],cache.target_cs[static_cast<size_t>(p)],cache.target_cs[t])){why="ik-follow-child-invalid";return false;}cache.moved[t]=1;}}

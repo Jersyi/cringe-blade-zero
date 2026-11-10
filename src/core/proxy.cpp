@@ -1,3 +1,4 @@
+#include "append_log.h"
 #include <windows.h>
 #include <bcrypt.h>
 #include <array>
@@ -40,6 +41,8 @@
 #include "combo_menu.h"
 #include "net_steam.h"
 #include "net_puppet.h"
+#include "bone_motion.h"
+#include "bone_motion_page.h"
 #include "net_page.h"
 #include "air_skills.h"
 #include "air_skills_menu.h"
@@ -90,19 +93,8 @@ void Log(const char* message) {
     // _TRUNCATE returns -1 on a cut line: keep the cut text with its line end instead of dropping the line.
     if (n < 0) { n = static_cast<int>(sizeof(line)) - 1; line[n - 2] = '\r'; line[n - 1] = '\n'; }
     if (n <= 0) return;
-    HANDLE file = CreateFileW(log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    LARGE_INTEGER size{};
-    if (GetFileSizeEx(file, &size) && size.QuadPart >= 1024 * 1024) {
-        CloseHandle(file);
-        const std::wstring previous = log_path + L".previous";
-        if (!MoveFileExW(log_path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING)) return;
-        file = CreateFileW(log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE) return;
-    }
-    DWORD written = 0; WriteFile(file, line, static_cast<DWORD>(n), &written, nullptr); CloseHandle(file);
+    static AppendLog writer;
+    writer.Write(log_path,line,static_cast<DWORD>(n));
 }
 
 ULONG_PTR WINAPI MissingExport() {
@@ -223,6 +215,7 @@ void DispatchGameThread() {
     if (!BossRush::IsTransitioning()) BossAssist::OnGameThreadGuarded();  // BOSS 援护
     if (!BossRush::IsTransitioning()) MovePreview::OnGameThreadGuarded();  // 招式预览 (招式派生 page)
     NetSteam::OnGameThreadGuarded();                                          // 联机测试: Steam room and messages
+    BoneMotionRuntime::Tick(BossRush::IsTransitioning());
     NetPuppet::OnGameThreadGuarded(BossRush::IsTransitioning());              // 联机测试: the puppet
     DebugSupplement::OnGameThreadGuarded();
     // A 招式预览 needs the world running; it holds the hero and the enemies still itself (MovePreview::HoldsGameplay).
@@ -283,6 +276,8 @@ void PollCommand(HairControls& controls) {
     else if (!std::strcmp(text, "boss") || !std::strcmp(text, "rush")) ok = BossRush::HandleCommand(text, argument);
     else if (!std::strcmp(text, "title")) ok = TitleControl::HandleCommand(text, argument);
     else if (!std::strcmp(text, "combo")) ok = ComboMenu::HandleCommand(argument);  // tests: the 招式派生 page
+    else if (!std::strcmp(text, "bones") && !std::strcmp(argument,"menu")) DebugHub::ShowPage(DebugHub::Page::BoneMotion);
+    else if (!std::strcmp(text, "bones")) ok=BoneMotionRuntime::Command(argument);
     else if (!std::strcmp(text, "net")) ok = NetPage::HandleCommand(argument);        // 联机测试
     else if (strcmp(text, "status")) ok = false;
     wchar_t status[320]{}, outfit[200]{}; GroomForce::Status(status, 320); GroomForce::OutfitStatus(outfit, 200);
@@ -367,6 +362,7 @@ DWORD WINAPI Worker(void*) {
     MovePreview::Initialize(&LogLine);
     NetSteam::Initialize(&LogLine);
     NetPuppet::Initialize(&LogLine);
+    BoneMotionRuntime::Initialize(&LogLine);
     BossRush::Initialize(&LogLine, directory.c_str());
     CharacterSwap::Initialize(&LogLine, &ReleaseNpcForOutfit);
     NpcRetarget::Initialize(&LogLine, &ReleasePlayerAppearanceForNpc);
@@ -430,6 +426,7 @@ DWORD WINAPI Worker(void*) {
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
     // The supplement page exists only with the supplement container; the hub lists registered pages only.
     if (DebugSupplement::Present()) DebugHub::Register(DebugHub::Page::Supplement, L"调试补充", &SupplementMenu::CreatePage);
+    DebugHub::Register(DebugHub::Page::BoneMotion, L"骨骼变换", &BoneMotionPage::CreatePage);
     DebugHub::Register(DebugHub::Page::Online, L"联机测试", &NetPage::CreatePage);
     DebugHub::Register(DebugHub::Page::Donate, L"Donate", &DonatePage::CreatePage);
     Log(DebugSupplement::Present() ? "DEBUG_HUB registered 13 embedded pages (supplement present); hotkeys toggle the host"
@@ -459,6 +456,7 @@ DWORD WINAPI Worker(void*) {
         SupplementMenu::Tick();
         DonatePage::Tick();
         NetPage::Tick();
+        BoneMotionPage::Tick();
         EntryFocus::Poll();
         controls.Tick();
         if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25); continue; }
@@ -476,6 +474,7 @@ DWORD WINAPI Worker(void*) {
         }
         Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25);
     }
+    BoneMotionPage::Shutdown();
     WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown(); DonatePage::Shutdown(); NetPage::Shutdown(); ComboMenu::Shutdown();
     SkillToast::Shutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
     UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();

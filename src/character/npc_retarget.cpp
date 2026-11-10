@@ -1,8 +1,13 @@
+﻿#include "npc_display_pool.h"
 #include "npc_skill_support.h"
 #include "npc_retarget.h"
+#include "bone_motion.h"
 #include "npc_source_budget.h"
 #include "npc_cutscene_policy.h"
 #include "combo_playback_rules.h"
+#include "combo_hold_scope.h"
+#include "view_follow_state.h"
+#include "trim_charge_runtime.h"
 #include "ue_runtime.h"
 #include "npc_grip_math.h"
 #include "npc_grip_routes.h"
@@ -198,6 +203,7 @@ struct FaceHook {
     int32_t component_index = -1, component_serial = 0, runtime_bones = 0;
     uintptr_t* original = nullptr; std::unique_ptr<uintptr_t[]> table;
     const Profile* profile = nullptr; uint8_t old_curve = 0, old_attributes = 0;
+    bool mesh_space=false; // fire weapon virtual bones have a different parent from their mapped source bone
     void* map_data = nullptr; int32_t map_slots = 0; uint64_t source_mesh = 0, target_mesh = 0;
     std::vector<int32_t> saved; volatile LONG failed = 0; uint32_t epochs = 0;
     bool map_written = false; const char* map_state = "unseen"; const char* restore_reason = nullptr; ULONGLONG restore_log_time = 0;
@@ -309,6 +315,7 @@ NpcCutscene::Playback cutscene_playback_;
 // counted strong reference while the skin is on, so the boss's montages, bullets and effects stay loaded.
 // relock_until: R3 is also the game's lock-on toggle, so the lock is put back if lost until then.
 // lock: the target struct the cast locked (RememberSkillLock), put back first when the lock is lost.
+TrimChargeRuntime::Pause charge_pause_;
 struct SkillCast { Identity asc,ability_class;int32_t handle=0;ULONGLONG started=0,relock_until=0;uint32_t relocks=0;std::string name;bool seen_active=false,owned=false,bare=false,lock_known=false;unsigned char lock[16]{}; };
 SkillCast skill_;NpcBodyCollision::SkillRound skill_round_;std::vector<Identity> skill_pins_;volatile LONG skill_request_=0;
 // The NPC skill key's random pick: the curated first tier of a skin's moves (11-05 tables list every castable boss
@@ -1074,7 +1081,7 @@ bool MatchArmsToHero(NpcPoseTransfer::Plan& plan) {
 // the sizes read with it) instead of building it. Rows are checked against the live meshes; the oldest goes first.
 struct PlanCacheRow { Identity source_asset,target_asset;std::string profile;NpcPoseTransfer::Plan plan;std::vector<int32_t> virtual_source;
     double skin_size=1,stature=0,camera_lift=0;const MountLoops* mount=nullptr;ULONGLONG used=0; };
-std::vector<PlanCacheRow> plan_cache_;constexpr size_t kPlanCacheRows=4;
+std::vector<PlanCacheRow> plan_cache_;constexpr size_t kPlanCacheRows=16;
 bool SameAsset(const Identity& cached,const Identity& now){return cached.object&&cached.object==now.object&&cached.index==now.index&&cached.serial==now.serial&&Same(cached);}
 void InstallPoseSession(std::unique_ptr<PoseSession> session){AcquireSRWLockExclusive(&pose_lock_);pose_session_=std::move(session);ReleaseSRWLockExclusive(&pose_lock_);}
 void SessionGenerations(PoseSession& session){
@@ -1083,6 +1090,7 @@ void SessionGenerations(PoseSession& session){
 }
 bool PreparePoseSession(Object* source,Object* target_asset,const Profile& profile) {
     auto session=std::make_unique<PoseSession>();session->source=Id(source);session->source_asset=Id(SkelMesh(source));session->target_asset=Id(target_asset);
+    plan_cache_.erase(std::remove_if(plan_cache_.begin(),plan_cache_.end(),[](const PlanCacheRow& row){return !Same(row.source_asset)||!Same(row.target_asset);}),plan_cache_.end());
     for(PlanCacheRow& row:plan_cache_){
         if(row.profile!=profile.id||!SameAsset(row.source_asset,session->source_asset)||!SameAsset(row.target_asset,session->target_asset))continue;
         session->plan=row.plan;session->virtual_source=row.virtual_source;skin_size_=row.skin_size;stature_ratio_=row.stature;camera_lift_=row.camera_lift;
@@ -1143,6 +1151,9 @@ bool PreparePoseSession(Object* source,Object* target_asset,const Profile& profi
         for(size_t t=0;t<follow.size();++t){if(follow[t]<0)continue;Name name;std::memcpy(&name,&plan.target[t].name,8);const std::string text=Text(name);
             if(t>=plan.target_raw||Lower(text).rfind("ik_",0)!=0){follow[t]=-1;continue;}++used;if(list.size()<240)list+=(list.empty()?"":",")+text;}
         const bool followed=NpcPoseTransfer::SetFollowers(plan,follow);
+        plan.authored_follow.assign(plan.target.size(),0);
+        for(size_t t=0;t<plan.target.size();++t){Name name;std::memcpy(&name,&plan.target[t].name,8);
+            if(NpcSkillSupport::AuthoredWeaponIk(profile.id,Lower(Text(name))))plan.authored_follow[t]=1;}
         session->virtual_source.assign(plan.target.size(),-1);size_t driven=0;std::string virtual_list;
         Object* skeleton=Class(profile.skeleton);const Array vbs=Property<Array>(skeleton,"VirtualBones");
         // FVirtualBone = {SourceBoneName, TargetBoneName, VirtualBoneName}; a row counts only if its virtual bone exists here under that source.
@@ -1352,6 +1363,7 @@ void FacePreUpdateBody(Object* node, Object* instance) {
     // Reassert before native caching; then filter every rebuilt map afterward.
     ue::At<uint8_t>(node,0x18) &= static_cast<uint8_t>(~2u);
     ue::At<uint8_t>(node,0x19) = 0;
+    if(hook->mesh_space)ue::At<uint8_t>(node,0x1a)|=1;
     reinterpret_cast<void(__fastcall*)(Object*,Object*)>(ue::Base()+0x35d7d30)(node,instance);
     if(hook->source_input&&(ue::At<uint64_t>(node,0x24)!=hook->source_input||ue::At<uint64_t>(node,0x34)!=hook->source_asset_input)){InterlockedExchange(&hook->failed,1);return;}
     const LONGLONG cache_started=hook->body?PerfStart():0;const bool mapped=hook->body?RewriteBodyCache(*hook):FaceMap(*hook,false);if(hook->body)PerfEnd(PerfKind::BodyCache,cache_started);
@@ -1380,6 +1392,17 @@ bool InstallFaceHook(Object* component, const Profile& profile,bool body=false) 
         original[8]!=ue::Base()+0x35d7d30 || original[14]!=ue::Base()+0x35a7fb0 ||
         !FaceReadable(original-1,21*8) || (ue::At<uint8_t>(node,0x1a)&1)) return false;
     auto hook=std::make_unique<FaceHook>(); hook->component=Id(component); hook->instance=Id(instance);hook->body=body;
+    hook->mesh_space=body&&NpcSkillSupport::MeshSpaceWeaponCopy(profile.id);
+    if(hook->mesh_space){
+        const uintptr_t mesh_pose=Field(type,"bUseMeshPose");
+        if(!mesh_pose||ue::At<int32_t>(reinterpret_cast<void*>(mesh_pose),ue::layout::kPropOffset)!=0x1a||
+            ue::At<uint8_t>(reinterpret_cast<void*>(mesh_pose),0x71)!=0||ue::At<uint8_t>(reinterpret_cast<void*>(mesh_pose),0x73)!=1)return false;
+        // The private cache already contains the target component-space pose. Bone-space CopyPose
+        // subtracts the source weapon's HAND parent when mapping it onto a root-parented virtual bone.
+        // The fire post-process then treats that hand-local value as a world-space weapon target.
+        // Native mesh-space copying retains the correct root-relative virtual target instead.
+        Logf("NPC_BODY fire virtual weapons: native mesh-space CopyPose enabled id=%s",profile.id);
+    }
     int32_t weak[2]{};
     reinterpret_cast<void(__fastcall*)(int32_t*,Object* const*)>(ue::Base()+0x166e900)(weak,&instance);
     hook->instance_index=weak[0]; hook->instance_serial=weak[1]; hook->node=node; hook->original=original; hook->profile=&profile;
@@ -1441,6 +1464,7 @@ bool RestoreFaceHooks() {
         if(hook.source_input&&ue::At<uint64_t>(hook.node,0x10)==hook.source_input)ue::At<uint64_t>(hook.node,0x10)=hook.old_source_input;
         uint8_t& curves=ue::At<uint8_t>(hook.node,0x18); if (!(curves&2)) curves|=hook.old_curve;
         if (!ue::At<uint8_t>(hook.node,0x19)) ue::At<uint8_t>(hook.node,0x19)=hook.old_attributes;
+        if(hook.mesh_space)ue::At<uint8_t>(hook.node,0x1a)&=static_cast<uint8_t>(~1u); // install requires original bit clear
         const char* table_result=current==hook.original?"already-original":"foreign-table-preserved";
         if (current==hook.table.get()+1) {
             void* previous=InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(hook.node),hook.original,current);
@@ -1597,6 +1621,7 @@ Transform* __fastcall GripSocketTransform(Object* self,Transform* out,Name name,
 }
 bool InstallGripHook(Object* component,const Profile& profile) {
     if(grip_hook_||!pose_session_||!FaceQuiesce(component))return false;
+    BoneMotionRuntime::BeforeComponentHook(component);
     auto hook=std::make_unique<GripHook>();hook->component=Id(component);const auto& plan=pose_session_->plan;hook->anchors.resize(plan.source.size());
     double torso_root[4],torso_cs[4],inv_root[4],tmp[4];if(!GeometryForAnchor(plan,0,0,false,false,torso_root))return false;NpcGripMath::Inverse(plan.source_ref_cs[0].rotation,inv_root);NpcGripMath::Mul(plan.target_rest_cs[0].rotation,torso_root,tmp);NpcGripMath::Mul(tmp,inv_root,torso_cs);
     for(size_t si=0;si<plan.source.size();++si){GripAnchor& a=hook->anchors[si];a.target=plan.source_to_target[si];if(a.target<0)continue;Name name;std::memcpy(&name,&plan.source[si].name,8);
@@ -1650,13 +1675,26 @@ std::vector<uint64_t> SocketKeys(Object* mesh) {
     if(names.data&&names.num>0&&names.num<=8192)for(int32_t i=0;i<names.num;++i){uint64_t key=0;std::memcpy(&key,static_cast<Name*>(names.data)+i,8);if(key)keys.push_back(key);}
     ue::Free(names.data);std::sort(keys.begin(),keys.end());keys.erase(std::unique(keys.begin(),keys.end()),keys.end());return keys;
 }
+struct DisplayRouteCache {
+    Identity source,target;std::vector<uint64_t> hero_keys,display_keys,only,shared;ULONGLONG used=0;
+};
+std::vector<DisplayRouteCache> display_route_cache_;
 void BuildDisplayRoutes(Object* hero,Object* display) {
     const std::vector<uint64_t> hero_keys=SocketKeys(hero),display_keys=SocketKeys(display);
+    const Identity source=Id(SkelMesh(hero)),target=Id(SkelMesh(display));
+    display_route_cache_.erase(std::remove_if(display_route_cache_.begin(),display_route_cache_.end(),[](const DisplayRouteCache& row){return !Same(row.source)||!Same(row.target);}),display_route_cache_.end());
+    for(auto& cached:display_route_cache_)if(SameAsset(cached.source,source)&&SameAsset(cached.target,target)&&cached.hero_keys==hero_keys&&cached.display_keys==display_keys){
+        cached.used=GetTickCount64();AcquireSRWLockExclusive(&grip_lock_);
+        if(grip_hook_){grip_hook_->display=Id(display);grip_hook_->display_only=cached.only;grip_hook_->shared=cached.shared;}
+        ReleaseSRWLockExclusive(&grip_lock_);Logf("NPC_GRIP display routes cached heroNames=%zu displayNames=%zu",hero_keys.size(),display_keys.size());return;
+    }
     std::vector<uint64_t> only,shared;std::string sample;
     for(uint64_t key:display_keys){Name name;std::memcpy(&name,&key,8);const std::string text=Lower(Text(name));
         if(!std::binary_search(hero_keys.begin(),hero_keys.end(),key)){only.push_back(key);if(sample.size()<200&&text.find("bone")==std::string::npos)sample+=(sample.empty()?"":",")+Text(name);continue;}
         if(text.rfind("ik_",0)==0||text.find("cam")!=std::string::npos||text=="root"||text=="interaction"||text=="center_of_mass")continue;
         shared.push_back(key);}
+    if(display_route_cache_.size()>=kPlanCacheRows)display_route_cache_.erase(std::min_element(display_route_cache_.begin(),display_route_cache_.end(),[](const DisplayRouteCache& a,const DisplayRouteCache& b){return a.used<b.used;}));
+    display_route_cache_.push_back({source,target,hero_keys,display_keys,only,shared,GetTickCount64()});
     AcquireSRWLockExclusive(&grip_lock_);
     if(grip_hook_){grip_hook_->display=Id(display);grip_hook_->display_only=std::move(only);grip_hook_->shared=std::move(shared);
         Logf("NPC_GRIP display routes heroNames=%zu displayNames=%zu displayOnly=%zu sharedDuringSkills=%zu (e.g. %s)",hero_keys.size(),display_keys.size(),grip_hook_->display_only.size(),grip_hook_->shared.size(),sample.empty()?"-":sample.c_str());}
@@ -1895,6 +1933,25 @@ struct Part {
     bool attachment_known = false, finished = false, head_branch = false;
 };
 #pragma warning(pop)
+struct DormantState {Identity component;uint8_t collision=0;bool primitive=false,overlap=false,tick=false,visible=false,hidden=true,shadow=false,hidden_shadow=false,has_shadow=false,fx=false,active=false,cloth=false,simulation=false;};
+struct DisplayBundle {
+    int row=-1;Identity pawn,source,source_asset,world,donor,target,body,copy_class;
+    std::vector<Part> parts;std::vector<Identity> owned,templates;
+    std::vector<DormantState> dormant;ULONGLONG used=0;bool ready=false,broken=false;
+};
+NpcDisplayPool::Store<DisplayBundle> display_pool_;
+std::unique_ptr<DisplayBundle> active_bundle_;
+bool pool_enabled_=true;
+std::map<int,unsigned> pool_attempts_;
+bool PoolOwns(Object* object){for(const auto& b:display_pool_.Items())for(const auto& id:b->owned)if(id.object==object&&Same(id))return true;return false;}
+bool PoolFreeze(DisplayBundle& bundle);
+bool PoolWake(DisplayBundle& bundle);
+bool PoolDrop(DisplayBundle& bundle);
+bool PoolParkActive();
+bool PoolClear();
+std::unique_ptr<DisplayBundle> PoolTake(const Context& context,int row,Object* donor,Object* target,std::vector<Part>& parts);
+void WarmDisplayPool(const Context& context,const std::vector<int32_t>& wanted);
+
 // A cloth or static mesh part template with nothing to show (no cloth asset / no mesh).
 bool EmptyTemplate(Object* source) {
     if (ue::IsA(source, Class("/Script/ChaosClothAssetEngine.ChaosClothComponent"))) {
@@ -1911,7 +1968,9 @@ std::string Variable(Object* object) {
     return value;
 }
 Object* LoadClassPackage(const std::string& package);
-Object* LoadDonor(const Profile& profile) { return LoadClassPackage(profile.donor); }
+Object* LoadDonor(const Profile& profile) {
+    return LoadClassPackage(profile.donor);
+}
 // A blueprint class by package path ("/PBZCombatAsset/.../GA_X" -> GA_X_C): found if loaded, else loaded blocking.
 // A copy the collector has marked for purge is not "loaded" (FindObject skips it): the engine's own
 // load brings the class back, and only a live class is returned.
@@ -2230,9 +2289,9 @@ bool Configure(Object* source, Object* dest, Object* primary, Object* parent, co
     }
     return true;
 }
-bool Assemble(const Context& context, Object* source_primary, const Profile& profile, std::vector<Part>& parts) {
+bool Assemble(const Context& context, Object* source_primary, const Profile& profile, std::vector<Part>& parts,DisplayBundle* warming=nullptr) {
     Transform body_relative; if (!TransformOf(source_primary, body_relative)) return false;
-    size_t remaining = parts.size();
+    size_t remaining=static_cast<size_t>(std::count_if(parts.begin(),parts.end(),[](const Part& part){return !part.finished;}));
     for (size_t pass = 0; remaining && pass <= parts.size(); ++pass) {
         size_t progress = 0;
         for (Part& part : parts) {
@@ -2248,12 +2307,13 @@ bool Assemble(const Context& context, Object* source_primary, const Profile& pro
             } else if (part.parent.empty() && !Relative(part.relative, body_relative, relative)) return false;
             const bool groom = ue::IsA(part.source, Class("/Script/HairStrandsCore.GroomComponent"));
             if (groom && !BindingParent(Property<Object*>(part.source, "BindingAsset"), context.mesh, parts)) continue;
-            part.created = Add(context.pawn, ue::ClassOf(part.source), relative);
-            if (!part.created) return false;
-            added_.push_back(Id(part.created));
+            const bool reused=part.created!=nullptr;
+            if(!reused){part.created=Add(context.pawn,ue::ClassOf(part.source),relative);if(!part.created)return false;
+                (warming?warming->owned:added_).push_back(Id(part.created));}
+            if(warming&&!SetVisible(part.created,false,true))return false;
             if (part.head_branch && !SetVisible(part.created,false,true)) return false;
             configure_line_ = 0;
-            if (!Configure(part.source, part.created, context.mesh, parent, parts)) {
+            if (!reused&&!Configure(part.source, part.created, context.mesh, parent, parts)) {
                 Logf("NPC_RETARGET part %s (%s) refused by Configure at npc_retarget.cpp:%d parent=%s",
                     part.variable.c_str(), Text(ue::ClassOf(part.source)).c_str(), configure_line_, Text(parent).c_str());
                 return Fail(L"NPC 部件的原生装配接口未能完成");
@@ -2261,7 +2321,10 @@ bool Assemble(const Context& context, Object* source_primary, const Profile& pro
             if (part.head_branch && ue::IsA(part.created,Class("/Script/Engine.SkeletalMeshComponent")) &&
                 (!Put(part.created,"VisibilityBasedAnimTickOption",uint8_t{0}) || !PutBool(part.created,"bEnableUpdateRateOptimizations",false)))
                 return Fail(L"Head 首次隐藏评估所需的动画 tick 设置未能验证");
-            if (!AttachFinish(context.pawn, part.created, parent, part.socket, relative)) return false;
+            if(reused){if(!ue::Alive(part.created)||Property<Object*>(part.created,"AttachParent")!=parent||!(Property<Name>(part.created,"AttachSocketName")==part.socket))return false;}
+            else if(!AttachFinish(context.pawn,part.created,parent,part.socket,relative))return false;
+            if(warming){part.finished=true;return PoolFreeze(*warming);} // one registered part per idle upkeep
+
             if (ue::IsA(part.created, Class("/Script/ChaosClothAssetEngine.ChaosClothComponent"))) EnableCloth(part);
             if (part.variable=="meshhead" && profile.head && !InstallFaceHook(part.created,profile)) return Fail(L"自有 Head 的面部 CopyPose 隔离未能通过原生布局 / 私有映射校验");
             if (ue::IsA(part.source, Class("/Script/Engine.SkeletalMeshComponent")) && SkelMesh(part.source)) {
@@ -2311,7 +2374,7 @@ bool IsBackKnife(Object* component) {
 }
 bool HideOriginalParts(const Context& context) {
     for (Object* component : Components(context.pawn, Class("/Script/Engine.SceneComponent"))) {
-        if (component == context.mesh || component == backup_.object || (!IsAppearancePart(component) && !IsBackKnife(component))) continue;
+        if (component == context.mesh || component == backup_.object || PoolOwns(component) || (!IsAppearancePart(component) && !IsBackKnife(component))) continue;
         bool visible = false, hidden = false;
         if (!VisibilityOf(component, visible, hidden)) return false;
         Visibility saved{Id(component),visible,hidden};
@@ -2546,6 +2609,13 @@ bool ShowSkillWeapon(const Context& context,Object* display,const NpcSkillWeapon
     Object* component=Add(context.pawn,is_skeletal?skeletal:static_type,relative);if(!component)return false;
     skill_weapons_.push_back(Id(component)); // tracked first: RemoveSkillWeapons destroys it whatever fails below
     const bool mesh_set=is_skeletal?SetMesh(component,asset):Call(component,"SetStaticMesh").Set("NewMesh",asset).Invoke();
+    // Rigid skeletal weapons (including the fire meteor heads) use the reference-pose render path on the boss.
+    // A new SkeletalMeshComponent otherwise defaults to GPU skinning with no animation instance.
+    bool render_static=false;
+    if(is_skeletal&&Bool(source,"bRenderStatic",render_static)&&render_static){
+        if(!Call(component,"SetRenderStatic").Set("bNewValue",true).Invoke())return false;
+        Logf("NPC_SKILL weapon reference-pose rendering component=%s asset=%s",Text(component).c_str(),Text(asset).c_str());
+    }
     Call(component,"SetCollisionEnabled").Set("NewType",uint8_t{0}).Invoke();
     const bool attached=AttachFinish(context.pawn,component,display,socket,relative);
     const bool dressed=attached&&CopyMaterials(source,component)&&MatchPlayerLighting(context.mesh,component);
@@ -3685,7 +3755,7 @@ bool TryPendingSkill(const Context& context) {
     // The spec leaves the ASC when the ability ends (GAS RemoveAfterActivation); WatchSkill only observes.
     const bool remove_on_end=!pending_.owned&&Call(asc,"SetRemoveAbilityOnEnd").Set("AbilitySpecHandle",pending_.handle).Invoke();
     const PendingCast cast=pending_;pending_={};
-    skill_={};skill_.asc=cast.asc;skill_.ability_class=cast.ability_class;skill_.handle=cast.handle;skill_.started=GetTickCount64();skill_.name=cast.name;skill_.owned=cast.owned;skill_.bare=cast.bare&&!active_;
+    charge_pause_.Reset();skill_={};skill_.asc=cast.asc;skill_.ability_class=cast.ability_class;skill_.handle=cast.handle;skill_.started=GetTickCount64();skill_.name=cast.name;skill_.owned=cast.owned;skill_.bare=cast.bare&&!active_;
     RememberSkillLock(context.pawn);
     if(boss){skill_route_until_.store(~0ull,std::memory_order_relaxed);NoExecutionOn(context.pawn);}
     if(cast.owned||!active_||selected_<0||static_cast<size_t>(selected_)>=std::size(kNpcSkillSets)){
@@ -3857,6 +3927,7 @@ void StopSkillSounds(const SkillSounds& sounds,Object* pawn,const char* why) {
     Logf("NPC_SKILL sounds stopped reason=%s actions=%zu ids=%d/%zu notifies=%zu events=%d/%zu",why,sounds.actions,ids,sounds.ids.size(),sounds.notifies,events,sounds.events.size());
 }
 void ClearSkill(const char* why) {
+    charge_pause_.Release();
     DropPendingSkill(why);
     if(skill_.handle<=0){RemoveSkillWeapons(why);return;}
     bool present=false;uint8_t active=0;
@@ -3873,10 +3944,10 @@ void ClearSkill(const char* why) {
 }
 void WatchSkill() {
     if(skill_.handle<=0)return;
-    if(!Same(skill_.asc)){Logf("NPC_SKILL ended ability=%s: ability system gone",skill_.name.c_str());skill_={};RemoveSkillWeapons("ability-system-gone");return;}
-    const ULONGLONG ms=GetTickCount64()-skill_.started;bool present=false;uint8_t active=0;
+    if(!Same(skill_.asc)){Logf("NPC_SKILL ended ability=%s: ability system gone",skill_.name.c_str());charge_pause_.Release();skill_={};RemoveSkillWeapons("ability-system-gone");return;}
+    const ULONGLONG elapsed=GetTickCount64()-skill_.started,paused=charge_pause_.Millis();const ULONGLONG ms=elapsed>(std::min)(elapsed,paused)?elapsed-paused:0;bool present=false;uint8_t active=0;
     if(!SpecState(skill_.asc.object,skill_.handle,present,active)){if(ms>kSkillTimeoutMs)ClearSkill("timeout-spec-unreadable");return;}
-    if(!present){Logf("NPC_SKILL ended ability=%s ms=%llu sawActive=%d",skill_.name.c_str(),ms,skill_.seen_active?1:0);skill_={};RemoveSkillWeapons("ended");return;}
+    if(!present){Logf("NPC_SKILL ended ability=%s ms=%llu sawActive=%d",skill_.name.c_str(),ms,skill_.seen_active?1:0);charge_pause_.Release();skill_={};RemoveSkillWeapons("ended");return;}
     if(active)skill_.seen_active=true;
     // The spec is left behind when SetRemoveAbilityOnEnd is unavailable: cleared as soon as the skill has
     // run and stopped (or never ran within 500 ms), so the next press is free right away.
@@ -4267,9 +4338,9 @@ void RedirectWeaponTrace() {
     for(const int32_t handle:running){
         bool instance=false;Object* ability=SpecAbility(asc,handle,instance);
         if(!instance||!IsBlueprint(ability,"GA_WeaponTraceAttack_Base_C"))continue;
-        Object* was=Property<Object*>(ability,"PP");if(was==pp||!Put(ability,"PP",pp))continue;
+        Object* was=Property<Object*>(ability,"PP");if(was!=pp&&!Put(ability,"PP",pp))continue;
         const auto known=std::find_if(traced_.begin(),traced_.end(),[&](const TracedAbility& t){return t.ability.object==ability&&Same(t.ability);});
-        if(known==traced_.end())traced_.push_back({Id(ability),Id(was),pp});else{known->original=Id(was);known->pp=pp;}
+        if(known==traced_.end())traced_.push_back({Id(ability),Id(was),pp});else if(was!=pp){known->original=Id(was);known->pp=pp;}else continue;
         Logf("NPC_SKILL weapon trace %s: PP %s -> %s",Text(ability).c_str(),Text(was).c_str(),Text(pp).c_str());
     }
 }
@@ -4417,6 +4488,26 @@ void AuditTraceSample() {
     for(const Identity& c:skill_colliders_){if(shapes.size()>300||!Same(c))continue;Call where(c.object,"K2_GetComponentLocation");if(!where.Invoke())continue;
         const Vector v=where.Get<Vector>("ReturnValue");const double d=has_dummy?std::sqrt((v.x-dummy.x)*(v.x-dummy.x)+(v.y-dummy.y)*(v.y-dummy.y)):-1;
         _snprintf_s(number,sizeof(number),_TRUNCATE," (%.0f,%.0f,%.0f)d=%.0f",v.x,v.y,v.z,d);shapes+=number;}
+    if(Object* display=WeaponDisplay()){
+        std::string motion;
+        for(const char* side:{"l","r"}){
+            Vector points[3]{};bool valid=true;int i=0;
+            for(const char* prefix:{"hand_","weapon_","ik_weapon_"}){
+                const std::string bone=std::string(prefix)+side;const std::wstring wide(bone.begin(),bone.end());
+                Call at(display,"GetSocketTransform");if(!at.Set("InSocketName",ue::MakeName(wide.c_str())).Set("TransformSpace",uint8_t{1}).Invoke()){valid=false;break;}
+                const Transform t=at.Get<Transform>("ReturnValue");points[i++]={t.translation[0],t.translation[1],t.translation[2]};}
+            if(valid){const auto distance=[](Vector a,Vector b){return std::hypot(std::hypot(a.x-b.x,a.y-b.y),a.z-b.z);};
+                _snprintf_s(number,sizeof(number),_TRUNCATE," %s hand_weapon=%.1f hand_ik=%.1f weapon_ik=%.1f",side,distance(points[0],points[1]),distance(points[0],points[2]),distance(points[1],points[2]));motion+=number;}}
+        if(!motion.empty())Logf("NPC_AUDIT_CHAIN t=%llums%s",GetTickCount64()-skill_.started,motion.c_str());
+        if(WeaponSkin()>=0&&NpcSkillSupport::AuthoredWeaponIk(kProfiles[WeaponSkin()].id,"ik_weapon_l"))for(const Identity& weapon:skill_weapons_)if(Same(weapon)){
+            Call where(weapon.object,"K2_GetComponentToWorld"),bounds(Kismet(),"GetComponentBounds");
+            if(!where.Invoke())continue;const Transform w=where.Get<Transform>("ReturnValue");
+            const bool bounded=bounds.Set("Component",weapon.object).Invoke();const Vector lo=bounds.Get<Vector>("Origin"),hi=bounds.Get<Vector>("BoxExtent");
+            bool visible=false,hidden=false;VisibilityOf(weapon.object,visible,hidden);
+            Logf("NPC_AUDIT_WEAPON t=%llums component=%s visible=%d hidden=%d worldT=(%.1f,%.1f,%.1f) worldS=(%.3f,%.3f,%.3f) bounds=%d origin=(%.1f,%.1f,%.1f) extent=(%.1f,%.1f,%.1f)",
+                GetTickCount64()-skill_.started,Text(weapon.object).c_str(),visible,hidden,w.translation[0],w.translation[1],w.translation[2],w.scale[0],w.scale[1],w.scale[2],bounded,lo.x,lo.y,lo.z,hi.x,hi.y,hi.z);
+        }
+    }
     Logf("NPC_AUDIT_TRACE t=%llums pp=%s%s dummy=(%.0f,%.0f,%.0f) shapes=%s",GetTickCount64()-skill_.started,Text(ue::ClassOf(pp)).c_str(),vars.empty()?" vars=-":vars.c_str(),
         dummy.x,dummy.y,dummy.z,shapes.empty()?"-":shapes.c_str());
 }
@@ -4845,6 +4936,10 @@ void HoldBodyCollision() {
     if(GetTickCount64()<body_state_logged_)return;body_state_logged_=GetTickCount64()+10000;
     Logf("NPC_BODY capsule radius=%.1f half=%.1f is a game state of its own (skin %.1f/%.1f); left until it returns to the default",r,h,body_.kept_radius,body_.half);
 }
+LONGLONG QpcNow();
+double QpcMs(LONGLONG from);
+#include "npc_display_pool_runtime.h"
+
 bool RestoreSourceSettings();
 bool Restore(bool preserve_external = true) {
     stage_ = "restore";
@@ -4896,7 +4991,8 @@ bool Restore(bool preserve_external = true) {
     } else if (!Same(primary_)) {
         primary_restored_ = true; // Old avatar was unloaded; never call it.
     }
-    active_ = false;
+    if(active_&&PoolParkActive())added_.clear();
+    active_bundle_.reset();active_ = false;
     for (size_t i = added_.size(); i-- > 0;) {
         if (!Same(added_[i]) || Destroy(added_[i].object)) added_.erase(added_.begin() + i);
         else restored = false;
@@ -5141,14 +5237,17 @@ bool Apply(const Context& context,int32_t entry) {
     source_driver_mode_=true;primary_=Id(context.mesh);source_asset_=Id(SkelMesh(context.mesh));pawn_=Id(context.pawn);original_class_=Id(AnimClass(context.mesh));target_mesh_=Id(target);
     if(!PreparePoseSession(context.mesh,target,profile)||!HideOriginalParts(context)||!AcquireSourceSettings(context.mesh)){Restore();return Fail(L"独立姿势映射 / 原附件隐藏准备失败，已保留恢复记录");}
     clock.Mark("pose");stage_="create NPC display";
-    Object* display=Add(context.pawn,Class("/Script/Engine.SkeletalMeshComponent"));
-    if(display){display_=Id(display);added_.push_back(display_);pose_session_->display=display_;}
+    active_bundle_=cutscene_host_?nullptr:PoolTake(context,entry,donor,target,parts);
+    const bool reused=active_bundle_!=nullptr;
+    Object* display=reused?active_bundle_->body.object:Add(context.pawn,Class("/Script/Engine.SkeletalMeshComponent"));
+    if(reused)added_=active_bundle_->owned;
+    if(display){display_=Id(display);if(!reused)added_.push_back(display_);pose_session_->display=display_;}
     const std::string copy_package="/HuaShira/Characters/Hero/Hero_Hun/Hun_CopyPose";Profile copy_profile=profile;copy_profile.donor=copy_package.c_str();Object* copy_class=LoadDonor(copy_profile);
-    if(!display||!copy_class||!SetVisible(display,false,true)||!SetMesh(display,target)||!WriteAnimOptions(display,options)||!CopyMaterials(donor,display)||
+    if(!display||!copy_class||(!reused&&(!SetVisible(display,false,true)||!SetMesh(display,target)||!WriteAnimOptions(display,options)||!CopyMaterials(donor,display)||
         !SetPhysics(display,Property<Object*>(donor,"PhysicsAssetOverride"))||!Call(display,"SetAnimInstanceClass").Set("NewClass",copy_class).Invoke()||
         !Put(display,"VisibilityBasedAnimTickOption",uint8_t{0})||!PutBool(display,"bEnableUpdateRateOptimizations",false)||
         !Call(display,"SetCollisionEnabled").Set("NewType",uint8_t{0}).Invoke()||!Call(display,"SetGenerateOverlapEvents").Set("bInGenerateOverlapEvents",false).Invoke()||
-        !Call(display,"AddTickPrerequisiteComponent").Set("PrerequisiteComponent",context.mesh).Invoke()||!AttachFinish(context.pawn,display,context.mesh,Name{},Transform{})){
+        !Call(display,"AddTickPrerequisiteComponent").Set("PrerequisiteComponent",context.mesh).Invoke()||!AttachFinish(context.pawn,display,context.mesh,Name{},Transform{})))){
         Restore();return Fail(L"NPC 独立显示组件初始化失败，已请求完整恢复");}
     CopyRenderFlags(donor,display);
     if(!Property<Object*>(donor,"PhysicsAssetOverride")&&!Property<Object*>(target,"PhysicsAsset")){
@@ -5158,17 +5257,29 @@ bool Apply(const Context& context,int32_t entry) {
         Logf("NPC_RETARGET display has no physics asset; boundsScale=%.1f applied=%d",kNoPhysicsBoundsScale,widened?1:0);}
     if(!MatchPlayerLighting(context.mesh,display)||!HasNoLeader(display)||!VerifyPostProcess(display,options,"NPC-display")||!InstallFaceHook(display,profile,true)){
         Restore();return Fail(L"NPC 显示的独立 CopyPose / 照明校验失败，已请求恢复");}
+    // Restore dormant native state before authored hair/cloth setup, so that
+    // setup wins over the inactive defaults captured during pre-registration.
+    if(reused&&!PoolWake(*active_bundle_)){Restore();return Fail(L"缓存外观未能恢复更新状态，已清理并保留原装配路径");}
     QuietAimNodes(display);if(mount_.row&&!cutscene_host_)CreateMountPuppet(context,display,target);
     clock.Mark("display");stage_="assemble NPC parts";Context display_context=context;display_context.mesh=display;face_wait_started_=face_wait_seen_=GetTickCount64();
-    if(!Assemble(display_context,donor,profile,parts)||!InstallGripHook(context.mesh,profile)||(BuildDisplayRoutes(context.mesh,display),!SetVisible(display,true,false))){
+    const bool assembled=Assemble(display_context,donor,profile,parts);clock.Mark("parts-create");
+    const bool gripped=assembled&&InstallGripHook(context.mesh,profile);clock.Mark("grip");
+    if(gripped)BuildDisplayRoutes(context.mesh,display);clock.Mark("routes");
+    if(!gripped||!SetVisible(display,true,false)){
         Restore();return Fail(L"NPC 部件 / 原生武器适配 / 源姿势持续更新未通过，已请求恢复");}
-    clock.Mark("assemble");
+    clock.Mark("reveal");
     const char* lease_why=nullptr;
     if(!SourceLeaseValid(lease_why)||!SourceSettingsHeld()){Restore();return Fail(L"主角源动画 / 隐藏更新状态未通过读回，已请求恢复");}
     LARGE_INTEGER seed{};QueryPerformanceCounter(&seed);skill_round_.Reset(static_cast<uint64_t>(seed.QuadPart)^(GetTickCount64()<<32));pending_={};
     foreign_weight_.store(0.0,std::memory_order_relaxed);foreign_own_.store(false,std::memory_order_relaxed);foreign_from_=foreign_to_=0;foreign_montage_=nullptr;
     if(resume_entry_>=0)Logf("NPC_RETARGET resumed id=%s after a scene / player change (try %u)",profile.id,resume_tries_);
     resume_entry_=-1;resume_at_=0;resume_tries_=0;
+    if(pool_enabled_&&PoolEligible(entry)&&!cutscene_host_&&!mount_.row&&!active_bundle_){
+        active_bundle_=std::make_unique<DisplayBundle>();auto& b=*active_bundle_;b.row=entry;b.pawn=Id(context.pawn);b.source=Id(context.mesh);b.source_asset=Id(SkelMesh(context.mesh));b.world=Id(context.world);
+        b.donor=Id(donor);b.target=Id(target);b.body=Id(display);b.copy_class=Id(copy_class);b.parts=parts;b.owned=added_;b.ready=true;for(const auto& part:parts)b.templates.push_back(Id(part.source));
+    }
+    if(active_bundle_){active_bundle_->parts=parts;active_bundle_->used=GetTickCount64();}
+    Logf("NPC_POOL activate id=%s reused=%d parts=%zu",profile.id,reused?1:0,parts.size());
     active_=true;cleanup_pending_=false;selected_=entry;Publish();stage_="idle";
     if(!cutscene_host_){ApplyBodyCollision(context,entry);ApplyHurtVoice(context,entry);ApplyCameraLift(context.pawn);}  // gameplay only, not on a cutscene copy
     Status(L"NPC %s 已装配：保留原主角完整动画，%d 个共享骨与 %d 条原生武器挂点；需实测攻击 / 技能",profile.name,static_cast<int>(pose_session_->plan.mapped),static_cast<int>(grip_hook_->count));
@@ -5278,22 +5389,17 @@ bool CastMove(const Context& context,const std::string& package,const std::wstri
     pending_.bare=!active_;  // no NPC look: the boss move on the hero's own body (retried, watched and ended as the hero's own)
     TryPendingSkill(context);return true;
 }
-// Chains are driven by presses. A trigger (the NPC skill key, or a hero action whose ability is cancelled as it
-// starts) starts its chain; every later press walks on from the move that played last (NpcCombo::Decide): a wire
-// straight to a move takes the same button again, a branch the row of the pressed button whose pause - since the
-// press before - has passed. A press while the move cannot be cut yet is kept (预输入, one press: a newer press that
-// leads somewhere takes its place until it plays) and plays the moment it can: at the end of the intervals on the way
-// (from the move's start; a shorter move is slowed to fill the ones straight after it, a longer one is cut there),
-// at its 派生点, or without one when the move ends. A press too early for every row of its button is kept for that
-// row's pause. A press that leads nowhere ends the chain (it starts a trigger's chain, or does what it did before)
-// unless a press is kept or the move plays on, and so does no press within the trigger's reset time after a move ends
-// (while a branch row waits for its pause: until that pause plus at least 1.5 s after the press before). The
-// trigger's own button pressed again restarts the chain once the move can be cut; another trigger cuts in at once.
+// Each move visit owns an outgoing-path clock. It opens at the derivation point
+// (or natural end), then intervals and branch pauses count from their arrival.
+// Press history is used only for input consumption; buffering never ages a new
+// node. Every completed move refreshes its own idle reset window.
 struct ComboRun {
     enum class Phase { Idle, Starting, Running };
     int32_t owner=-2;uint64_t generation=0;NpcCombo::Config config; // owner: -1 the hero's own chain, -2 none
     int trigger=-1,cursor=-1,button=0,playing=-1,reset_ms=NpcCombo::kResetDefault;Phase phase=Phase::Idle;
     NpcCombo::Hop queued;ULONGLONG queued_at=0,queued_ready=0;bool hold=false; // queued.move<0: no press waiting; hold: after the playing move; queued_ready: a pause row's press, not before then
+    uint64_t visit=0; // changes even when a loop re-enters the same node
+    ComboPlayback::NodeClock path_clock,step_clock,restart_clock; // restart waits without changing the live cursor
     ULONGLONG ended_at=0; // when the last move ended (the wait for the next press counts from there)
     int32_t home=-2; // the look the chain ends in, set by a 变身 / 变回主角 node (-1 the hero's own; -2 none: the owner's)
     ULONGLONG at=0,started=0,last_press=0,reset_at=0,rate_check=0,cut_at=0; // cut_at: when the move before could be cut (0: not yet)
@@ -5307,6 +5413,9 @@ struct ComboRun {
     ULONGLONG press_before=0; // combo_.last_press before the kept press came (back when 预输入 clears that press)
 };
 ComboRun combo_;
+NpcCombo::Press charge_queued_input_,charge_active_input_;
+ComboPlayback::NativeInput native_input_;
+bool native_detour_=false,native_handoff_=false;
 // The look the chain ends in: the one a 变身 / 变回主角 node set, else `fallback`.
 int32_t ChainHome(int32_t fallback){return combo_.home!=-2?combo_.home:fallback;}
 // A 组合 playing: its moves in order (NpcCombo::GroupSteps) and the one up now. While it plays the chain's place
@@ -5315,6 +5424,7 @@ struct GroupRun { int index=-1,button=0; std::vector<int> steps; size_t step=0; 
 GroupRun group_;
 bool ComboInterruptible();
 bool ChainGrabActive();
+bool MoveCut(ULONGLONG now);
 // 保持派生 (NpcCombo::KeepChainFor) where the chain is now - the move playing (a 组合's step), else its place - while
 // the chain goes on from there: its time in ms (0: not kept). No press of the hero ends such a chain: one it does not
 // take is left to the game (cutting the move playing) and the chain waits that long from the move's end or that press.
@@ -5324,10 +5434,12 @@ int KeepChainMs(){
 }
 // How long the chain waits for the next press after a move: 保持派生's own time, else the trigger's reset time.
 int ChainWaitMs(){const int keep=KeepChainMs();return keep>0?keep:combo_.reset_ms;}
-// May the hero's own action (a press the chain does not take) cut the move playing now: 允许中断, or 保持派生 (a
-// paired grab plays on: it takes 允许中断 only).
+// Native actions share the next-move gate; 允许中断 / 保持派生 may open it earlier.
+// Paired grabs remain owned by their separate cancellation path.
 bool HeroCuts(){
-    return ComboInterruptible()||(!ChainGrabActive()&&combo_.phase==ComboRun::Phase::Running&&combo_.playing>=0&&KeepChainMs()>0);
+    const bool running=combo_.phase==ComboRun::Phase::Running&&combo_.playing>=0;
+    const bool paired=ChainGrabActive();
+    return ComboPlayback::HeroMayCut(running,paired,ComboInterruptible(),KeepChainMs(),running&&!paired&&MoveCut(GetTickCount64()));
 }
 // A 组合 is playing its steps: a press that leads nowhere then is swallowed (only 允许中断 / 保持派生 cut the 组合).
 bool GroupHolds(){return group_.index>=0&&combo_.trigger>=0&&combo_.phase!=ComboRun::Phase::Idle&&!HeroCuts();}
@@ -5944,6 +6056,7 @@ void StartComboAir();
 void DriveHookProbe();
 void DriveHookClose();
 void DriveViewFollow();
+void BeforeViewTrimSeek(double position,double destination);
 void EndViewFollow(const char* why);
 bool SendViewOffset(Object* camera,Object* pawn,const Vector& world,float blend);
 Object* HeroCamera(Object* pawn);
@@ -5958,7 +6071,10 @@ void EndTeleport(const char* why);
 void StartTeleport(const Context& context,int index,int button,ULONGLONG now);
 bool TeleportRefused(ULONGLONG now);
 void EndSpeed(const char* why);
+void EndTrim(const char* why);
 void ResetCombo(const char* why,const std::wstring& note) {
+    EndTrim(why);
+    native_input_={};native_detour_=false;native_handoff_=false;
     EndSpeed(why);
     SetComboArmor(false);
     SetComboInvincible(false);
@@ -5969,6 +6085,7 @@ void ResetCombo(const char* why,const std::wstring& note) {
     combo_.native=false;
     if(combo_.trigger>=0&&combo_.cursor>=0)Logf("NPC_COMBO reset reason=%s trigger=%d node=%d",why,combo_.trigger,combo_.cursor);
     combo_.trigger=-1;combo_.cursor=-1;combo_.playing=-1;combo_.queued={};combo_.queued_ready=0;combo_.hold=false;combo_.phase=ComboRun::Phase::Idle;combo_.reset_at=0;combo_.cut_at=0;
+    ++combo_.visit;combo_.path_clock.Reset();combo_.step_clock.Reset();combo_.restart_clock.Reset();
     combo_.last_press=0;combo_.ended_at=0;combo_.home=-2;combo_.row_branch=-1;combo_.row_row=-1;
     PublishCombo(note);
 }
@@ -6057,21 +6174,28 @@ void CallAssist(int index,ULONGLONG now){
          mods.armor?" armor":"",mods.invincible?" invincible":"",mods.ignore_guard?" ignore-guard":"",mods.interrupt?" interrupt":"");
 }
 void PlayHop(const NpcCombo::Hop& hop,ULONGLONG now){
+    charge_active_input_=charge_queued_input_;
+    if(combo_.hold){combo_.row_branch=-1;combo_.row_row=-1;} // restart commits only when the old move has finished
     if(hop.branch>=0||!NpcCombo::OwnKeysTrigger(hop.button)){combo_.row_branch=hop.branch;combo_.row_row=hop.row;}
     const std::vector<int> assists=hop.assists;const int move=hop.move,button=hop.button;  // hop may be combo_.queued, which PlayNode clears
     for(const int assist:assists)CallAssist(assist,now);
     PlayNode(move,button,now);
 }
 void PlayNode(int index,int button,ULONGLONG now) {
+    native_input_={};native_detour_=false;native_handoff_=false;
     if(ChainGrabActive())LeaveGrab("next-move",now);  // only GrabCuttable lets a node play then
     air_cast_node_=index;air_cast_airborne_=Same(ChainPawn())&&Airborne(ChainPawn().object);  // 空中释放: cast in the air?
     const bool step=group_.index>=0&&group_.step<group_.steps.size()&&group_.steps[group_.step]==index;
     if(!step){
         if(group_.index>=0){Logf("NPC_COMBO group=%d cut by node=%d",group_.index,index);EndGroup("cut");}
-        combo_.queued={};combo_.queued_ready=0;combo_.hold=false;
+        combo_.queued={};combo_.queued_ready=0;combo_.hold=false;combo_.restart_clock.Reset();
     }
     if(TeleportBusy()&&tp_.node!=index)EndTeleport("next-node");
-    combo_.reset_at=0;
+    ++combo_.visit;combo_.reset_at=0;combo_.ended_at=0;combo_.step_clock.Reset();
+    const int group_cut=step?NpcCombo::CancelOf(combo_.config,group_.index):0;
+    const bool group_open=step&&(NpcCombo::InterruptFor(combo_.config,combo_.trigger,group_.index)||
+        (group_cut>0&&now>=group_.started+static_cast<ULONGLONG>(group_cut)));
+    if(!group_open)combo_.path_clock.Reset(); // a step-local interrupt never grants the next step permission
     const int keep=combo_.cursor;
     PlayNodeImpl(index,button,now);
     if(step)StepCursor(keep);
@@ -6264,6 +6388,7 @@ std::string PlayingName() {
 // May the playing move be cut now: it is under 允许中断 (any time), its 派生点 or the intervals straight after it are
 // over (an interval holds the next move to its end), or without either it has ended?
 bool MoveCut(ULONGLONG now) {
+    if(charge_pause_.active)return false;
     if(combo_.phase==ComboRun::Phase::Starting)return false;
     if(combo_.phase!=ComboRun::Phase::Running)return true;
     if(ChainGrabActive())return GrabCuttable(now);  // a paired grab: only under 允许中断
@@ -6278,77 +6403,87 @@ bool MoveCut(ULONGLONG now) {
     if(PlayingGrab()){const MotianGrab::Snapshot s=MotianGrab::GetSnapshot();return !s.active||s.hero_free;}  // a paired grab is never cut short
     if(NpcCombo::InterruptFor(combo_.config,combo_.trigger,combo_.playing))return true;
     if(PlayingTeleport()&&TeleportBusy())return false;  // landing first
-    const int cut=NpcCombo::CutMs(combo_.config,combo_.playing);
+    const int cut=NpcCombo::CancelOf(combo_.config,combo_.playing);
     if(cut>0&&now>=combo_.started+static_cast<ULONGLONG>(cut))return true;
-    if(NpcCombo::SharedWait(combo_.config,combo_.playing)>0)return false;
     WatchSkill();return skill_.handle<=0;
 }
-// May the kept press play now? From a trigger: its intervals after the press (after the playing move when it is the
-// same trigger again); from a move under 允许中断: at once, or at the end of the intervals on the way; from another
-// move: its 派生点 or the intervals on the way from its start, whichever comes first, or without either its end.
-bool QueuedReady(ULONGLONG now) {
-    if(combo_.queued.move<0)return false;
-    if(ChainGrabActive()&&!GrabCuttable(now))return false;  // the grab plays to its end first
-    if(combo_.queued_ready&&now<combo_.queued_ready)return false;  // kept for its row's pause
-    const ULONGLONG wait=static_cast<ULONGLONG>(combo_.queued.wait_ms);
-    if(NpcCombo::IsTrigger(combo_.config,combo_.cursor))return (!combo_.hold||MoveCut(now))&&now>=combo_.queued_at+wait;
-    if(combo_.phase==ComboRun::Phase::Starting)return false;
-    // A 组合 counts from its own start; 允许中断 on its step playing counts as on the 组合.
-    const bool in_group=group_.index>=0;
-    const ULONGLONG from=in_group?group_.started:combo_.started;
-    if(NpcCombo::InterruptFor(combo_.config,combo_.trigger,in_group&&combo_.playing>=0?combo_.playing:combo_.cursor))return now>=from+wait;
-    const ULONGLONG cancel=static_cast<ULONGLONG>(NpcCombo::CancelOf(combo_.config,in_group?group_.index:combo_.cursor));
-    if(wait||cancel){
-        const ULONGLONG at=from+(wait&&cancel?(std::min)(wait,cancel):wait?wait:cancel);
-        if(now>=at)return true;
-        if(wait)return false;
+// Reach the outgoing path only once the preceding move can actually yield.
+// Intervals and branch pauses begin here, never at an earlier input or load.
+void ReachComboPath(ULONGLONG now){
+    if(combo_.path_clock.open||combo_.trigger<0)return;
+    if(NpcCombo::IsTrigger(combo_.config,combo_.cursor)){
+        if(!combo_.hold||MoveCut(now))combo_.path_clock.Reach(now);
+    }else if(combo_.phase!=ComboRun::Phase::Starting&&MoveCut(now))combo_.path_clock.Reach(now);
+}
+int BranchPrefix(){return NpcCombo::SharedWait(combo_.config,combo_.cursor);}
+ULONGLONG QueuedPathDue(){
+    if(combo_.hold)return combo_.restart_clock.Due(combo_.queued_at,combo_.queued.wait_ms,NpcCombo::SharedWait(combo_.config,combo_.trigger),combo_.queued.pause_ms,combo_.queued.branch>=0);
+    return combo_.path_clock.Due(combo_.queued_at,combo_.queued.wait_ms,BranchPrefix(),combo_.queued.pause_ms,combo_.queued.branch>=0);
+}
+bool RestartMoveFinished(){
+    WatchSkill();
+    const bool group_next=group_.index>=0&&group_.step+1<group_.steps.size();
+    bool busy=charge_pause_.active||TeleportBusy()||HookAnchorBusy();
+    if(PlayingGrab()||ChainGrabActive()){
+        const auto grab=MotianGrab::GetSnapshot();busy=busy||grab.active||grab.cleanup_pending;
     }
-    return MoveCut(now);
+    return ComboPlayback::RestartFinished(combo_.phase==ComboRun::Phase::Starting,group_next,skill_.handle>0,busy);
+}
+bool QueuedReady(ULONGLONG now) {
+    if(charge_pause_.active||combo_.queued.move<0)return false;
+    if(combo_.hold){
+        if(!RestartMoveFinished())return false;
+        combo_.restart_clock.Reach(now);
+        return now>=QueuedPathDue();
+    }
+    if(ChainGrabActive()&&!GrabCuttable(now))return false;
+    if(!NpcCombo::IsTrigger(combo_.config,combo_.cursor)&&combo_.phase==ComboRun::Phase::Running&&!MoveCut(now))return false;
+    ReachComboPath(now);
+    return combo_.path_clock.open&&now>=QueuedPathDue();
 }
 // What a press does now: continue (the hop from the move that played last), start `trigger`'s chain, or nothing
-// (kept: a press is kept already and stays). A branch row's pause counts from the press before (combo_.last_press);
+// (kept: a press is kept already and stays). A branch row's pause counts from arrival at that branch on this visit;
 // a press during the move whose pause has passed is kept for the move's 派生点 like any other. A press too early for
 // every row of its button is kept for the shortest such pause (later). One press is kept: a newer one that leads
 // somewhere replaces it until it plays (the last press wins).
 // button: the one a chain starts on when the press starts one (a trigger's own, a 武器派生修改's row's; -1 none).
-struct ComboPress { bool kept=false,later=false; NpcCombo::Hop hop; int trigger=-1,since=-1,ready_in=0,button=-1; };
+struct ComboPress { NpcCombo::Press input;bool kept=false,later=false; NpcCombo::Hop hop; int trigger=-1,since=-1,ready_in=0,button=-1; };
 int SinceLastPress(ULONGLONG now){return combo_.last_press?static_cast<int>((std::min<ULONGLONG>)(now-combo_.last_press,0x7fffffff)):-1;}
 void Queue(const ComboPress& where,ULONGLONG now,const char* source,bool hold) {
+    charge_queued_input_=where.input;
     const NpcCombo::Hop& hop=where.hop;const NpcCombo::Hop before=combo_.queued;
     if(before.move<0)combo_.press_before=combo_.last_press;
+    if(!hold||!combo_.hold)combo_.restart_clock.Reset();
     combo_.queued=hop;combo_.queued_at=now;combo_.hold=hold;combo_.reset_at=0;
-    combo_.queued_ready=where.later?now+static_cast<ULONGLONG>((std::max)(where.ready_in,0)):0;
+    combo_.queued_ready=0; // derived from path arrival, which may still be pending
     NpcCombo::Decision decision;decision.hop=hop;decision.later=where.later;
     combo_.last_press=NpcCombo::PressBefore(combo_.last_press,decision,now);
     char replaced[64]="";if(before.move>=0)std::snprintf(replaced,sizeof(replaced)," (replaces the kept press: node=%d)",before.move);
     char later[96]="";if(where.later)std::snprintf(later,sizeof(later)," (too early for its %dms pause: kept, plays in %dms unless a newer press comes)",hop.pause_ms,where.ready_in);
-    Logf("NPC_COMBO press source=%s from=%d -> node=%d button=%d waitMs=%d sinceLastPressMs=%d pauseMs=%d%s%s%s",source,combo_.cursor,hop.move,hop.button,hop.wait_ms,
+    Logf("NPC_COMBO press source=%s from=%d -> node=%d button=%d waitMs=%d sinceBranchMs=%d pauseMs=%d%s%s%s",source,combo_.cursor,hop.move,hop.button,hop.wait_ms,
          where.since,hop.pause_ms,replaced,later,hold?" (after the move)":"");
     if(QueuedReady(now))PlayHop(hop,now);
 }
-// 预输入: a kept press waits for the move before it (its 派生点 or end, a paired grab's end) for the chain's 预输入 time
-// (NpcCombo::PreInputMs; 0: no limit), then it is cleared and the chain waits for a new press as if it was never made.
-// The time counts from when the press could play at the earliest by what it waits for on purpose: the press itself, its
-// branch row's pause, the intervals on its way (after a trigger from the press, else from the move's or the 组合's
-// start). A move still starting (its look or weapon coming) holds the count: its start is not known yet.
-ULONGLONG QueuedDue(){
-    const ULONGLONG wait=static_cast<ULONGLONG>((std::max)(combo_.queued.wait_ms,0));
-    const ULONGLONG from=NpcCombo::IsTrigger(combo_.config,combo_.cursor)?combo_.queued_at:group_.index>=0?group_.started:combo_.started;
-    return (std::max)((std::max)(combo_.queued_at,combo_.queued_ready),from+wait);
-}
+// Pre-input lifetime begins only when the selected path can play. A deliberate
+// interval/pause and loading time cannot expire the buffered press in advance.
+ULONGLONG QueuedDue(){return (std::max)(combo_.queued_at,QueuedPathDue());}
 bool PreInputExpired(ULONGLONG now){
+    if(charge_pause_.active)return false;
     if(combo_.queued.move<0||combo_.phase==ComboRun::Phase::Starting)return false;
     const int keep=NpcCombo::PreInputMs(combo_.config);
-    return keep>0&&now>QueuedDue()+static_cast<ULONGLONG>(keep);
+    const ULONGLONG input_at=(std::max)(combo_.queued_at,group_.index>=0?group_.started:combo_.started);
+    const auto& clock=combo_.hold?combo_.restart_clock:combo_.path_clock;
+    const int prefix=combo_.hold?NpcCombo::SharedWait(combo_.config,combo_.trigger):BranchPrefix();
+    return clock.BufferExpired(now,input_at,keep,combo_.queued.wait_ms,prefix,combo_.queued.pause_ms,combo_.queued.branch>=0);
 }
 void ClearPreInput(ULONGLONG now){
     const int keep=NpcCombo::PreInputMs(combo_.config);
     Logf("NPC_COMBO pre-input cleared: the press for node=%d (%dms ago) was not taken within %dms (预输入) of when it could play; playing=%d%s",
          combo_.queued.move,static_cast<int>(now-combo_.queued_at),keep,combo_.playing,ChainGrabActive()?" (grab)":"");
-    combo_.queued={};combo_.queued_ready=0;combo_.hold=false;combo_.last_press=combo_.press_before;
+    combo_.queued={};combo_.queued_ready=0;combo_.hold=false;combo_.restart_clock.Reset();combo_.last_press=combo_.press_before;
     if(combo_.phase==ComboRun::Phase::Idle){
         if(!combo_.ended_at)combo_.ended_at=now;
-        combo_.reset_at=NpcCombo::WaitUntil(now,combo_.last_press,ChainWaitMs(),NpcCombo::MaxPause(combo_.config,combo_.cursor));}
+        combo_.reset_at=combo_.path_clock.Deadline(now,ChainWaitMs(),BranchPrefix(),NpcCombo::MaxPause(combo_.config,combo_.cursor),NpcCombo::kPauseGraceMs);}
     PublishCombo(L"预输入已清除：提前按的键没有接上");
 }
 // 武器派生修改 nodes go by the hero's main weapon: a hero action press names it (the 处决 path already did) when the
@@ -6356,16 +6491,19 @@ void ClearPreInput(ULONGLONG now){
 NpcCombo::Press WithWeapon(const NpcCombo::Press& press) {
     NpcCombo::Press out=press;
     if(!out.airborne&&Same(ChainPawn()))out.airborne=Airborne(ChainPawn().object);
-    if(press.key||press.combo>=0||press.branch>=0||!press.bits||!press.weapon.empty()||!NpcCombo::HasWeaponActions(combo_.config))return out;
+    const bool action_row=press.branch>=0&&static_cast<size_t>(press.branch)<combo_.config.chain.size()&&combo_.config.chain[static_cast<size_t>(press.branch)].type==NpcCombo::NodeType::WeaponActions;
+    if(press.key||press.combo>=0||(press.branch>=0&&!action_row)||!press.bits||!press.weapon.empty()||!NpcCombo::HasWeaponActions(combo_.config))return out;
     std::string id;if(WeaponPresets::CurrentMainWeaponId(id))out.weapon=id;
     return out;
 }
 ComboPress WhereTo(const NpcCombo::Press& given,ULONGLONG now) {
-    ComboPress out;const NpcCombo::Press press=WithWeapon(given);
-    if(combo_.cursor>=0&&combo_.trigger>=0&&(press.combo<0||press.combo==combo_.trigger)){  // a 组合键 goes on with its own chain only
+    ComboPress out;const NpcCombo::Press press=WithWeapon(given);out.input=press;
+    const bool action_row=press.branch>=0&&static_cast<size_t>(press.branch)<combo_.config.chain.size()&&combo_.config.chain[static_cast<size_t>(press.branch)].type==NpcCombo::NodeType::WeaponActions;
+    if(action_row&&NpcCombo::WeaponActionsRow(combo_.config.chain[static_cast<size_t>(press.branch)],press,press.branch)<0)return out;
+    if(combo_.cursor>=0&&combo_.trigger>=0&&(!action_row||press.branch==combo_.trigger)&&(press.combo<0||press.combo==combo_.trigger)){  // a 组合键 goes on with its own chain only
         const bool moving=combo_.phase!=ComboRun::Phase::Idle&&!NpcCombo::IsTrigger(combo_.config,combo_.cursor);
         if(moving&&!combo_.cut_at&&MoveCut(now))combo_.cut_at=now;
-        out.since=SinceLastPress(now);
+        ReachComboPath(now);out.since=combo_.path_clock.Elapsed(now,BranchPrefix());
         const NpcCombo::Decision decision=NpcCombo::Decide(combo_.config,combo_.cursor,combo_.button,press,out.since);
         if(decision.hop.move>=0){out.hop=decision.hop;out.later=decision.later;out.ready_in=decision.ready_in_ms;return out;}
     }
@@ -6386,12 +6524,17 @@ ComboPress WhereTo(const NpcCombo::Press& given,ULONGLONG now) {
 // (no branch next), that row again (its keys are the same button again); a 自定义按键 chain on its 继续派生 key (no
 // branch next): that key (then). The keys are copies: a press may reset the chain.
 // hold: the 按住 its trigger or row wants (ms; 0 none).
-struct KeyWatch { int trigger=-1,branch=-1,row=-1;std::vector<int> keys;bool chord=false,swallow=false,then=false;int window=NpcCombo::kKeyWindowDefault;int hold=0; };
+struct KeyWatch { int trigger=-1,branch=-1,row=-1;std::vector<int> keys;bool chord=false,swallow=false,then=false,weapon_action=false;int window=NpcCombo::kKeyWindowDefault;int hold=0; };
 std::vector<KeyWatch> KeyWatches(bool raw){
     std::vector<KeyWatch> out;const NpcCombo::Config& c=combo_.config;
     for(size_t i=0;i<c.chain.size();++i){const NpcCombo::Node& n=c.chain[i];
         if(raw?(NpcCombo::IsKeysTrigger(n)&&n.on&&n.next>=0&&!n.keys.empty()):(NpcCombo::IsComboTrigger(n)&&n.on&&n.next>=0&&n.keys.size()>=NpcCombo::kComboKeysMin)){
             KeyWatch w;w.trigger=static_cast<int>(i);w.keys=n.keys;w.chord=n.chord;w.window=n.window;w.swallow=n.swallow;w.hold=NpcCombo::ClampHold(n.hold_ms);out.push_back(std::move(w));}}
+    std::string weapon;if(NpcCombo::HasWeaponActions(c))WeaponPresets::CurrentMainWeaponId(weapon);
+    const bool airborne=Same(ChainPawn())&&Airborne(ChainPawn().object);
+    for(size_t i=0;i<c.chain.size();++i){const auto& n=c.chain[i];if(n.type!=NpcCombo::NodeType::WeaponActions||!n.on||(n.air_set?!airborne:n.weapon.empty()||n.weapon!=weapon))continue;
+        for(size_t r=0;r<n.routes.size();++r){const auto& route=n.routes[r];if(route.next<0||!NpcCombo::KeysRouteReady(route)||(route.button==static_cast<int>(NpcCombo::Trigger::Keys))!=raw)continue;
+            KeyWatch w;w.branch=static_cast<int>(i);w.row=static_cast<int>(r);w.keys=route.keys;w.chord=route.chord;w.window=route.window;w.swallow=route.swallow;w.hold=NpcCombo::ClampHold(route.hold_ms);w.weapon_action=true;out.push_back(std::move(w));}}
     if(combo_.trigger<0||combo_.cursor<0)return out;
     const int count=static_cast<int>(c.chain.size());
     const auto row=[&](int b,int r){
@@ -6457,23 +6600,28 @@ bool ComboTakes(const NpcCombo::Press& press) {
     if(const int32_t kept=KeptLookEnding();kept!=-2&&KeptChainTakes(kept,press))return true;
     const ComboPress where=WhereTo(press,GetTickCount64());
     const bool assist_only=where.hop.move>=0&&AssistNode(where.hop.move);  // the hero's action plays beside the boss
+    if(where.hop.move<0&&!ComboKeyPart(press)&&NpcCombo::NativeDetour(press,combo_.cursor>=0&&combo_.trigger>=0))return false;
     return where.kept||(where.hop.move>=0&&!assist_only)||GroupHolds()||MoveHolds()||ComboKeyPart(press);
 }
 // 保持派生: a press the chain does not take is the game's (the caller lets the hero's action play, cutting the move
 // playing) and the chain stays where it is; while it waits for its next press, the wait starts again from this press.
 void KeepPress(const NpcCombo::Press& press,const char* source,int keep,ULONGLONG now){
+    if(NpcCombo::NativeDetour(press,true))native_detour_=true;
     const bool waiting=combo_.phase==ComboRun::Phase::Idle&&combo_.queued.move<0;
     if(waiting)combo_.reset_at=(std::max)(combo_.reset_at,now+static_cast<ULONGLONG>(keep));
-    Logf("NPC_COMBO press source=%s bits=0x%x%s from=%d playing=%d kept: 保持派生 %dms leaves it to the game and the chain stays%s",source,press.bits,press.key?" (npc key)":"",
+    Logf("NPC_COMBO press source=%s bits=0x%x%s from=%d playing=%d kept: native action / chain wait %dms leaves it to the game and the chain stays%s",source,press.bits,press.key?" (npc key)":"",
          combo_.cursor,combo_.playing,keep,waiting?" (its wait starts again)":"");
 }
 void InterruptMove(const char* source,unsigned bits,int node);
-// The hero's own action out of a move under 允许中断 / 保持派生. Under 保持派生 alone the hero chose that action: a press
-// kept for the move's 派生点 is dropped (it would play the moment the move is cut), and the chain stays.
-void CutForHero(const char* source,unsigned bits,int node){
-    if(!ComboInterruptible()&&KeepChainMs()>0&&combo_.queued.move>=0){
-        Logf("NPC_COMBO pre-input dropped: 保持派生 lets the hero's own action (bits=0x%x) cut node=%d, the press for node=%d is not played",bits,node,combo_.queued.move);
+// The hero chose a native action: discard an older queued chain press, otherwise it
+// would immediately replace the dodge when cancelling the boss move opens its gate.
+void DropQueuedForNative(unsigned bits,int node){
+    if(combo_.queued.move>=0){
+        Logf("NPC_COMBO pre-input dropped: the newer native action (bits=0x%x) at node=%d supersedes the press for node=%d",bits,node,combo_.queued.move);
         combo_.queued={};combo_.queued_ready=0;combo_.hold=false;combo_.last_press=combo_.press_before;}
+}
+void CutForHero(const char* source,unsigned bits,int node){
+    DropQueuedForNative(bits,node);
     InterruptMove(source,bits,node);
 }
 // One press; false when it leads nowhere and starts no chain (the caller does what the press did before).
@@ -6487,6 +6635,9 @@ bool PressCombo(const NpcCombo::Press& press,const char* source) {
             return true;}
     }
     const ComboPress where=WhereTo(press,now);
+    if(where.hop.move<0&&!ComboKeyPart(press)&&NpcCombo::NativeDetour(press,combo_.cursor>=0&&combo_.trigger>=0)){
+        DropQueuedForNative(press.bits,combo_.playing);KeepPress(press,source,ChainWaitMs(),now);return false;
+    }
     if(where.kept){Logf("NPC_COMBO press source=%s bits=0x%x from=%d leads nowhere: the kept press stays (node=%d)",source,press.bits,combo_.cursor,combo_.queued.move);return true;}
     if(where.hop.move<0){
         if(GroupHolds()){Logf("NPC_COMBO press source=%s bits=0x%x ignored: group=%d plays on (step %zu/%zu)",source,press.bits,group_.index,group_.step+1,group_.steps.size());return true;}
@@ -6503,9 +6654,14 @@ bool PressCombo(const NpcCombo::Press& press,const char* source) {
     }
     if(where.trigger<0){Queue(where,now,source,false);return true;}
     const NpcCombo::Node& node=combo_.config.chain[static_cast<size_t>(where.trigger)];
-    const bool again=where.trigger==combo_.trigger&&combo_.phase!=ComboRun::Phase::Idle;  // the playing move ends first
-    if(!again)ResetCombo("other-trigger",L"");
+    const bool again=where.trigger==combo_.trigger&&combo_.phase!=ComboRun::Phase::Idle;
+    if(again){
+        Logf("NPC_COMBO restart queued trigger=%d from=%d playing=%d source=%s: waits for completion",combo_.trigger,combo_.cursor,combo_.playing,source);
+        Queue(where,now,source,true);return true; // preserve the live cursor, visit and timers while buffering
+    }
+    ResetCombo("other-trigger",L"");
     combo_.trigger=where.trigger;combo_.cursor=where.trigger;combo_.button=where.button>=0?where.button:node.trigger;combo_.reset_ms=NpcCombo::ClampReset(node.ms);
+    ++combo_.visit;combo_.path_clock.Reset();combo_.ended_at=0;
     combo_.row_branch=-1;combo_.row_row=-1;
     if(node.type==NpcCombo::NodeType::WeaponActions){
         const char* action=NpcCombo::TriggerTag(static_cast<NpcCombo::Trigger>(combo_.button));
@@ -6668,6 +6824,8 @@ struct TrimHold { int node=-1;Object* montage=nullptr;NpcCombo::TrimRange range;
 // on past its montage, GA_MoTian_Skill_06 6.5 s after a jump to 5.9 s of its 6.5 s montage, 11-08: the part is what
 // plays). 0: nothing is cut (no part set, or a start past the montage's end: the whole move plays).
 TrimHold trim_;
+ComboPlayback::ChargePoints charge_points_;
+bool ChargeButtonDown();
 // How the part's start is reached (npcretarget trimjump now|tick|replay|clock, tests): 0 Montage_SetPosition on the
 // frame the montage is first seen, 1 the same once the montage has ticked, 2 the montage played again from the start
 // time, 3 the ability's own clock moved there (the default). The boss abilities are Lego abilities: a task
@@ -6707,6 +6865,7 @@ bool TrimClock(Object* anim,Object* montage,double rate,double from,std::string&
     if(!task){how="no timeline task on "+Text(ability);return false;}
     const float was=ue::At<float>(task,at);const double r=rate>0.01?rate:1.0;
     const float to=ComboPlayback::TrimClock(was,pos,from,r);  // the timeline's time where the montage is at `from`
+    BeforeViewTrimSeek(pos,from);
     ue::At<float>(task,at)=to;
     Call(anim,"Montage_SetPosition").Set("Montage",montage).Set("NewPosition",static_cast<float>(from)).Invoke();
     trim_.task=Id(task);trim_.task_time_at=at;
@@ -6726,6 +6885,7 @@ void ProbeTrim(const char* when){
 }
 // Moves the trimmed montage to the part's start (see trim_jump_mode_).
 bool TrimJump(Object* anim,Object* montage,double rate,double from,bool replay){
+    BeforeViewTrimSeek(MontagePosition(anim,montage),from);
     if(replay){
         Call play(anim,"Montage_Play");
         return play.Set("MontageToPlay",montage).Set("InPlayRate",static_cast<float>(rate>0?rate:1.0)).Set("ReturnValueType",uint8_t{0})
@@ -6735,6 +6895,7 @@ bool TrimJump(Object* anim,Object* montage,double rate,double from,bool replay){
 }
 // The trimmed move is over or another plays: a part with an end that was never reached says what was watched.
 void EndTrim(const char* why){
+    charge_pause_.Release();charge_points_={};
     if(trim_.node>=0&&!trim_.cut&&trim_.end>0)
         Logf("NPC_COMBO trim node=%d not cut (%s): %d checks (%d without a montage, %d on another, %d found on another instance), %d frames watched, the montage read "
              "%.2fs first and up to %.2fs (the part ends at %.2fs of %.2fs)",trim_.node,why,trim_.calls,trim_.no_montage,trim_.other,trim_.found,trim_.frames,trim_.first,trim_.seen,
@@ -6772,7 +6933,24 @@ void TrimCut(Object* anim,const char* why,float at){
 // The playing move's montages as they come up: the first one's length goes to the page and sets the 加速 factor
 // (its speed, slowed further to fill the intervals straight after the move); later ones of the move play at its
 // speed. The montage that was up when the move was cast (the hero's own action) is left alone for its first moments.
+bool ChargeAt(const Context& context,Object* anim,Object* montage,double position,const NpcCombo::TrimRange& range,double length){
+    if(range.holds.empty()||(!charge_points_.holding&&charge_points_.next>=range.holds.size()))return false;
+    const double end=range.from+NpcCombo::TrimSpan(range,length);
+    if(!charge_points_.Step(range.holds,position,range.from,end,ChargeButtonDown()))return false;
+    std::string how;
+    // Both clocks must be movable; never leave damage running behind a paused montage.
+    Call rate(anim,"Montage_GetPlayRate");const double value=rate.Set("Montage",montage).Invoke()?rate.Get<float>("ReturnValue"):1;
+    if(!TrimClock(anim,montage,value,charge_points_.at,how)||!charge_pause_.Begin(context.pawn,anim,montage)){
+        charge_points_.holding=false;Logf("NPC_COMBO charge unavailable node=%d clock=%s",combo_.playing,how.c_str());return false;}
+    trim_.seen=static_cast<float>(charge_points_.at);trim_.restarted=false;trim_.clocked=true;
+    Logf("NPC_COMBO charge held node=%d at=%.3f",combo_.playing,charge_points_.at);return true;
+}
 void RateComboMove(const Context& context,ULONGLONG now) {
+    if(charge_pause_.active){
+        if(ChargeButtonDown()&&charge_pause_.Hold())return;
+        charge_pause_.Release();charge_points_.holding=false;
+        Logf("NPC_COMBO charge released node=%d at=%.3f",combo_.playing,charge_points_.at);
+    }
     const NpcCombo::Node* node=ComboNode(combo_.playing);if(!node)return;
     if(speed_.node>=0&&speed_.node!=combo_.playing)EndSpeed("next-move");
     if(trim_.node>=0&&trim_.node!=combo_.playing)EndTrim("another node");
@@ -6803,6 +6981,7 @@ void RateComboMove(const Context& context,ULONGLONG now) {
     const NpcCombo::Node* speed_node=NpcCombo::SpeedNodeFor(combo_.config,combo_.trigger,combo_.playing);
     const bool curve=NpcCombo::CurveOn(speed_node);
     if(montage&&montage==combo_.rated){
+        if(trim_.node==combo_.playing&&!trim_.jump_pending&&ChargeAt(context,anim,montage,MontagePosition(anim,montage),trim,trim_.length))return;
         if(trim_.node==combo_.playing&&trim_.jump_pending&&montage==trim_.montage){  // "tick": the montage has played a frame, then it jumps
             const float at=MontagePosition(anim,montage);++trim_.waited;
             if(at>0){trim_.jump_pending=false;
@@ -6825,7 +7004,7 @@ void RateComboMove(const Context& context,ULONGLONG now) {
     const double full=length.Get<float>("ReturnValue"),now_rate=rate.Get<float>("ReturnValue");
     if(first&&node->type==NpcCombo::NodeType::BossSkill)NpcCombo::RecordClip(node->ability,static_cast<float>(full));
     if(trim.on&&first){
-        trim_={combo_.playing,montage,trim,full,false};trim_.anim=Id(anim);trim_.rate=now_rate>0?now_rate:1.0;
+        charge_points_={};trim_={combo_.playing,montage,trim,full,false};trim_.anim=Id(anim);trim_.rate=now_rate>0?now_rate:1.0;
         const bool inside=trim.from>0&&trim.from<full,later=inside&&trim_jump_mode_==1;
         trim_.end=trim.from<full&&(trim.from>0||trim.to>0)?(trim.to>0?(std::min)(static_cast<double>(trim.to),full):full):0;
         std::string clock_how;
@@ -6852,7 +7031,7 @@ void RateComboMove(const Context& context,ULONGLONG now) {
         HoldSpeed(anim,montage,now);
         return;
     }
-    const int interval=first?NpcCombo::SharedWait(combo_.config,combo_.playing):0,speed=NpcCombo::SpeedFor(combo_.config,combo_.trigger,combo_.playing);
+    const int interval=0,speed=NpcCombo::SpeedFor(combo_.config,combo_.trigger,combo_.playing);
     const double wanted=NpcCombo::MoveRate(speed,interval,seconds,now_rate,scale);
     if(!(now_rate>0))return;
     const double factor=wanted/now_rate;
@@ -6888,13 +7067,18 @@ float WeaponStrength(Object* pawn,ULONGLONG now) {
 // A 组合's step is over for the next one: its 派生点 (or the intervals wired after it) has passed, or it has ended (a
 // grab when it lets go, a 瞬移 once landed). The last step ends the 组合 as any move ends.
 bool StepDone(ULONGLONG now){
+    if(charge_pause_.active)return false;
     if(group_.index<0||combo_.phase!=ComboRun::Phase::Running||group_.step+1>=group_.steps.size())return false;
     if(PlayingTeleport()&&TeleportBusy())return false;
-    if(PlayingGrab()){const MotianGrab::Snapshot s=MotianGrab::GetSnapshot();return !s.active||s.hero_free;}
-    const int cut=NpcCombo::CutMs(combo_.config,combo_.playing);
-    if(cut>0&&now>=combo_.started+static_cast<ULONGLONG>(cut))return true;
-    if(NpcCombo::SharedWait(combo_.config,combo_.playing)>0)return false;
-    WatchSkill();return skill_.handle<=0;
+    bool ready=false;
+    if(PlayingGrab()){const MotianGrab::Snapshot s=MotianGrab::GetSnapshot();ready=!s.active||s.hero_free;}
+    else{
+        const int cut=NpcCombo::CancelOf(combo_.config,combo_.playing);
+        ready=cut>0&&now>=combo_.started+static_cast<ULONGLONG>(cut);
+        if(!ready){WatchSkill();ready=skill_.handle<=0;}
+    }
+    if(ready)combo_.step_clock.Reach(now);
+    return combo_.step_clock.open&&now>=combo_.step_clock.Arrival(NpcCombo::SharedWait(combo_.config,combo_.playing));
 }
 // A 投技 that is not cast (no target in range, not prepared, refused) is passed over: the chain goes on from it as from
 // a move that ended (a 组合 with its next step), in the look it is in. It used to stop the chain there and bring the
@@ -6920,7 +7104,7 @@ void DriveCombo() {
     using P=ComboRun::Phase;
     // 霸体 / 无敌 from the move's start, through its look or weapon change (the blink) too.
     // A 援护's modifiers are its boss's (DriveAssistEffects), never the hero's.
-    const bool hero_move=combo_.phase!=P::Idle&&combo_.playing>=0&&!PlayingAssist();
+    const bool hero_move=combo_.phase!=P::Idle&&combo_.playing>=0&&!PlayingAssist()&&!native_handoff_;
     SetComboArmor(hero_move&&NpcCombo::ArmorFor(combo_.config,combo_.trigger,combo_.playing));
     SetComboInvincible(hero_move&&NpcCombo::InvincibleFor(combo_.config,combo_.trigger,combo_.playing));
     // 无视防御 on the enemies around, likewise from the move's start.
@@ -6974,15 +7158,18 @@ void DriveCombo() {
         else{if(pending_.handle<=0&&!TeleportRefused(now))ResetCombo("refused",L"派生链停止：这一招没有施放（主角正忙或条件不满足）");return;}
     }
     if(combo_.phase==P::Running&&!combo_.cut_at&&MoveCut(now))combo_.cut_at=now;
+    ReachComboPath(now);
+    if(PreInputExpired(now))ClearPreInput(now);
     const bool ready=QueuedReady(now);
-    if(!ready&&PreInputExpired(now))ClearPreInput(now);
     if(ready){PlayHop(combo_.queued,now);return;}
     if(combo_.phase==P::Running&&StepDone(now)){AdvanceGroup(now);return;}
     if(combo_.phase==P::Running){
-        if(PlayingGrab()){const MotianGrab::Snapshot s=MotianGrab::GetSnapshot();if(s.active&&!s.hero_free)return;}  // over once the hero is free
+        // hero_free permits explicit wired derivation above, but an unwired
+        // restart must not treat a still-active paired grab as a finished tail.
+        if(PlayingGrab()){const MotianGrab::Snapshot s=MotianGrab::GetSnapshot();if(s.active||s.cleanup_pending)return;}
         else{
-            {Context context;if(ContextNow(context)&&context.pawn==ChainPawn().object)RateComboMove(context,now);}  // every frame: the rate is held
             WatchSkill();
+            {Context context;if(skill_.handle>0&&!native_handoff_&&ContextNow(context)&&context.pawn==ChainPawn().object)RateComboMove(context,now);}  // never retime the native action after a handoff or natural end
             if(skill_.handle>0||TeleportBusy()||HookAnchorBusy())return;}
         if(group_.index>=0&&group_.step+1<group_.steps.size())return;  // the 组合 goes on (StepDone)
         // The move ended with no press ready: the chain waits reset_ms for the next one; a branch row's pause keeps it
@@ -6996,19 +7183,30 @@ void DriveCombo() {
         // look it needs (连续变身); the chain stopping or timing out brings the owner's look back (ResetCombo). The hero
         // look a 武器派生 borrowed follows its weapon.
         const bool weapon_held=weapon_.stage==WeaponHold::Stage::Holding;
-        if(weapon_held)BeginWeaponReturn("move-ended");
-        if(borrow_.stage==Borrow::Stage::Wearing&&!(borrow_.row<0&&weapon_.stage!=WeaponHold::Stage::Off)&&!NpcCombo::Continues(combo_.config,combo_.cursor))
+        if(weapon_held&&!native_detour_)BeginWeaponReturn("move-ended");
+        if(!native_detour_&&borrow_.stage==Borrow::Stage::Wearing&&!(borrow_.row<0&&weapon_.stage!=WeaponHold::Stage::Off)&&!NpcCombo::Continues(combo_.config,combo_.cursor))
             BeginReturn("move-ended");
         (void)ended;
         if(!combo_.cut_at)combo_.cut_at=now;
         combo_.ended_at=now;
         const int pause=NpcCombo::MaxPause(combo_.config,combo_.cursor),keep=KeepChainMs();
-        combo_.reset_at=NpcCombo::WaitUntil(now,combo_.last_press,keep>0?keep:combo_.reset_ms,pause);
+        combo_.path_clock.Reach(now);
+        combo_.reset_at=combo_.path_clock.Deadline(now,keep>0?keep:combo_.reset_ms,BranchPrefix(),pause,NpcCombo::kPauseGraceMs);
         if(NpcCombo::Continues(combo_.config,combo_.cursor)&&combo_.queued.move<0)
-            Logf("NPC_COMBO node=%d ended: the next press is taken for %dms (%s %dms; longest pause %dms from the last press %dms ago)",ended,
-                 static_cast<int>(combo_.reset_at-now),keep>0?"保持派生":"reset",keep>0?keep:combo_.reset_ms,pause,SinceLastPress(now));
+            Logf("NPC_COMBO node=%d ended: the next press is taken for %dms (%s %dms; longest pause %dms; branch elapsed %dms)",ended,
+                 static_cast<int>(combo_.reset_at-now),keep>0?"保持派生":"reset",keep>0?keep:combo_.reset_ms,pause,combo_.path_clock.Elapsed(now,BranchPrefix()));
         PublishCombo(NpcCombo::Continues(combo_.config,combo_.cursor)?L"等待下一次按键":L"派生链完成；再按从第一招开始");
         return;
+    }
+    if(native_detour_&&combo_.phase==P::Idle){
+        Context context;
+        if(ContextNow(context)&&context.pawn==ChainPawn().object&&ActiveMontage(context))
+            combo_.reset_at=(std::max)(combo_.reset_at,now+static_cast<ULONGLONG>(ChainWaitMs()));
+        else{
+            native_detour_=false;
+            if(weapon_.stage==WeaponHold::Stage::Holding)BeginWeaponReturn("native-action-ended");
+            if(borrow_.stage==Borrow::Stage::Wearing&&!(borrow_.row<0&&weapon_.stage!=WeaponHold::Stage::Off)&&!NpcCombo::Continues(combo_.config,combo_.cursor))BeginReturn("native-action-ended");
+        }
     }
     if(combo_.native&&combo_.phase==P::Idle){
         // The weapon's native combo goes on while the hero plays its own montages; the chain resets after it.
@@ -7053,6 +7251,9 @@ bool ComboInterruptible() {
 // (it replays a press it held back as soon as the boss ability ends).
 void InterruptMove(const char* source,unsigned bits,int node) {
     Logf("NPC_COMBO interrupt source=%s bits=0x%x node=%d: move cut for the hero's own action",source,bits,node);
+    native_input_={};native_detour_=true;native_handoff_=true;
+    EndTrim("native-action");EndSpeed("native-action");
+    SetComboArmor(false);SetComboInvincible(false);SetComboIgnoreGuard(false);
     ClearSkill("interrupted");
     EndGroup("interrupted");  // the 组合's steps left are not played
     EndTeleport("interrupted");
@@ -7122,7 +7323,10 @@ void FireRowKeys(const KeyWatch& w,bool raw,int held=0){
     std::string keys;
     if(raw)keys=NpcCombo::RawKeysToken(w);
     else{const std::wstring text=NpcCombo::ComboKeysText(w);char utf8[200]{};WideCharToMultiByte(CP_UTF8,0,text.c_str(),-1,utf8,static_cast<int>(sizeof(utf8)),nullptr,nullptr);keys=utf8;}
-    const bool taken=PressCombo(press,raw?"branch-keys":"branch-combo-keys");
+    if(w.weapon_action){const auto where=WhereTo(press,GetTickCount64());Context context;
+        if(!(combo_.trigger==w.branch&&combo_.phase!=ComboRun::Phase::Idle)&&
+           where.hop.move>=0&&!AssistNode(where.hop.move)&&ContextNow(context)&&context.pawn==ChainPawn().object)CancelHeroActions(context);}
+    const bool taken=PressCombo(press,w.weapon_action?(raw?"weapon-action-keys":"weapon-action-combo"):raw?"branch-keys":"branch-combo-keys");
     Logf("NPC_COMBO branch keys node=%d row=%d [%s] %s window=%dms swallow=%d held=%dms -> %s",w.branch,w.row,keys.c_str(),
          w.keys.size()==1?"one key":w.chord?"together":"in order",NpcCombo::ClampKeyWindow(w.window),w.swallow?1:0,held,taken?"taken":"leads nowhere");
 }
@@ -7162,7 +7366,7 @@ void FireThenKey(const KeyWatch& w,int held=0){
 // one press's tap and hold alternatives (watches): the one with the longest hold reached is fired.
 enum class HoldKind { Hero, NpcKey, Raw, Combo };
 struct HoldWait { bool on=false;HoldKind kind=HoldKind::Hero;NpcCombo::Press press;std::string source;ULONGLONG down=0;int need=0;bool tap_takes=false;unsigned bits=0;
-    std::vector<KeyWatch> watches;Identity pawn; };
+    std::vector<KeyWatch> watches;Identity pawn;ComboPlayback::HoldScope scope; };
 HoldWait hold_;
 std::atomic<ULONGLONG> test_hold_until_{0};  // npcretarget press <bits> hold <ms> / skill hold <ms>: the button counts as held until then
 struct HeldInput { Object* pawn=nullptr;Object* sinput=nullptr;std::vector<Object*> actions;std::vector<unsigned> bits;ULONGLONG refresh=0; };
@@ -7190,6 +7394,21 @@ bool RawKeyDown(int code){
     const UiHotkeys::PadLevel pad=UiHotkeys::CurrentPad();if(!pad.in_game)return false;
     if(NpcCombo::IsPadKey(code))return ((NpcCombo::PadCodeBits(pad.buttons,pad.stick)>>(code-NpcCombo::kPadKey))&1u)!=0;
     return (GetAsyncKeyState(code)&0x8000)!=0;
+}
+bool ChargeButtonDown(){
+    if(!UiHotkeys::CurrentPad().in_game)return false;
+    const auto& press=charge_active_input_;
+    if(press.key)return UiHotkeys::Held(UiHotkeys::Action::NpcSkill);
+    if(press.then){const auto* node=ComboNode(combo_.trigger);return node&&RawKeyDown(NpcCombo::ThenRawKey(*node));}
+    std::vector<int> keys;bool chord=false,raw=false;
+    const auto* branch=ComboNode(press.branch);
+    if(branch&&press.row>=0&&static_cast<size_t>(press.row)<branch->routes.size()){
+        const auto& row=branch->routes[static_cast<size_t>(press.row)];keys=row.keys;chord=row.chord;raw=row.button==static_cast<int>(NpcCombo::Trigger::Keys);
+    }else if(const auto* trigger=ComboNode(press.combo)){keys=trigger->keys;chord=trigger->chord;raw=NpcCombo::IsKeysTrigger(*trigger);}
+    if(keys.empty()){bool known=false;return press.bits&&HeroButtonDown(press.bits,known)&&known;}
+    const auto down=[&](int key){if(raw)return RawKeyDown(key);bool known=false;return key>=0&&key<32&&HeroButtonDown(1u<<key,known)&&known;};
+    if(chord){for(int key:keys)if(!down(key))return false;return true;}
+    return down(keys.back());
 }
 // Is the waiting press's button still held?
 bool HoldDown(bool& known){
@@ -7225,7 +7444,8 @@ HoldStart PressOrHold(const NpcCombo::Press& press,const char* source,HoldKind k
     if(hold_.on)EndHold("another press",now);
     const int need=HoldNeed(press,now);
     if(need<=0)return {false,PressCombo(press,source)};
-    hold_={};hold_.on=true;hold_.kind=kind;hold_.press=press;hold_.source=source;hold_.down=now;hold_.need=need;hold_.bits=bits;hold_.pawn=ChainPawn();
+    hold_={};hold_.on=true;hold_.kind=kind;hold_.press=WithWeapon(press);hold_.source=source;hold_.down=now;hold_.need=need;hold_.bits=bits;hold_.pawn=ChainPawn();
+    hold_.scope={combo_.owner,combo_.generation,combo_.visit};
     hold_.tap_takes=ComboTakes(press);
     Logf("NPC_COMBO hold wait source=%s (%s) bits=0x%x need=%dms from=%d (a tap %s)",source,HoldKindName(kind),press.bits,need,combo_.cursor,
          hold_.tap_takes?"is taken too: the hero's action is cancelled":"is left to the game");
@@ -7240,10 +7460,15 @@ void FireHeldWatch(const KeyWatch& w,bool raw,int held,ULONGLONG now){
 // none wants a hold, else the press waits (hold_).
 void FireOrHoldKeys(const std::vector<KeyWatch>& watches,const KeyWatch& first,bool raw,ULONGLONG now){
     std::vector<KeyWatch> same;int need=0;
-    for(const KeyWatch& w:watches)if(w.keys==first.keys&&w.chord==first.chord&&w.then==first.then){same.push_back(w);need=(std::max)(need,w.hold);}
+    for(const KeyWatch& w:watches)if(w.keys==first.keys&&w.chord==first.chord&&w.then==first.then&&w.weapon_action==first.weapon_action&&(!w.weapon_action||w.branch==first.branch)){same.push_back(w);need=(std::max)(need,w.hold);}
     if(need<=0){FireHeldWatch(first,raw,0,now);return;}
+    const ComboPlayback::HoldScope scope{combo_.owner,combo_.generation,combo_.visit};
     if(hold_.on)EndHold("another press",now);
+    // Finishing the old press can change the node. These row indices were
+    // collected before that change and must not arm a hold in the new visit.
+    if(!scope.Matches(combo_.owner,combo_.generation,combo_.visit))return;
     hold_={};hold_.on=true;hold_.kind=raw?HoldKind::Raw:HoldKind::Combo;hold_.source=raw?"keys":"combo-keys";hold_.down=now;hold_.need=need;hold_.pawn=ChainPawn();
+    hold_.scope=scope;
     hold_.watches=std::move(same);
     const std::string keys=raw?NpcCombo::RawKeysToken(first):std::string();
     Logf("NPC_COMBO hold wait source=%s [%s] alternatives=%zu need=%dms",hold_.source.c_str(),keys.c_str(),hold_.watches.size(),need);
@@ -7253,8 +7478,8 @@ void EndHold(const char* why,ULONGLONG now){
     if(!hold_.on)return;
     HoldWait wait=std::move(hold_);hold_={};
     const int held=static_cast<int>((std::min<ULONGLONG>)(now-wait.down,static_cast<ULONGLONG>(NpcCombo::kHoldMax)));
-    if(!Same(wait.pawn)||wait.pawn.object!=ChainPawn().object||!ComboReady()){
-        Logf("NPC_COMBO hold dropped source=%s after %dms (%s): the chain's pawn or set changed",wait.source.c_str(),held,why);return;}
+    if(!ComboReady()||!Same(wait.pawn)||wait.pawn.object!=ChainPawn().object||!wait.scope.Matches(combo_.owner,combo_.generation,combo_.visit)){
+        Logf("NPC_COMBO hold dropped source=%s after %dms (%s): the chain's pawn, set or node visit changed",wait.source.c_str(),held,why);return;}
     if(wait.kind==HoldKind::Raw||wait.kind==HoldKind::Combo){
         const KeyWatch* pick=nullptr;
         for(const KeyWatch& w:wait.watches)if(w.hold<=held&&(!pick||w.hold>pick->hold))pick=&w;
@@ -7264,6 +7489,7 @@ void EndHold(const char* why,ULONGLONG now){
         return;
     }
     NpcCombo::Press press=wait.press;press.hold_ms=held;
+    if(!press.weapon.empty()){std::string current;if(!WeaponPresets::CurrentMainWeaponId(current)||current!=press.weapon){Logf("NPC_COMBO hold dropped: main weapon changed");return;}}
     std::string cut="none";
     if(wait.kind==HoldKind::Hero&&!wait.tap_takes&&ComboTakes(press)){
         Context context;if(ContextNow(context)&&context.pawn==ChainPawn().object)cut=CancelHeroActions(context,false);}
@@ -7275,6 +7501,8 @@ void EndHold(const char* why,ULONGLONG now){
 void DriveHold(){
     if(!hold_.on)return;
     const ULONGLONG now=GetTickCount64();
+    if(!ComboReady()||!Same(hold_.pawn)||hold_.pawn.object!=ChainPawn().object||!hold_.scope.Matches(combo_.owner,combo_.generation,combo_.visit)){
+        Logf("NPC_COMBO hold dropped source=%s: the chain's pawn, set or node visit changed",hold_.source.c_str());hold_={};return;}
     bool known=true;const bool down=HoldDown(known);
     if(!known){EndHold("unreadable",now);return;}
     if(!down){EndHold("let go",now);return;}
@@ -7320,9 +7548,11 @@ void DriveRawKeys(){
     if(went.empty())return;
     // The 继续派生 key first (the chain going on takes it, even when it ends the trigger's own keys), then the longest,
     // so one that ends another (A -> B inside A -> A -> B) wins with all its keys.
-    std::stable_sort(watches.begin(),watches.end(),[](const KeyWatch& a,const KeyWatch& b){return a.then!=b.then?a.then:a.keys.size()>b.keys.size();});
+    std::stable_sort(watches.begin(),watches.end(),[](const KeyWatch& a,const KeyWatch& b){return a.then!=b.then?a.then:a.keys.size()!=b.keys.size()?a.keys.size()>b.keys.size():a.weapon_action&&!b.weapon_action;});
     for(const KeyWatch& w:watches){
-        const bool done=w.trigger>=0?NpcCombo::RawKeysDone(raw_.presses,w.keys,w.chord,w.window,NpcCombo::kChordMs):
+        bool done=false;
+        if(w.weapon_action&&w.chord){std::vector<int> down;for(size_t i=0;i<raw_.watched.size();++i)if(raw_.down[i])down.push_back(raw_.watched[i]);done=NpcCombo::HeldRawChord(w.keys,down,went);}
+        else done=w.trigger>=0||w.weapon_action?NpcCombo::RawKeysDone(raw_.presses,w.keys,w.chord,w.window,NpcCombo::kChordMs):
                                      NpcCombo::RawKeysDone(PressesSince(raw_.presses,combo_.last_press),w.keys,w.chord,w.window,NpcCombo::kChordMs);
         if(!done)continue;
         raw_.presses.clear();
@@ -7337,7 +7567,9 @@ void DriveHeroInput() {
     const bool playing=combo_.trigger>=0&&combo_.phase!=ComboRun::Phase::Idle;
     const bool buttons=playing&&ComboReady()&&HeroButtonsUsed();
     const Identity& pawn=ChainPawn();
-    if(!playing||!ComboReady()||(!buttons&&!HeroCuts())||!Same(pawn)){hero_input_.baselined=false;return;}
+    if(!playing||!ComboReady()||!Same(pawn)){hero_input_.baselined=false;native_input_={};return;}
+    if(const unsigned buffered=native_input_.Take(skill_.started,combo_.playing,now,NpcCombo::PreInputMs(combo_.config),HeroCuts());buffered&&skill_.handle>0)
+        CutForHero("hero-input-buffer",buffered,combo_.playing);
     if(hero_input_.pawn!=pawn.object||now>=hero_input_.refresh){
         void* sinput=nullptr;std::vector<AirSkills::HeroAction> found;
         const bool ok=AirSkills::HeroActions(pawn.object,sinput,found);
@@ -7366,13 +7598,18 @@ void DriveHeroInput() {
         const bool cut=HeroCuts();const int node=combo_.playing;
         bool taken=false;
         if(bits&&buttons){taken=PressOrHold({bits,false},"hero-input",HoldKind::Hero,all).taken;input_presses_.push_back({bits,now,taken});}
-        if(!taken&&cut&&skill_.handle>0)CutForHero("hero-input",all,node);
+        if(taken)native_input_={};
+        else if(skill_.handle>0){
+            DropQueuedForNative(all,node);
+            if(cut)CutForHero("hero-input",all,node);
+            else native_input_.Arm(skill_.started,combo_.playing,all,now);
+        }
     }
     hero_input_.baselined=true;
 }
 void DriveHeroTriggers() {
     if(!ComboReady()){combo_.active.clear();return;}
-    if(!HeroButtonsUsed())return;
+    if(!HeroButtonsUsed()&&combo_.trigger<0)return;  // NPC-key-only chains still observe native detours
     if(!Same(ChainPawn()))return;
     if(borrow_.stage==Borrow::Stage::Going||borrow_.stage==Borrow::Stage::Returning)return;
     if(weapon_.stage==WeaponHold::Stage::Taking||weapon_.stage==WeaponHold::Stage::Returning)return;
@@ -7500,11 +7737,12 @@ void DriveComboKeys(){
     if(keys_.presses.size()>NpcCombo::kComboKeysMax*2)keys_.presses.erase(keys_.presses.begin(),keys_.presses.end()-static_cast<std::ptrdiff_t>(NpcCombo::kComboKeysMax*2));
     // The longest combo first, so one that ends another (轻 → 重 inside 轻 → 轻 → 重) wins with all its keys. A branch
     // row counts only the presses after the one the chain took last.
-    std::stable_sort(watches.begin(),watches.end(),[](const KeyWatch& a,const KeyWatch& b){return a.keys.size()>b.keys.size();});
+    std::stable_sort(watches.begin(),watches.end(),[](const KeyWatch& a,const KeyWatch& b){return a.keys.size()!=b.keys.size()?a.keys.size()>b.keys.size():a.weapon_action&&!b.weapon_action;});
     for(const KeyWatch& w:watches){
-        const std::vector<NpcCombo::KeyPress> recent=w.trigger>=0?std::vector<NpcCombo::KeyPress>():PressesSince(keys_.presses,combo_.last_press);
-        const std::vector<NpcCombo::KeyPress>& presses=w.trigger>=0?keys_.presses:recent;
-        if(!(w.chord?NpcCombo::ChordDone(presses,w.keys,NpcCombo::kChordMs):NpcCombo::SequenceDone(presses,w.keys,w.window)))continue;
+        const std::vector<NpcCombo::KeyPress> recent=w.trigger>=0||w.weapon_action?std::vector<NpcCombo::KeyPress>():PressesSince(keys_.presses,combo_.last_press);
+        const std::vector<NpcCombo::KeyPress>& presses=w.trigger>=0||w.weapon_action?keys_.presses:recent;
+        unsigned held=0;for(size_t i=0;i<keys_.down.size();++i)if(keys_.down[i])held|=keys_.bits[i];
+        if(!(w.weapon_action&&w.chord?NpcCombo::HeldActionChord(w.keys,held,went):w.chord?NpcCombo::ChordDone(presses,w.keys,NpcCombo::kChordMs):NpcCombo::SequenceDone(presses,w.keys,w.window)))continue;
         keys_.presses.clear();
         if(w.trigger>=0&&ThenTakes(w.trigger,went)){Logf("NPC_COMBO combo keys trigger=%d complete on its 继续派生 button bits=0x%x: the chain takes the press (no new start)",w.trigger,went);return;}
         FireOrHoldKeys(watches,w,false,now);
@@ -8522,24 +8760,22 @@ const char* LockOn(Object* pawn,Object* target){
 // place. The game's camera hangs on the actor (the capsule); a boss move whose body leaves the capsule (its montage
 // carries the displayed body, not the actor: a leap 6 m up, a lunge across) would leave the frame. While a move of the
 // chain plays, or a skill cast by the NPC key, the pivot is moved by how far the body (bone 1, the pelvis) has gone
-// from where it sat on the actor when the move started (the actor's own turn taken along), past kViewDeadCm across and
-// kViewRiseCm up or down (an attack's own sway is left as the game leaves it), through a named additive target offset
+// from where it sat on the actor when the move started (the actor's own turn taken along), past 25 cm across and
+// 35 cm up or down (an attack's own sway is left as the game leaves it), through a named additive target offset
 // of the hero's ATPC camera (PBZ_ViewFollow, beside the look's height lift). It is eased every frame (kViewEaseIn s
-// both ways) and back to zero over kViewBackS when the move ends; a camera whose arm folds in (closer than
-// kViewFoldShare of its distance to the body at the start: an eave or a tree behind the raised pivot) caps the rise
-// for the rest of the move at kViewFoldKeep of the height it folded at; while so capped, a body above the frame
-// tilts the view up (pitch only, at most kViewPitchMax, not under a lock-on), given back as it comes down and when the
-// move ends. The view is never turned sideways:
+// both ways) and back to zero over kViewBackS when the move ends. Only a confirmed obstacle trace restricts the
+// pivot for the current frame; camera-to-body distance cannot distinguish a jumping body from a folded camera arm.
+// Do not accumulate a ceiling or rotate the controller to compensate for one:
 // the player's and the lock-on's aim stay as they are (11-08 round 2: turning the controller toward the body fought
 // the lock-on camera, 861 deg of turns in one 6.5 s move). One NPC_VIEW line per move.
 double ClockSeconds(){LARGE_INTEGER hz{},t{};QueryPerformanceFrequency(&hz);QueryPerformanceCounter(&t);return static_cast<double>(t.QuadPart)/static_cast<double>(hz.QuadPart);}
 double Gap3(const Vector& a,const Vector& b){return std::sqrt((a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)+(a.z-b.z)*(a.z-b.z));}
-constexpr double kViewDeadCm=25,kViewRiseCm=35,kViewMaxCm=1200,kViewEaseIn=0.07,kViewEaseOut=0.07,kViewFoldShare=0.55,kViewFoldKeep=0.6,
-                 kViewPitchKeep=14,kViewPitchMax=35,kViewPitchRate=110;constexpr float kViewBackS=0.35f;
+constexpr double kViewEaseIn=0.07,kViewEaseOut=0.07;constexpr float kViewBackS=0.35f;
 struct ViewFollow { Identity pawn,camera,mesh;int node=-1;int64_t handle=0;bool on=false;Vector applied{},base{};double base_yaw=0,clock=0;ULONGLONG started=0;
-                    double max_off=0,max_angle=0,max_flat=0,max_rise=0,arm=0,ceiling=1e9,pitched=0,max_pitch=0;int sends=0,clamped=0,folds=0;std::vector<Object*> skip;std::string move; };
+                    uint64_t visit=0,cast_start=0,camera_probe_at=0;ViewFollowState::Lease lease;
+                    double max_off=0,max_angle=0,max_flat=0,max_rise=0,max_goal_rise=0,max_sent_rise=0;int sends=0,clamped=0,reasserts=0,rebinds=0,seeks=0;std::vector<Object*> skip;std::string move; };
 ViewFollow view_;bool view_enabled_=true;int view_space_=0;
-double view_pitch_back_=0,view_pitch_clock_=0;Identity view_pitch_pawn_;  // pitch the follow added and still owes back (deg)  // 0: offsets in world axes, 1: in the control yaw's frame (npcretarget viewfollow world|local)
+// 0: offsets in world axes, 1: in the control yaw's frame (npcretarget viewfollow world|local)
 Object* HeroCamera(Object* pawn){
     Object* atpc=Class("/Script/AdvancedThirdPersonCamera.ATPCCameraComponent");if(!atpc||!ue::Alive(pawn))return nullptr;
     Call get(pawn,"GetComponentByClass");Object* camera=get.Set("ComponentClass",atpc).Invoke()?get.Get<Object*>("ReturnValue"):nullptr;
@@ -8558,28 +8794,15 @@ bool SendViewOffset(Object* camera,Object* pawn,const Vector& world,float blend)
     return Call(camera,"SetAdditiveParameter_TargetOffset").Set("AdditiveName",name).Set("TargetOffset",offset).Set("BlendTime",blend).Invoke();
 }
 double ActorYaw(Object* actor){Call r(actor,"K2_GetActorRotation");return r.Invoke()?r.Get<RotatorD>("ReturnValue").yaw:0;}
-// Adds `deg` to the controller's pitch (the player's view).
-bool PitchView(Object* pawn,double deg){
-    Object* pc=PlayerController(pawn);if(!pc)return false;Call get(pc,"GetControlRotation");if(!get.Invoke())return false;
-    RotatorD r=get.Get<RotatorD>("ReturnValue");double p=r.pitch+deg;while(p>180)p-=360;while(p<-180)p+=360;r.pitch=p;
-    return Call(pc,"SetControlRotation").Set("NewRotation",r).Invoke();
-}
-// The pitch a follow added, given back over a few frames after it ended.
-void GiveBackPitch(){
-    if(view_pitch_back_<=0.05||!Same(view_pitch_pawn_)){view_pitch_back_=0;view_pitch_clock_=0;return;}
-    const double clock=ClockSeconds(),dt=view_pitch_clock_>0?(std::min)(0.1,clock-view_pitch_clock_):0;view_pitch_clock_=clock;
-    const double step=(std::min)(view_pitch_back_,kViewPitchRate*dt);if(step>0&&PitchView(view_pitch_pawn_.object,-step))view_pitch_back_-=step;
-}
 void EndViewFollow(const char* why){
     if(!view_.on)return;
-    if(view_.pitched>0.05&&Same(view_.pawn)){view_pitch_back_+=view_.pitched;view_pitch_pawn_=view_.pawn;view_pitch_clock_=0;}
     const bool moved=std::abs(view_.applied.x)+std::abs(view_.applied.y)+std::abs(view_.applied.z)>0.5;
     if(moved&&Same(view_.camera)&&Same(view_.pawn))SendViewOffset(view_.camera.object,view_.pawn.object,Vector{},kViewBackS);
     Logf("NPC_VIEW %s: body up to %.0fcm across and %.0fcm up/down from where it started, up to %.0f deg off the view centre; camera %s%s (%d updates, %d held short of a wall or roof, "
-         "arm folded %d times: rise capped at %.0fcm, view tilted up to %.0f deg, %llums; %s)",view_.move.c_str(),view_.max_flat,view_.max_rise,view_.max_angle,
+         "rise goal %.0fcm sent %.0fcm, %llums; %s; reasserts=%d rebinds=%d seeks=%d)",view_.move.c_str(),view_.max_flat,view_.max_rise,view_.max_angle,
          view_.max_off>0.5?"followed up to ":"not moved",view_.max_off>0.5?(std::to_string(static_cast<int>(view_.max_off))+"cm").c_str():"",view_.sends,view_.clamped,
-         view_.folds,view_.folds?view_.ceiling:0.0,view_.max_pitch,
-         GetTickCount64()-view_.started,why);
+         view_.max_goal_rise,view_.max_sent_rise,
+         GetTickCount64()-view_.started,why,view_.reasserts,view_.rebinds,view_.seeks);
     view_={};
 }
 void DriveViewFollow(){
@@ -8587,10 +8810,12 @@ void DriveViewFollow(){
     const bool chain_move=n&&NpcCombo::IsMove(*n)&&n->type!=NpcCombo::NodeType::Assist;  // a 援护 is another actor
     const int64_t handle=skill_.handle>0?static_cast<int64_t>(skill_.handle):0;
     const bool want=view_enabled_&&(chain_move||handle>0);
-    if(!want){EndViewFollow(view_enabled_?"the move is over":"switched off");GiveBackPitch();return;}
+    if(!want){EndViewFollow(view_enabled_?"the move is over":"switched off");return;}
     Context context;if(!ContextNow(context)||!ue::Alive(context.pawn))return;
     const int node=chain_move?combo_.playing:-1;
-    if(view_.on&&(view_.node!=node||(node<0&&view_.handle!=handle)||!Same(view_.pawn)||view_.pawn.object!=context.pawn))EndViewFollow("the next move");
+    const ULONGLONG now=GetTickCount64();
+    if(view_.on&&(!ViewFollowState::SameCast(view_.node,view_.visit,view_.handle,view_.cast_start,node,combo_.visit,handle,skill_.started)||
+        !Same(view_.pawn)||view_.pawn.object!=context.pawn))EndViewFollow("the next cast");
     Object* mesh=Same(display_)?display_.object:context.mesh;if(!ue::Alive(mesh))return;
     Call bone_name(mesh,"GetBoneName");if(!bone_name.Set("BoneIndex",int32_t{1}).Invoke())return;
     const Name pelvis=bone_name.Get<Name>("ReturnValue");if(pelvis.None())return;
@@ -8602,55 +8827,63 @@ void DriveViewFollow(){
     const auto rebase=[&]{const double c0=std::cos(-yaw*kRad),s0=std::sin(-yaw*kRad),bx=body.x-actor.x,by=body.y-actor.y;
                           view_.base={bx*c0-by*s0,bx*s0+by*c0,body.z-actor.z};view_.base_yaw=yaw;view_.mesh=Id(mesh);};
     if(!view_.on){
-        view_.on=true;view_.node=node;view_.handle=handle;view_.pawn=Id(context.pawn);view_.camera=Id(HeroCamera(context.pawn));view_.started=GetTickCount64();
+        view_.on=true;view_.node=node;view_.visit=combo_.visit;view_.handle=handle;view_.cast_start=skill_.started;view_.pawn=Id(context.pawn);view_.started=now;
         rebase();view_.move=n&&chain_move?"node="+std::to_string(node)+" "+(n->boss.empty()?std::string():n->boss+" ")+n->ability:"skill "+skill_.name;
     }else if(!Same(view_.mesh)||view_.mesh.object!=mesh)rebase();
+    if(handle>0){view_.handle=handle;view_.cast_start=skill_.started;}
+    // Native camera modes can replace a component or clear its named additives.
+    // Reacquire on a bounded schedule, without changing the pose's baseline.
+    if(now>=view_.camera_probe_at){
+        view_.camera_probe_at=now+250;Object* camera=HeroCamera(context.pawn);
+        if(camera&&(!Same(view_.camera)||camera!=view_.camera.object)){
+            if(Same(view_.camera))SendViewOffset(view_.camera.object,context.pawn,Vector{},0.f);
+            view_.camera=Id(camera);view_.lease.Invalidate();++view_.rebinds;
+        }
+    }
     const double clock=ClockSeconds(),dt=view_.clock>0?(std::min)(0.1,clock-view_.clock):0;view_.clock=clock;
     const double c=std::cos(yaw*kRad),s=std::sin(yaw*kRad);
     const Vector base{view_.base.x*c-view_.base.y*s,view_.base.x*s+view_.base.y*c,view_.base.z};
     const double dx=body.x-actor.x-base.x,dy=body.y-actor.y-base.y,dz=body.z-actor.z-base.z,flat=std::sqrt(dx*dx+dy*dy);
     view_.max_flat=(std::max)(view_.max_flat,flat);view_.max_rise=(std::max)(view_.max_rise,std::abs(dz));
-    // The camera now: its distance to the body against the one at the start (a folded arm).
+    // Current rendered-camera transform is used only for the view-angle diagnostic.
     Call manager(ue::Default("/Script/Engine.Default__GameplayStatics"),"GetPlayerCameraManager");
     Object* cam=manager.Set("WorldContextObject",context.pawn).Set("PlayerIndex",int32_t{0}).Invoke()?manager.Get<Object*>("ReturnValue"):nullptr;
     Vector eye{};RotatorD view{};bool seen=false;
     if(ue::Alive(cam)){Call eye_at(cam,"GetCameraLocation"),eye_turn(cam,"GetCameraRotation");
         if(eye_at.Invoke()&&eye_turn.Invoke()){eye=eye_at.Get<Vector>("ReturnValue");view=eye_turn.Get<RotatorD>("ReturnValue");seen=true;}}
-    if(seen){const double arm=Gap3(eye,body);
-        if(view_.arm<=0)view_.arm=arm>150?arm:380;
-        else if(arm<kViewFoldShare*view_.arm&&view_.applied.z>40&&view_.applied.z*kViewFoldKeep<view_.ceiling){view_.ceiling=view_.applied.z*kViewFoldKeep;++view_.folds;}}
-    Vector goal{};
-    if(flat>kViewDeadCm){const double k=((std::min)(flat,kViewMaxCm)-kViewDeadCm)/flat;goal.x=dx*k;goal.y=dy*k;}
-    if(std::abs(dz)>kViewRiseCm)goal.z=(dz>0?1:-1)*((std::min)(std::abs(dz),kViewMaxCm)-kViewRiseCm);
-    goal.z=(std::min)(goal.z,view_.ceiling);
-    // The pivot is never put past what stands between the actor and it (a roof or a tree over a leap folded the
-    // camera's arm onto the body, 11-08): a line from the actor's chest height, cut 40 cm short of a hit.
+    Vector goal=ViewFollowState::DesiredOffset<Vector>(dx,dy,dz);
+    view_.max_goal_rise=(std::max)(view_.max_goal_rise,std::abs(goal.z));
+    // Keep the pivot 40 cm short of a confirmed hit from the actor's chest.
+    // Native camera-arm collision remains independent of this target-offset clamp.
     if(const double len=std::sqrt(goal.x*goal.x+goal.y*goal.y+goal.z*goal.z);len>20){
         if(view_.skip.empty())view_.skip=TraceIgnore(context.pawn,nullptr);
         const Vector from{actor.x,actor.y,actor.z+60},to{from.x+goal.x,from.y+goal.y,from.z+goal.z};Vector hit{};
-        if(TraceLine(context.pawn,from,to,view_.skip,&hit)==1){const double keep=(std::max)(0.0,Gap3(from,hit)-40)/len;goal={goal.x*keep,goal.y*keep,goal.z*keep};++view_.clamped;}
+        if(TraceLine(context.pawn,from,to,view_.skip,&hit)==1){goal=ViewFollowState::ObstacleLimited(goal,Gap3(from,hit));++view_.clamped;}
     }
     // Eased toward the goal: quicker following than coming back.
     const bool out=std::sqrt(goal.x*goal.x+goal.y*goal.y+goal.z*goal.z)>std::sqrt(view_.applied.x*view_.applied.x+view_.applied.y*view_.applied.y+view_.applied.z*view_.applied.z);
     const double k=dt>0?1-std::exp(-dt/(out?kViewEaseIn:kViewEaseOut)):0;
     const Vector next{view_.applied.x+(goal.x-view_.applied.x)*k,view_.applied.y+(goal.y-view_.applied.y)*k,view_.applied.z+(goal.z-view_.applied.z)*k};
     view_.max_off=(std::max)(view_.max_off,std::sqrt(next.x*next.x+next.y*next.y+next.z*next.z));
-    if(Same(view_.camera)&&Gap3(next,view_.applied)>0.3){
-        if(SendViewOffset(view_.camera.object,context.pawn,next,0.f)){view_.applied=next;++view_.sends;}}
+    const bool changed=Gap3(next,view_.applied)>0.3;
+    if(Same(view_.camera)&&view_.lease.Due(now,changed,Gap3(next,Vector{})>0.3)){
+        const bool sent=SendViewOffset(view_.camera.object,context.pawn,next,0.f);view_.lease.Sent(now,sent);
+        if(sent){view_.applied=next;view_.max_sent_rise=(std::max)(view_.max_sent_rise,std::abs(next.z));++view_.sends;if(!changed)++view_.reasserts;}}
     // How far off the view centre the body is (log only).
     if(!seen)return;
     const Vector to{body.x-eye.x,body.y-eye.y,body.z-eye.z};const double reach=std::sqrt(to.x*to.x+to.y*to.y);if(reach<1)return;
     const auto wrap=[](double v){while(v>180)v-=360;while(v<-180)v+=360;return v;};
     const double yaw_off=wrap(std::atan2(to.y,to.x)/kRad-view.yaw),pitch_off=wrap(std::atan2(to.z,reach)/kRad-view.pitch);
     view_.max_angle=(std::max)(view_.max_angle,std::sqrt(yaw_off*yaw_off+pitch_off*pitch_off));
-    // Capped and the body above the frame: tilt up (not under a lock-on); back down as it comes back.
-    if(dt<=0)return;
-    const char* via="lock";const bool locked=LockedEnemy(context.pawn,via)!=nullptr;
-    if(view_.folds>0&&!locked&&pitch_off>kViewPitchKeep&&view_.pitched<kViewPitchMax){
-        const double step=(std::min)({pitch_off-kViewPitchKeep,kViewPitchRate*dt,kViewPitchMax-view_.pitched});
-        if(PitchView(context.pawn,step)){view_.pitched+=step;view_.max_pitch=(std::max)(view_.max_pitch,view_.pitched);}
-    }else if(view_.pitched>0.05&&pitch_off<kViewPitchKeep*0.5){
-        const double step=(std::min)(view_.pitched,kViewPitchRate*dt);if(PitchView(context.pawn,-step))view_.pitched-=step;}
+}
+void BeforeViewTrimSeek(double position,double destination){
+    if(!view_enabled_)return;
+    if(!ViewFollowState::IsPoseJump(position,destination))return;
+    // Sample the pre-seek pose even when the first camera tick has not run yet.
+    // Replays and deferred jumps use the same path; never rebase to the jumped pose.
+    DriveViewFollow();if(!view_.on)return;
+    view_.lease.Invalidate();++view_.seeks;
+    Logf("NPC_VIEW trim seek node=%d visit=%llu from=%.3f to=%.3f: baseline kept, follow reasserted",view_.node,view_.visit,position,destination);
 }
 // Tests: npcretarget lockstruct: SetLockTarget's reflected Target struct, the combat system's lock / target structs and the
 // soft-lock picks as bytes (bytes 8..15 also read as a name). Log only.
@@ -9932,12 +10165,13 @@ void DriveBorrow(){
 // montages and bullet data come with it) and the blink effects. Once a look's blueprint is held its CDO and part
 // templates are looked up too (WarmLook), so the look change finds them cached.
 struct PreloadItem { std::string path; bool is_class=false; int32_t row=-1; std::string skill;
-    enum class State { Waiting, Loading, Held, Missing }; State state=State::Waiting; Identity pin; SoftPath soft; bool soft_ok=false;
+    enum class State { Waiting, Loading, Deferred, Held, Missing }; State state=State::Waiting; Identity pin; SoftPath soft; bool soft_ok=false;
     ULONGLONG asked=0; double game_ms=0; };
 struct PreloadGroup { size_t begin=0,end=0; int32_t row=-1; std::string skill; bool reported=false,started=false; ULONGLONG t0=0; };
 struct Preload { uint64_t generation=0; Object* world=nullptr; std::vector<PreloadItem> items; std::vector<PreloadGroup> groups; size_t poll=0; uint32_t uuid=0;
+    bool complete=false,idle=false;
     int async=-1; // -1 not checked yet, 0 blocking loads, 1 the engine's async loader
-    std::vector<int32_t> warm; };  // looks whose part templates are found once their donor is held
+    std::vector<int32_t> warm,display_rows; };  // looks whose part templates are found once their donor is held
 Preload preload_;
 constexpr size_t kPreloadInFlight=6,kPreloadAsksPerFrame=2,kPreloadPollsPerFrame=8;constexpr ULONGLONG kPreloadTimeoutMs=30000;
 double QpcMs(LONGLONG from){
@@ -9955,14 +10189,28 @@ void ReleasePreload(){
     if(total)Logf("NPC_COMBO preload released=%zu of %zu",released,total);
 }
 std::vector<PreloadItem> PreloadWanted(){
-    std::vector<PreloadItem> items;std::vector<std::pair<int32_t,std::string>> seen;
+    std::vector<PreloadItem> items;std::set<std::pair<int32_t,std::string>> seen;std::set<std::pair<std::string,bool>> paths;
+    const auto configs=NpcCombo::All();
+    const MotianGrab::Snapshot grab=MotianGrab::GetSnapshot();
+    preload_.display_rows.clear();
+    // Prefer the current chain, then the hero's chain. Bare skills and assist
+    // actors do not need an appearance bundle and must not occupy the pool.
+    const std::string current=ComboProfile();
+    for(int priority=0;priority<3;++priority)for(const auto& [profile,config]:configs){
+        const int rank=profile==current?0:profile==NpcCombo::kHeroProfile?1:2;if(rank!=priority||!config.enabled)continue;
+        for(const auto& node:config.chain){int row=-1;
+            if(node.type==NpcCombo::NodeType::Look||(node.type==NpcCombo::NodeType::BossSkill&&!node.own_look))row=ProfileRow(node.boss);
+            else if(node.type==NpcCombo::NodeType::Grab&&!node.own_look){const auto* variant=GrabVariantData(grab,GrabVariantOf(node,grab));if(variant)row=SkinForGrab(variant->boss_id,variant->source);}
+            if(row>=0&&std::find(preload_.display_rows.begin(),preload_.display_rows.end(),row)==preload_.display_rows.end())preload_.display_rows.push_back(row);
+        }
+    }
     const auto add=[&](const char* path,bool is_class,int32_t row,const std::string& skill){
-        if(!path||!*path)return;for(const PreloadItem& i:items)if(i.path==path)return;items.push_back({path,is_class,row,skill});};
-    for(const auto& [profile,config]:NpcCombo::All())for(const NpcCombo::Node& n:config.chain){
+        if(!path||!*path||!paths.emplace(path,is_class).second)return;items.push_back({path,is_class,row,skill});};
+    for(const auto& [profile,config]:configs)for(const NpcCombo::Node& n:config.chain){
         // A BOSS 援护 calls in that boss's combat blueprint (its own mesh, weapons and the move): the same set.
         if(!NpcCombo::PicksBossMove(n)||!NpcCombo::IsMove(n))continue;
         const int32_t row=ProfileRow(n.boss);if(row<0)continue;
-        if(std::find(seen.begin(),seen.end(),std::make_pair(row,n.ability))!=seen.end())continue;seen.emplace_back(row,n.ability);
+        if(!seen.emplace(row,n.ability).second)continue;
         const Profile& p=kProfiles[row];const NpcSkillSet& set=kNpcSkillSets[static_cast<size_t>(row)];
         add(p.donor,true,row,n.ability);add(p.body,false,row,n.ability);add(p.skeleton,false,row,n.ability);
         if(p.head&&std::strchr(p.head,'.'))add(p.head,false,row,n.ability);
@@ -9976,31 +10224,31 @@ std::vector<PreloadItem> PreloadWanted(){
         add(set.monster,true,row,n.ability);
         // The move last: a group ends at its own ability (its log line).
         const std::string ga=MovePackage(static_cast<size_t>(row),n.ability);
-        if(!ga.empty())items.push_back({ga,true,row,n.ability});
+        if(!ga.empty())add(ga.c_str(),true,row,n.ability);
     }
     // An NPC look's own chain (its profile): its moves are that boss's skills, cast while the look is on: after a
     // 保留变身 / 变身 the hero's chain ended in (the look's chain takes over), or with the look put on from its page.
     // The look is on (loaded) by then, so only the moves: their abilities (montages and bullet data come with them);
     // a 闪避 node, every dodge of the look (the stick picks one at the press).
-    for(const auto& [profile,config]:NpcCombo::All()){
+    for(const auto& [profile,config]:configs){
         const int32_t row=ProfileRow(profile);if(row<0||!config.enabled)continue;
         for(const NpcCombo::Node& n:config.chain){
             if(n.type==NpcCombo::NodeType::Skill&&!n.ability.empty()){
-                if(std::find(seen.begin(),seen.end(),std::make_pair(row,n.ability))!=seen.end())continue;seen.emplace_back(row,n.ability);
+                if(!seen.emplace(row,n.ability).second)continue;
                 const std::string ga=MovePackage(static_cast<size_t>(row),n.ability);
                 if(!ga.empty())add(ga.c_str(),true,row,n.ability);
             }else if(n.type==NpcCombo::NodeType::AutoDodge){
-                if(std::find(seen.begin(),seen.end(),std::make_pair(row,std::string("#dodges")))!=seen.end())continue;seen.emplace_back(row,"#dodges");
+                if(!seen.emplace(row,"#dodges").second)continue;
                 const NpcDodgeSet& dodges=kNpcDodgeSets[static_cast<size_t>(row)];
                 for(size_t d=0;d<dodges.count;++d)add(dodges.dodges[d].ability,true,row,"dodges");
             }
         }
     }
     // 变身 nodes: their look (no move).
-    for(const auto& [profile,config]:NpcCombo::All())for(const NpcCombo::Node& n:config.chain){
+    for(const auto& [profile,config]:configs)for(const NpcCombo::Node& n:config.chain){
         if(n.type!=NpcCombo::NodeType::Look||n.boss.empty())continue;
         const int32_t row=ProfileRow(n.boss);if(row<0)continue;
-        if(std::find(seen.begin(),seen.end(),std::make_pair(row,std::string("#look")))!=seen.end())continue;seen.emplace_back(row,"#look");
+        if(!seen.emplace(row,"#look").second)continue;
         const Profile& p=kProfiles[row];const NpcSkillSet& set=kNpcSkillSets[static_cast<size_t>(row)];const std::string key="look";
         add(p.donor,true,row,key);add(p.body,false,row,key);add(p.skeleton,false,row,key);
         if(p.head&&std::strchr(p.head,'.'))add(p.head,false,row,key);
@@ -10009,18 +10257,19 @@ std::vector<PreloadItem> PreloadWanted(){
     }
     // 投技 nodes: the look of the grab's boss (the hero takes it for the grab; the grab's own assets are the grab
     // module's: its slot for the chain).
-    const MotianGrab::Snapshot grab=MotianGrab::GetSnapshot();
-    for(const auto& [profile,config]:NpcCombo::All())for(const NpcCombo::Node& n:config.chain){
+
+    for(const auto& [profile,config]:configs)for(const NpcCombo::Node& n:config.chain){
         if(n.type!=NpcCombo::NodeType::Grab)continue;
         const MotianGrab::Variant* v=GrabVariantData(grab,GrabVariantOf(n,grab));if(!v)continue;
         const int32_t row=SkinForGrab(v->boss_id,v->source);if(row<0)continue;
-        if(std::find(seen.begin(),seen.end(),std::make_pair(row,std::string("#grab")))!=seen.end())continue;seen.emplace_back(row,"#grab");
+        if(!seen.emplace(row,"#grab").second)continue;
         const Profile& p=kProfiles[row];const NpcSkillSet& set=kNpcSkillSets[static_cast<size_t>(row)];const std::string key="grab:"+n.ability;
         add(p.donor,true,row,key);add(p.body,false,row,key);add(p.skeleton,false,row,key);
         if(p.head&&std::strchr(p.head,'.'))add(p.head,false,row,key);
         for(size_t w=0;w<set.weapon_count;++w)add(set.weapons[w].actor_class,true,row,key);
         add(set.monster,true,row,key);  // its combat blueprint, as for BOSS 技能
     }
+    if(!items.empty())add("/HuaShira/Characters/Hero/Hero_Hun/Hun_CopyPose",true,-1,"copy-pose");
     if(!items.empty())for(const char* fx:{kBlinkOutFx,kBlinkInFx,kBlinkOutSound,kBlinkInSound})add(fx,false,-1,"");
     return items;
 }
@@ -10054,7 +10303,7 @@ bool PreloadAsyncReady(){
     const bool layout=latent&&ue::StructSize(latent)==24&&ue::Offset(latent,"Linkage")==0&&ue::Offset(latent,"UUID")==4&&ue::Offset(latent,"ExecutionFunction")==8&&ue::Offset(latent,"CallbackTarget")==16;
     latent_size_=layout?24:0;
     preload_.async=ue::Alive(manager)&&functions&&layout?1:0;
-    Logf("NPC_COMBO preload loader=%s (asset manager %s, LoadAsset/LoadAssetClass %s, LatentActionInfo %s)",preload_.async?"async":"blocking one per frame",
+    Logf("NPC_COMBO preload loader=%s (asset manager %s, LoadAsset/LoadAssetClass %s, LatentActionInfo %s)",preload_.async?"async":"blocking one per idle upkeep",
          manager?Text(manager).c_str():"none",functions?"found":"missing",layout?"24 bytes":"unexpected");
     return preload_.async==1;
 }
@@ -10097,7 +10346,7 @@ void BuildPreloadGroups(){
 // A look whose donor is held: its CDO and part templates are found now (DefaultObject, PartTemplates), so the look
 // change itself finds them cached. One look per call.
 void WarmLook(){
-    if(preload_.warm.empty())return;
+    if(preload_.warm.empty()||!preload_.idle)return;
     const int32_t row=preload_.warm.front();preload_.warm.erase(preload_.warm.begin());
     const LONGLONG t0=QpcNow();const Profile& profile=kProfiles[row];
     Object* cls=Class((std::string(profile.donor)+"."+std::string(profile.donor).substr(std::string(profile.donor).find_last_of('/')+1)+"_C").c_str());
@@ -10122,11 +10371,14 @@ void DrivePreload(const Context* context){
     Object* world=context?context->world:nullptr;
     const uint64_t generation=NpcCombo::Generation();
     if(generation!=preload_.generation||world!=preload_.world){
+        preload_.complete=false;preload_.idle=false;
         std::vector<PreloadItem> want=PreloadWanted();
         const bool scene=world!=preload_.world;size_t kept=0,released=0,added=0;
-        if(scene)ReleasePreload();
+        std::map<std::pair<std::string,bool>,size_t> lookup;
+        for(size_t i=0;i<want.size();++i)lookup.emplace(std::make_pair(want[i].path,want[i].is_class),i);
+        if(scene){ReleasePreload();preload_.warm.clear();pool_attempts_.clear();}
         else for(PreloadItem& old:preload_.items){
-            auto it=std::find_if(want.begin(),want.end(),[&](const PreloadItem& w){return w.path==old.path&&w.is_class==old.is_class&&w.state==PreloadItem::State::Waiting&&!w.pin.object&&!w.asked;});
+            const auto found=lookup.find({old.path,old.is_class});auto it=found!=lookup.end()?want.begin()+static_cast<std::ptrdiff_t>(found->second):want.end();
             if(it!=want.end()&&old.state!=PreloadItem::State::Missing){it->state=old.state;it->pin=old.pin;it->soft=old.soft;it->soft_ok=old.soft_ok;it->asked=old.asked;it->game_ms=0;old.pin={};++kept;}
             else if(old.pin.object){ReleasePreloadPin(old.pin);++released;}}
         for(const PreloadItem& w:want)added+=w.state==PreloadItem::State::Waiting?1:0;
@@ -10136,22 +10388,35 @@ void DrivePreload(const Context* context){
             Logf("NPC_COMBO preload set items=%zu kept=%zu new=%zu released=%zu (%s)",preload_.items.size(),kept,added,released,scene?"scene change: all loaded again":"set changed: only new items load");
     }
     if(!world)return;
+    preload_.idle=context&&combo_.playing<0&&!skill_.asc.object&&Idle(*context);
     WarmLook();
     PreloadStep(true);
+    std::vector<int32_t> wanted;
+    for(int row:preload_.display_rows)if(std::any_of(preload_.items.begin(),preload_.items.end(),[&](const PreloadItem& item){return item.row==row&&item.state==PreloadItem::State::Held&&item.path==kProfiles[row].donor;}))wanted.push_back(row);
+    if(!InterlockedCompareExchange(&experimental_,0,0)){PoolClear();return;}
+    if(context){
+        display_pool_.Prune([&](const DisplayBundle& b){return !b.broken&&Same(b.pawn)&&Same(b.source)&&Same(b.world)&&b.pawn.object==context->pawn&&b.source.object==context->mesh&&b.world.object==context->world;},PoolDrop);
+        if(preload_.idle&&waiting_action_<0&&!cutscene_host_)WarmDisplayPool(*context,wanted);
+    }else PoolClear();
 }
 // Asks and polls: every frame with the async loader, with the 250 ms upkeep (DrivePreload) when loads block.
 void PreloadStep(bool upkeep){
     Object* world=preload_.world;
-    if(preload_.items.empty()||!ue::Alive(world))return;
+    if(preload_.complete||preload_.items.empty()||!ue::Alive(world))return;
     const bool async=PreloadAsyncReady();
-    if(!async&&!upkeep)return;
+    const bool blocking=upkeep&&preload_.idle&&combo_.playing<0&&!skill_.asc.object;
+    if(!async&&!blocking)return;
+    const LONGLONG step_start=QpcNow();bool blocked=false;
     const ULONGLONG now=GetTickCount64();
     size_t loading=0;for(const PreloadItem& i:preload_.items)loading+=i.state==PreloadItem::State::Loading?1:0;
     // Ask: a few new items a frame, a few in flight (async); one blocking load a frame otherwise.
     size_t asks=0;
     for(size_t g=0;g<preload_.groups.size();++g){PreloadGroup& group=preload_.groups[g];
         for(size_t i=group.begin;i<group.end;++i){PreloadItem& item=preload_.items[i];
-            if(item.state!=PreloadItem::State::Waiting)continue;
+            const bool deferred=item.state==PreloadItem::State::Deferred;
+            if(item.state!=PreloadItem::State::Waiting&&!deferred)continue;
+            if(deferred&&!blocking)continue;
+            if(blocked||QpcMs(step_start)>=2.0)break;
             if(async?(asks>=kPreloadAsksPerFrame||loading>=kPreloadInFlight):asks>=1)break;
             const LONGLONG t0=QpcNow();
             if(!group.t0){group.t0=now;if(!group.started){group.started=true;
@@ -10159,20 +10424,22 @@ void PreloadStep(bool upkeep){
                 else Logf("NPC_COMBO preload blink effects async start items=%zu (%s)",group.end-group.begin,async?"async":"blocking");}}
             Object* ready=PreloadResolved(item);  // loaded already (the game, or a set before): held at once
             if(ready)PreloadHold(item,ready);
-            else if(async&&PreloadAsk(item,world)){item.state=PreloadItem::State::Loading;item.asked=now;++loading;}
-            else PreloadHold(item,PreloadOne(item));  // the blocking way (no async loader, or the ask was refused)
+            else if(async&&!deferred&&PreloadAsk(item,world)){item.state=PreloadItem::State::Loading;item.asked=now;++loading;}
+            else if(blocking){PreloadHold(item,PreloadOne(item));blocked=true;}
+            else item.state=PreloadItem::State::Deferred;  // never synchronously load on the per-frame combat path
             item.game_ms+=QpcMs(t0);++asks;}
-        if(async?(asks>=kPreloadAsksPerFrame||loading>=kPreloadInFlight):asks>=1)break;}
+        if(blocked||QpcMs(step_start)>=2.0||(async?(asks>=kPreloadAsksPerFrame||loading>=kPreloadInFlight):asks>=1))break;}
     // Poll the items in flight by their soft reference, a few a frame.
     size_t polls=0;
-    for(size_t n=0;n<preload_.items.size()&&polls<kPreloadPollsPerFrame;++n){
+    for(size_t n=0;n<preload_.items.size()&&polls<kPreloadPollsPerFrame&&QpcMs(step_start)<2.0;++n){
         preload_.poll=(preload_.poll+1)%preload_.items.size();PreloadItem& item=preload_.items[preload_.poll];
         if(item.state!=PreloadItem::State::Loading)continue;++polls;
         const LONGLONG t0=QpcNow();Object* ready=PreloadResolved(item);
         if(ready)PreloadHold(item,ready);
-        else if(now>item.asked+kPreloadTimeoutMs){Logf("NPC_COMBO preload %s: nothing after %llums async, loading it blocking",item.path.c_str(),now-item.asked);PreloadHold(item,PreloadOne(item));}
+        else if(now>item.asked+kPreloadTimeoutMs){Logf("NPC_COMBO preload %s: nothing after %llums async, deferred until idle",item.path.c_str(),now-item.asked);item.state=PreloadItem::State::Deferred;}
         item.game_ms+=QpcMs(t0);}
     ReportPreloadGroups();
+    preload_.complete=std::all_of(preload_.items.begin(),preload_.items.end(),[](const PreloadItem& item){return item.state==PreloadItem::State::Held||item.state==PreloadItem::State::Missing;});
 }
 // ---- 慢放 on the hero's side ----------------------------------------------------------------------------------------
 // The game's slomo moves are Lego timeline actions derived from /MagCombatAbilities/Actions/GAAction_Slomo. Its Slomo
@@ -10429,7 +10696,7 @@ void DriveSlomo(){
 }
 // What each frame's drivers cost on the game thread while a chain runs (NPC_PERF chain, one line per 10 s with
 // chain frames): average and largest ms per frame of each group, the whole frame's share, and FindObject's work.
-enum ChainPart : size_t { kPartDisplay, kPartSkill, kPartLooks, kPartCombo, kPartKeys, kPartInput, kPartTriggers, kPartComboKeys, kPartDamage, kPartPreload, kPartUpkeep, kPartCount };
+enum ChainPart : size_t { kPartPool, kPartDisplay, kPartSkill, kPartLooks, kPartCombo, kPartKeys, kPartInput, kPartTriggers, kPartComboKeys, kPartDamage, kPartPreload, kPartUpkeep, kPartCount };
 struct ChainCost { double sum[kPartCount]{},max[kPartCount]{},frame_sum=0,frame_max=0;uint32_t frames=0;ULONGLONG since=0;ue::LookupStats lookups;size_t part_scans=0; };
 ChainCost chain_cost_;double chain_frame_[kPartCount]{};bool chain_frame_on_=false;
 template<class F> void Timed(ChainPart part,F&& work){const LONGLONG t0=QpcNow();work();chain_frame_[part]+=QpcMs(t0);}
@@ -10443,7 +10710,7 @@ void CommitChainFrame(){
     std::fill(std::begin(chain_frame_),std::end(chain_frame_),0.0);
     ChainCost& c=chain_cost_;
     if(c.frames&&GetTickCount64()>=c.since+10000){
-        static const char* const kNames[kPartCount]={"display","skill","looks","combo","rawKeys","heroInput","heroTriggers","comboKeys","damage","preload","upkeep"};
+        static const char* const kNames[kPartCount]={"pool","display","skill","looks","combo","rawKeys","heroInput","heroTriggers","comboKeys","damage","preload","upkeep"};
         std::string parts;char row[64];
         for(size_t i=0;i<kPartCount;++i){std::snprintf(row,sizeof(row)," %s=%.3f/%.2f",kNames[i],c.sum[i]/c.frames,c.max[i]);parts+=row;}
         const ue::LookupStats now=ue::LookupTotals();
@@ -10495,6 +10762,7 @@ void DriveCutsceneLook(const Context& context) {
 void Tick() {
     if (!initialized_) return;
     ChainFrame chain_frame;
+    Timed(kPartPool,[]{HoldPoolDormancy();});
     const LONGLONG display_t0 = QpcNow();
     if (active_ && !cleanup_pending_ && !RefreshFaceVisibility()) {
         cleanup_pending_=true;
@@ -10565,7 +10833,7 @@ void Tick() {
     PerfReport();PerfScope timing(PerfKind::Maintenance);UpkeepTime upkeep_time;  // a look change in here shows as upkeep max (its own line: apply timing)
     const bool disabled = InterlockedCompareExchange(&disabled_, 0, 0) != 0;
     if (disabled && waiting_action_ != static_cast<int32_t>(Action::Restore)) {
-        AcquireSRWLockExclusive(&snapshot_lock); snapshot_.ready = false; ReleaseSRWLockExclusive(&snapshot_lock);
+        PoolClear();AcquireSRWLockExclusive(&snapshot_lock); snapshot_.ready = false; ReleaseSRWLockExclusive(&snapshot_lock);
         Publish(); return;
     }
     Context context; const bool context_ok = ContextNow(context);
@@ -10678,7 +10946,7 @@ void Tick() {
 int FaultFilter(const EXCEPTION_POINTERS* exception) {
     fault_code_ = exception->ExceptionRecord->ExceptionCode; fault_address_ = reinterpret_cast<uintptr_t>(exception->ExceptionRecord->ExceptionAddress); return EXCEPTION_EXECUTE_HANDLER;
 }
-void Recover() { __try { Restore(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+void Recover() { __try { pool_enabled_=false;Restore();PoolClear(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
 void GuardedTick() {
     __try { Tick(); }
     __except (FaultFilter(GetExceptionInformation())) {
@@ -10792,23 +11060,29 @@ int32_t SkinForGrab(const std::wstring& boss_id, const std::wstring& source) {
     }
     return best;
 }
+ue::Object* BoneBody(){if(active_&&Same(display_))return display_.object;Context context;return ContextNow(context)?context.mesh:nullptr;}
+BoneMotion::Config BoneEdits(){
+    if(combo_.trigger<0||combo_.playing<0||combo_.phase==ComboRun::Phase::Idle)return {};
+    const int mod=NpcCombo::ModFor(combo_.config,combo_.trigger,combo_.playing,NpcCombo::kModBone);
+    return mod>=0?combo_.config.chain[static_cast<size_t>(mod)].bones:BoneMotion::Config{};
+}
 void OnGameThreadGuarded() { GuardedTick(); }
 bool BeforeTravel() {
     AcquireSRWLockExclusive(&request_lock); pending_action_ = -1; ReleaseSRWLockExclusive(&request_lock);
-    __try { KeepForNextScene("travel"); waiting_action_ = -1; return Restore(); }
+    __try { KeepForNextScene("travel"); waiting_action_ = -1; const bool restored=Restore();return PoolClear()&&restored; }
     __except (FaultFilter(GetExceptionInformation())) { Logf("NPC_RETARGET pre-travel cleanup fault 0x%08lx", fault_code_); return false; }
 }
 bool ReleaseForExternal() {
     AcquireSRWLockExclusive(&request_lock); pending_action_ = -1; ReleaseSRWLockExclusive(&request_lock);
     __try {
         waiting_action_ = -1;
-        if (!HasResources()) { Publish(); return true; }
+        if (!HasResources()) { const bool cleared=PoolClear();Publish();return cleared; }
         ForgetResume("hero outfit applied");
         Context context;
         if (!primary_restored_ && Same(primary_) && ContextNow(context) && context.mesh == primary_.object && !Idle(context)) {
             Status(L"先等待当前 NPC 模型空闲，再恢复并切换到主角套装"); Publish(true); return false;
         }
-        const bool restored = Restore(); Publish(); return restored;
+        const bool restored = Restore();const bool cleared=PoolClear(); Publish(); return restored&&cleared;
     } __except (FaultFilter(GetExceptionInformation())) {
         cleanup_pending_ = HasResources(); Publish();
         Logf("NPC_RETARGET appearance-release fault 0x%08lx; preserved cleanup ledger", fault_code_); return false;

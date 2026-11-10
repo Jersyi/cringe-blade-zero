@@ -1,4 +1,5 @@
 #include "move_preview.h"
+#include "bone_motion.h"
 #include "boss_assist.h"
 #include "hub_pause.h"
 #include "ue_runtime.h"
@@ -38,6 +39,7 @@ Logger logger_ = nullptr;
 SRWLOCK lock_ = SRWLOCK_INIT;
 std::string want_monster_, want_ability_; bool want_shown_ = false; ULONGLONG hidden_at_ = 0;
 int want_speed_ = 100; std::vector<NpcCombo::CurvePoint> want_curve_;  // under lock_: the move's 加速
+std::vector<int> want_trim_holds_;
 int want_trim_from_ = 0, want_trim_to_ = 0;  // under lock_: its 裁剪 (ms)
 Frame frame_;  // under lock_
 DWORD faults_ = 0; bool disabled_ = false;
@@ -580,10 +582,11 @@ void Read(Object* context_object) {
 void Tick() {
     if (disabled_) return;
     std::string monster, ability; bool shown = false; ULONGLONG hidden_at = 0;
-    int speed = 100, trim_from = 0, trim_to = 0; std::vector<NpcCombo::CurvePoint> curve;
+    int speed = 100, trim_from = 0, trim_to = 0;std::vector<int> holds; std::vector<NpcCombo::CurvePoint> curve;
     AcquireSRWLockShared(&lock_); monster = want_monster_; ability = want_ability_; shown = want_shown_; hidden_at = hidden_at_; speed = want_speed_; curve = want_curve_;
-    trim_from = want_trim_from_; trim_to = want_trim_to_;
+    trim_from = want_trim_from_; trim_to = want_trim_to_;holds=want_trim_holds_;
     ReleaseSRWLockShared(&lock_);
+    if(!shown)BossAssist::PreviewTrim(trim_from,trim_to,holds,false);
     const ULONGLONG now = GetTickCount64();
     if (!shown) {
         if (!monster_.empty()) { BossAssist::StopPreview(); monster_.clear(); ability_.clear(); framed_ = false; fx_lod_.clear(); }
@@ -614,7 +617,9 @@ void Tick() {
         if (!BossAssist::StartPreview(monster, ability, at, 0, stage_.dummy)) { SetStatus(L"这一招无法预览"); return; }
     }
     BossAssist::PreviewSpeed(speed, curve);  // held on the boss every frame
-    BossAssist::PreviewTrim(trim_from, trim_to);
+    DWORD foreground_pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&foreground_pid);
+    const bool holding=foreground_pid==GetCurrentProcessId()&&(GetAsyncKeyState(VK_SPACE)&0x8000)!=0;
+    BossAssist::PreviewTrim(trim_from, trim_to,holds,holding);
     Object* boss = BossAssist::PreviewBoss();
     if (boss) { FrameCamera(boss, !framed_); framed_ = true; }
     RECT view{}; int source = -1;
@@ -638,14 +643,16 @@ void Debug(const std::string& what, int value) {
     ReleaseSRWLockExclusive(&lock_);
     Logf("MOVE_PREVIEW debug %s %d", what.c_str(), value);
 }
-void Show(const std::string& monster, const std::string& ability, int speed, const std::vector<NpcCombo::CurvePoint>& curve, int trim_from, int trim_to) {
+void Show(const std::string& monster, const std::string& ability, int speed, const std::vector<NpcCombo::CurvePoint>& curve, int trim_from, int trim_to, const BoneMotion::Config& bones,const std::vector<int>& holds) {
     AcquireSRWLockExclusive(&lock_);
-    want_trim_from_ = NpcCombo::ClampTrim(trim_from); want_trim_to_ = NpcCombo::ClampTrim(trim_to);
+    BoneMotionRuntime::Preview(bones);
+    want_trim_holds_=NpcCombo::TrimHolds(holds);want_trim_from_ = NpcCombo::ClampTrim(trim_from); want_trim_to_ = NpcCombo::ClampTrim(trim_to);
     want_monster_ = monster; want_ability_ = ability; want_shown_ = !monster.empty() && !ability.empty();
     want_speed_ = NpcCombo::ClampSpeed(speed); want_curve_ = curve.size() >= 2 ? curve : std::vector<NpcCombo::CurvePoint>{};
     ReleaseSRWLockExclusive(&lock_);
 }
 void Hide() {
+    BoneMotionRuntime::Preview({});
     AcquireSRWLockExclusive(&lock_);
     if (want_shown_) hidden_at_ = GetTickCount64();
     want_shown_ = false; view_ = {};

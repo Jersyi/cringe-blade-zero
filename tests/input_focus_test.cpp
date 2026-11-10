@@ -4,6 +4,7 @@
 // while a window of this process is foreground, then counted where they land.
 // Exit code = number of failed checks.
 #include "debug_hub.h"
+#include "combo_menu.h"
 #include "entry_focus.h"
 #include "ui_cursor.h"
 #include "ui_glass.h"
@@ -31,6 +32,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// This harness does not construct the combo page or its text input.
+namespace ComboMenu { bool OwnsTextMessage(const MSG&) { return false; } bool HandleRecordingMessage(const MSG&) { return false; } }
 
 // Grab backend stub for the page layout check (no engine in this harness).
 namespace MotianGrab {

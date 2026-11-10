@@ -1,7 +1,11 @@
 #include "hair_controls.h"
+#include "combo_menu.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+
+// This harness does not construct the combo page or its text input.
+namespace ComboMenu { bool OwnsTextMessage(const MSG&) { return false; } bool HandleRecordingMessage(const MSG&) { return false; } }
 
 namespace {
 int failures = 0;

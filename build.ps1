@@ -21,6 +21,9 @@ $readme = @"
   一键安装：先退出游戏，双击 Install.bat，按 1 安装完整版、2 安装精简版、3 卸载。
     安装器从注册表找到游戏目录（找不到时可手动输入 PBZ.exe 所在文件夹），校验游戏版本，复制后再校验 DLL；
     目录里已有其他 MOD 的 version.dll 时先备份，卸载时还原。界面语言随系统显示语言（中文 / 英文）。
+    完整版会同时安装作者的示例 combos\sampleCombo.combo；也可选 5 单独安装示例。
+    如果已有改过的同名示例，随包版本另存为 sampleCombo_bundled_<校验码>.combo，保留原文件。
+    启动后在“招式派生”的文件列表选择 sampleCombo；不会覆盖 default，也不自动更改当前派生文件。
   Steam / WeGame 共用同一个 version.dll，无需分别下载。
   手动安装：把 version.dll 复制到 PBZ.exe 所在的文件夹：
     Steam 版   <PBZ 安装目录>\platform\steam\version.dll
@@ -71,8 +74,17 @@ $files = [ordered]@{
     "$name/triggers_only/version.dll" = Join-Path $buildRoot 'triggers_only\version.dll'
     "$name/EnvCheck.exe"              = Join-Path $buildRoot 'Release\EnvCheck.exe'
     "$name/CHANGELOG.md"              = Join-Path $projectRoot 'CHANGELOG.md'
+    "$name/THIRD_PARTY_NOTICES.md"    = Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'
+    "$name/licenses/UUEPBS-LICENSE-STATUS.txt" = Join-Path $projectRoot 'licenses\UUEPBS-LICENSE-STATUS.txt'
+    "$name/docs/WEAPON_DERIVATIONS.md" = Join-Path $projectRoot 'docs\WEAPON_DERIVATIONS.md'
+    "$name/docs/ANIMATION_PRESETS.md" = Join-Path $projectRoot 'docs\ANIMATION_PRESETS.md'
+    "$name/docs/SOFT_BONES.md" = Join-Path $projectRoot 'docs\SOFT_BONES.md'
     "$name/Install.bat"               = Join-Path $projectRoot 'installer\Install.bat'
+    "$name/samples/sampleCombo.combo" = Join-Path $projectRoot 'samples\sampleCombo.combo'
 }
+# The manual is added when present; the first release build may precede PDF authoring.
+$manual = Join-Path $projectRoot 'output\pdf\CringeBladeZero_Manual_ZH.pdf'
+if (Test-Path -LiteralPath $manual -PathType Leaf) { $files["$name/CringeBladeZero_Manual_ZH.pdf"] = $manual }
 # The installer checks the game against the builds proxy.cpp accepts: Steam (kExeBytes, kSha256), WeGame (kWeGame...).
 $proxy = Get-Content -LiteralPath (Join-Path $projectRoot 'src\core\proxy.cpp') -Raw
 $exeBuilds = foreach ($build in @(@('Steam', ''), @('WeGame', 'WeGame'))) {

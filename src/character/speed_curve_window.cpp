@@ -1,3 +1,4 @@
+#include "ui_paint_buffer.h"
 #include "speed_curve_window.h"
 
 #include <windowsx.h>
@@ -140,10 +141,9 @@ void Paint() {
     PAINTSTRUCT ps{}; const HDC target = BeginPaint(window_, &ps);
     const RECT client = Client();
     const int w = (std::max)(1L, client.right), h = (std::max)(1L, client.bottom);
-    const HDC dc = CreateCompatibleDC(target);
-    const HBITMAP bitmap = dc ? CreateCompatibleBitmap(target, w, h) : nullptr;
-    const HGDIOBJ old = bitmap ? SelectObject(dc, bitmap) : nullptr;
-    const HDC surface = bitmap ? dc : target;
+    {
+    UiPaintBuffer::Frame buffer(window_,target,w,h,&ps.rcPaint);
+    const HDC surface=buffer.dc();
     const COLORREF panel = UiTheme::Panel(), base = UiTheme::Base(), text = UiTheme::Text(), muted = UiTheme::MutedText(), accent = UiTheme::Accent(),
                    border = UiTheme::Border();
     const COLORREF hue = UiTheme::HighContrast() ? UiTheme::AccentBlue() : UiTheme::Mix(RGB(74, 178, 140), text, 12);
@@ -243,8 +243,7 @@ void Paint() {
         Gdiplus::Pen frame(Argb(UiTheme::Mix(border, hue, 30)), 1.f);
         g.DrawRectangle(&frame, 0, 0, w - 1, h - 1);
     }
-    if (bitmap) { BitBlt(target, 0, 0, w, h, dc, 0, 0, SRCCOPY); SelectObject(dc, old); DeleteObject(bitmap); }
-    if (dc) DeleteDC(dc);
+    }
     EndPaint(window_, &ps);
 }
 

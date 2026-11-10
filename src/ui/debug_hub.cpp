@@ -1,4 +1,6 @@
+#include "ui_paint_buffer.h"
 #include "debug_hub.h"
+#include "combo_menu.h"
 #include "entry_focus.h"
 #include "ui_i18n.h"
 #include "ui_theme.h"
@@ -32,7 +34,7 @@ constexpr wchar_t kTitle[]=L"豪之刃";
 constexpr int kLanguage=9101,kCloseId=9102;
 constexpr size_t kPages=static_cast<size_t>(Page::Count);
 // Header subtitle and nav glyph (Segoe Fluent Icons / MDL2) for each page.
-constexpr const wchar_t* kSubtitles[kPages]={
+constexpr const wchar_t* kSubtitles[]={
     L"传送、直接触战与连战流程，附难度 / 周目设置",
     L"读取并调整当前 Boss 实例的原生 AI 参数",
     L"主角兼容装束的完整装配替换",
@@ -46,8 +48,10 @@ constexpr const wchar_t* kSubtitles[kPages]={
     L"补充包中的原版调试功能：战斗、移动、画面、进度与剧情",
     L"Steam 房间、邀请与替身（联机第 0 阶段）",
     L"MOD 完全免费，不打赏也可以使用全部功能",
+    L"多骨骼局部变换、胯部动作与有界惯性跟随",
 };
-constexpr wchar_t kGlyphs[kPages]={0xE945,0xE99A,0xE77B,0xE716,0xE8AB,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A,0xE774,0xEB51};
+constexpr wchar_t kGlyphs[]={0xE945,0xE99A,0xE77B,0xE716,0xE8AB,0xE805,0xE7AD,0xE771,0xE8AB,0xE144,0xEC7A,0xE774,0xEB51,0xE8D4};
+static_assert(std::size(kSubtitles)==kPages&&std::size(kGlyphs)==kPages,"Every page needs a subtitle and icon");
 struct Entry { const wchar_t* title=L""; Factory factory; HWND window=nullptr; int width=0,height=0; double x=0,y=0; int target_x=0,target_y=0; };
 std::array<Entry,kPages> entries;
 // Sidebar rows: registered pages only, in page order (the debug supplement may be missing before Donate).
@@ -99,20 +103,17 @@ class Paint {
 public:
     explicit Paint(HWND window) : window_(window) {
         target_=BeginPaint(window,&paint_); GetClientRect(window,&area_);
-        dc_=CreateCompatibleDC(target_);
-        bitmap_=dc_?CreateCompatibleBitmap(target_,(std::max)(1L,area_.right),(std::max)(1L,area_.bottom)):nullptr;
-        if (bitmap_) old_=SelectObject(dc_,bitmap_);
+        buffer_=std::make_unique<UiPaintBuffer::Frame>(window,target_,static_cast<int>(area_.right),static_cast<int>(area_.bottom),&paint_.rcPaint);
         SetBkMode(dc(),TRANSPARENT);
     }
     ~Paint() {
-        if (bitmap_) { BitBlt(target_,0,0,area_.right,area_.bottom,dc_,0,0,SRCCOPY); SelectObject(dc_,old_); DeleteObject(bitmap_); }
-        if (dc_) DeleteDC(dc_);
+        buffer_.reset();
         EndPaint(window_,&paint_);
     }
-    HDC dc() const { return bitmap_?dc_:target_; }
+    HDC dc() const { return buffer_?buffer_->dc():target_; }
     const RECT& area() const { return area_; }
 private:
-    HWND window_; PAINTSTRUCT paint_{}; HDC target_=nullptr,dc_=nullptr; HBITMAP bitmap_=nullptr; HGDIOBJ old_=nullptr; RECT area_{};
+    HWND window_; PAINTSTRUCT paint_{}; HDC target_=nullptr;std::unique_ptr<UiPaintBuffer::Frame> buffer_; RECT area_{};
 };
 Gdiplus::Color Argb(COLORREF color,BYTE alpha=255) { return {alpha,GetRValue(color),GetGValue(color),GetBValue(color)}; }
 void Path(Gdiplus::GraphicsPath& path,Gdiplus::RectF rect,float radius) {
@@ -139,11 +140,12 @@ bool KeyboardCues(HWND window) { return !(SendMessageW(window,WM_QUERYUISTATE,0,
 // ---- geometry -------------------------------------------------------------
 int SidebarWidth() { return S(224); }
 int NavTop() { return S(86); }
-// Rows shrink (down to S(30)) when the window is too short for every page above the shortcut legend.
+// At compact heights, prioritize every page over the optional shortcut legend.
 int NavStep() {
     RECT client{}; if (window_) GetClientRect(window_,&client);
-    const int room=static_cast<int>(client.bottom)-NavTop()-S(96);
-    return room>0?std::clamp(room/NavCount(),S(30),S(46)):S(46);
+    int room=static_cast<int>(client.bottom)-NavTop()-S(96);
+    if(room<NavCount()*S(30))room=static_cast<int>(client.bottom)-NavTop()-S(10);
+    return room>0?std::clamp(room/NavCount(),S(20),S(46)):S(46);
 }
 int NavItem() { return NavStep()-S(4); }
 RECT NavItemRect(int index) {
@@ -1109,7 +1111,9 @@ void Tick() {
                        UiCursor::NoteDispatch(hub,m,f.QuadPart?static_cast<double>(t1.QuadPart-t0.QuadPart)*1000.0/static_cast<double>(f.QuadPart):0.0); }
         } timed(message,window_);
         if (window_&&(message.hwnd==window_||IsChild(window_,message.hwnd))) {
+            if(ComboMenu::HandleRecordingMessage(message))continue;
             if (UiHotkeys::Capturing()&&(message.message==WM_KEYDOWN||message.message==WM_KEYUP||message.message==WM_SYSKEYDOWN||message.message==WM_SYSKEYUP||message.message==WM_CHAR)) continue;
+            if(ComboMenu::OwnsTextMessage(message)){TranslateMessage(&message);DispatchMessageW(&message);continue;}
             if (message.message==WM_KEYDOWN&&message.wParam==VK_ESCAPE) { if (!UiTheme::DismissPopup()) Hide(); continue; }
             if (message.message==WM_KEYDOWN&&message.wParam==VK_TAB&&(GetKeyState(VK_CONTROL)&0x8000)) {
                 const int direction=(GetKeyState(VK_SHIFT)&0x8000)?-1:1;

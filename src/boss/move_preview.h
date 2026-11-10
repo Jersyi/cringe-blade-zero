@@ -21,7 +21,7 @@ void Initialize(Logger logger);
 // Any thread. monster / ability: package paths (kNpcSkillSets); Show again with the same pair keeps it going (a new
 // speed takes effect at once). speed: the move's 加速 (percent); curve: its 曲线调节 (2+ points: the speed over each cast).
 // trim_from / trim_to: its 裁剪 (ms of its montage; 0 / 0: all of it), updated on the current cast (timeline + montage seek).
-void Show(const std::string& monster, const std::string& ability, int speed = 100, const std::vector<NpcCombo::CurvePoint>& curve = {}, int trim_from = 0, int trim_to = 0);
+void Show(const std::string& monster, const std::string& ability, int speed = 100, const std::vector<NpcCombo::CurvePoint>& curve = {}, int trim_from = 0, int trim_to = 0, const BoneMotion::Config& bones = {}, const std::vector<int>& holds = {});
 void Hide();
 // Any thread: the newest frame (kWidth x kHeight BGRA, top row first) when its serial is newer than `serial`; status:
 // what the stage does now (empty while frames come).

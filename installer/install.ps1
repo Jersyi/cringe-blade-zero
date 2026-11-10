@@ -235,7 +235,12 @@ function Select-Game([object[]]$Games) {
 }
 
 # ---- State ----------------------------------------------------------------------------
-function Get-Sha([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+function Get-Sha([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+}
 # The full DLL carries PBZDebugMenu strings, the triggers-only DLL a wide PBZTriggersOff.log; Latin-1 maps bytes 1:1,
 # so both forms can be searched in one string.
 function Test-OurDll([string]$Path) {
@@ -319,10 +324,36 @@ function Restart-Elevated([string]$Selected) {
     exit 0
 }
 
+function Install-SampleCombo([string]$GameFolder) {
+    $source = Join-Path $Here 'samples\sampleCombo.combo'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw (T '安装包缺少 sampleCombo.combo。' 'sampleCombo.combo is missing from the package.') }
+    $sourceSha = Get-Sha $source
+    $folder = Join-Path $GameFolder 'combos'
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    $target = Join-Path $folder 'sampleCombo.combo'
+    if ((Test-Path -LiteralPath $target) -and (Get-Sha $target) -ne $sourceSha) {
+        # Preserve the player's edited example. Never touch default or the active-file setting.
+        $stem = 'sampleCombo_bundled_' + $sourceSha.Substring(0, 8)
+        $target = Join-Path $folder ($stem + '.combo')
+        $suffix = 1
+        while ((Test-Path -LiteralPath $target) -and (Get-Sha $target) -ne $sourceSha) {
+            $target = Join-Path $folder ($stem + '_' + $suffix + '.combo'); $suffix++
+        }
+    }
+    if (-not (Test-Path -LiteralPath $target)) { Copy-Item -LiteralPath $source -Destination $target }
+    if ((Get-Sha $target) -ne $sourceSha) { throw (T '示例连招校验失败。' 'Sample combo verification failed.') }
+    Write-Host ('   ' + (T '示例已就绪：' 'Sample ready: ') + $target)
+    Write-Host ('   ' + (T '在“招式派生”的文件列表选择该示例即可使用；未修改 default 或当前选中的文件。' 'Select this example in the combo editor file list; default and the active file were left unchanged.'))
+    return $target
+}
+
 function Install-Dll([string]$Selected, [string]$Target) {
     $source = if ($Selected -eq '1') { $FullDll } else { $TriggersDll }
     $name = if ($Selected -eq '1') { T '完整版' 'the full version' } else { T '精简版' 'triggers-only' }
     if (-not (Test-Path -LiteralPath $source)) { Write-Host ("   $Red" + (T '安装包里缺少 ' 'Missing from the package: ') + $source + $R); return $false }
+    if ($Selected -eq '1' -and -not (Test-Path -LiteralPath (Join-Path $Here 'samples\sampleCombo.combo') -PathType Leaf)) {
+        Write-Host (T '安装包缺少 sampleCombo.combo，请重新解压完整安装包。' 'sampleCombo.combo is missing; extract the complete package again.'); return $false
+    }
     if (-not (Wait-GameClosed)) { return $false }
     try {
         if ((Test-Path -LiteralPath $Target) -and -not (Test-OurDll $Target)) {
@@ -333,6 +364,7 @@ function Install-Dll([string]$Selected, [string]$Target) {
         Copy-Item -LiteralPath $source -Destination $Target -Force
         # The copy keeps the ZIP's "downloaded from the internet" mark, which some security software refuses.
         Unblock-File -LiteralPath $Target -ErrorAction SilentlyContinue
+        if ($Selected -eq '1') { [void](Install-SampleCombo ([IO.Path]::GetDirectoryName($Target))) }
     } catch {
         if (Test-AccessDenied $_) { Restart-Elevated $Selected; return $false }
         Write-Host ("   $Red" + (T '复制失败：' 'Copy failed: ') + $_.Exception.Message + $R); return $false
@@ -396,6 +428,7 @@ while ($true) {
             @('2', (T '安装精简版' 'Install triggers-only'), (T '只关闭 DualSense 自适应扳机' 'Only turns off DualSense adaptive triggers')),
             @('3', (T '卸载' 'Uninstall'), (T '删除 version.dll，保留设置文件' 'Removes version.dll, keeps the settings file')),
             @('4', (T '环境检查与修复' 'Check and repair'), (T '运行库、系统组件、游戏版本、安装位置，发现问题可一键修复' 'Runtimes, system parts, game build, install location; repairs what it finds')),
+            @('5', (T '安装示例连招 sampleCombo' 'Install sampleCombo'), (T '保留 default 和已有的自定义示例' 'Keeps default and edited examples')),
             @('0', (T '退出' 'Quit'), ''))
     }
     Write-Host ''
@@ -404,6 +437,7 @@ while ($true) {
         '2' { [void](Install-Dll '2' $target) }
         '3' { Uninstall-Dll $target }
         '4' { Invoke-EnvCheck $exe }
+        '5' { if (Wait-GameClosed) { try { [void](Install-SampleCombo $folder) } catch { if (Test-AccessDenied $_) { Restart-Elevated '5' } else { Write-Host $_.Exception.Message -ForegroundColor Red } } } }
         default { exit 0 }
     }
     Write-Host ''

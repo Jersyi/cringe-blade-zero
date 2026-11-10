@@ -46,7 +46,7 @@ ue::Object* PreviewBoss();
 void PreviewSpeed(int percent, const std::vector<NpcCombo::CurvePoint>& curve);
 // GT only: the preview move's 裁剪 (ms of its montage; 0 / 0: all of it): each cast starts at `from` and ends at `to`,
 // and a 加速 curve runs over that part. The montage's length goes to NpcCombo::RecordClip (the page's timeline).
-void PreviewTrim(int from_ms, int to_ms);
+void PreviewTrim(int from_ms, int to_ms, const std::vector<int>& holds = {}, bool held = false);
 // Tests ("npcretarget preview arm 0|1"): the preview boss's Main weapon slot armed at its spawn (default on).
 void PreviewOption(const std::string& what, int value);
 void OnGameThreadGuarded();

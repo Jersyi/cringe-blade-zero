@@ -1,4 +1,5 @@
 #include "grab_extras.h"
+#include "grab_weapon_visibility.h"
 #include "settings_store.h"
 #include "ue_runtime.h"
 #include <windows.h>
@@ -79,6 +80,11 @@ struct Session {
     // The player's main slot drawn when the grab began (sheathed: the grab still shows the boss weapon in hand), and the
     // stand-ins' last shown state with its reasons (logged when it changes).
     bool armed_known = false, armed_at_begin = true; int shown_logged = -1;
+    Object* source_ability = nullptr; ue::Name source_name;
+    Object* source_timeline = nullptr; ue::Name timeline_name;
+    std::vector<GrabWeaponVisibility::Window> sheathe_windows;
+    float visibility_time = 0;
+    GrabWeaponVisibility::NativeState native_visibility;
     // Ticks since Begin: the stand-ins show from the second one on (the proxy's first pose is not the move's yet, and the
     // first placement put the weapon about 90 cm off for a frame).
     int ticks = 0;
@@ -628,6 +634,59 @@ bool WeaponShouldShow(Object* weapons, bool& armed_now) {
     }
     return true;
 }
+// Read the actual success timeline, not a boss-name list. The main-slot switch
+// with Armed=false is an explicit sheathe; Armed=true (e.g. DuYan) is not.
+void CaptureNativeVisibility(Object* ability, Object* timeline) {
+    if (!ue::Alive(ability) || !ue::Alive(timeline)) return;
+    Object* event = ue::FindObject("/Script/LegoAbility.LGAActionEvent");
+    Object* switch_class = ue::FindObject("/PBZCombatAsset/Prototypes/Actions/GAA_SwitchWeapon.GAA_SwitchWeapon_C");
+    const int32_t stride = ue::StructSize(event);
+    const int32_t start = ue::Offset(event, "StartTime"), duration = ue::Offset(event, "duration"),
+        trigger = ue::Offset(event, "TriggerTimeOffset"), end_trigger = ue::Offset(event, "EndTriggerTimeOffset"),
+        action_at = ue::Offset(event, "Action");
+    if (!switch_class || stride <= 0 || stride > 1024 || start < 0 || duration < 0 || trigger < 0 || end_trigger < 0 || action_at < 0 ||
+        start + 4 > stride || duration + 4 > stride || trigger + 4 > stride || end_trigger + 4 > stride || action_at + 8 > stride) return;
+    ue::Array actions;
+    if (!ReadField(timeline, "Actions", actions) || actions.num <= 0 || actions.num > 512 || actions.num > actions.max ||
+        !Readable(actions.data, static_cast<size_t>(actions.num) * stride)) return;
+    const ue::Name main_slot = ue::MakeName(L"Weapon.Slot.Main");
+    for (int32_t i = 0; i < actions.num; ++i) {
+        Object* row = static_cast<Object*>(actions.data) + static_cast<size_t>(i) * stride;
+        Object* action = ue::At<Object*>(row, action_at); bool armed = true; ue::Name slot;
+        if (!ue::Alive(action) || !ue::IsA(action, switch_class) || !Bool(action, "Armed", armed) ||
+            !ReadField(action, "SlotTag", slot) || !(slot == main_slot)) continue;
+        const float at = ue::At<float>(row, start), length = ue::At<float>(row, duration);
+        GrabWeaponVisibility::Window window{at + ue::At<float>(row, trigger), at + length + ue::At<float>(row, end_trigger)};
+        Logf("GRAB_EXTRAS native switch armed=%d start=%.4f end=%.4f", armed ? 1 : 0, window.begin, window.end);
+        if (!armed && window.Contains(window.begin)) session_.sheathe_windows.push_back(window);
+    }
+    session_.source_ability = ability; session_.source_name = ue::NameOf(ability);
+    session_.source_timeline = timeline; session_.timeline_name = ue::NameOf(timeline);
+    Logf("GRAB_EXTRAS native visibility windows=%zu", session_.sheathe_windows.size());
+}
+bool NativeSheathe(bool armed) {
+    if (session_.sheathe_windows.empty()) return false;
+    // Use the task's game clock so pause, rate changes and jumps stay in sync.
+    // An unavailable clock keeps the last time until the grab's normal cleanup.
+    if (Same(session_.source_ability, session_.source_name) && Same(session_.source_timeline, session_.timeline_name)) {
+        ue::Array tasks;
+        Object* task_class = ue::FindObject("/Script/LegoAbility.LGATask_PlayTimeline");
+        if (task_class && ReadField(session_.source_ability, "ActiveTasks", tasks) && tasks.num > 0 && tasks.num <= 64 &&
+            tasks.num <= tasks.max && Readable(tasks.data, static_cast<size_t>(tasks.num) * sizeof(Object*))) {
+            for (int32_t i = 0; i < tasks.num; ++i) {
+                Object* task = static_cast<Object**>(tasks.data)[i]; Object* timeline = nullptr; float time = 0;
+                if (ue::Alive(task) && ue::IsA(task, task_class) && ReadField(task, "Timeline", timeline) && timeline == session_.source_timeline &&
+                    ReadField(task, "CurrentTime", time) && std::isfinite(time) && time >= 0) { session_.visibility_time = time; break; }
+            }
+        }
+    }
+    // Do not hide when the native switch kept the slot armed (e.g. condition rejected).
+    const bool authored_now=std::any_of(session_.sheathe_windows.begin(), session_.sheathe_windows.end(),
+        [](const auto& window) { return window.Contains(session_.visibility_time); });
+    // End can restore a cached weapon without drawing it. Stay sheathed until
+    // the native slot is drawn again; don't flash a stand-in at the window end.
+    return session_.native_visibility.Hidden(armed,authored_now);
+}
 void UpdateDisplays() {
     if (session_.displays.empty()) return;
     // The grab's own force-hides, and a sheathe during it; a sword already sheathed when the grab began (the grab from
@@ -635,10 +694,11 @@ void UpdateDisplays() {
     bool armed = true;
     const bool unhidden = WeaponShouldShow(session_.weapons_component, armed);
     if (!session_.armed_known) { session_.armed_known = true; session_.armed_at_begin = armed; }
-    const bool show = unhidden && (armed || !session_.armed_at_begin) && session_.ticks >= 2;
+    const bool native_sheathe = NativeSheathe(armed);
+    const bool show = GrabWeaponVisibility::Show(unhidden, armed, session_.armed_at_begin, native_sheathe, session_.ticks);
     if (session_.shown_logged != (show ? 1 : 0)) {
         session_.shown_logged = show ? 1 : 0;
-        Logf("GRAB_EXTRAS stand-ins %s (main slot drawn %d, drawn at the start %d, force-hidden %d)", show ? "shown" : "hidden", armed ? 1 : 0, session_.armed_at_begin ? 1 : 0, unhidden ? 0 : 1);
+        Logf("GRAB_EXTRAS stand-ins %s (main slot drawn %d, drawn at the start %d, force-hidden %d, native-sheathe %d time %.4f)", show ? "shown" : "hidden", armed ? 1 : 0, session_.armed_at_begin ? 1 : 0, unhidden ? 0 : 1, native_sheathe ? 1 : 0, session_.visibility_time);
     }
     for (Display& display : session_.displays) {
         if (display.visible == show || !Same(display.component, display.name)) continue;
@@ -826,7 +886,7 @@ void SetOptions(const Options& value) {
 }
 Options GetOptions() { AcquireSRWLockShared(&lock_); const Options o = options_; ReleaseSRWLockShared(&lock_); return o; }
 std::wstring LastResult() { AcquireSRWLockShared(&lock_); std::wstring text = result_; ReleaseSRWLockShared(&lock_); return text; }
-void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move, double hero_over_boss) {
+void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move, double hero_over_boss, unsigned char* source_ability, unsigned char* source_timeline) {
     if (session_.active) Finish(false);
     session_ = {};
     if (!ue::Alive(pawn) || !ue::Alive(target)) return;
@@ -835,6 +895,7 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
     session_.pawn = pawn; session_.pawn_name = ue::NameOf(pawn);
     session_.target = target; session_.target_name = ue::NameOf(target);
     session_.began = GetTickCount64(); session_.grab_montage = CurrentMontage(pawn);
+    CaptureNativeVisibility(source_ability, source_timeline);
     double size = 1; if (skin_display_ && !ue::Alive(reinterpret_cast<Object*>(skin_display_(size)))) size = 1;
     if (!std::isfinite(size) || size < .1 || size > 10) size = 1;
     if (!std::isfinite(hero_over_boss) || hero_over_boss < .1 || hero_over_boss > 10) hero_over_boss = 1;

@@ -15,6 +15,16 @@ function(pbz_settings target)
     target_link_options(${target} PRIVATE "$<$<CONFIG:Release>:/OPT:REF;/OPT:ICF>")
 endfunction()
 
+add_executable(grab_weapon_visibility_test tests/grab_weapon_visibility_test.cpp)
+pbz_settings(grab_weapon_visibility_test)
+add_executable(sample_combo_test tests/sample_combo_test.cpp src/character/combo_file.cpp)
+target_link_libraries(sample_combo_test PRIVATE Cabinet)
+pbz_settings(sample_combo_test)
+add_executable(bone_body_editor_test tests/bone_body_editor_test.cpp)
+pbz_settings(bone_body_editor_test)
+add_executable(weapon_action_hold_test tests/weapon_action_hold_test.cpp)
+pbz_settings(weapon_action_hold_test)
+
 add_library(version SHARED
     src/core/proxy.cpp
     src/ui/debug_hub.cpp src/ui/ui_i18n.cpp src/ui/ui_theme.cpp src/ui/ui_glass.cpp src/ui/ui_load_banner.cpp
@@ -22,7 +32,7 @@ add_library(version SHARED
     src/hair/hair_controls.cpp
     src/boss/boss_menu.cpp src/boss/boss_rush.cpp src/boss/boss_record_guard.cpp src/boss/boss_ai.cpp src/boss/boss_ai_menu.cpp
     src/boss/entry_safety.cpp src/boss/entry_protection.cpp src/boss/entry_focus.cpp src/boss/test_dummy.cpp src/boss/boss_assist.cpp src/boss/move_preview.cpp
-    src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp
+    src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion.cpp src/character/bone_motion_page.cpp
     src/air/air_skills.cpp src/air/air_skills_menu.cpp
     src/grab/motian_grab.cpp src/grab/motian_grab_menu.cpp src/grab/grab_extras.cpp
     src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp src/ui/skill_toast.cpp src/core/title_control.cpp
@@ -44,14 +54,27 @@ set_target_properties(version_triggers PROPERTIES OUTPUT_NAME version
     ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/triggers_only ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/triggers_only_debug)
 
 # Tests
+add_executable(bone_motion_test tests/bone_motion_test.cpp)
+pbz_settings(bone_motion_test)
+
+add_executable(net_puppet_rules_test tests/net_puppet_rules_test.cpp)
+pbz_settings(net_puppet_rules_test)
+
 add_executable(npc_cutscene_policy_test tests/npc_cutscene_policy_test.cpp)
 pbz_settings(npc_cutscene_policy_test)
 
 add_executable(npc_source_budget_test tests/npc_source_budget_test.cpp)
 pbz_settings(npc_source_budget_test)
 
+add_executable(trim_charge_runtime_test tests/trim_charge_runtime_test.cpp)
+pbz_settings(trim_charge_runtime_test)
+
 add_executable(combo_playback_rules_test tests/combo_playback_rules_test.cpp)
 pbz_settings(combo_playback_rules_test)
+add_executable(combo_hold_scope_test tests/combo_hold_scope_test.cpp)
+pbz_settings(combo_hold_scope_test)
+add_executable(view_follow_state_test tests/view_follow_state_test.cpp)
+pbz_settings(view_follow_state_test)
 
 add_executable(air_attack_reset_test tests/air_attack_reset_test.cpp)
 pbz_settings(air_attack_reset_test)
@@ -125,16 +148,21 @@ add_executable(npc_combo_test tests/npc_combo_test.cpp)
 pbz_settings(npc_combo_test)
 
 # 招式派生 page rendered offline from the generated skill / dodge tables (stubbed game state) to a PNG.
-add_executable(combo_menu_preview tests/combo_menu_preview.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(combo_menu_preview tests/combo_menu_preview.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_menu_preview)
 target_link_libraries(combo_menu_preview PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
 
 # Hidden host only: no activation, capture, injected input, game launch or real chain folders.
-add_executable(combo_library_test tests/combo_library_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(combo_library_test tests/combo_library_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_library_test)
 target_link_libraries(combo_library_test PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
+
+add_executable(combo_canvas_perf_test tests/combo_canvas_perf_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+    src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
+pbz_settings(combo_canvas_perf_test)
+target_link_libraries(combo_canvas_perf_test PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
 
 add_executable(combo_save_stress_test tests/combo_save_stress_test.cpp src/character/combo_file.cpp src/character/npc_combo.cpp src/core/settings_store.cpp)
 pbz_settings(combo_save_stress_test)
@@ -170,3 +198,12 @@ add_dependencies(env_check_test pbz_known_exes)
 pbz_settings(env_check_test)
 target_include_directories(env_check_test PRIVATE src/env_check ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(env_check_test PRIVATE bcrypt)
+
+add_executable(ui_paint_buffer_test tests/ui_paint_buffer_test.cpp)
+pbz_settings(ui_paint_buffer_test)
+target_link_libraries(ui_paint_buffer_test PRIVATE user32 gdi32 comctl32)
+add_executable(append_log_test tests/append_log_test.cpp)
+pbz_settings(append_log_test)
+
+add_executable(npc_display_pool_test tests/npc_display_pool_test.cpp)
+pbz_settings(npc_display_pool_test)

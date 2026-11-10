@@ -1,5 +1,8 @@
 #include "net_puppet.h"
 #include "net_steam.h"
+#include "net_puppet_rules.h"
+#include "groom_force.h"
+#include "settings_store.h"
 #include "motian_grab.h"
 #include "npc_retarget.h"
 #include "ue_runtime.h"
@@ -7,10 +10,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <vector>
+#include <utility>
 
 namespace NetPuppet {
 namespace {
@@ -23,16 +28,16 @@ struct SoftObject { int32_t index, serial; Name package, asset; ue::String subpa
 static_assert(sizeof(SoftObject) == 40, "TSoftObjectPtr layout");
 
 constexpr double kPi = 3.14159265358979, kBesideCm = 300, kSnapCm = 600;
-constexpr ULONGLONG kStateMs = 33, kPoseMs = 33, kScanMs = 500, kPartsResendMs = 4000, kCameraGuardMs = 10000, kPublishMs = 100, kRateMs = 2000;
+constexpr ULONGLONG kStateMs = 33, kPoseMs = 33, kScanMs = 100, kPartsResendMs = 4000, kCameraGuardMs = 10000, kPublishMs = 100, kRateMs = 2000;
 constexpr ULONGLONG kReportsMs[] = {0, 1000, 5000};
-constexpr size_t kMaxParts = 96, kMaxBones = 1500;
+constexpr size_t kMaxParts = NetPuppetRules::MaxParts, kMaxBones = NetPuppetRules::MaxBones;
 constexpr uint16_t kNone = 0xFFFF;
 constexpr uint8_t kSpaceWorld = 0, kSpaceParentBone = 3;  // ERelativeTransformSpace
 constexpr uint8_t kBoneComponentSpace = 1;                // EBoneSpaces::ComponentSpace
 // GroomComponent.SimulationSettings: copied as GroomForce copies it (0x90 bytes, the LocalBone FString cleared).
 constexpr size_t kGroomSettingsBytes = 0x90, kLocalBoneString = 0x08 + 0x10;
 // Pose entry flags: shown, bones follow, its scale is not 1, the source is gone (nothing follows).
-constexpr uint8_t kShown = 1, kBones = 2, kScaled = 4, kGone = 0x80;
+constexpr uint8_t kShown = 1, kBones = 2, kScaled = 4, kFxActive = 8, kFxValues = 16, kSplinePoints = 32, kGone = 0x80;
 // Bone flags: its translation follows as floats; its scale follows (else 1); it is in the mesh's reference pose (nothing
 // follows; the high 4 bits: how many more bones after it are, up to 15); its translation follows as 16-bit offsets from
 // the reference one in 0.01 cm. Without a translation flag the translation is the reference one.
@@ -45,12 +50,14 @@ Logger logger_ = nullptr;
 SRWLOCK lock_ = SRWLOCK_INIT;
 std::vector<Request> requests_;
 Snapshot snapshot_;
+volatile LONG hair_mode_=0;
 
 Object* engine_ = nullptr;
 Object* puppet_ = nullptr; Name puppet_name_{};
 Object* hero_ = nullptr; Name hero_name_{};
 bool mirror_ = true, auto_spawn_ = false, peer_was_ready_ = false;
 Vector offset_{};
+bool duel_=false;NetPuppetRules::Duel duel_state_;
 ULONGLONG spawned_at_ = 0, next_state_ = 0, last_tick_ = 0, next_camera_ = 0, next_publish_ = 0;
 size_t reports_ = 0;
 std::string cls_name_, controller_name_, local_map_;
@@ -271,17 +278,91 @@ struct Reader {
     Vec3 Move() { const float x = Get<float>(), y = Get<float>(), z = Get<float>(); return {x, y, z}; }
 };
 
+// Typed Niagara user values. Enumerate reflected parameter names, then let the game's getters validate types.
+// Object/data-interface references are deliberately excluded: a sender's pointer is never a receiver binding.
+struct FxParam { std::string name;uint8_t kind=0; };
+struct FxValue { double v[4]{}; };
+const char* const kFxGet[]={"","GetVariableBool","GetVariableInt","GetVariableFloat","GetVariableVec2","GetVariableVec3","GetVariableVec4","GetVariablePosition","GetVariableColor","GetVariableQuat"};
+const char* const kFxSet[]={"","SetVariableBool","SetVariableInt","SetVariableFloat","SetVariableVec2","SetVariableVec3","SetVariableVec4","SetVariablePosition","SetVariableLinearColor","SetVariableQuat"};
+int FxWidth(uint8_t kind){return kind<=3?1:kind==4?2:kind==5||kind==7?3:4;}
+bool ReadFx(Object* comp,const FxParam& param,FxValue& value){
+    if(param.kind<1||param.kind>9)return false;
+    Call get(comp,kFxGet[param.kind]);
+    if(!get.Set("InVariableName",ue::MakeName(Wide(param.name).c_str())).Invoke()||!get.Get<bool>("bIsValid"))return false;
+    switch(param.kind){
+    case 1:value.v[0]=get.Get<bool>("ReturnValue")?1:0;break;
+    case 2:value.v[0]=get.Get<int32_t>("ReturnValue");break;
+    case 3:value.v[0]=get.Get<float>("ReturnValue");break;
+    case 8:{struct Color{float v[4];};const Color c=get.Get<Color>("ReturnValue");for(int i=0;i<4;++i)value.v[i]=c.v[i];break;}
+    default:{const int width=FxWidth(param.kind);unsigned char* data=get.Slot("ReturnValue",sizeof(double)*static_cast<size_t>(width));if(!data)return false;std::memcpy(value.v,data,sizeof(double)*static_cast<size_t>(width));break;}
+    }
+    for(int i=0;i<FxWidth(param.kind);++i)if(!std::isfinite(value.v[i])||std::fabs(value.v[i])>1e9)return false;
+    return true;
+}
+std::vector<FxParam> FxParameters(Object* comp){
+    std::vector<FxParam> out;
+    const int32_t store=Offset(comp,"OverrideParameters");
+    Object* type=Cls("/Script/Niagara.NiagaraParameterStore"),*variable=Cls("/Script/Niagara.NiagaraVariableWithOffset");
+    const int32_t list=type?ue::Offset(type,"SortedParameterOffsets"):-1,name=variable?ue::Offset(variable,"Name"):-1,size=variable?ue::StructSize(variable):0;
+    if(store<0||list<0||name<0||size<name+static_cast<int32_t>(sizeof(Name)))return out;
+    const Array a=ue::At<Array>(comp,store+list);
+    if(a.num<0||a.num>256||a.max<a.num||(a.num&&!Readable(a.data,static_cast<size_t>(a.num)*size)))return out;
+    int skipped=0;
+    for(int32_t i=0;i<a.num&&out.size()<32;++i){
+        char text[256]{};ue::NameText(ue::At<Name>(static_cast<unsigned char*>(a.data)+static_cast<size_t>(i)*size,name),text,sizeof(text));
+        if(std::strncmp(text,"User.",5))continue;
+        FxParam p;p.name=text;bool supported=false;
+        for(uint8_t kind=1;kind<=9;++kind){p.kind=kind;FxValue value;if(ReadFx(comp,p,value)){out.push_back(p);supported=true;break;}}
+        if(!supported)++skipped;
+    }
+    Logf("NET_FX parameters comp=%s typed=%zu unsupported=%d asset=%s",Text(comp).c_str(),out.size(),skipped,PathOf(Property(comp,"Asset")).c_str());
+    return out;
+}
+// The game's BP_ChainComponent binds this exact user object to a SplineComponent (cooked Kismet checked).
+// Resolve through reflected parameter-store arrays and remap to a receiver part ID, never copy a UObject address.
+Object* ChainSpline(Object* comp){
+    const int32_t store=Offset(comp,"OverrideParameters");Object* t=Cls("/Script/Niagara.NiagaraParameterStore"),*v=Cls("/Script/Niagara.NiagaraVariableWithOffset");
+    const int32_t list=t?ue::Offset(t,"SortedParameterOffsets"):-1,objects=t?ue::Offset(t,"UObjects"):-1,
+        name=v?ue::Offset(v,"Name"):-1,offset=v?ue::Offset(v,"Offset"):-1,size=v?ue::StructSize(v):0;
+    if(store<0||list<0||objects<0||name<0||offset<0||size<offset+4)return nullptr;
+    const Array a=ue::At<Array>(comp,store+list),o=ue::At<Array>(comp,store+objects);
+    if(a.num<0||a.num>256||o.num<0||o.num>256||a.max<a.num||o.max<o.num||
+        (a.num&&!Readable(a.data,static_cast<size_t>(a.num)*size))||(o.num&&!Readable(o.data,static_cast<size_t>(o.num)*sizeof(Object*))))return nullptr;
+    Object* spline=Cls("/Script/Engine.SplineComponent");
+    for(int32_t i=0;i<a.num;++i){auto* row=static_cast<unsigned char*>(a.data)+static_cast<size_t>(i)*size;
+        const Name n=ue::At<Name>(row,name);
+        if(!ue::NameIs(n,"User.UE_SplineDynamic_Object")&&!ue::NameIs(n,"UE_SplineDynamic_Object"))continue;
+        const int32_t at=ue::At<int32_t>(row,offset);if(at<0||at>=o.num)return nullptr;
+        Object* object=static_cast<Object**>(o.data)[at];return spline&&ue::Alive(object)&&ue::IsA(object,spline)?object:nullptr;
+    }
+    return nullptr;
+}
+void SetFx(Object* comp,const FxParam& p,const FxValue& value,const Transform& source_root,const Transform& display_root){
+    if(p.kind<1||p.kind>9)return;
+    Call set(comp,kFxSet[p.kind]);set.Set("InVariableName",ue::MakeName(Wide(p.name).c_str()));
+    switch(p.kind){
+    case 1:set.Set("InValue",value.v[0]!=0);break;
+    case 2:if(value.v[0]<INT32_MIN||value.v[0]>INT32_MAX)return;set.Set("InValue",static_cast<int32_t>(value.v[0]));break;
+    case 3:set.Set("InValue",static_cast<float>(value.v[0]));break;
+    case 7:{const Transform world=Make({}, {value.v[0],value.v[1],value.v[2]}, {1,1,1});const Vec3 v=MoveOf(Compose(RelativeTo(world,source_root),display_root));set.Set("InValue",v);break;}
+    case 8:{struct Color{float v[4];};Color c{};for(int i=0;i<4;++i)c.v[i]=static_cast<float>(value.v[i]);set.Set("InValue",c);break;}
+    default:{const size_t bytes=sizeof(double)*static_cast<size_t>(FxWidth(p.kind));unsigned char* dst=set.Slot("InValue",bytes);if(!dst)return;std::memcpy(dst,value.v,bytes);break;}
+    }
+    set.Invoke();
+}
 // One part of what the hero shows: a mesh (0 static, 1 skinned, 2 Groom, 3 Chaos Cloth: the hero's hair cards, upper
 // cloth, skirt and cape) with its asset, materials and where it hangs: on part `parent` at `socket` (kNone: the root).
 // A skinned part either poses itself (`posed`: its bones are sent) or takes the pose of part `leader` (leader pose).
 struct PartDesc {
-    uint16_t id = 0, parent = kNone, leader = kNone, bones = 0; uint8_t kind = 0, posed = 0, main_hair = 0, local_sim = 0;
-    std::string socket, asset, binding, physics; std::vector<std::string> materials; std::vector<unsigned char> settings;
+    uint16_t id = 0, parent = kNone, leader = kNone, bones = 0, spline = kNone; uint8_t kind = 0, posed = 0, main_hair = 0, local_sim = 0, render_static = 0;
+    std::string socket, asset, binding, physics; std::vector<std::string> materials; std::vector<unsigned char> settings; std::vector<FxParam> fx;
 };
 void WriteDesc(Writer& w, const PartDesc& d) {
     w.Put(d.id); w.Put(d.kind); w.Put(d.posed); w.Put(d.parent); w.Put(d.leader); w.Put(d.bones);
+    w.Put(d.render_static);
     w.Str(d.socket); w.Str(d.asset);
     w.Put(static_cast<uint8_t>((std::min)(d.materials.size(), static_cast<size_t>(64)))); for (size_t i = 0; i < d.materials.size() && i < 64; ++i) w.Str(d.materials[i]);
+    if(d.kind==4){w.Put(d.spline);w.Put(static_cast<uint8_t>(d.fx.size()));for(const FxParam& p:d.fx){w.Str(p.name);w.Put(p.kind);}}
     if (d.kind == 2) {
         w.Str(d.binding); w.Str(d.physics); w.Put(d.main_hair); w.Put(d.local_sim);
         w.Put(static_cast<uint16_t>(d.settings.size())); w.b.insert(w.b.end(), d.settings.begin(), d.settings.end());
@@ -289,19 +370,22 @@ void WriteDesc(Writer& w, const PartDesc& d) {
 }
 PartDesc ReadDesc(Reader& r) {
     PartDesc d; d.id = r.Get<uint16_t>(); d.kind = r.Get<uint8_t>(); d.posed = r.Get<uint8_t>(); d.parent = r.Get<uint16_t>(); d.leader = r.Get<uint16_t>(); d.bones = r.Get<uint16_t>();
+    d.render_static=r.Get<uint8_t>();
     d.socket = r.Str(); d.asset = r.Str();
     const uint8_t materials = r.Get<uint8_t>(); for (uint8_t i = 0; i < materials && !r.bad; ++i) d.materials.push_back(r.Str());
+    if(d.kind==4){d.spline=r.Get<uint16_t>();const uint8_t n=r.Get<uint8_t>();if(n>32)r.bad=true;
+        for(uint8_t i=0;i<n&&!r.bad;++i){FxParam p;p.name=r.Str();p.kind=r.Get<uint8_t>();if(p.kind<1||p.kind>9||p.name.size()>255||p.name.rfind("User.",0)!=0)r.bad=true;d.fx.push_back(std::move(p));}}
     if (d.kind == 2) {
         d.binding = r.Str(); d.physics = r.Str(); d.main_hair = r.Get<uint8_t>(); d.local_sim = r.Get<uint8_t>();
         const uint16_t bytes = r.Get<uint16_t>();
         if (!r.bad && r.at + bytes <= r.n) { d.settings.assign(r.p + r.at, r.p + r.at + bytes); r.at += bytes; } else r.bad = true;
     }
-    if (d.kind > 3) r.bad = true;
+    if (d.kind > 6 || (d.kind==6?!d.asset.empty():!NetPuppetRules::AssetPath(d.asset))) r.bad = true;
     return d;
 }
 // The same component on the puppet can show it (only materials may differ).
 bool SameShape(const PartDesc& a, const PartDesc& b) {
-    return a.kind == b.kind && a.posed == b.posed && a.parent == b.parent && a.leader == b.leader && a.socket == b.socket && a.asset == b.asset &&
+    return a.render_static==b.render_static && a.spline==b.spline && a.kind == b.kind && a.posed == b.posed && a.parent == b.parent && a.leader == b.leader && a.socket == b.socket && a.asset == b.asset &&
            a.binding == b.binding && a.physics == b.physics;
 }
 
@@ -315,6 +399,9 @@ bool SourceShown(Object* component) {
     return !(actor && Bool(actor, "bHidden", actor_hidden) && actor_hidden);
 }
 Object* MeshAsset(Object* component, int kind) {
+    if (kind == 6) return component;
+    if (kind == 4) return Property(component, "Asset");
+    if (kind == 5) return Property(component, "Template");
     if (kind == 0) return Property(component, "StaticMesh");
     if (kind == 1) { Object* asset = Property(component, "SkinnedAsset"); return asset ? asset : Property(component, "SkeletalMesh"); }
     if (kind == 3) {
@@ -367,8 +454,8 @@ std::vector<Vec3> RefMoves(const std::vector<RefBone>& ref) { std::vector<Vec3> 
 // the hero's root, each part's place on what it hangs on and whether it shows, and the bones (local, parent-bone
 // space) of the self-posing skinned parts something shown needs.
 struct Source {
-    Object* comp = nullptr; Name name{}; Object* asset = nullptr; PartDesc desc; Object* parent = nullptr, *leader = nullptr; Name socket{};
-    std::vector<Name> bones; std::vector<RefBone> ref; bool ref_ok = false; Object* bones_of = nullptr; Object* socket_fn = nullptr; bool shown = false, needed = false;
+    Object* comp = nullptr; Name name{}; Object* asset = nullptr; PartDesc desc; Object* parent = nullptr, *leader = nullptr, *spline=nullptr; Name socket{};
+    std::vector<Name> bones; std::vector<RefBone> ref; bool ref_ok = false; Object* bones_of = nullptr; Object* socket_fn = nullptr; Object* projectile = nullptr; Name projectile_name{}; bool shown = false, needed = false;
     std::vector<int> parents; Object* bone_fn = nullptr; std::vector<Transform> worlds;  // parent bone indices; GetBoneTransform where there is one; scratch
 };
 std::vector<Source> sources_;
@@ -385,6 +472,33 @@ int IndexOf(const std::vector<Source>& list, Object* comp) {
     for (size_t i = 0; i < list.size(); ++i) if (list[i].comp == comp) return static_cast<int>(i);
     return -1;
 }
+int fx_world_=0,fx_owned_=0,fx_active_=0,fx_shown_=0; uint32_t fx_starts_=0; ULONGLONG next_fx_report_=0;
+int projectiles_=0, projectile_parts_=0,parts_dropped_=0; uint32_t projectile_starts_=0;
+// EBulletStatus was verified from the live UEnum: Uninitialized=0, Ready=1, Running=2, Deactivated=3.
+// Pool entries keep their owner; ownership alone is insufficient to display them.
+bool ProjectileLive(Object* actor,Object* hero) {
+    if(!ue::Alive(actor)||ue::IsTemplate(actor))return false;
+    const int32_t status=Offset(actor,"BulletStatus");
+    bool hidden=false,dying=false;
+    Bool(actor,"bHidden",hidden);Bool(actor,"bActorIsBeingDestroyed",dying);
+    return NetPuppetRules::ProjectileVisible(Property(actor,"BulletOwnerAvatar")==hero,
+        status>=0?ue::At<uint8_t>(actor,status):255,hidden,dying);
+}
+bool SourceLive(const Source& s) {
+    return Same(s.comp,s.name)&&(!s.projectile||(Same(s.projectile,s.projectile_name)&&ProjectileLive(s.projectile,hero_)))&&SourceShown(s.comp);
+}
+bool Active(Object* component) { Call get(component,"IsActive"); return get.Invoke()&&get.Get<bool>("ReturnValue"); }
+bool FxBelongs(Object* comp,const std::vector<Object*>& actors) {
+    Object* at=comp;
+    for(int i=0;i<24&&ue::Alive(at);++i) {
+        if(at==puppet_)return false;
+        if(std::find(actors.begin(),actors.end(),at)!=actors.end())return true;
+        if(Object* parent=Property(at,"AttachParent")){at=parent;continue;}
+        Call owner(at,"GetOwner"); Object* next=owner.Invoke()?owner.Get<Object*>("ReturnValue"):Property(at,"Owner");
+        if(!ue::Alive(next)||next==at)break;at=next;
+    }
+    return false;
+}
 void ScanSources(Object* hero, ULONGLONG now) {
     if (now < next_scan_) return;
     next_scan_ = now + kScanMs;
@@ -399,14 +513,38 @@ void ScanSources(Object* hero, ULONGLONG now) {
         actors.push_back(a);
         for (Object* b : AttachedActors(a)) if (std::find(actors.begin(), actors.end(), b) == actors.end()) actors.push_back(b);
     }
+    // Discover bullets before resolving FX owners. Reuse one object walk for both; never activate a gameplay bullet
+    // on the puppet. Its mesh/FX components alone are recreated with collision disabled.
+    Object* bullet_class=Cls("/Script/SGameCombatSystem.BulletActorBase");
+    Object* niagara=Cls("/Script/Niagara.NiagaraComponent"),*cascade=Cls("/Script/Engine.ParticleSystemComponent");
+    std::vector<Object*> bullets;std::vector<std::pair<Object*,int>> effects;
+    ue::ForEachObject([&](Object* object){
+        if(!ue::Alive(object)||ue::IsTemplate(object))return true;
+        if(bullet_class&&ue::IsA(object,bullet_class)&&ProjectileLive(object,hero)){
+            bullets.push_back(object);
+            if(std::find(actors.begin(),actors.end(),object)==actors.end())actors.push_back(object);
+            return true;
+        }
+        const int kind=niagara&&ue::IsA(object,niagara)?4:cascade&&ue::IsA(object,cascade)?5:0;
+        if(kind)effects.emplace_back(object,kind);
+        return true;
+    });
+    projectiles_=static_cast<int>(bullets.size());projectile_parts_=0;parts_dropped_=0;
     std::vector<Source> next;
     const auto add = [&](Object* c, int kind) {
-        if (next.size() >= kMaxParts || IndexOf(next, c) >= 0) return;
+        if(IndexOf(next,c)>=0)return;
+        if(next.size()>=kMaxParts){++parts_dropped_;return;}
         Object* asset = MeshAsset(c, kind); if (!asset) return;
         Source s; s.comp = c; s.name = ue::NameOf(c); s.asset = asset; s.desc.kind = static_cast<uint8_t>(kind);
-        for (const Source& old : sources_) if (old.comp == c && old.name == s.name) {
-            s.desc.id = old.desc.id; s.bones = old.bones; s.ref = old.ref; s.ref_ok = old.ref_ok; s.bones_of = old.bones_of; s.socket_fn = old.socket_fn; s.parents = old.parents; s.bone_fn = old.bone_fn; break; }
-        if (!s.desc.id) { s.desc.id = next_id_++; if (next_id_ == kNone) next_id_ = 1; }
+        for (const Source& old : sources_) if (old.comp == c && old.name == s.name && old.asset == asset) {
+            s.desc.id = old.desc.id; s.bones = old.bones; s.ref = old.ref; s.ref_ok = old.ref_ok; s.bones_of = old.bones_of; s.socket_fn = old.socket_fn; s.parents = old.parents; s.bone_fn = old.bone_fn;s.desc.fx=old.desc.fx; break; }
+        if (!s.desc.id) { s.desc.id = next_id_++; if (next_id_ == kNone) next_id_ = 1;if(kind==4)s.desc.fx=FxParameters(c); }
+        for(Object* bullet:bullets)if(FxBelongs(c,std::vector<Object*>{bullet})){
+            s.projectile=bullet;s.projectile_name=ue::NameOf(bullet);++projectile_parts_;
+            bool existed=false;for(const Source& old:sources_)if(old.comp==c&&old.name==s.name&&old.projectile==bullet&&old.projectile_name==s.projectile_name){existed=true;break;}
+            if(!existed){++projectile_starts_;Logf("NET_PROJECTILE part id=%u kind=%d actor=%s asset=%s",s.desc.id,kind,Text(bullet).c_str(),PathOf(asset).c_str());}
+            break;
+        }
         next.push_back(std::move(s));
     };
     for (Object* actor : actors) {
@@ -414,6 +552,23 @@ void ScanSources(Object* hero, ULONGLONG now) {
         for (Object* c : Components(actor, static_class)) add(c, 0);
         for (Object* c : Components(actor, skinned_class)) add(c, cloth_class && ue::IsA(c, cloth_class) ? 3 : 1);
         for (Object* c : Components(actor, groom_class)) add(c, 2);
+    }
+    // World-owned attached effects (common for weapon trails) do not appear in the hero's component array.
+    // Only an attachment/owner chain back to a captured actor establishes ownership; proximity alone never does.
+    fx_world_=fx_owned_=fx_active_=0;
+    for(const auto& effect:effects) {
+        Object* object=effect.first;const int kind=effect.second;
+        Call owner(object,"GetOwner");
+        if(owner.Invoke()&&owner.Get<Object*>("ReturnValue")==puppet_)continue;
+        ++fx_world_;
+        if(!FxBelongs(object,actors))continue;
+        ++fx_owned_;
+        if(!Active(object)||!SourceShown(object))continue;
+        ++fx_active_;
+        Object* spline=kind==4?ChainSpline(object):nullptr;
+        if(spline&&FxBelongs(spline,actors))add(spline,6);else spline=nullptr;
+        add(object,kind);
+        const int at=IndexOf(next,object);if(at>=0)next[static_cast<size_t>(at)].spline=spline;
     }
     // What each hangs on, and the pose it takes.
     for (Source& s : next) {
@@ -450,6 +605,8 @@ void ScanSources(Object* hero, ULONGLONG now) {
     for (size_t pass = 0; pass <= next.size() && ordered.size() < next.size(); ++pass)
         for (size_t i = 0; i < next.size(); ++i) {
             if (placed[i]) continue;
+            const int sp=next[i].spline?IndexOf(next,next[i].spline):-1;
+            if(sp>=0&&!placed[static_cast<size_t>(sp)])continue;
             const int p = next[i].parent ? IndexOf(next, next[i].parent) : -1, l = next[i].leader ? IndexOf(next, next[i].leader) : -1;
             if ((p >= 0 && !placed[static_cast<size_t>(p)]) || (l >= 0 && !placed[static_cast<size_t>(l)])) continue;
             placed[i] = true; ordered.push_back(next[i]);
@@ -461,10 +618,12 @@ void ScanSources(Object* hero, ULONGLONG now) {
         if (p < 0) s.parent = nullptr;
         if (l < 0) s.leader = nullptr;
         d.socket.clear();  // a part hangs on its parent part's component frame: a socket can be overridden by the game (grabs) on the hero only
-        d.asset = PathOf(s.asset);
+        d.asset = d.kind==6?std::string():PathOf(s.asset);
+        const int sp=s.spline?IndexOf(ordered,s.spline):-1;d.spline=sp>=0?ordered[static_cast<size_t>(sp)].desc.id:kNone;
         d.posed = d.kind == 1 && !s.leader ? 1 : 0;
+        bool render_static=false;d.render_static=d.kind==1&&Bool(s.comp,"bRenderStatic",render_static)&&render_static?1:0;
         d.bones = d.posed ? static_cast<uint16_t>(std::clamp(NumBones(s.comp), 0, static_cast<int32_t>(kMaxBones))) : 0;
-        if (d.kind != 2) d.materials = MaterialsOf(s.comp);
+        if (d.kind < 4) d.materials = MaterialsOf(s.comp);
         if (d.kind == 2) {
             d.binding = PathOf(Property(s.comp, "BindingAsset")); d.physics = PathOf(Property(s.comp, "PhysicsAsset"));
             const int32_t main = Offset(s.comp, "bIsMainHair"), local = Offset(s.comp, "bForceLocalSpaceSimulation"), settings = Offset(s.comp, "SimulationSettings");
@@ -475,6 +634,8 @@ void ScanSources(Object* hero, ULONGLONG now) {
             }
         }
     }
+    for(const Source& old:sources_)if(old.projectile&&IndexOf(ordered,old.comp)<0)
+        Logf("NET_PROJECTILE removed id=%u",old.desc.id);
     sources_ = std::move(ordered);
     Writer body; body.Put(static_cast<uint16_t>(sources_.size())); for (const Source& s : sources_) WriteDesc(body, s.desc);
     if (body.b != parts_body_) {
@@ -513,16 +674,36 @@ Object* BoneTransformFn(Object* comp) {
     }
     return name && space && value ? fn : nullptr;
 }
-// A bone's world transform by its name only. GetSocketTransform is no use for bones: a socket of that name, or a socket
-// override the game adds (during a grab weapon_l / WEAPON_R led to other sockets), comes first.
-Transform BoneOnlyWorld(Object* comp, Object* bone_fn, Name bone, const Vec3& scale) {
-    Transform t{};
-    if (bone_fn) { Call get(comp, bone_fn); if (get.Set("InBoneName", bone).Set("TransformSpace", kSpaceWorld).Invoke()) t = get.Get<Transform>("ReturnValue"); }
-    else BoneOwnWorld(comp, bone, scale, t);
-    return t;
+// The reflected GetBoneTransform(FName) wraps GetSocketTransform. Same-name sockets must not enter a bone pose.
+// Read the checked component-space buffer used by the retargeter, preserving animated bone scale.
+// These offsets are gated by the supported game-build check; no engine memory is written here.
+bool ReadBoneComponent(Object* comp,int index,Transform& out) {
+    if(index>=0&&Readable(comp,0x650)){
+        const int32_t read=ue::At<int32_t>(comp,0x640);
+        if(read==0||read==1){
+            const Array a=ue::At<Array>(comp,0x5f8+read*16);
+            if(a.num>index&&a.num<=4096&&a.max>=a.num&&a.data&&Readable(static_cast<const Transform*>(a.data)+index,sizeof(Transform))){
+                const Transform local=static_cast<const Transform*>(a.data)[index];
+                const Quat q=QuatOf(local);const double norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+                bool valid=std::isfinite(norm)&&std::fabs(norm-1)<.001;
+                for(int i=0;i<3;++i)valid=valid&&std::isfinite(local.translation[i])&&std::isfinite(local.scale[i]);
+                if(valid){out=local;return true;}
+            }
+        }
+    }
+    return false;
+}
+Transform BoneOnlyWorld(Object* comp, Object*, Name bone, const Vec3& scale, int index=-1, const Transform* component_world=nullptr) {
+    if(index<0){Call get(comp,"GetBoneIndex");if(get.Set("BoneName",bone).Invoke())index=get.Get<int32_t>("ReturnValue");}
+    Transform local{},world{};
+    if(ReadBoneComponent(comp,index,local)){
+        if(component_world)return Compose(local,*component_world);
+        if(WorldOf(comp,world))return Compose(local,world);
+    }
+    Transform t{};BoneOwnWorld(comp,bone,scale,t);return t;
 }
 // The bones of a self-posing part, local (each in its parent bone's space; the root in the component's), made from the
-// bones' final world transforms read by bone name only (GetBoneTransform, else TransformFromBoneSpace without scale).
+// bones' final component-space buffer (fallback: TransformFromBoneSpace without bone scale).
 // Never the engine's own parent-bone-space answer: the game moves some bones after the animation, in component space
 // (during a grab weapon_l / WEAPON_R are snapped to a socket, scale 1.04), and that answer leaves this out.
 void WriteBones(Writer& w, Source& s) {
@@ -536,17 +717,22 @@ void WriteBones(Writer& w, Source& s) {
             if (!up.None()) for (size_t k = 0; k < i; ++k) if (s.bones[k] == up) { s.parents[i] = static_cast<int>(k); break; }
         }
         s.bone_fn = BoneTransformFn(s.comp);
-        Logf("NET_PUPPET part %u: %zu bones read with %s", s.desc.id, s.bones.size(), s.bone_fn ? "GetBoneTransform" : "TransformFromBoneSpace");
+        Logf("NET_PUPPET part %u: %zu bones read from component-space buffer (bone-only fallback)", s.desc.id, s.bones.size());
     }
     Transform comp_world{}; WorldOf(s.comp, comp_world);
     s.worlds.resize(s.bones.size());
-    for (size_t i = 0; i < s.bones.size(); ++i) s.worlds[i] = BoneOnlyWorld(s.comp, s.bone_fn, s.bones[i], ScaleOf(comp_world));
+    // Keep this scratch pose in component space. A world-space round trip is not associative
+    // with rotated bones under nonuniform component scale (ChangHong's spear is one such case).
+    for (size_t i = 0; i < s.bones.size(); ++i)
+        if(!ReadBoneComponent(s.comp,static_cast<int>(i),s.worlds[i])){
+            Transform world{};BoneOwnWorld(s.comp,s.bones[i],ScaleOf(comp_world),world);s.worlds[i]=RelativeTo(world,comp_world);
+        }
     w.Put(static_cast<uint16_t>(s.bones.size()));
     size_t run = 0;  // bones in the reference pose not written yet (one byte for up to 16)
     const auto flush = [&] { while (run) { const size_t n = (std::min)(run, static_cast<size_t>(16)); w.Put(static_cast<uint8_t>(kBoneRef | ((n - 1) << 4))); run -= n; } };
     for (size_t i = 0; i < s.bones.size(); ++i) {
         const int up = s.parents[i];
-        Transform local = RelativeTo(s.worlds[i], up >= 0 ? s.worlds[static_cast<size_t>(up)] : comp_world);
+        Transform local = up>=0?RelativeTo(s.worlds[i],s.worlds[static_cast<size_t>(up)]):s.worlds[i];
         if (!s.bone_fn) local.scale[0] = local.scale[1] = local.scale[2] = 1;
         const Vec3 t = MoveOf(local), sc = ScaleOf(local);
         const bool has_ref = s.ref_ok && i < s.ref.size();
@@ -574,7 +760,7 @@ void Capture(uint32_t seq);
 bool BuildPose(Object* hero, std::vector<unsigned char>& out) {
     Transform root{}; Object* root_comp = Property(hero, "RootComponent");
     if (!root_comp || !WorldOf(root_comp, root)) return false;
-    for (Source& s : sources_) { s.shown = Same(s.comp, s.name) && SourceShown(s.comp); s.needed = false; }
+    for (Source& s : sources_) { s.shown = SourceLive(s); s.needed = false; }
     // What a shown part needs: its leader's bones and everything it hangs on.
     for (const Source& s : sources_) {
         if (!s.shown) continue;
@@ -596,9 +782,14 @@ bool BuildPose(Object* hero, std::vector<unsigned char>& out) {
         Transform parent_world = root; if (s.parent) WorldOf(s.parent, parent_world);
         const Transform rel = RelativeTo(world, parent_world);
         const bool bones = s.desc.posed && (s.shown || s.needed), scaled = !Unscaled(ScaleOf(rel));
-        w.Put(static_cast<uint8_t>((s.shown ? kShown : 0) | (bones ? kBones : 0) | (scaled ? kScaled : 0)));
+        w.Put(static_cast<uint8_t>((s.shown ? kShown : 0) | (bones ? kBones : 0) | (scaled ? kScaled : 0) | ((s.desc.kind==4||s.desc.kind==5) && Active(s.comp) ? kFxActive : 0) | (!s.desc.fx.empty()?kFxValues:0) | (s.desc.kind==6?kSplinePoints:0)));
         w.Move(MoveOf(rel)); w.Q(QuatOf(rel)); if (scaled) w.Move(ScaleOf(rel));
+        if(s.desc.kind==6){
+            Call count(s.comp,"GetNumberOfSplinePoints");const int32_t n=count.Invoke()?std::clamp(count.Get<int32_t>("ReturnValue"),0,64):0;w.Put(static_cast<uint8_t>(n));
+            for(int32_t i=0;i<n;++i){Call get(s.comp,"GetLocationAtSplinePoint");get.Set("PointIndex",i).Set("CoordinateSpace",uint8_t{0}).Invoke();const Vector v=get.Get<Vector>("ReturnValue");w.Move({v.x,v.y,v.z});}
+        }
         if (bones) WriteBones(w, s);
+        if(!s.desc.fx.empty())for(const FxParam& param:s.desc.fx){FxValue value;const bool valid=ReadFx(s.comp,param,value);w.Put(static_cast<uint8_t>(valid?1:0));if(valid)for(int j=0;j<FxWidth(param.kind);++j)w.Put(value.v[j]);}
     }
     Capture(pose_seq_);
     out = std::move(w.b); send_bones_ = bones_sent_; send_ref_ = bones_ref_;
@@ -619,10 +810,14 @@ struct Bone { Quat q; Vec3 t; Vec3 s{1, 1, 1}; };
 struct Part {
     PartDesc desc; Object* comp = nullptr; Name name{}; int32_t pose_at = -1; std::vector<Name> bones; std::vector<int> parents; std::vector<RefBone> ref; bool ref_ok = false;
     std::vector<Bone> prev, curr; bool have_bones = false; Transform rel_prev{}, rel_curr{}, rel_set{}; bool has_rel = false, rel_applied = false;
-    int shown = -1, want_shown = 0; std::vector<std::string> materials_set;
+    int shown = -1, want_shown = 0, fx_running = -1; bool want_fx=false; std::vector<Vec3> spline_points;std::vector<FxValue> fx;std::vector<uint8_t> fx_valid;uint32_t fx_seq=0; std::vector<std::string> materials_set;
 };
 #pragma warning(pop)
 std::vector<Part> parts_;
+std::vector<Part> local_grooms_;
+std::vector<Part> groom_drivers_; // hidden render drivers; Groom binding rejects PoseableMeshComponent
+std::vector<std::pair<Object*,Name>> hair_tried_;
+std::vector<PartDesc> received_descs_;
 uint32_t parts_in_serial_ = 0; bool parts_in_valid_ = false;
 uint32_t pose_in_seq_ = 0; bool pose_in_valid_ = false; ULONGLONG pose_in_at_ = 0, pose_in_prev_at_ = 0;
 Transform root_prev_{}, root_curr_{}; bool root_valid_ = false, root_placed_ = false;
@@ -637,8 +832,10 @@ void DropPart(Part& p) {
     p.comp = nullptr;
 }
 void ClearParts(const char* why) {
+    for(Part& p:local_grooms_)DropPart(p);local_grooms_.clear();hair_tried_.clear();
     if (!parts_.empty()) Logf("NET_PUPPET parts removed (%zu, %s)", parts_.size(), why);
     for (Part& p : parts_) DropPart(p);
+    for(Part& p:groom_drivers_)DropPart(p);groom_drivers_.clear();
     parts_.clear(); parts_in_valid_ = false; pose_in_valid_ = false; root_valid_ = false; root_placed_ = false; parts_shown_ = 0;
 }
 // UPoseableMeshComponent::BoneSpaceTransforms: the array of `bones` transforms in the class's own part (it starts a
@@ -712,19 +909,38 @@ void SetMaterials(Part& p) {
 // The step CreatePart is in and the component it is making (a fault names the step and removes the half-made one).
 int make_step_ = 0; Object* making_ = nullptr; Name making_name_{};
 uintptr_t fault_at_ = 0; DWORD fault_code_ = 0;
+Object* GroomParent(Part* parent){
+    if(!parent)return nullptr;
+    if(!parent->desc.posed)return parent->comp;
+    for(auto& p:groom_drivers_)if(p.desc.parent==parent->desc.id&&Same(p.comp,p.name))return p.comp;
+    Call add(puppet_,"AddComponentByClass");
+    if(!add.Set("Class",Cls("/Script/Engine.SkeletalMeshComponent")).Set("bManualAttachment",true).Set("RelativeTransform",Transform{}).Set("bDeferredFinish",true).Invoke())return nullptr;
+    Object* c=add.Get<Object*>("ReturnValue");if(!ue::Alive(c))return nullptr;
+    Part driver;driver.comp=c;driver.name=ue::NameOf(c);driver.desc.parent=parent->desc.id;groom_drivers_.push_back(driver);
+    Call(c,"SetCollisionEnabled").Set("NewType",uint8_t{0}).Invoke();
+    Call(c,"SetRenderInMainPass").Set("bValue",false).Invoke();Call(c,"SetRenderInDepthPass").Set("bValue",false).Invoke();Call(c,"SetCastShadow").Set("NewCastShadow",false).Invoke();
+    Call(c,"K2_AttachToComponent").Set("Parent",parent->comp).Set("LocationRule",uint8_t{0}).Set("RotationRule",uint8_t{0}).Set("ScaleRule",uint8_t{0}).Invoke();
+    if(!Call(c,"SetSkeletalMeshAsset").Set("NewMesh",MeshAsset(parent->comp,1)).Invoke()||
+       !Call(c,"SetLeaderPoseComponent").Set("NewLeaderBoneComponent",parent->comp).Set("bForceUpdate",true).Set("bInFollowerShouldTickPose",false).Invoke()){
+        DropPart(groom_drivers_.back());groom_drivers_.pop_back();return nullptr;}
+    Call(puppet_,"FinishAddComponent").Set("Component",c).Set("bManualAttachment",true).Set("RelativeTransform",Transform{}).Invoke();
+    Call(c,"AddTickPrerequisiteComponent").Set("PrerequisiteComponent",parent->comp).Invoke();
+    Logf("NET_HAIR binding driver parent=%u",parent->desc.id);return c;
+}
 bool CreatePart(const PartDesc& d) {
     make_step_ = 0; making_ = nullptr;
     const bool posed = d.kind == 1 && d.posed;
-    const char* path = d.kind == 0 ? "/Script/Engine.StaticMeshComponent" : d.kind == 2 ? "/Script/HairStrandsCore.GroomComponent" :
+    const char* path = d.kind == 6 ? "/Script/Engine.SplineComponent" : d.kind == 4 ? "/Script/Niagara.NiagaraComponent" : d.kind == 5 ? "/Script/Engine.ParticleSystemComponent" : d.kind == 0 ? "/Script/Engine.StaticMeshComponent" : d.kind == 2 ? "/Script/HairStrandsCore.GroomComponent" :
                        d.kind == 3 ? "/Script/ChaosClothAssetEngine.ChaosClothComponent" : posed ? "/Script/Engine.PoseableMeshComponent" : "/Script/Engine.SkeletalMeshComponent";
     Object* cls = Cls(path), *root = Property(puppet_, "RootComponent");
     if (!cls || !root) return false;
-    Object* asset = FindAsset(d.asset);
-    if (!asset) { if (++assets_missing_ <= 10) Logf("NET_PUPPET part %u: asset %s not found", d.id, d.asset.c_str()); return false; }
+    Object* asset = d.kind==6?nullptr:FindAsset(d.asset);
+    if (!asset&&d.kind!=6) { if (++assets_missing_ <= 10) Logf("NET_PUPPET part %u: asset %s not found", d.id, d.asset.c_str()); return false; }
     Part* parent = d.parent != kNone ? FindPart(d.parent) : nullptr, *leader = d.leader != kNone ? FindPart(d.leader) : nullptr;
     if ((d.parent != kNone && (!parent || !Same(parent->comp, parent->name))) || (d.leader != kNone && (!leader || !Same(leader->comp, leader->name)))) return false;
     if ((d.kind == 3 || (d.kind == 1 && !posed)) && !leader) return false;
     Object* parent_comp = parent ? parent->comp : root;
+    if(d.kind==2&&parent){parent_comp=GroomParent(parent);if(!parent_comp)return false;}
     Name socket{}; if (!d.socket.empty()) socket = ue::MakeName(Wide(d.socket).c_str());
     make_step_ = 1;
     Call add(puppet_, "AddComponentByClass");
@@ -732,6 +948,7 @@ bool CreatePart(const PartDesc& d) {
     Object* comp = add.Get<Object*>("ReturnValue");
     if (!comp || !ue::Alive(comp)) return false;
     making_ = comp; making_name_ = ue::NameOf(comp);
+    if(d.kind==4||d.kind==5)Call(comp,"SetAutoActivate").Set("bNewAutoActivate",false).Invoke();
     make_step_ = 2;
     if (d.kind == 3) {
         Call set(comp, "SetClothAsset");
@@ -742,7 +959,7 @@ bool CreatePart(const PartDesc& d) {
         const auto put = [&](const char* name, Object* value) { const int32_t at = Offset(comp, name); if (at >= 0) ue::At<Object*>(comp, at) = value; };
         put("GroomAsset", asset); put("BindingAsset", FindAsset(d.binding)); put("PhysicsAsset", FindAsset(d.physics));
         const int32_t main = Offset(comp, "bIsMainHair"), local = Offset(comp, "bForceLocalSpaceSimulation"), settings = Offset(comp, "SimulationSettings");
-        if (main >= 0) ue::At<uint8_t>(comp, main) = d.main_hair;
+        if (main >= 0) ue::At<uint8_t>(comp, main) = 0; // receiver preference, independent of the hero's global hair mode
         if (local >= 0) ue::At<uint8_t>(comp, local) = d.local_sim;
         if (settings >= 0 && d.settings.size() == kGroomSettingsBytes) {
             std::memcpy(static_cast<unsigned char*>(comp) + settings, d.settings.data(), kGroomSettingsBytes);
@@ -761,7 +978,9 @@ bool CreatePart(const PartDesc& d) {
         Call(comp, "SetCollisionEnabled").Set("NewType", uint8_t{0}).Invoke();
         make_step_ = 6;
         bool set = true;
-        if (d.kind == 0) set = Call(comp, "SetStaticMesh").Set("NewMesh", asset).Invoke();
+        if(d.kind==4) set=Call(comp,"SetAsset").Set("InAsset",asset).Set("bResetExistingOverrideParameters",true).Invoke();
+        else if(d.kind==5) set=Call(comp,"SetTemplate").Set("NewTemplate",asset).Invoke();
+        else if (d.kind == 0) set = Call(comp, "SetStaticMesh").Set("NewMesh", asset).Invoke();
         else if (d.kind == 1 && !posed) set = Call(comp, "SetSkeletalMeshAsset").Set("NewMesh", asset).Invoke();
         else if (posed) {
             Call update(comp, "SetSkinnedAssetAndUpdate");
@@ -769,8 +988,11 @@ bool CreatePart(const PartDesc& d) {
             if (!set) set = Call(comp, "SetSkeletalMesh").Set("NewMesh", asset).Set("bReinitPose", true).Invoke();
         }
         if (!set) { Call(comp, "K2_DestroyComponent").Set("Object", comp).Invoke(); making_ = nullptr; return false; }
+        if(d.render_static&&!Call(comp,"SetRenderStatic").Set("bNewValue",true).Invoke()){
+            Call(comp,"K2_DestroyComponent").Set("Object",comp).Invoke();making_=nullptr;return false;
+        }
         make_step_ = 7;
-        SetMaterials(p);
+        if(d.kind<4) SetMaterials(p);
         if (leader) {
             make_step_ = 8;
             Call(comp, "SetLeaderPoseComponent").Set("NewLeaderBoneComponent", leader->comp).Set("bForceUpdate", true).Set("bInFollowerShouldTickPose", false).Invoke();
@@ -784,11 +1006,81 @@ bool CreatePart(const PartDesc& d) {
         Call(comp, "ResumeSimulation").Invoke();
         Call(comp, "ForceNextUpdateTeleportAndReset").Invoke();
     }
+    if(d.kind==4||d.kind==5) Call(comp,"Deactivate").Invoke();
+    if(d.kind==4&&d.spline!=kNone){
+        Part* spline=FindPart(d.spline);
+        if(!spline||spline->desc.kind!=6||!Call(comp,"SetVariableObject").Set("InVariableName",ue::MakeName(L"UE_SplineDynamic_Object")).Set("Object",spline->comp).Invoke()){
+            Call(comp,"K2_DestroyComponent").Set("Object",comp).Invoke();making_=nullptr;return false;}
+        Logf("NET_FX spline bound effect=%u spline=%u",d.id,d.spline);
+    }
     if (posed) { make_step_ = 12; SetupBones(p); }
+    if(d.kind==2)SetMaterials(p);
     make_step_ = 10;
     parts_.push_back(std::move(p));
     making_ = nullptr;
     return true;
+}
+unsigned Hair(const Part& p){return p.desc.kind<=3?NetPuppetRules::HairMask(p.desc.asset,p.desc.kind==2):0;}
+uint16_t HairAnchor(const Part& p){
+    const Part* at=&p;
+    for(size_t n=0;n<=parts_.size();++n){
+        if(!Hair(*at)&&at->desc.kind==1&&at->desc.leader==kNone)return at->desc.id;
+        const uint16_t next=at->desc.leader!=kNone?at->desc.leader:at->desc.parent;
+        at=FindPart(next);if(!at)break;
+    }
+    return kNone;
+}
+bool HairAvailable(const Part& p){
+    if(!Same(p.comp,p.name))return false;
+    const Part* anchor=FindPart(HairAnchor(p));
+    return anchor?anchor->want_shown!=0:p.want_shown!=0;
+}
+std::vector<Part*> HairParts(){std::vector<Part*> out;for(auto& p:parts_)if(Hair(p))out.push_back(&p);for(auto& p:local_grooms_)out.push_back(&p);return out;}
+void SetShown(Part& p,bool show){
+    if(p.shown==static_cast<int>(show))return;
+    Call(p.comp,"SetVisibility").Set("bNewVisibility",true).Set("bPropagateToChildren",false).Invoke();
+    Call(p.comp,"SetHiddenInGame").Set("NewHidden",!show).Set("bPropagateToChildren",false).Invoke();p.shown=show?1:0;
+}
+void ShowHair(){
+    const auto all=HairParts();std::vector<uint16_t> done;
+    for(Part* seed:all){const auto anchor=HairAnchor(*seed);if(std::find(done.begin(),done.end(),anchor)!=done.end())continue;done.push_back(anchor);
+        std::vector<Part*> group;std::vector<NetPuppetRules::HairChoice> choices;
+        for(Part* p:all)if(HairAnchor(*p)==anchor){bool available=HairAvailable(*p);
+            if(p->desc.id==0)for(const Part& wire:parts_)if(wire.desc.kind==2&&HairAnchor(wire)==anchor&&(Hair(wire)&Hair(*p))&&HairAvailable(wire))available=false;
+            for(Part* old:group)if(old->desc.kind==p->desc.kind&&old->desc.asset==p->desc.asset&&old->desc.binding==p->desc.binding&&HairAvailable(*old))available=false;
+            group.push_back(p);choices.push_back({Hair(*p),p->desc.kind==2,available});}
+        const auto shows=NetPuppetRules::ChooseHair(choices,InterlockedCompareExchange(&hair_mode_,0,0)==0);
+        for(size_t i=0;i<group.size();++i)if(Same(group[i]->comp,group[i]->name))SetShown(*group[i],shows[i]);
+    }
+}
+int CreatePartGuarded(const PartDesc& d);
+void EnsureLocalHair(){
+    // Donor resources are local to the receiver and never sent as fabricated source parts.
+    for(Part& p:local_grooms_){Part* parent=FindPart(p.desc.parent);if(!parent||!Same(parent->comp,parent->name))DropPart(p);}
+    local_grooms_.erase(std::remove_if(local_grooms_.begin(),local_grooms_.end(),[](const Part& p){return !p.comp;}),local_grooms_.end());
+    for(Part& p:groom_drivers_)if(!FindPart(p.desc.parent))DropPart(p);
+    groom_drivers_.erase(std::remove_if(groom_drivers_.begin(),groom_drivers_.end(),[](const Part& p){return !p.comp;}),groom_drivers_.end());
+    const size_t count=parts_.size();
+    for(size_t i=0;i<count;++i){const Part parent=parts_[i];
+        if(parent.desc.kind!=1||Hair(parent)||!Same(parent.comp,parent.name))continue;
+        std::string leaf=parent.desc.asset.substr(parent.desc.asset.find_last_of('/')+1);for(char& c:leaf)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if(leaf.find("body")==std::string::npos&&leaf.find("head")==std::string::npos&&leaf.find("face")==std::string::npos)continue;
+        if(std::any_of(hair_tried_.begin(),hair_tried_.end(),[&](const auto& x){return x.first==parent.comp&&x.second==parent.name;}))continue;
+        hair_tried_.push_back({parent.comp,parent.name});
+        for(Object* source:GroomForce::MirrorTemplates(MeshAsset(parent.comp,1))){
+            PartDesc d;d.kind=2;d.parent=parent.desc.id;d.asset=PathOf(Property(source,"GroomAsset"));d.binding=PathOf(Property(source,"BindingAsset"));d.physics=PathOf(Property(source,"PhysicsAsset"));d.materials=MaterialsOf(source);
+            if(d.asset.empty())continue;
+            bool exists=false;
+            // A hairstyle may contain separate bangs, crown, ponytail and ends. Keep the whole donor set.
+            for(const Part& p:parts_)if(HairAnchor(p)==HairAnchor(parent)&&p.desc.kind==2&&Hair(p)==NetPuppetRules::HairMask(d.asset,true))exists=true;
+            for(const Part& p:local_grooms_)if(p.desc.parent==d.parent&&p.desc.asset==d.asset&&p.desc.binding==d.binding)exists=true;
+            if(exists)continue;
+            const int32_t local=Offset(source,"bForceLocalSpaceSimulation"),settings=Offset(source,"SimulationSettings");
+            if(local>=0)d.local_sim=ue::At<uint8_t>(source,local);
+            if(settings>=0){const auto* bytes=source+settings;d.settings.assign(bytes,bytes+kGroomSettingsBytes);std::memset(d.settings.data()+kLocalBoneString,0,sizeof(ue::String));}
+            if(CreatePartGuarded(d)==1){local_grooms_.push_back(std::move(parts_.back()));parts_.pop_back();Logf("NET_HAIR local groom parent=%u asset=%s",d.parent,d.asset.c_str());}
+        }
+    }
 }
 int CreateFaultFilter(const EXCEPTION_POINTERS* e) {
     fault_code_ = e->ExceptionRecord->ExceptionCode; fault_at_ = reinterpret_cast<uintptr_t>(e->ExceptionRecord->ExceptionAddress);
@@ -813,8 +1105,13 @@ void TakeParts(const std::vector<unsigned char>& blob) {
     const uint32_t serial = r.Get<uint32_t>(); const uint16_t n = r.Get<uint16_t>();
     std::vector<PartDesc> list;
     for (uint16_t i = 0; i < n && !r.bad && i < kMaxParts; ++i) list.push_back(ReadDesc(r));
+    std::vector<NetPuppetRules::Description> descriptions;
+    for(const PartDesc& d:list)descriptions.push_back({d.id,d.parent,d.leader,d.bones,d.kind,d.posed,d.spline,d.render_static});
+    for(const PartDesc& d:list)if(d.spline!=kNone){const auto it=std::find_if(list.begin(),list.end(),[&](const PartDesc& x){return x.id==d.spline;});
+        const auto me=std::find_if(list.begin(),list.end(),[&](const PartDesc& x){return x.id==d.id;});if(it==list.end()||it>=me||it->kind!=6)r.bad=true;}
+    if(n>kMaxParts||r.at!=r.n||!NetPuppetRules::Descriptions(descriptions))r.bad=true;
     if (r.bad) { Logf("NET_PUPPET parts list #%u unreadable (%zu bytes)", serial, blob.size()); return; }
-    if (parts_in_valid_ && serial == parts_in_serial_) return;  // sent again
+    if (parts_in_valid_ && static_cast<int32_t>(serial-parts_in_serial_)<=0) return;  // sent again
     const auto desc_of = [&](uint16_t id) -> const PartDesc* { for (const PartDesc& d : list) if (d.id == id) return &d; return nullptr; };
     std::vector<uint16_t> drop;
     for (const Part& p : parts_) { const PartDesc* d = desc_of(p.desc.id); if (!d || !SameShape(*d, p.desc) || !Same(p.comp, p.name)) drop.push_back(p.desc.id); }
@@ -822,14 +1119,16 @@ void TakeParts(const std::vector<unsigned char>& blob) {
         more = false;
         for (const Part& p : parts_) {
             if (std::find(drop.begin(), drop.end(), p.desc.id) != drop.end()) continue;
-            if (std::find(drop.begin(), drop.end(), p.desc.parent) != drop.end() || std::find(drop.begin(), drop.end(), p.desc.leader) != drop.end()) { drop.push_back(p.desc.id); more = true; }
+            if (std::find(drop.begin(), drop.end(), p.desc.parent) != drop.end() || std::find(drop.begin(), drop.end(), p.desc.leader) != drop.end() || std::find(drop.begin(),drop.end(),p.desc.spline)!=drop.end()) { drop.push_back(p.desc.id); more = true; }
         }
     }
+    for(Part& p:local_grooms_)if(std::find(drop.begin(),drop.end(),p.desc.parent)!=drop.end())DropPart(p);
+    for(Part& p:groom_drivers_)if(std::find(drop.begin(),drop.end(),p.desc.parent)!=drop.end())DropPart(p);
     for (Part& p : parts_) if (std::find(drop.begin(), drop.end(), p.desc.id) != drop.end()) DropPart(p);
     parts_.erase(std::remove_if(parts_.begin(), parts_.end(), [](const Part& p) { return !p.comp; }), parts_.end());
     size_t made = 0, failed = 0;
     for (const PartDesc& d : list) {
-        if (Part* p = FindPart(d.id)) { p->desc = d; SetMaterials(*p); continue; }
+        if (Part* p = FindPart(d.id)) { p->desc = d; if(d.kind<4)SetMaterials(*p); continue; }
         if (std::find(refused_.begin(), refused_.end(), d.asset) != refused_.end()) continue;
         _snprintf_s(stage_part_, sizeof(stage_part_), _TRUNCATE, "part %u %s %s", d.id, d.kind == 0 ? "static" : d.kind == 1 ? (d.posed ? "posed" : "skinned") : d.kind == 2 ? "groom" : "cloth", d.asset.c_str());
         stage_ = "part";
@@ -847,49 +1146,86 @@ void TakeParts(const std::vector<unsigned char>& blob) {
         }
     }
     part_failures_ += static_cast<int>(failed);
-    parts_in_serial_ = serial; parts_in_valid_ = true; ++parts_updates_;
+    received_descs_=list;parts_in_serial_ = serial; parts_in_valid_ = true; ++parts_updates_;
+    EnsureLocalHair();
     Logf("NET_PUPPET parts list #%u: %zu parts, -%zu +%zu (failed %zu)", serial, list.size(), drop.size(), made, failed);
 }
 // A pose: newer than the last one taken (by its sequence number), it becomes the newest and the one before it the
 // one blended from.
 void TakePose(const std::vector<unsigned char>& blob, ULONGLONG received) {
     Reader r{blob.data(), blob.size()};
-    r.Get<uint32_t>(); const uint32_t seq = r.Get<uint32_t>();
-    if (r.bad || (pose_in_valid_ && static_cast<int32_t>(seq - pose_in_seq_) <= 0)) return;
+    const uint32_t serial=r.Get<uint32_t>(); const uint32_t seq = r.Get<uint32_t>();
+    if(r.bad||!NetPuppetRules::AcceptPose(serial,parts_in_serial_,parts_in_valid_,seq,pose_in_seq_,pose_in_valid_))return;
     Transform root{}; root.translation[0] = r.Get<double>(); root.translation[1] = r.Get<double>(); root.translation[2] = r.Get<double>();
     { const Quat q = r.Q(); root.rotation[0] = q.x; root.rotation[1] = q.y; root.rotation[2] = q.z; root.rotation[3] = q.w; }
+    #pragma warning(push)
+    #pragma warning(disable:4324)
+    struct Pending { Part* part=nullptr; uint8_t flags=0; Transform rel{}; std::vector<Bone> bones;std::vector<Vec3> spline_points;std::vector<FxValue> fx;std::vector<uint8_t> fx_valid; };
+    #pragma warning(pop)
+    std::vector<Pending> pending;
+    const auto finite=[](Vec3 v){return std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z)&&std::fabs(v.x)<1e9&&std::fabs(v.y)<1e9&&std::fabs(v.z)<1e9;};
+    if(!finite(MoveOf(root)))return;
     const uint16_t n = r.Get<uint16_t>();
+    if(n>kMaxParts)return;
+    std::vector<uint16_t> ids;
     for (uint16_t i = 0; i < n && !r.bad; ++i) {
         const uint16_t id = r.Get<uint16_t>(); const uint8_t flags = r.Get<uint8_t>();
-        if (flags & kGone) continue;
-        const Vec3 t = r.Move(); const Quat q = r.Q(); const Vec3 s = (flags & kScaled) ? r.Move() : Vec3{1, 1, 1};
-        Part* p = FindPart(id);
-        if (p) { const Transform rel = Make(q, t, s); p->rel_prev = p->has_rel ? p->rel_curr : rel; p->rel_curr = rel; p->has_rel = true; p->want_shown = (flags & kShown) ? 1 : 0; }
-        if (!(flags & kBones)) continue;
-        const uint16_t count = r.Get<uint16_t>();
-        const bool keep = p && p->desc.posed && count == p->bones.size();
-        std::vector<Bone> bones; if (keep) bones.resize(count);
-        for (uint16_t b = 0; b < count && !r.bad; ++b) {
-            const uint8_t bf = r.Get<uint8_t>(); Bone bone;
-            const RefBone ref = keep && p->ref_ok && b < p->ref.size() ? p->ref[b] : RefBone{};
-            if (bf & kBoneRef) {
-                const uint16_t same = static_cast<uint16_t>((bf >> 4) + 1);
-                for (uint16_t k = 0; k < same && b + k < count; ++k) {
-                    const RefBone rk = keep && p->ref_ok && b + k < p->ref.size() ? p->ref[b + k] : RefBone{};
-                    if (keep) { bones[b + k].q = rk.q; bones[b + k].t = rk.t; bones[b + k].s = rk.s; }
-                }
-                b = static_cast<uint16_t>(b + same - 1); continue;
-            }
-            bone.q = r.Q();
-            if (bf & kBoneMoved) bone.t = r.Move();
-            else if (bf & kBoneNear) { const int16_t x = r.Get<int16_t>(), y = r.Get<int16_t>(), z = r.Get<int16_t>(); bone.t = {ref.t.x + x * 0.01, ref.t.y + y * 0.01, ref.t.z + z * 0.01}; }
-            else bone.t = ref.t;
-            if (bf & kBoneScaled) bone.s = r.Move();
-            if (keep) bones[b] = bone;
+        if(!id||id==kNone||std::find(ids.begin(),ids.end(),id)!=ids.end()||(flags&~(kShown|kBones|kScaled|kFxActive|kFxValues|kSplinePoints|kGone))){r.bad=true;break;}
+        ids.push_back(id); Pending item; item.part=FindPart(id);item.flags=flags;
+        if (flags & kGone) { if(flags!=kGone){r.bad=true;break;} pending.push_back(std::move(item));continue; }
+        const Vec3 t = r.Move(); const Quat q = r.Q(); const Vec3 scale = (flags & kScaled) ? r.Move() : Vec3{1, 1, 1};
+        if(!finite(t)||!finite(scale)){r.bad=true;break;}
+        item.rel=Make(q,t,scale);Part* p=item.part;
+        if(flags&kSplinePoints){
+            const auto schema=std::find_if(received_descs_.begin(),received_descs_.end(),[&](const PartDesc& d){return d.id==id;});
+            const uint8_t count=r.Get<uint8_t>();if(count>64||schema==received_descs_.end()||schema->kind!=6){r.bad=true;break;}
+            for(uint8_t j=0;j<count;++j){const Vec3 v=r.Move();if(!finite(v))r.bad=true;item.spline_points.push_back(v);}
         }
-        if (keep && !r.bad) { p->prev = p->have_bones ? p->curr : bones; p->curr = std::move(bones); p->have_bones = true; }
+        if (flags & kBones) {
+            const uint16_t count = r.Get<uint16_t>();
+            if(count>kMaxBones){r.bad=true;break;}
+            const bool keep = p && p->desc.posed && count == p->bones.size();
+            if(p&&!keep){r.bad=true;break;}
+            if (keep) item.bones.resize(count);
+            for (uint16_t b = 0; b < count && !r.bad; ++b) {
+                const uint8_t bf = r.Get<uint8_t>(); Bone bone;
+                const RefBone ref = keep && p->ref_ok && b < p->ref.size() ? p->ref[b] : RefBone{};
+                if (bf & kBoneRef) {
+                    const uint16_t same = static_cast<uint16_t>((bf >> 4) + 1);
+                    if((bf&15)!=kBoneRef||b+same>count){r.bad=true;break;}
+                    for (uint16_t j = 0; j < same; ++j) {
+                        const RefBone rk = keep && p->ref_ok && b+j < p->ref.size() ? p->ref[b+j] : RefBone{};
+                        if (keep) { item.bones[b+j].q=rk.q;item.bones[b+j].t=rk.t;item.bones[b+j].s=rk.s; }
+                    }
+                    b=static_cast<uint16_t>(b+same-1);continue;
+                }
+                if((bf&~(kBoneMoved|kBoneScaled|kBoneNear))||((bf&kBoneMoved)&&(bf&kBoneNear))){r.bad=true;break;}
+                bone.q=r.Q();
+                if(bf&kBoneMoved)bone.t=r.Move();
+                else if(bf&kBoneNear){const int16_t x=r.Get<int16_t>(),y=r.Get<int16_t>(),z=r.Get<int16_t>();bone.t={ref.t.x+x*.01,ref.t.y+y*.01,ref.t.z+z*.01};}
+                else bone.t=ref.t;
+                if(bf&kBoneScaled)bone.s=r.Move();
+                if(!finite(bone.t)||!finite(bone.s)){r.bad=true;break;}
+                if(keep)item.bones[b]=bone;
+            }
+        }
+        if(flags&kFxValues){
+            const auto schema=std::find_if(received_descs_.begin(),received_descs_.end(),[&](const PartDesc& d){return d.id==id;});
+            if(schema==received_descs_.end()||schema->kind!=4||schema->fx.empty()){r.bad=true;break;}
+            for(const FxParam& param:schema->fx){FxValue value;const uint8_t valid=r.Get<uint8_t>();if(valid>1){r.bad=true;break;}
+                if(valid)for(int j=0;j<FxWidth(param.kind);++j){value.v[j]=r.Get<double>();if(!std::isfinite(value.v[j])||std::fabs(value.v[j])>1e9)r.bad=true;}
+                item.fx.push_back(value);item.fx_valid.push_back(valid);}
+        }
+        pending.push_back(std::move(item));
     }
-    if (r.bad) return;
+    // Validate the complete packet before changing any visible state (truncation must be atomic).
+    if(r.bad||r.at!=r.n)return;
+    for(Pending& item:pending)if(Part* p=item.part){
+        if(item.flags&kGone){p->want_shown=0;p->want_fx=false;continue;}
+        p->rel_prev=p->has_rel?p->rel_curr:item.rel;p->rel_curr=item.rel;p->has_rel=true;
+        p->want_shown=(item.flags&kShown)?1:0;p->want_fx=(item.flags&kFxActive)!=0;p->spline_points=std::move(item.spline_points);p->fx=std::move(item.fx);p->fx_valid=std::move(item.fx_valid);
+        if(!item.bones.empty()){p->prev=p->have_bones?p->curr:item.bones;p->curr=std::move(item.bones);p->have_bones=true;}
+    }
     root_prev_ = root_valid_ ? root_curr_ : root; root_curr_ = root; root_valid_ = true;
     pose_in_seq_ = seq; pose_in_valid_ = true; pose_in_prev_at_ = pose_in_at_ ? pose_in_at_ : received - kPoseMs; pose_in_at_ = received;
 }
@@ -899,21 +1235,44 @@ void ShowPose(ULONGLONG now, bool loop) {
     const double span = static_cast<double>((std::max<ULONGLONG>)(pose_in_at_ - pose_in_prev_at_, 10));
     const double k = check_until_ ? 1.0 : std::clamp(static_cast<double>(now - pose_in_at_) / span, 0.0, 1.0);
     Transform root = Blend(root_prev_, root_curr_, k);
-    if (loop) { root.translation[0] += offset_.x; root.translation[1] += offset_.y; root.translation[2] += offset_.z; }
+    if (loop) {
+        if(duel_){
+            const Vec3 forward=Rotate(QuatOf(root),{180,0,0});
+            root.translation[0]+=forward.x;root.translation[1]+=forward.y;
+            const Quat turn=Mul(QuatOf(root),Quat{0,0,1,0});
+            root.rotation[0]=turn.x;root.rotation[1]=turn.y;root.rotation[2]=turn.z;root.rotation[3]=turn.w;
+        }else{root.translation[0]+=offset_.x;root.translation[1]+=offset_.y;root.translation[2]+=offset_.z;}
+    }
     if (Object* own = Property(puppet_, "RootComponent")) {
         Transform at{}; const bool jump = !root_placed_ || (WorldOf(own, at) && std::hypot(std::hypot(at.translation[0] - root.translation[0], at.translation[1] - root.translation[1]), at.translation[2] - root.translation[2]) > kSnapCm);
         Call(own, "K2_SetWorldTransform").Set("NewTransform", root).Set("bSweep", false).Set("bTeleport", jump).Invoke();
         root_placed_ = true;
     }
+    ShowHair();
     int shown = 0;
     std::vector<Transform> locals, spaces;
     for (Part& p : parts_) {
         if (!Same(p.comp, p.name)) continue;
-        if (p.want_shown != p.shown) { Call(p.comp, "SetHiddenInGame").Set("NewHidden", p.want_shown == 0).Set("bPropagateToChildren", false).Invoke(); p.shown = p.want_shown; }
+        if(!Hair(p))SetShown(p,p.want_shown!=0);
         shown += p.shown > 0 ? 1 : 0;
         if (p.has_rel) {
             const Transform rel = Blend(p.rel_prev, p.rel_curr, k);
             if (!p.rel_applied || !Close(rel, p.rel_set)) { Call(p.comp, "K2_SetRelativeTransform").Set("NewTransform", rel).Set("bSweep", false).Set("bTeleport", false).Invoke(); p.rel_set = rel; p.rel_applied = true; }
+        }
+        if(p.desc.kind==6&&p.fx_seq!=pose_in_seq_){
+            const int32_t n=static_cast<int32_t>(p.spline_points.size());Array points{p.spline_points.data(),n,n};
+            Call(p.comp,"SetSplinePoints").Set("Points",points).Set("CoordinateSpace",uint8_t{0}).Set("bUpdateSpline",true).Invoke();p.fx_seq=pose_in_seq_;
+        }
+        if(p.desc.kind==4&&p.fx_seq!=pose_in_seq_&&p.fx.size()==p.desc.fx.size()){
+            for(size_t i=0;i<p.fx.size();++i)if(i<p.fx_valid.size()&&p.fx_valid[i])SetFx(p.comp,p.desc.fx[i],p.fx[i],root_curr_,root);
+            p.fx_seq=pose_in_seq_;
+        }
+        if(p.desc.kind==4||p.desc.kind==5) {
+            const int run=p.want_fx&&p.want_shown?1:0;
+            if(run!=p.fx_running) {
+                const bool ok=run?Call(p.comp,"Activate").Set("bReset",true).Invoke():Call(p.comp,"Deactivate").Invoke();
+                if(ok){p.fx_running=run;if(run)++fx_starts_;}
+            }
         }
         if (!p.desc.posed || !p.have_bones || p.curr.size() != p.bones.size() || p.prev.size() != p.curr.size() || p.bones.empty()) continue;
         const size_t n = p.curr.size();
@@ -951,25 +1310,92 @@ void ShowPose(ULONGLONG now, bool loop) {
 // shows the pose before.)
 #pragma warning(push)
 #pragma warning(disable: 4324)
-struct Captured { uint16_t id = 0; bool shown = false; Transform world{}; std::vector<Transform> bones; };
+struct Captured { uint16_t id = 0; bool shown = false, projectile = false; Transform world{}; std::vector<Transform> bones; std::vector<Vector> spline; };
 #pragma warning(pop)
 std::vector<Captured> capture_next_, capture_shown_; uint32_t capture_next_seq_ = 0; bool capture_ready_ = false;
 double check_bone_max_ = 0, check_part_max_ = 0, check_sum_ = 0; uint64_t check_bones_ = 0; int check_rounds_ = 0, check_shown_bad_ = 0; char check_worst_[200] = "-";
+double check_spline_max_ = 0; uint64_t check_spline_points_ = 0; int check_spline_bad_ = 0;
+int check_place_details_ = 0;
+uint64_t check_projectile_parts_=0;double check_projectile_max_=0;int check_projectile_shown_bad_=0;
+double check_native_bone_max_ = 0; uint64_t check_native_bones_ = 0;
 double Gap(const Transform& a, const Transform& b, bool offset) {
     const double dx = a.translation[0] - (offset ? offset_.x : 0) - b.translation[0], dy = a.translation[1] - (offset ? offset_.y : 0) - b.translation[1],
                  dz = a.translation[2] - (offset ? offset_.z : 0) - b.translation[2];
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 // Both sides read bones by name only (BoneOnlyWorld): the hero's sockets can be overridden by the game.
-Transform BoneWorld(Object* comp, Object* fn, Name bone) { Transform w{}; WorldOf(comp, w); return BoneOnlyWorld(comp, fn, bone, ScaleOf(w)); }
+Transform BoneWorld(Object* comp, Object* fn, Name bone, int index=-1) { Transform w{}; WorldOf(comp, w); return BoneOnlyWorld(comp, fn, bone, ScaleOf(w),index,&w); }
+// Local contact experiment. Montage-name gating is intentionally approximate, not native attack notifies.
+// Only displayed weapon bones contribute; footsteps, idle FX and projectiles cannot damage either lab counter.
+struct DuelSample { uint16_t part=0;Name bone{};Vec3 local{},remote{}; };
+std::vector<DuelSample> duel_samples_;
+Object* duel_montage_=nullptr;Name duel_montage_name_{};float duel_position_=0;ULONGLONG duel_at_=0;
+void ResetDuel(bool enabled) {
+    duel_=enabled;duel_state_={};duel_samples_.clear();duel_montage_=nullptr;duel_position_=0;duel_at_=0;
+    Logf("NET_DUEL %s local-only experimental HP; native damage/notifies/guard/projectiles not simulated",enabled?"on":"off");
+}
+void TickDuel(ULONGLONG now) {
+    if(!duel_)return;
+    Object* montage=nullptr;float position=0;
+    for(const Source& source:sources_)if(!source.projectile&&source.desc.kind==1&&Same(source.comp,source.name)){
+        Call get(source.comp,"GetAnimInstance");Object* anim=get.Invoke()?get.Get<Object*>("ReturnValue"):nullptr;
+        Call active(anim,"GetCurrentActiveMontage");Object* m=active.Invoke()?active.Get<Object*>("ReturnValue"):nullptr;
+        if(!ue::Alive(m))continue;
+        std::string name=Text(m);std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+        if(name.find("attack")==std::string::npos&&name.find("atk")==std::string::npos&&name.find("skill")==std::string::npos)continue;
+        Call at(anim,"Montage_GetPosition");if(!at.Set("Montage",m).Invoke())continue;
+        montage=m;position=at.Get<float>("ReturnValue");break;
+    }
+    if(!montage){duel_montage_=nullptr;duel_samples_.clear();duel_at_=now;return;}
+    if(montage!=duel_montage_||!Same(duel_montage_,duel_montage_name_)||position+.05f<duel_position_){
+        duel_state_.BeginAttack();duel_samples_.clear();duel_montage_=montage;duel_montage_name_=ue::NameOf(montage);
+        Logf("NET_DUEL attack=%u montage=%s",duel_state_.attacks,Text(montage).c_str());
+    }
+    duel_position_=position;
+    Vector target[2]{};if(!Location(hero_,target[0])||!Location(puppet_,target[1]))return;
+    std::vector<DuelSample> next;
+    const auto contact=[&](Vec3 a,Vec3 b,int victim){
+        for(double z:{-50.0,0.0,50.0})if(NetPuppetRules::SweepHit({a.x,a.y,a.z},{b.x,b.y,b.z},{target[victim].x,target[victim].y,target[victim].z+z},45))return true;
+        return false;
+    };
+    for(const Source& source:sources_){
+        Part* part=FindPart(source.desc.id);
+        if(!source.desc.posed||!source.shown||!Same(source.comp,source.name)||!part||!Same(part->comp,part->name)||part->shown<=0)continue;
+        for(Name bone:source.bones){
+            char name[128]{};ue::NameText(bone,name,sizeof(name));
+            if(!std::strstr(name,"weapon")&&!std::strstr(name,"Weapon"))continue;
+            const Vec3 local=MoveOf(BoneWorld(source.comp,source.bone_fn,bone));
+            const Vec3 remote=MoveOf(BoneWorld(part->comp,BoneTransformFn(part->comp),bone));
+            const auto old=std::find_if(duel_samples_.begin(),duel_samples_.end(),[&](const DuelSample& v){return v.part==source.desc.id&&v.bone==bone;});
+            if(old!=duel_samples_.end()&&now-duel_at_<=100){
+                const bool hit[2]{contact(old->remote,remote,0),contact(old->local,local,1)};
+                for(int victim=0;victim<2;++victim)if(hit[victim]&&duel_state_.Hit(victim))
+                    Logf("NET_DUEL hit attack=%u victim=%s bone=%s hp=%d/%d",duel_state_.attacks,victim==0?"hero-lab":"puppet-lab",name,duel_state_.health[0],duel_state_.health[1]);
+            }
+            next.push_back({source.desc.id,bone,local,remote});
+        }
+    }
+    duel_samples_=std::move(next);duel_at_=now;
+}
 // BuildPose, while a check is due: the hero as this pose shows it.
 void Capture(uint32_t seq) {
     if (!check_until_ || GetTickCount64() < next_check_) return;
     capture_next_.clear();
     for (const Source& s : sources_) {
         if (!Same(s.comp, s.name)) continue;
-        Captured c; c.id = s.desc.id; c.shown = s.shown; WorldOf(s.comp, c.world);
-        if (s.desc.posed && (s.shown || s.needed)) for (Name bone : s.bones) c.bones.push_back(BoneWorld(s.comp, s.bone_fn, bone));
+        Captured c; c.id = s.desc.id; c.shown = s.shown;c.projectile=s.projectile!=nullptr; WorldOf(s.comp, c.world);
+        if (s.desc.posed && (s.shown || s.needed)) for (size_t i=0;i<s.bones.size();++i) c.bones.push_back(BoneOnlyWorld(s.comp,s.bone_fn,s.bones[i],ScaleOf(c.world),static_cast<int>(i),&c.world));
+        // An independent native bone-only getter checks the buffer reader at historically ambiguous socket names.
+        for(size_t i=0;i<c.bones.size();++i)if(ue::NameIs(s.bones[i],"foot_r")||ue::NameIs(s.bones[i],"weapon_l")||ue::NameIs(s.bones[i],"CNT001")){
+            Transform native{};if(BoneOwnWorld(s.comp,s.bones[i],ScaleOf(c.world),native)){
+                check_native_bone_max_=(std::max)(check_native_bone_max_,Gap(native,c.bones[i],false));++check_native_bones_;
+            }
+        }
+        if(s.desc.kind==6){
+            Call count(s.comp,"GetNumberOfSplinePoints");
+            const int n=count.Invoke()?std::clamp(count.Get<int32_t>("ReturnValue"),0,64):0;
+            for(int i=0;i<n;++i){Call get(s.comp,"GetLocationAtSplinePoint");get.Set("PointIndex",i).Set("CoordinateSpace",uint8_t{0}).Invoke();c.spline.push_back(get.Get<Vector>("ReturnValue"));}
+        }
         capture_next_.push_back(std::move(c));
     }
     capture_next_seq_ = seq;
@@ -979,6 +1405,9 @@ void CheckLoop(ULONGLONG now) {
     if (now >= check_until_) {
         Logf("NET_PUPPET check done: %d rounds, %llu bones, largest %.2f cm (%s), mean %.3f cm, part places largest %.2f cm, shown mismatches %d", check_rounds_,
              static_cast<unsigned long long>(check_bones_), check_bone_max_, check_worst_, check_bones_ ? check_sum_ / static_cast<double>(check_bones_) : 0.0, check_part_max_, check_shown_bad_);
+        Logf("NET_PROJECTILE check done: %llu part samples, largest %.4f cm, shown mismatches %d",static_cast<unsigned long long>(check_projectile_parts_),check_projectile_max_,check_projectile_shown_bad_);
+        Logf("NET_FX check done: %llu spline points, largest %.4f cm, count mismatches %d",static_cast<unsigned long long>(check_spline_points_),check_spline_max_,check_spline_bad_);
+        Logf("NET_PUPPET native bone crosscheck: %llu samples, largest %.6f cm",static_cast<unsigned long long>(check_native_bones_),check_native_bone_max_);
         check_until_ = 0; capture_ready_ = false; return;
     }
     if (!capture_ready_) return;
@@ -989,22 +1418,37 @@ void CheckLoop(ULONGLONG now) {
         const Captured* c = nullptr; for (const Captured& q : capture_shown_) if (q.id == p.desc.id) { c = &q; break; }
         if (!c) continue;
         ++compared;
-        if ((p.shown > 0) != c->shown) ++shown_bad;
+        if (!Hair(p)&&(p.shown > 0) != c->shown) ++shown_bad; // hair has its own receiver preference/audit
         Transform a{}; WorldOf(p.comp, a);
+        const double place_gap=Gap(a,c->world,true);
+        if(c->projectile){++check_projectile_parts_;check_projectile_max_=(std::max)(check_projectile_max_,place_gap);if((p.shown>0)!=c->shown)++check_projectile_shown_bad_;}
+        if(place_gap>1.0&&check_place_details_++<5)
+            Logf("NET_PUPPET check place detail: id=%u kind=%u shown=%d parent=%u asset=%s gap=%.3f source=(%.2f,%.2f,%.2f) puppet=(%.2f,%.2f,%.2f)",
+                p.desc.id,p.desc.kind,p.shown,p.desc.parent,p.desc.asset.c_str(),place_gap,c->world.translation[0],c->world.translation[1],c->world.translation[2],a.translation[0],a.translation[1],a.translation[2]);
         if (Gap(a, c->world, true) > part_max) { part_max = Gap(a, c->world, true); worst_place = p.desc.id; }
+        if(p.desc.kind==6){
+            Call count(p.comp,"GetNumberOfSplinePoints");
+            const int n=count.Invoke()?count.Get<int32_t>("ReturnValue"):-1;
+            if(n!=static_cast<int>(c->spline.size()))++check_spline_bad_;
+            else for(int i=0;i<n;++i){
+                Call get(p.comp,"GetLocationAtSplinePoint");get.Set("PointIndex",i).Set("CoordinateSpace",uint8_t{0}).Invoke();
+                const Vector v=get.Get<Vector>("ReturnValue"),b=c->spline[static_cast<size_t>(i)];
+                const double dx=v.x-b.x,dy=v.y-b.y,dz=v.z-b.z;
+                check_spline_max_=(std::max)(check_spline_max_,std::sqrt(dx*dx+dy*dy+dz*dz));++check_spline_points_;
+            }
+        }
         if (!p.desc.posed || c->bones.size() != p.bones.size()) continue;
         Object* fn = BoneTransformFn(p.comp);
         for (size_t i = 0; i < p.bones.size(); ++i) {
-            const double d = Gap(BoneWorld(p.comp, fn, p.bones[i]), c->bones[i], true);
+            const double d = Gap(BoneOnlyWorld(p.comp,fn,p.bones[i],ScaleOf(a),static_cast<int>(i),&a), c->bones[i], true);
             sum += d; ++bones;
             if (d > bone_max) {
                 bone_max = d; char bone[64]{}, up[64] = "-"; ue::NameText(p.bones[i], bone, sizeof(bone));
                 const int pi = i < p.parents.size() ? p.parents[i] : -1; double pd = -1;
-                if (pi >= 0) { ue::NameText(p.bones[static_cast<size_t>(pi)], up, sizeof(up)); pd = Gap(BoneWorld(p.comp, fn, p.bones[static_cast<size_t>(pi)]), c->bones[static_cast<size_t>(pi)], true); }
+                if (pi >= 0) { ue::NameText(p.bones[static_cast<size_t>(pi)], up, sizeof(up)); pd = Gap(BoneOnlyWorld(p.comp,fn,p.bones[static_cast<size_t>(pi)],ScaleOf(a),pi,&a), c->bones[static_cast<size_t>(pi)], true); }
                 _snprintf_s(worst, sizeof(worst), _TRUNCATE, "part %u bone %s, its parent %s %.2f cm", p.desc.id, bone, up, pd);
                 if (d > 5 && pi >= 0 && pd < 1 && i < p.curr.size()) {  // the bone itself: the puppet's local, the one received, the hero's (from the capture)
-                    Transform mine{}; Call get(p.comp, "GetSocketTransform");
-                    if (get.Set("InSocketName", p.bones[i]).Set("TransformSpace", kSpaceParentBone).Invoke()) mine = get.Get<Transform>("ReturnValue");
+                    const Transform mine=RelativeTo(BoneWorld(p.comp,fn,p.bones[i],static_cast<int>(i)),BoneWorld(p.comp,fn,p.bones[static_cast<size_t>(pi)],pi));
                     const Transform hero = RelativeTo(c->bones[i], c->bones[static_cast<size_t>(pi)]); const Bone& got = p.curr[i];
                     Logf("NET_PUPPET check   %s local: puppet t(%.2f %.2f %.2f) q(%.3f %.3f %.3f %.3f) s%.2f; received t(%.2f %.2f %.2f) q(%.3f %.3f %.3f %.3f) s%.2f; hero t(%.2f %.2f %.2f) q(%.3f %.3f %.3f %.3f) s%.2f",
                          bone, mine.translation[0], mine.translation[1], mine.translation[2], mine.rotation[0], mine.rotation[1], mine.rotation[2], mine.rotation[3], mine.scale[0],
@@ -1038,6 +1482,8 @@ void HideOwn() {
     for (const char* path : {"/Script/Engine.MeshComponent"})
         for (Object* c : Components(puppet_, Cls(path))) {
             if (std::any_of(parts_.begin(), parts_.end(), [&](const Part& p) { return p.comp == c; })) continue;
+            if (std::any_of(local_grooms_.begin(), local_grooms_.end(), [&](const Part& p) { return p.comp == c; })) continue;
+            if (std::any_of(groom_drivers_.begin(), groom_drivers_.end(), [&](const Part& p) { return p.comp == c; })) continue;
             Call(c, "SetHiddenInGame").Set("NewHidden", true).Set("bPropagateToChildren", false).Invoke();
         }
 }
@@ -1082,6 +1528,7 @@ bool Spawn(const Context& c, ULONGLONG now, const char* why) {
     return true;
 }
 void Remove(const char* why) {
+    if(duel_)ResetDuel(false);
     if (PuppetAlive()) {
         ClearParts(why);
         Call(puppet_, "K2_DestroyActor").Invoke();
@@ -1196,8 +1643,14 @@ void Publish(ULONGLONG now) {
     Snapshot s;
     s.alive = PuppetAlive(); s.mirror = mirror_; s.source = s.alive ? source_ : 0; s.cls = cls_name_; s.controller = controller_name_;
     s.parts = static_cast<int>(parts_.size()); s.parts_shown = parts_shown_; s.part_failures = part_failures_;
+    s.hair_mode=InterlockedCompareExchange(&hair_mode_,0,0);
+    for(Part* p:HairParts())if(p->shown>0){if(p->desc.kind==2)++s.hair_grooms;else ++s.hair_cards;}
     s.poses = poses_applied_; s.assets_missing = assets_missing_; s.parts_lists = parts_updates_; s.frames_sent = frames_sent_;
     s.send_parts = static_cast<int>(sources_.size()); s.send_bones = static_cast<int>(send_bones_); s.send_kbps = send_kbps_;
+    s.parts_dropped=parts_dropped_;s.projectiles=projectiles_;s.projectile_parts=projectile_parts_;s.projectile_starts=projectile_starts_;
+    s.fx_world=fx_world_;s.fx_owned=fx_owned_;s.fx_active=fx_active_;s.fx_shown=0;s.fx_starts=fx_starts_;
+    for(const Part& p:parts_)if((p.desc.kind==4||p.desc.kind==5)&&p.fx_running>0)++s.fx_shown;
+    s.duel=duel_;s.duel_attacks=duel_state_.attacks;for(int i=0;i<2;++i){s.duel_health[i]=duel_state_.health[i];s.duel_hits[i]=duel_state_.hits[i];}
     s.camera_fixes = camera_fixes_; s.possess_fixes = possess_fixes_;
     s.note[0] = note_[0]; s.note[1] = note_[1];
     AcquireSRWLockExclusive(&lock_); snapshot_ = std::move(s); ReleaseSRWLockExclusive(&lock_);
@@ -1217,6 +1670,7 @@ void Tick(bool transitioning) {
     }
     Context c;
     if (transitioning || !ContextNow(c)) {
+        if(duel_)ResetDuel(false);
         for (Request r : requests) if (r == Request::MirrorOn || r == Request::MirrorOff) mirror_ = r == Request::MirrorOn;
         Publish(now); return;
     }
@@ -1236,22 +1690,43 @@ void Tick(bool transitioning) {
         case Request::Remove: Remove("button"); auto_spawn_ = false; Note(L"替身已移除", L"Puppet removed"); break;
         case Request::MirrorOn: mirror_ = true; break;
         case Request::MirrorOff: mirror_ = false; break;
+        case Request::DuelOn:
+            if(peer){Logf("NET_DUEL refused: local test only, leave the peer first");break;}
+            if(Spawn(c,now,"duel lab")){mirror_=true;check_until_=0;ResetDuel(true);}break;
+        case Request::DuelOff: ResetDuel(false);break;
+        case Request::Inspect:
+            Logf("NET_HAIR mode=%s local=%zu",InterlockedCompareExchange(&hair_mode_,0,0)==0?"groom":"cards",local_grooms_.size());
+            for(Part* p:HairParts())Logf("NET_HAIR part anchor=%u mask=%u kind=%u shown=%d actual=%d asset=%s",HairAnchor(*p),Hair(*p),p->desc.kind,p->shown,SourceShown(p->comp)?1:0,p->desc.asset.c_str());
+            {Object* cls=Cls("/Script/Niagara.NiagaraComponent");
+            Logf("NET_FX API enumerate=%d get_float=%d get_position=%d",ue::FindFunction(Cls("/Script/Niagara.NiagaraFunctionLibrary"),"GetAllUserParameters")?1:0,ue::FindFunction(cls,"GetVariableFloat")?1:0,ue::FindFunction(cls,"GetVariablePosition")?1:0);}
+            for(const Source& source:sources_)Logf("NET_PUPPET inventory id=%u kind=%u shown=%d active=%d asset=%s",source.desc.id,source.desc.kind,SourceShown(source.comp)?1:0,(source.desc.kind==4||source.desc.kind==5)&&Active(source.comp)?1:0,source.desc.asset.c_str());
+            break;
         case Request::Check:
+            if(duel_)ResetDuel(false);
             check_until_ = now + 10000; next_check_ = 0; check_bone_max_ = check_part_max_ = check_sum_ = 0; check_bones_ = 0; check_rounds_ = check_shown_bad_ = 0; strcpy_s(check_worst_, "-");
+            check_spline_max_=0;check_spline_points_=0;check_spline_bad_=0;
+            check_projectile_parts_=0;check_projectile_max_=0;check_projectile_shown_bad_=0;
+            check_place_details_=0;
+            check_native_bone_max_=0;check_native_bones_=0;
             capture_next_.clear(); capture_shown_.clear(); capture_ready_ = false;
             Logf("NET_PUPPET check started (10 s; the loop: mirror on, no peer, puppet %s)", PuppetAlive() ? "here" : "not spawned");
             break;
         }
     }
+    if(duel_&&(peer||!mirror_||!PuppetAlive()))ResetDuel(false);
     if (auto_spawn_ && !PuppetAlive()) { stage_ = "spawn"; Spawn(c, now, "peer connected"); }
     if (peer) { stage_ = "send"; SendState(c, now); Stream(c.pawn, now, true, false); }
     if (PuppetAlive()) {
         stage_ = "report"; Report(c, now);
         stage_ = "guard"; Guard(c, now);
         Drive(c, now, peer);
+        if(duel_)TickDuel(now);
     }  // no puppet yet: the peer's newest parts and pose wait in NetSteam
     stage_ = "publish";
     if (PuppetAlive()) Timing(now);
+    if(PuppetAlive()&&now>=next_fx_report_){next_fx_report_=now+2000;
+        int copied=0,active=0;for(const Part& p:parts_)if(p.desc.kind==4||p.desc.kind==5){++copied;if(p.fx_running>0)++active;}
+        Logf("NET_FX world=%d owned=%d source_active=%d copied=%d active=%d starts=%u",fx_world_,fx_owned_,fx_active_,copied,active,fx_starts_);}
     Publish(now);
     stage_ = "idle";
 }
@@ -1262,7 +1737,8 @@ void RemoveAfterFault() {
 }
 }  // namespace
 
-void Initialize(Logger logger) { logger_ = logger; }
+void Initialize(Logger logger) { logger_ = logger;SetHairMode(SettingsStore::GetInt(L"NetPuppet",L"HairMode",0),false); }
+void SetHairMode(int mode,bool save){mode=mode==1?1:0;InterlockedExchange(&hair_mode_,mode);if(save)SettingsStore::PutInt(L"NetPuppet",L"HairMode",mode);}
 void OnGameThreadGuarded(bool transitioning) {
     if (disabled_) return;
     __try { Tick(transitioning); }

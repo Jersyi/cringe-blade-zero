@@ -29,6 +29,16 @@ build_*/
 dist/
 local/
 
-# Players' chain files (combos\*.combo next to version.dll) are personal data: never in the repository or the ZIP.
+# Player files stay private. The maintainer explicitly publishes this named example only.
 combos/
 *.combo
+!samples/sampleCombo.combo
+!samples/README.md
+!tests/installer_sample_test.ps1
+!scripts/build_manual.py
+!docs/USER_MANUAL.md
+!docs/ANIMATION_PRESETS.md
+!docs/WEAPON_DERIVATIONS.md
+!THIRD_PARTY_NOTICES.md
+!licenses/UUEPBS-LICENSE-STATUS.txt
+!docs/SOFT_BONES.md

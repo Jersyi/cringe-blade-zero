@@ -22,6 +22,9 @@ inline const Move* MoveOf(const std::string& id, const std::string& ability) {
     return nullptr;
 }
 inline bool IsShaqi(const std::string& id) { const Weapon* weapon = Find(id); return weapon && weapon->shaqi; }
+inline bool HeldAttack(const std::string& ability) {
+    return ability.find("_B_Hold")!=std::string::npos || ability.find("_BCharge")!=std::string::npos;
+}
 // "AAB" -> "轻轻重"; empty for a move outside the numbered stages.
 inline std::wstring StagePresses(const char* stage) {
     std::wstring out;

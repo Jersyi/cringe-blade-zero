@@ -1,4 +1,5 @@
 #pragma once
+#include "bone_motion_model.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -215,7 +216,7 @@ inline bool Fires(Trigger trigger, unsigned bits) {
 // one button has rows with holds, its press waits: the longest hold is taken the moment it is reached, otherwise the
 // longest hold reached when the button is let go (a tap: none).
 enum class NodeType : int { Skill, Interval, Trigger, AutoDodge, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, WeaponMove, Damage, Group, Teleport,
-                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirDefault };
+                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirDefault, BoneTransform };
 // One row of a branch: a press of `button` (a Trigger, the NPC key included) at least pause_ms after the press
 // before it goes on to `next`. A 自定义组合键 / 自定义按键 row is pressed with its own keys, as such a trigger is: `keys`
 // (the hero's buttons / keyboard, mouse and pad keys) in order (each within `window` ms, default kKeyWindowDefault)
@@ -226,7 +227,7 @@ struct Route { int button = static_cast<int>(Trigger::Light); int pause_ms = 0; 
 // The modifier slots of a node's `mods`: the 加速, 霸体, 武器属性, 允许中断, 伤害倍率, 无敌, 保留变身, 强制受击, 无视防御,
 // 保持派生, 裁剪 and 滞空 node it points at (-1 none).
 enum ModSlot : int { kModSpeed, kModArmor, kModWeapon, kModInterrupt, kModDamage, kModInvincible, kModKeepLook, kModForceHit, kModIgnoreGuard, kModKeepChain, kModTrim,
-                     kModAir, kModSlots };
+                     kModAir, kModBone, kModSlots };
 // Every slot empty (-1), however many slots there are.
 inline constexpr std::array<int, kModSlots> NoMods() { std::array<int, kModSlots> mods{}; for (size_t i = 0; i < mods.size(); ++i) mods[i] = -1; return mods; }
 // A node on the page's canvas: x, y its top-left (96-dpi units); next the node its exec output is wired to (-1
@@ -277,8 +278,10 @@ struct Node {
     // 裁剪: the part of the BOSS 技能 pointing at it that plays, in its montage's own time (ms): from trim_from to trim_to
     // (0, or not after trim_from: to its end).
     int trim_from = 0, trim_to = 0;
+    std::vector<int> trim_holds; // montage ms: hold the activating input here, release to continue
     struct CurvePoint { int t = 0; int speed = 100; };
     std::vector<CurvePoint> points;
+    BoneMotion::Config bones; // per-move visual edits; serialized as an unwired interval for old builds
 };
 // placed: false when the text had no places (saved before the canvas), so the page lays the nodes out once.
 struct Config { bool enabled = true; std::vector<Node> chain; bool placed = true; };
@@ -286,6 +289,10 @@ struct Config { bool enabled = true; std::vector<Node> chain; bool placed = true
 constexpr size_t kMaxNodes = 10000, kMaxRoutes = 6;
 constexpr int kTrimMax = 60000, kTrimStep = 50;  // 裁剪, ms of the move's montage
 inline int ClampTrim(int ms) { return std::clamp(ms, 0, kTrimMax); }
+inline std::vector<int> TrimHolds(std::vector<int> points){
+    for(int& t:points)t=ClampTrim(t);std::sort(points.begin(),points.end());points.erase(std::unique(points.begin(),points.end()),points.end());
+    if(points.size()>32)points.resize(32);return points;
+}
 constexpr int kIntervalMin = 50, kIntervalMax = 10000, kIntervalDefault = 500, kIntervalStep = 50;
 constexpr int kResetMin = 100, kResetMax = 5000, kResetDefault = 1200, kResetStep = 100;
 constexpr int kSpeedMin = 50, kSpeedMax = 1000, kSpeedDefault = 100, kSpeedNew = 150, kSpeedStep = 10;
@@ -428,23 +435,23 @@ inline const char* HitKindTag(int kind) {
 }
 // A key of a combo: the hero's attack / skill / jump buttons, or the dodge button (any dodge).
 inline bool ValidComboKey(int key) {
-    return (key >= static_cast<int>(Trigger::Light) && key <= static_cast<int>(Trigger::Jump)) || key == static_cast<int>(Trigger::AnyDodge);
+    return (key >= static_cast<int>(Trigger::Light) && key <= static_cast<int>(Trigger::Jump)) || key == static_cast<int>(Trigger::AnyDodge) || key == static_cast<int>(Trigger::Stance);
 }
 inline const wchar_t* ComboKeyLabel(int key) {
     switch (static_cast<Trigger>(key)) {
     case Trigger::Light: return L"轻攻击"; case Trigger::Heavy: return L"重攻击"; case Trigger::Shachi: return L"影之武装";
     case Trigger::Special: return L"特殊攻击"; case Trigger::CombatArt: return L"战技"; case Trigger::Jump: return L"跳跃";
-    case Trigger::AnyDodge: return L"闪避"; default: return L"";
+    case Trigger::AnyDodge: return L"闪避"; case Trigger::Stance: return L"格挡"; default: return L"";
     }
 }
-// 自定义按键: 1 to 6 keyboard keys / mouse side buttons / pad buttons / left-stick pushes, a code each: a virtual key
-// (1..254, never the left / right mouse button), kPadKey + a bit of the hotkey module's pad layout (the Xbox buttons; a
+// 自定义按键: 1 to 6 keyboard keys / five mouse buttons / pad buttons / left-stick pushes, a code each: a virtual key
+// (1..254, including left / right mouse buttons), kPadKey + a bit of the hotkey module's pad layout (the Xbox buttons; a
 // PlayStation pad's sit on the same bits, and Steam Input's virtual pad reads as Xbox), or kStickKey + a way of the left
 // stick (up / forward, down / back, left, right: a push past half way along its main axis is one press, as the
 // motion inputs of a fighting game: 上推 -> 下推 -> 方块 in order).
 constexpr int kPadKey = 0x100, kPadBits = 16, kStickWays = 4, kStickKey = kPadKey + kPadBits;
 inline bool ValidRawKey(int code) {
-    return (code > 0x02 && code < 0xFF) || (code >= kPadKey && code < kStickKey + kStickWays);
+    return (code > 0 && code < 0xFF) || (code >= kPadKey && code < kStickKey + kStickWays);
 }
 // A pad code: a button or a stick way (both read from the pad, by bit: the button bits, then the stick's after them).
 inline bool IsPadKey(int code) { return code >= kPadKey && code < kStickKey + kStickWays; }
@@ -480,7 +487,7 @@ inline bool ValidRouteButton(int button) {
 inline bool WeaponTrigger(int trigger) { return trigger == static_cast<int>(Trigger::Execution) || trigger == static_cast<int>(Trigger::SimpleExecution); }
 // A 武器派生修改 row's action: a hero action (never the NPC key or own keys).
 inline bool ValidWeaponAction(int button) {
-    return ValidButton(button) && button != static_cast<int>(Trigger::NpcKey) && button != static_cast<int>(Trigger::Combo) && button != static_cast<int>(Trigger::Keys);
+    return ValidButton(button) && button != static_cast<int>(Trigger::NpcKey);
 }
 // A 空中派生 row's press: the NPC key or a hero action (never an execution, nor own keys).
 inline bool ValidAirAction(int button) {
@@ -543,14 +550,14 @@ inline bool EmptyMove(const Node& node) {
 inline bool IsModifier(const Node& node) {
     return node.type == NodeType::Speed || node.type == NodeType::Weapon || node.type == NodeType::Armor || node.type == NodeType::Interrupt ||
            node.type == NodeType::Damage || node.type == NodeType::Invincible || node.type == NodeType::KeepLook || node.type == NodeType::ForceHit ||
-           node.type == NodeType::IgnoreGuard || node.type == NodeType::KeepChain || node.type == NodeType::Trim || node.type == NodeType::Air;
+           node.type == NodeType::IgnoreGuard || node.type == NodeType::KeepChain || node.type == NodeType::Trim || node.type == NodeType::Air || node.type == NodeType::BoneTransform;
 }
 // A modifier's slot in `mods` (-1: not a modifier).
 inline int SlotOf(NodeType type) {
     return type == NodeType::Speed ? kModSpeed : type == NodeType::Armor ? kModArmor : type == NodeType::Weapon ? kModWeapon : type == NodeType::Interrupt ? kModInterrupt :
            type == NodeType::Damage ? kModDamage : type == NodeType::Invincible ? kModInvincible : type == NodeType::KeepLook ? kModKeepLook :
            type == NodeType::ForceHit ? kModForceHit : type == NodeType::IgnoreGuard ? kModIgnoreGuard : type == NodeType::KeepChain ? kModKeepChain : type == NodeType::Trim ? kModTrim :
-           type == NodeType::Air ? kModAir : -1;
+           type == NodeType::Air ? kModAir : type == NodeType::BoneTransform ? kModBone : -1;
 }
 // A move 滞空 / 空中释放 act on: one the hero casts and moves in (not a 钩子 or a 瞬移, which carry the hero their own
 // way, nor a 投技, a 援护 or a look change).
@@ -706,6 +713,23 @@ inline int TriggerOf(const Config& config, size_t node) {
     }
     return -1;
 }
+// All first-trigger owners in one traversal. An earlier trigger's reachable
+// subgraph is already complete, so later triggers never need to walk it again.
+inline std::vector<int> Owners(const Config& config) {
+    std::vector<int> owners(config.chain.size(),-1),stack;
+    for(size_t root=0;root<config.chain.size();++root){
+        if(!StartsChain(config.chain[root])||owners[root]>=0)continue;
+        stack.push_back(static_cast<int>(root));
+        while(!stack.empty()){
+            const int index=stack.back();stack.pop_back();
+            if(index<0||static_cast<size_t>(index)>=owners.size()||owners[static_cast<size_t>(index)]>=0)continue;
+            owners[static_cast<size_t>(index)]=static_cast<int>(root);
+            const auto& node=config.chain[static_cast<size_t>(index)];
+            for(size_t out=0;out<OutCount(node);++out)stack.push_back(OutOf(node,out));
+        }
+    }
+    return owners;
+}
 // Wires output `out` of `from` (a branch's route row; 0 otherwise) to `to` (-1: unwired). No exec wire goes into a
 // trigger, a modifier or the node itself, and none comes out of a modifier.
 inline void Link(Config& config, int from, int to, size_t out = 0) {
@@ -799,6 +823,11 @@ inline void Remove(Config& config, size_t index) {
 // hold_ms: how long the button has been held when the press is taken (按住; 0: the moment it went down).
 // airborne: the hero was in the air at the press (a 空中派生 takes it).
 struct Press { unsigned bits = 0; bool key = false; std::string weapon; int combo = -1; int branch = -1, row = -1; bool then = false; int hold_ms = 0; bool airborne = false; };
+// An unmapped native action is a detour, not an instruction to reset a live chain.
+// Explicit graph keys/rows keep their own routing and reset semantics.
+inline bool NativeDetour(const Press& press,bool active) {
+    return active&&press.bits&&!press.key&&press.combo<0&&press.branch<0&&!press.then;
+}
 inline bool Matches(int button, const Press& press) {
     if (button == kThenKeyButton) return press.then;
     if (press.then) return false;
@@ -828,16 +857,19 @@ inline bool KeysRouteReady(const Route& route) {
 inline int ActionRank(int button) { return button == static_cast<int>(Trigger::AnyDodge) || button == static_cast<int>(Trigger::Execution) ? 0 : 1; }
 // The row of a 武器派生修改 a press takes (-1: none): its weapon is the press's (a 空中派生: the press was made in the
 // air), the row is wired and fires on the press; the most specific such row (ActionRank), the first of those.
-inline int WeaponActionsRow(const Node& node, const Press& press) {
+inline int WeaponActionsRow(const Node& node, const Press& press, int node_index=-1) {
     if (node.type != NodeType::WeaponActions || !node.on) return -1;
     if (node.air_set ? !press.airborne : node.weapon.empty() || press.key || node.weapon != press.weapon) return -1;
     int best = -1;
     for (size_t r = 0; r < node.routes.size(); ++r) {
         const Route& route = node.routes[r];
         if (route.next < 0) continue;
+        if (ClampHold(route.hold_ms) > press.hold_ms) continue;
+        if (KeysRoute(route) && (node_index<0 || press.branch!=node_index || press.row!=static_cast<int>(r) || !KeysRouteReady(route))) continue;
         if (node.air_set ? !ValidAirAction(route.button) || !Matches(route.button, press) :
                            !ValidWeaponAction(route.button) || !Fires(static_cast<Trigger>(route.button), press.bits)) continue;
-        if (best < 0 || ActionRank(route.button) > ActionRank(node.routes[static_cast<size_t>(best)].button)) best = static_cast<int>(r);
+        if (best < 0 || ActionRank(route.button) > ActionRank(node.routes[static_cast<size_t>(best)].button) ||
+            (ActionRank(route.button) == ActionRank(node.routes[static_cast<size_t>(best)].button) && ClampHold(route.hold_ms) > ClampHold(node.routes[static_cast<size_t>(best)].hold_ms))) best = static_cast<int>(r);
     }
     return best;
 }
@@ -851,9 +883,10 @@ inline Hop Follow(const Config& config, int from, int button, const Press& press
     int i = origin.next;
     if (config.chain[static_cast<size_t>(from)].type == NodeType::WeaponActions) {  // from the row of the press's action
         const Node& start = config.chain[static_cast<size_t>(from)];
-        const int row = WeaponActionsRow(start, press);
+        const int row = WeaponActionsRow(start, press, from);
         if (row < 0) return {};
         hop.button = start.routes[static_cast<size_t>(row)].button; i = start.routes[static_cast<size_t>(row)].next;
+        hop.hold_ms = ClampHold(start.routes[static_cast<size_t>(row)].hold_ms);
     }
     // Past a BOSS 援护 a press that finds nothing more to play stops at the last 援护 (it is the hop's move).
     const auto rest = [&]() -> Hop {
@@ -894,7 +927,7 @@ inline Hop Follow(const Config& config, int from, int button, const Press& press
         }
         if (best < 0) return {};
         hop.button = node.routes[static_cast<size_t>(best)].button; hop.pause_ms = ClampPause(node.routes[static_cast<size_t>(best)].pause_ms);
-        hop.hold_ms = ClampHold(node.routes[static_cast<size_t>(best)].hold_ms);
+        hop.hold_ms = (std::max)(hop.hold_ms, ClampHold(node.routes[static_cast<size_t>(best)].hold_ms));
         hop.branch = i; hop.row = best;
         i = node.routes[static_cast<size_t>(best)].next;
     }
@@ -904,8 +937,8 @@ inline Hop Follow(const Config& config, int from, int button, const Press& press
 // none): the one with the longest such hold, the first of those. A 空中派生 with a row for a press made in the air goes
 // first, then a 武器派生修改 of the press's weapon with a row for it.
 inline int TriggerFor(const Config& config, const Press& press) {
-    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].air_set && WeaponActionsRow(config.chain[i], press) >= 0) return static_cast<int>(i);
-    for (size_t i = 0; i < config.chain.size(); ++i) if (WeaponActionsRow(config.chain[i], press) >= 0) return static_cast<int>(i);
+    for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].air_set && WeaponActionsRow(config.chain[i], press, static_cast<int>(i)) >= 0) return static_cast<int>(i);
+    for (size_t i = 0; i < config.chain.size(); ++i) if (WeaponActionsRow(config.chain[i], press, static_cast<int>(i)) >= 0) return static_cast<int>(i);
     int best = -1;
     for (size_t i = 0; i < config.chain.size(); ++i) {
         const Node& node = config.chain[i];
@@ -927,11 +960,21 @@ inline int StartButton(const Config& config, int start, const Press& press) {
     if (start < 0 || static_cast<size_t>(start) >= config.chain.size()) return -1;
     const Node& node = config.chain[static_cast<size_t>(start)];
     if (node.type != NodeType::WeaponActions) return node.trigger;
-    const int row = WeaponActionsRow(node, press);
+    const int row = WeaponActionsRow(node, press, start);
     return row < 0 ? -1 : node.routes[static_cast<size_t>(row)].button;
 }
 // 自定义组合键 presses: one per frame with any of the hero's buttons going down (bits of every button down then).
 struct KeyPress { unsigned bits = 0; unsigned long long at = 0; };
+// Weapon-action chords allow a modifier already held (block, then E).
+// Require a fresh edge of one member, so a held chord cannot fire every frame.
+inline bool HeldActionChord(const std::vector<int>& keys,unsigned held,unsigned went){
+    if(keys.size()<kComboKeysMin||keys.size()>kComboKeysMax)return false;bool edge=false;
+    for(int key:keys){if(!ValidComboKey(key)||!Fires(static_cast<Trigger>(key),held))return false;edge=edge||Fires(static_cast<Trigger>(key),went);}return edge;
+}
+inline bool HeldRawChord(const std::vector<int>& keys,const std::vector<int>& held,const std::vector<int>& went){
+    if(keys.empty()||keys.size()>kComboKeysMax)return false;bool edge=false;
+    for(int key:keys){if(!ValidRawKey(key)||std::find(held.begin(),held.end(),key)==held.end())return false;edge=edge||std::find(went.begin(),went.end(),key)!=went.end();}return edge;
+}
 // In order: the newest presses are the keys one after another, each within `window` ms of the one before.
 inline bool SequenceDone(const std::vector<KeyPress>& presses, const std::vector<int>& keys, int window) {
     if (keys.size() < kComboKeysMin || presses.size() < keys.size()) return false;
@@ -1128,11 +1171,11 @@ inline int ModOf(const Config& config, int from, int slot) {
 }
 // 裁剪: the part of a move that plays (seconds of its montage). A BOSS 技能 pointing at a 裁剪 node (its own arrow only):
 // from trim_from to trim_to; `to` 0 means to the end (also a trim_to not after trim_from).
-struct TrimRange { bool on = false; double from = 0, to = 0; };
+struct TrimRange { bool on = false; double from = 0, to = 0; std::vector<int> holds; };
 inline TrimRange TrimOf(const Node& trim) {
     TrimRange r; r.from = ClampTrim(trim.trim_from) / 1000.0;
     const int to = ClampTrim(trim.trim_to); r.to = to > ClampTrim(trim.trim_from) ? to / 1000.0 : 0;
-    r.on = r.from > 0 || r.to > 0; return r;
+    r.holds=TrimHolds(trim.trim_holds);r.on = r.from > 0 || r.to > 0 || !r.holds.empty(); return r;
 }
 inline TrimRange TrimFor(const Config& config, int index) {
     if (index < 0 || static_cast<size_t>(index) >= config.chain.size() || config.chain[static_cast<size_t>(index)].type != NodeType::BossSkill) return {};
@@ -1237,6 +1280,41 @@ inline std::vector<int> GroupSteps(const Config& config, int group, int guard = 
     }
     return steps;
 }
+// Canvas clipboard: a detached subgraph. The three unique settings/entry nodes
+// stay in their original table. Selecting a group also selects its descendants.
+inline bool ClipboardNode(const Node& node) {
+    return !IsSetting(node)&&!(node.type==NodeType::Trigger&&node.trigger==static_cast<int>(Trigger::NpcKey));
+}
+inline std::vector<Node> CopyNodes(const Config& config,const std::vector<int>& selection) {
+    std::vector<bool> picked(config.chain.size(),false);
+    for(int index:selection)if(index>=0&&static_cast<size_t>(index)<picked.size())picked[static_cast<size_t>(index)]=true;
+    for(size_t i=0;i<config.chain.size();++i){
+        int parent=config.chain[i].group;
+        for(int depth=0;parent>=0&&static_cast<size_t>(parent)<picked.size()&&depth<=kGroupDepthMax;++depth){
+            if(picked[static_cast<size_t>(parent)]&&config.chain[static_cast<size_t>(parent)].type==NodeType::Group){picked[i]=true;break;}
+            parent=config.chain[static_cast<size_t>(parent)].group;
+        }
+    }
+    std::vector<int> map(config.chain.size(),-1);std::vector<Node> out;
+    for(size_t i=0;i<picked.size();++i)if(picked[i]&&ClipboardNode(config.chain[i])){map[i]=static_cast<int>(out.size());out.push_back(config.chain[i]);}
+    const auto link=[&](int target){return target>=0&&static_cast<size_t>(target)<map.size()?map[static_cast<size_t>(target)]:-1;};
+    for(auto& node:out){node.next=link(node.next);node.group=link(node.group);for(int& mod:node.mods)mod=link(mod);for(auto& route:node.routes)route.next=link(route.next);}
+    return out;
+}
+// Appends atomically; preserves relative geometry and returns the new indices.
+inline std::vector<int> PasteNodes(Config& config,const std::vector<Node>& copied,int dx,int dy) {
+    if(copied.empty()||copied.size()>kMaxNodes||config.chain.size()>kMaxNodes-copied.size()||
+        std::any_of(copied.begin(),copied.end(),[](const Node& node){return !ClipboardNode(node);}))return {};
+    int min_x=kCanvasLimit,max_x=-kCanvasLimit,min_y=kCanvasLimit,max_y=-kCanvasLimit;
+    for(const auto& node:copied){min_x=(std::min)(min_x,node.x);max_x=(std::max)(max_x,node.x);min_y=(std::min)(min_y,node.y);max_y=(std::max)(max_y,node.y);}
+    if(min_x<-kCanvasLimit||max_x>kCanvasLimit||min_y<-kCanvasLimit||max_y>kCanvasLimit)return {};
+    dx=std::clamp(dx,-kCanvasLimit-min_x,kCanvasLimit-max_x);dy=std::clamp(dy,-kCanvasLimit-min_y,kCanvasLimit-max_y);
+    const int base=static_cast<int>(config.chain.size());std::vector<Node> nodes=copied;std::vector<int> added;added.reserve(nodes.size());
+    const auto link=[&](int target){return target>=0&&static_cast<size_t>(target)<nodes.size()?base+target:-1;};
+    for(size_t i=0;i<nodes.size();++i){auto& node=nodes[i];node.x+=dx;node.y+=dy;node.next=link(node.next);node.group=link(node.group);
+        for(int& mod:node.mods)mod=link(mod);for(auto& route:node.routes)route.next=link(route.next);added.push_back(base+static_cast<int>(i));}
+    config.chain.reserve(config.chain.size()+nodes.size());config.chain.insert(config.chain.end(),nodes.begin(),nodes.end());config.placed=true;return added;
+}
 // The modifier for a move in a slot: its own arrow, else its frames' (innermost first), else the trigger's (-1: none).
 inline int ModFor(const Config& config, int trigger, int move, int slot) {
     int mod = ModOf(config, move, slot);
@@ -1292,7 +1370,7 @@ inline bool IgnoreGuardFor(const Config& config, int trigger, int move) {
     return ModFor(config, trigger, move, kModIgnoreGuard) >= 0;
 }
 // 保持派生 at the chain's place `at` (a move it plays or waits after; a trigger, a 组合): its time in ms, from the move,
-// a frame it sits in or the trigger (0: none, the chain ends on a press it does not take as before).
+// a frame it sits in or the trigger (0: the regular reset window; native detours still preserve the cursor).
 inline int KeepChainFor(const Config& config, int trigger, int at) {
     const int mod = ModFor(config, trigger, at, kModKeepChain);
     return mod < 0 ? 0 : ClampKeepChain(config.chain[static_cast<size_t>(mod)].ms);
@@ -1534,7 +1612,7 @@ inline std::wstring Encode(const Config& config) {
         case NodeType::KeepChain: text += "|k:" + std::to_string(ClampKeepChain(node.ms)) + "," + pos(node); break;
         case NodeType::PreInput: text += "|J:" + std::to_string(ClampPreInput(node.ms)) + "," + pos(node); break;
         // An unwired 间隔 in an older build; the "f:" / "j:" marks below make them 滞空 / 空中释放 again.
-        case NodeType::Air: case NodeType::AirDefault: text += "|I:" + std::to_string(kIntervalDefault) + "," + pos(node) + ",-1"; break;
+        case NodeType::BoneTransform: case NodeType::Air: case NodeType::AirDefault: text += "|I:" + std::to_string(kIntervalDefault) + "," + pos(node) + ",-1"; break;
         case NodeType::Grab: text += "|G:" + at(node) + (GrabMoveId(node.ability) ? "," + node.ability : std::string()); break;
         case NodeType::Assist:
             text += "|a:" + (AbilityName(node.boss) ? node.boss : std::string("_")) + "," + (AbilityName(node.ability) ? node.ability : std::string("_")) + "," + at(node);
@@ -1560,7 +1638,7 @@ inline std::wstring Encode(const Config& config) {
         case NodeType::WeaponActions:
             text += "|O:" + pos(node) + "," + (AbilityName(node.weapon) ? node.weapon : std::string("_")) + "," + std::to_string(ClampReset(node.ms));
             for (const Route& route : node.routes)
-                if (node.air_set ? ValidAirAction(route.button) : ValidWeaponAction(route.button)) text += "," + std::to_string(route.button) + "," + std::to_string(route.next);
+                if (node.air_set ? ValidAirAction(route.button) : ValidWeaponAction(route.button)) text += "," + RouteButtonToken(route) + "," + std::to_string(route.next);
             break;
         case NodeType::Branch:
             text += "|K:" + std::to_string(ClampPosition(node.x)) + "," + std::to_string(ClampPosition(node.y));
@@ -1575,6 +1653,9 @@ inline std::wstring Encode(const Config& config) {
             const int mod = ModOf(config, static_cast<int>(i), s);
             if (mod >= 0) text += "|L:" + std::to_string(i) + "," + std::to_string(mod);
         }
+    // b:node~config. Older readers keep an inert, unwired interval and ignore its modifier link.
+    for(size_t i=0;i<config.chain.size();++i)if(config.chain[i].type==NodeType::BoneTransform)
+        text+="|b:"+std::to_string(i)+"~"+BoneMotion::Encode(config.chain[i].bones);
     // 不变身 marks: "h:node" (an older build ignores them; the node keeps its look change there).
     for (size_t i = 0; i < config.chain.size(); ++i)
         if (TakesOwnLook(config.chain[i]) && config.chain[i].own_look) text += "|h:" + std::to_string(i);
@@ -1604,13 +1685,15 @@ inline std::wstring Encode(const Config& config) {
     }
     // 裁剪 marks: "c:node,from,to" (ms); an older build reads a 武器属性 there, and a BOSS 技能's arrow to it does not fit one.
     for (size_t i = 0; i < config.chain.size(); ++i)
-        if (config.chain[i].type == NodeType::Trim)
+        if (config.chain[i].type == NodeType::Trim){
             text += "|c:" + std::to_string(i) + "," + std::to_string(ClampTrim(config.chain[i].trim_from)) + "," + std::to_string(ClampTrim(config.chain[i].trim_to));
+            const auto points=TrimHolds(config.chain[i].trim_holds);if(!points.empty()){text+="|z:"+std::to_string(i);for(int t:points)text+=","+std::to_string(t);}
+        }
     // 按住 marks: "w:node,row,ms" (row -1: a trigger's own); an older build takes any press.
     for (size_t i = 0; i < config.chain.size(); ++i) {
         const Node& node = config.chain[i];
         if (node.type == NodeType::Trigger && ClampHold(node.hold_ms) > 0) text += "|w:" + std::to_string(i) + ",-1," + std::to_string(ClampHold(node.hold_ms));
-        if (node.type == NodeType::Branch)
+        if (HasRows(node))
             for (size_t r = 0; r < node.routes.size(); ++r)
                 if (ClampHold(node.routes[r].hold_ms) > 0) text += "|w:" + std::to_string(i) + "," + std::to_string(r) + "," + std::to_string(ClampHold(node.routes[r].hold_ms));
     }
@@ -1621,6 +1704,7 @@ inline Config Decode(const std::wstring& wide) {
     for (wchar_t c : wide) text.push_back(c < 128 ? static_cast<char>(c) : '?');
     struct OldReplace { int hero = 5; std::string ability; bool on = true; bool placed = false; int x = 0, y = 0; };
     std::vector<OldReplace> olds;
+    std::vector<std::pair<int,BoneMotion::Config>> bone_marks;
     bool triggers = false, old_key = false, placed = true; int start = -1, start_x = 24, start_y = 24;
     std::vector<std::pair<int, int>> arrows;  // node -> modifier
     std::vector<int> own_looks;  // 不变身 BOSS 技能 / 投技 nodes
@@ -1632,6 +1716,7 @@ inline Config Decode(const std::wstring& wide) {
     std::vector<HoldMark> holds;  // 按住
     struct TrimMark { int node = -1, from = 0, to = 0; };
     std::vector<TrimMark> trims;  // 裁剪 (written as 武器属性)
+    std::vector<std::pair<int,std::vector<int>>> charge_marks;
     struct AirMark { int node = -1; bool fixed = false, on = true; int lift = 0, hang = 0, foe_lift = 0, foe_hang = 0; };
     std::vector<AirMark> airs;  // 滞空 / 空中释放 (written as 间隔)
     std::vector<std::pair<int, int>> launches;  // 强制受击 击飞 heights
@@ -1646,6 +1731,10 @@ inline Config Decode(const std::wstring& wide) {
         else if (part[0] == 'L') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
             if (f.size() == 2) arrows.push_back({std::atoi(f[0].c_str()), std::atoi(f[1].c_str())});
+        } else if(part[0]=='b') {
+            const size_t sep=part.find('~',2);
+            if(sep!=std::string::npos&&sep>2&&std::isdigit(static_cast<unsigned char>(part[2]))&&bone_marks.size()<kMaxNodes)
+                bone_marks.emplace_back(std::atoi(part.substr(2,sep-2).c_str()),BoneMotion::Decode(part.substr(sep+1)));
         } else if (part[0] == 'h') {
             const std::string f = part.substr(2);
             if (!f.empty() && std::isdigit(static_cast<unsigned char>(f[0]))) own_looks.push_back(std::atoi(f.c_str()));
@@ -1675,6 +1764,10 @@ inline Config Decode(const std::wstring& wide) {
         } else if (part[0] == 'u') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
             if (f.size() == 2) launches.push_back({std::atoi(f[0].c_str()), ClampLaunch(std::atoi(f[1].c_str()))});
+        } else if (part[0] == 'z') {
+            const auto f=Split(part.substr(2),',');if(f.size()<2||f.size()>33||f[0].empty()||f[0].size()>5||f[0].find_first_not_of("0123456789")!=std::string::npos)continue;
+            std::vector<int> points;bool valid=true;for(size_t j=1;j<f.size();++j){if(f[j].empty()||f[j].find_first_not_of("0123456789")!=std::string::npos||f[j].size()>5){valid=false;break;}points.push_back(ClampTrim(std::atoi(f[j].c_str())));}
+            if(valid)charge_marks.push_back({std::atoi(f[0].c_str()),TrimHolds(points)});
         } else if (part[0] == 'c') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
             if (f.size() == 3) trims.push_back({std::atoi(f[0].c_str()), ClampTrim(std::atoi(f[1].c_str())), ClampTrim(std::atoi(f[2].c_str()))});
@@ -1828,7 +1921,7 @@ inline Config Decode(const std::wstring& wide) {
             if (AbilityName(f[2]) && f[2] != "_") node.weapon = f[2];
             node.ms = ClampReset(std::atoi(f[3].c_str()));
             for (size_t r = 4; r + 1 < f.size() && node.routes.size() < kMaxRoutes; r += 2) {
-                Route route; route.button = std::atoi(f[r].c_str()); route.next = std::atoi(f[r + 1].c_str());
+                Route route = RouteFromToken(f[r]); route.next = std::atoi(f[r + 1].c_str());
                 if (ValidWeaponAction(route.button) || ValidAirAction(route.button)) node.routes.push_back(route);  // which: once the "s:" marks are read
             }
             config.chain.push_back(node);
@@ -1883,6 +1976,10 @@ inline Config Decode(const std::wstring& wide) {
             config.chain.push_back(trigger); config.chain.push_back(move);
         }
     }
+    for(auto& mark:bone_marks)if(mark.first>=0&&mark.first<count){
+        Node& n=config.chain[static_cast<size_t>(mark.first)];
+        if(n.type==NodeType::Interval&&n.next<0){n.type=NodeType::BoneTransform;n.ms=0;n.bones=std::move(mark.second);}
+    }
     // 滞空 / 空中释放 first too (unwired 间隔 in the text; 空中释放 once).
     for (const AirMark& a : airs) {
         if (a.node < 0 || a.node >= count) continue;
@@ -1907,6 +2004,7 @@ inline Config Decode(const std::wstring& wide) {
         Node& node = config.chain[static_cast<size_t>(t.node)];
         if (node.type == NodeType::Weapon) { node.type = NodeType::Trim; node.trim_from = t.from; node.trim_to = t.to; }
     }
+    for(const auto& mark:charge_marks)if(mark.first>=0&&mark.first<count&&config.chain[static_cast<size_t>(mark.first)].type==NodeType::Trim)config.chain[static_cast<size_t>(mark.first)].trim_holds=mark.second;
     // Arrows only where they fit (one per slot: the last one read wins); no exec wire into a trigger, a modifier or
     // itself.
     for (const auto& arrow : arrows) if (arrow.first < count && arrow.second < count) LinkModifier(config, arrow.first, arrow.second);
@@ -1944,7 +2042,7 @@ inline Config Decode(const std::wstring& wide) {
         if (h.node < 0 || h.node >= count) continue;
         Node& node = config.chain[static_cast<size_t>(h.node)];
         if (h.row < 0 && node.type == NodeType::Trigger) node.hold_ms = h.ms;
-        else if (h.row >= 0 && node.type == NodeType::Branch && static_cast<size_t>(h.row) < node.routes.size()) node.routes[static_cast<size_t>(h.row)].hold_ms = h.ms;
+        else if (h.row >= 0 && HasRows(node) && static_cast<size_t>(h.row) < node.routes.size()) node.routes[static_cast<size_t>(h.row)].hold_ms = h.ms;
     }
     EnsureKey(config);
     config.placed = placed;

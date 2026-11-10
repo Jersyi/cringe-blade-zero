@@ -11,6 +11,7 @@
 #include "test_dummy.h"
 #include "move_preview.h"
 #include "speed_curve_window.h"
+#include "bone_motion.h"
 #include "grab_boss.h"
 #include "debug_hub.h"
 #include "ui_hotkeys.h"
@@ -33,10 +34,20 @@ HWND host_ = nullptr, page_ = nullptr;
 int min_height_ = 600;
 int dummy_requests_ = 0;
 bool dummy_standing_ = false;
-int preview_from_=0,preview_to_=0;
+int preview_from_=0,preview_to_=0;std::vector<int> preview_holds_;
+BoneMotion::Config preview_bones_;
 std::string preview_shown_;  // 招式预览 stand-in: the package the page asked for (empty: hidden)
 }
 // 测试木桩 stand-in: a request stands it up / takes it away at once (the game thread does that in the game).
+namespace BoneMotionRuntime {
+BoneMotion::Config Global(){return {};}
+void SetGlobal(const BoneMotion::Config&,bool){}
+Snapshot Get(){Snapshot s;s.mesh="fixture";s.bones={"root","pelvis","head","thigh_l","FACIAL_L_LipCorner","jaw","breast_l"};s.parents={-1,0,1,1,2,2,1};s.positions={{{0,0,0}},{{0,0,90}},{{0,0,180}},{{0,-10,50}},{{0,0,177}},{{0,0,170}},{{5,-10,130}}};return s;}
+void Debug(bool){}
+void Preview(const BoneMotion::Config& c){preview_bones_=c;}
+void Supplement(bool,bool){}
+bool SupplementEnabled(){return false;}
+}
 namespace TestDummy {
 void Request(bool spawn, double) { ++dummy_requests_; dummy_standing_ = spawn; }
 Snapshot GetSnapshot() { Snapshot s; s.present = dummy_standing_; return s; }
@@ -44,7 +55,7 @@ Snapshot GetSnapshot() { Snapshot s; s.present = dummy_standing_; return s; }
 
 // 招式预览 stand-in: what was asked is kept; one grey frame comes back.
 namespace MovePreview {
-void Show(const std::string&, const std::string& ability, int, const std::vector<NpcCombo::CurvePoint>&, int from, int to) { preview_shown_ = ability; preview_from_=from; preview_to_=to; }
+void Show(const std::string&, const std::string& ability, int, const std::vector<NpcCombo::CurvePoint>&, int from, int to, const BoneMotion::Config& bones,const std::vector<int>& holds) { preview_holds_=holds;preview_shown_ = ability; preview_from_=from; preview_to_=to; preview_bones_=bones; }
 void Hide() { preview_shown_.clear(); }
 void Place(const RECT&) {}
 bool Latest(Frame& frame, uint64_t newer_than) {
@@ -499,9 +510,9 @@ int wmain(int argc, wchar_t** argv) {
               "as 自定义按键 its old keys go and its key list opens (录制, 16 pad buttons, 4 left-stick ways, 完成)");
         key_down(VK_RETURN);
         check(ComboMenu::Probe::RecordingNode() == fork_node && ComboMenu::Probe::RecordingRoute() == 3, "Enter records the row's keys");
-        key_down('Q'); key_down(VK_ESCAPE);
+        key_down('Q'); key_down(VK_RETURN);
         check(ComboMenu::Probe::RecordingNode() < 0 && row3().keys == std::vector<int>{'Q'} && NpcCombo::Encode(now()).find(L",15/81/0/650/0,0,") != std::wstring::npos,
-              "Q recorded into the row; Esc ends it (15/81/0/650/0)");
+              "Q recorded into the row; Enter confirms it (15/81/0/650/0)");
         click(ComboMenu::Probe::RouteMode(fork_node, 3));
         check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 13, "a 自定义按键 row's mode also offers 吞掉 / 不吞掉");
         type(english ? L"swallows" : L"吞掉原动作"); key_down(VK_RETURN);
@@ -1005,11 +1016,11 @@ int wmain(int argc, wchar_t** argv) {
     check(ComboMenu::Probe::RecordingNode() == raw_node && !ComboMenu::Probe::SearchOpen(), "the list starts on 录制: Enter starts recording");
     key_down('Q');
     UiHotkeys::g_pad = 1u << 8; ComboMenu::Tick(); UiHotkeys::g_pad = 0; ComboMenu::Tick();
-    check(now().chain[static_cast<size_t>(raw_node)].keys == std::vector<int>{'Q', NpcCombo::kPadKey + 8}, "a key and a pad button (LB) pressed while recording join it");
+    check(ComboMenu::Probe::RecordingKeys() == std::vector<int>{'Q', NpcCombo::kPadKey + 8}, "a key and pad button join the unsaved recording draft");
     { std::wstring path = argv[1]; path.insert(path.size() - 4, L"_record"); shot(path); }
-    key_down(VK_ESCAPE);
+    key_down(VK_RETURN);
     check(ComboMenu::Probe::RecordingNode() < 0 && NpcCombo::Encode(now()).find(L",81;264/0/400/0") != std::wstring::npos,
-          "Esc ends recording; saved as keys/0/window/0 (in order, not swallowed)");
+          "Enter confirms recording; saved as keys/0/window/0 (in order, not swallowed)");
     click(ComboMenu::Probe::Toggle2(raw_node));
     check(now().chain[static_cast<size_t>(raw_node)].swallow && NpcCombo::Encode(now()).find(L",81;264/0/400/1") != std::wstring::npos, "its 吞掉 box swallows the keys' game actions (saved /1)");
     click(ComboMenu::Probe::Field3(raw_node)); type(english ? L"together" : L"一起"); key_down(VK_RETURN);
@@ -1018,7 +1029,7 @@ int wmain(int argc, wchar_t** argv) {
     check(ComboMenu::Probe::SearchOpen() && ComboMenu::Probe::SearchRows() == 40, "its 继续派生 list: its keys again, 录制, 20 pad keys and the hero's buttons");
     type(english ? L"record one key" : L"录制一个键"); key_down(VK_RETURN);
     check(ComboMenu::Probe::RecordingNode() == raw_node && ComboMenu::Probe::RecordingRoute() == -5 && !ComboMenu::Probe::SearchOpen(), "录制一个键 records its 继续派生 key");
-    key_down('E');
+    key_down('E'); key_down(VK_RETURN);
     check(ComboMenu::Probe::RecordingNode() < 0 && now().chain[static_cast<size_t>(raw_node)].then == NpcCombo::kThenRaw + 'E' &&
           now().chain[static_cast<size_t>(raw_node)].keys == std::vector<int>{'Q', NpcCombo::kPadKey + 8} && NpcCombo::Encode(now()).find(L",81;264/1/400/1/4165") != std::wstring::npos,
           "one key pressed: it is the 继续派生 key (the trigger's own keys stay), saved after 吞掉 (/4165) and the recording ends");
@@ -1039,7 +1050,7 @@ int wmain(int argc, wchar_t** argv) {
         UiHotkeys::g_stick = 1; ComboMenu::Tick(); UiHotkeys::g_stick = 0; ComboMenu::Tick();
         UiHotkeys::g_stick = 2; ComboMenu::Tick(); UiHotkeys::g_stick = 0; ComboMenu::Tick();
         UiHotkeys::g_pad = 1u << 12; ComboMenu::Tick(); UiHotkeys::g_pad = 0; ComboMenu::Tick();
-        key_down(VK_ESCAPE);
+        key_down(VK_RETURN);
         check(recording && now().chain[static_cast<size_t>(raw_node)].keys == std::vector<int>{NpcCombo::kStickKey, NpcCombo::kStickKey + 1, NpcCombo::kPadKey + 12} &&
               NpcCombo::Encode(now()).find(L",272;273;268/") != std::wstring::npos,
               "recording takes the left stick's ways as keys: 上推, 下推, 方块 (saved 272;273;268)");

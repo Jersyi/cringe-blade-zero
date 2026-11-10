@@ -1,6 +1,8 @@
 #pragma once
 #include <windows.h>
 #include <cstdint>
+#include "ue_runtime.h"
+#include <vector>
 
 // Force-loads Groom hair onto gameplay characters and lets the game's own
 // MainHairMode logic choose between it and their mesh hair.
@@ -34,6 +36,8 @@ void OnFault(DWORD code, uintptr_t address, DWORD faults, bool disabled);
 void Request(Command command);           // any thread
 bool Ready();                            // hook running and layout validated
 bool Active();
+// GT only. Loads donor assets but never changes a source actor. Exact binding target only.
+std::vector<ue::Object*> MirrorTemplates(ue::Object* mesh);
 void Status(wchar_t* out, size_t out_size);
 
 void RequestOutfitUnlock(bool on);       // any thread

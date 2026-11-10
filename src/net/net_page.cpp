@@ -17,11 +17,11 @@
 namespace NetPage {
 namespace {
 constexpr wchar_t kClass[] = L"PBZNetPage_v1";
-enum : int { kHost = 601, kOverlay, kLeave, kPing, kFriends, kInvite, kJoinFriend, kRefresh, kRoom, kJoin, kCopy, kSpawn, kRemove, kMirror };
+enum : int { kHost = 601, kOverlay, kLeave, kPing, kFriends, kInvite, kJoinFriend, kRefresh, kRoom, kJoin, kCopy, kSpawn, kRemove, kMirror, kDuel, kDuelOff, kHair };
 HWND window_ = nullptr, title_ = nullptr, intro_ = nullptr, status_ = nullptr, room_ = nullptr, host_ = nullptr, overlay_ = nullptr, leave_ = nullptr,
      ping_ = nullptr, friends_label_ = nullptr, friends_ = nullptr, invite_ = nullptr, join_friend_ = nullptr, refresh_ = nullptr, room_label_ = nullptr,
      room_id_ = nullptr, join_ = nullptr, copy_ = nullptr, puppet_ = nullptr, spawn_ = nullptr, remove_ = nullptr, mirror_ = nullptr,
-     puppet_status_ = nullptr, note_ = nullptr;
+     puppet_status_ = nullptr, note_ = nullptr, duel_=nullptr,duel_off_=nullptr, hair_=nullptr, hair_label_=nullptr;
 std::vector<uint64_t> friend_ids_;
 uint64_t friends_serial_ = ~0ull, lobby_ = 0;
 ULONGLONG next_refresh_ = 0;
@@ -91,6 +91,11 @@ std::wstring PuppetText(const NetPuppet::Snapshot& p) {
     }
     if (p.frames_sent)
         t += Format(en ? L"\r\nMy poses sent: %u (%d parts, %d bones per pose, %.0f KB/s)" : L"\r\n发出的姿势：%u 帧（%d 个部件，每帧 %d 根骨骼，%.0f KB/秒）", p.frames_sent, p.send_parts, p.send_bones, p.send_kbps);
+    if(p.alive)t+=Format(L"\r\nGroom %d / Hair cards %d",p.hair_grooms,p.hair_cards);
+    if(p.alive)t+=Format(en?L"\r\nFX: source %d active %d / puppet active %d, starts %u":L"\r\n特效：来源 %d（活动 %d）/ 替身活动 %d，启动 %u 次",p.fx_owned,p.fx_active,p.fx_shown,p.fx_starts);
+    if(p.alive)t+=Format(en?L"\r\nMy projectiles: %d live, %d visual parts, %u parts captured (visuals only)":L"\r\n本机弹道：活动 %d 个，显示部件 %d 个，累计捕获 %u 部件（仅视觉同步）",p.projectiles,p.projectile_parts,p.projectile_starts);
+    if(p.parts_dropped)t+=Format(en?L"\r\nPart limit reached: %d omitted":L"\r\n部件数量达到上限：本轮省略 %d 个",p.parts_dropped);
+    if(p.duel)t+=Format(en?L"\r\nLOCAL DUEL LAB: hero %d / puppet %d HP; hits %u / %u; attacks %u (approximate)":L"\r\n本地对战判定：主角 %d / 替身 %d 实验血量；命中 %u / %u；攻击 %u 次（近似判定）",p.duel_health[0],p.duel_health[1],p.duel_hits[0],p.duel_hits[1],p.duel_attacks);
     if (p.camera_fixes || p.possess_fixes) t += Format(en ? L"\r\nPut back: camera %d, player control %d" : L"\r\n纠正：镜头 %d 次，玩家控制 %d 次", p.camera_fixes, p.possess_fixes);
     if (!p.note[l].empty()) t += L"\r\n" + p.note[l];
     return t;
@@ -121,6 +126,9 @@ void Layout() {
     row.Add(spawn_, (std::max)(m.S(120), UiLayout::ButtonWidth(spawn_, m))); row.Add(remove_, (std::max)(m.S(120), UiLayout::ButtonWidth(remove_, m)));
     row.Add(mirror_, UiLayout::CheckWidth(mirror_, m), m.Check());
     y = row.Bottom() + gap;
+    UiLayout::Place(hair_label_,x,y,w,m.Line());y+=m.Line();
+    UiLayout::Place(hair_,x,y,w,m.S(180));y+=m.Row()+gap;
+    y=UiLayout::ButtonRow({duel_,duel_off_},x,y,w,m,m.S(150))+gap;
     const int puppet_h = UiLayout::TextHeight(puppet_status_, w - m.S(28), 4) + m.S(20); UiLayout::Place(puppet_status_, x, y, w, puppet_h); y += puppet_h + gap;
     const int note_h = UiLayout::TextHeight(note_, w); UiLayout::Place(note_, x, y, w, note_h); y += note_h;
     DebugHub::SetMinimum(window_, m.S(420) + 2 * x, y + x);
@@ -157,6 +165,7 @@ void Refresh(bool force) {
     if (force || puppet != puppet_text_) { puppet_text_ = puppet; SetWindowTextW(puppet_status_, puppet.c_str()); }
     const bool mirror = SendMessageW(mirror_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     if (mirror != p.mirror) SendMessageW(mirror_, BM_SETCHECK, p.mirror ? BST_CHECKED : BST_UNCHECKED, 0);
+    if(SendMessageW(hair_,CB_GETCURSEL,0,0)!=p.hair_mode)SendMessageW(hair_,CB_SETCURSEL,p.hair_mode,0);
     if (grew) Layout();
 }
 uint64_t SelectedFriend() {
@@ -199,6 +208,9 @@ void Command(int id) {
         break;
     }
     case kCopy: DebugHub::Notify(Tr(CopyRoom() ? L"已复制房间号" : L"还没有房间号，先建立房间").c_str()); break;
+    case kHair: NetPuppet::SetHairMode(static_cast<int>(SendMessageW(hair_,CB_GETCURSEL,0,0)));break;
+    case kDuel: NetPuppet::Ask(NetPuppet::Request::DuelOn);break;
+    case kDuelOff: NetPuppet::Ask(NetPuppet::Request::DuelOff);break;
     case kSpawn: NetPuppet::Ask(NetPuppet::Request::Spawn); break;
     case kRemove: NetPuppet::Ask(NetPuppet::Request::Remove); break;
     case kMirror:
@@ -212,7 +224,8 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
     case WM_COMMAND:
         if (LOWORD(wparam) == IDCANCEL) { DebugHub::Hide(); return 0; }
-        if (HIWORD(wparam) == BN_CLICKED) Command(LOWORD(wparam));
+        if(LOWORD(wparam)==kHair&&HIWORD(wparam)==CBN_SELCHANGE)Command(kHair);
+        else if (HIWORD(wparam) == BN_CLICKED) Command(LOWORD(wparam));
         else if (LOWORD(wparam) == kFriends && HIWORD(wparam) == LBN_DBLCLK) Command(kInvite);
         return 0;
     case WM_SIZE: Layout(); return 0;
@@ -232,8 +245,8 @@ HWND CreatePage(HWND parent) {
         if (!RegisterClassExW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return nullptr;
         window_ = CreateWindowExW(0, kClass, L"联机测试", WS_CHILD | WS_CLIPCHILDREN, 0, 0, 800, 650, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
         if (!window_) return nullptr;
-        title_ = Control(L"STATIC", L"联机测试（第 0 阶段）", SS_LEFT);
-        intro_ = Control(L"STATIC", L"需要两台电脑、两个都拥有游戏的 Steam 账号（同一个账号不能连自己）。一方建立房间并邀请，另一方在 Steam 聊天里接受邀请，或者在好友列表里加入、输入房间号加入。连上后双方各自出现一个替身，逐帧照对方主角的骨骼姿势显示：招式、格挡跳跃闪避等动作、投技（连同被抓的对象）、变身外观、武器、头发和布料都和对方一样。替身暂时不造成伤害，也不能被打。", SS_LEFT);
+        title_ = Control(L"STATIC", L"联机测试（本地验证阶段）", SS_LEFT);
+        intro_ = Control(L"STATIC", L"需要两台电脑、两个都拥有游戏的 Steam 账号（同一个账号不能连自己）。一方建立房间并邀请，另一方在 Steam 聊天里接受邀请，或者在好友列表里加入、输入房间号加入。替身同步骨骼姿势、部件可见状态及已支持的特效。完整特效与战斗同步仍在验证。普通替身不造成游戏伤害；本地对战判定只使用独立实验血量。", SS_LEFT);
         status_ = Control(L"STATIC", L"", SS_LEFT, 0, false);
         room_ = Control(L"STATIC", L"房间", SS_LEFT);
         host_ = Control(L"BUTTON", L"建立房间", BS_PUSHBUTTON | WS_TABSTOP, kHost);
@@ -255,8 +268,13 @@ HWND CreatePage(HWND parent) {
         remove_ = Control(L"BUTTON", L"移除替身", BS_PUSHBUTTON | WS_TABSTOP, kRemove);
         mirror_ = Control(L"BUTTON", L"没连上时替身模仿我", BS_AUTOCHECKBOX | WS_TABSTOP, kMirror);
         SendMessageW(mirror_, BM_SETCHECK, BST_CHECKED, 0);
+        hair_label_=Control(L"STATIC",L"替身头发 / Puppet hair（缺少资源时自动回退）",SS_LEFT,0,false);
+        hair_=Control(L"COMBOBOX",L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,kHair,false);
+        for(const wchar_t* option:{L"Groom · 毛发（默认）",L"发片 / Hair cards"})SendMessageW(hair_,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+        duel_=Control(L"BUTTON",L"本地对战判定 / 重置",BS_PUSHBUTTON|WS_TABSTOP,kDuel);
+        duel_off_=Control(L"BUTTON",L"结束对战判定",BS_PUSHBUTTON|WS_TABSTOP,kDuelOff);
         puppet_status_ = Control(L"STATIC", L"", SS_LEFT, 0, false);
-        note_ = Control(L"STATIC", L"一台电脑也能先测替身：不进房间，点“生成替身”后正常出招。替身走和联机相同的数据编码，在旁边跟着显示每个招式、动作和投技。测试过程都记在游戏目录 PBZDebugMenu.log 的 NET_ 开头的行里，测完把两台电脑的这个文件发给作者。", SS_LEFT);
+        note_ = Control(L"STATIC", L"一台电脑也能先测替身：不进房间，点“生成替身”后正常出招。替身走和联机相同的数据编码，在旁边跟着显示每个招式、动作和投技。“本地对战判定”让替身面对主角，用武器轨迹检测接触：每次攻击最多扣一次实验血量，按重置重新开始。判定窗口暂按攻击动画名称识别，不包含原生受击、格挡和投射物。测试过程都记在游戏目录 PBZDebugMenu.log 的 NET_ 开头的行里，测完把两台电脑的这个文件发给作者。", SS_LEFT);
         UiTheme::SetRole(title_, UiTheme::Role::Section); UiTheme::SetRole(room_, UiTheme::Role::Section); UiTheme::SetRole(puppet_, UiTheme::Role::Section);
         UiTheme::SetRole(intro_, UiTheme::Role::Hint); UiTheme::SetRole(friends_label_, UiTheme::Role::Hint); UiTheme::SetRole(note_, UiTheme::Role::Hint);
         UiTheme::SetRole(status_, UiTheme::Role::Card); UiTheme::SetRole(puppet_status_, UiTheme::Role::Card);
@@ -290,6 +308,9 @@ bool HandleCommand(const char* argument) {
     else if (verb == "spawn") NetPuppet::Ask(NetPuppet::Request::Spawn);
     else if (verb == "remove") NetPuppet::Ask(NetPuppet::Request::Remove);
     else if (verb == "mirror") NetPuppet::Ask(std::strcmp(rest, "0") ? NetPuppet::Request::MirrorOn : NetPuppet::Request::MirrorOff);
+    else if (verb == "duel") NetPuppet::Ask(!std::strcmp(rest,"off")||!std::strcmp(rest,"0")?NetPuppet::Request::DuelOff:NetPuppet::Request::DuelOn);
+    else if(verb=="hair"&&(!std::strcmp(rest,"groom")||!std::strcmp(rest,"cards")))NetPuppet::SetHairMode(!std::strcmp(rest,"cards")?1:0,false);
+    else if (verb == "inspect") NetPuppet::Ask(NetPuppet::Request::Inspect);
     else if (verb == "check") NetPuppet::Ask(NetPuppet::Request::Check);  // tests: the loop's puppet against the hero for 10 s
     else if (verb == "menu") DebugHub::ShowPage(DebugHub::Page::Online);
     else return false;

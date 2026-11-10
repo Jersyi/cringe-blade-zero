@@ -30,7 +30,7 @@ NpcCombo::Config Fixture(size_t count,int salt) {
     using namespace NpcCombo;
     Config c=Decode(L"E1"); EnsurePreInput(c); EnsureAirDefault(c); c.placed=true;
     std::vector<NodeType> types;
-    for (int t=0;t<=static_cast<int>(NodeType::AirDefault);++t)
+    for (int t=0;t<=static_cast<int>(NodeType::BoneTransform);++t)
         if (t!=static_cast<int>(NodeType::PreInput)&&t!=static_cast<int>(NodeType::AirDefault)) types.push_back(static_cast<NodeType>(t));
     while (c.chain.size()<count) {
         const size_t i=c.chain.size(); Node n;
@@ -42,10 +42,12 @@ NpcCombo::Config Fixture(size_t count,int salt) {
             n.routes.clear();
             for (size_t j=0;j<kMaxRoutes;++j) { Route route; route.button=static_cast<int>(Trigger::Light)+static_cast<int>(j); route.pause_ms=static_cast<int>(j)*100; route.next=static_cast<int>((i+j+1)%count); n.routes.push_back(route); }
         }
+        if(n.type==NodeType::BoneTransform){n.next=-1;n.bones=BoneMotion::Feminine();for(auto& row:n.bones.rows)row.translation[0]=salt*0.01;}
+        if(n.type==NodeType::Trim){n.trim_from=100;n.trim_to=5000;for(int point=0;point<32;++point)n.trim_holds.push_back(200+point*100+(salt%10));}
         if (n.type==NodeType::Speed) { n.curve=true; n.points=DefaultCurve(125); }
         if (n.type==NodeType::Hook) { n.hook_auto=true; n.hook_dist=1800; n.hook_speed=150; }
         if (n.type==NodeType::Group) { n.w=500; n.h=360; }
-        n.next=static_cast<int>((i+1)%count);
+        n.next=IsModifier(n)?-1:static_cast<int>((i+1)%count);
         c.chain.push_back(n);
     }
     // Normalize the generated fixture through the same authored constraints as the editor.

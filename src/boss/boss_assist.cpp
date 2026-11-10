@@ -2,6 +2,7 @@
 #include "npc_retarget.h"
 #include "npc_combo.h"
 #include "combo_playback_rules.h"
+#include "trim_charge_runtime.h"
 #include "ue_runtime.h"
 #include <windows.h>
 #include <algorithm>
@@ -61,9 +62,11 @@ uint32_t preview_clip_tries_ = 0;
 int preview_speed_ = 100; std::vector<NpcCombo::CurvePoint> preview_curve_; Object* preview_montage_ = nullptr; double preview_length_ = 0;
 float preview_logged_ = -1; uint32_t preview_speed_logs_ = 0;
 // The preview's 裁剪 (PreviewTrim, ms) and this cast's part: the start jumped to, the end cut.
+std::vector<int> preview_trim_holds_;bool preview_hold_down_=false;
+ComboPlayback::ChargePoints preview_charge_;TrimChargeRuntime::Pause preview_pause_;
 int preview_trim_from_ = 0, preview_trim_to_ = 0; bool preview_trim_jumped_ = false, preview_trim_cut_ = false; uint32_t preview_trim_logs_ = 0;
 bool preview_trim_dirty_ = false; unsigned preview_trim_wait_ = 0;
-NpcCombo::TrimRange PreviewRange() { NpcCombo::Node n; n.trim_from = preview_trim_from_; n.trim_to = preview_trim_to_; return NpcCombo::TrimOf(n); }
+NpcCombo::TrimRange PreviewRange() { NpcCombo::Node n; n.trim_from = preview_trim_from_; n.trim_to = preview_trim_to_;n.trim_holds=preview_trim_holds_; return NpcCombo::TrimOf(n); }
 double side_ = 1;
 uint32_t side_logs_ = 0;
 DWORD faults_ = 0; bool disabled_ = false;
@@ -741,6 +744,7 @@ void RemoveLeftovers(Object* boss) {
     preview_world_pawns_.clear();
 }
 void DestroyPreviewBoss(Slot& s) {
+    preview_pause_.Reset();preview_charge_={};
     if (SameBoss(s)) {
         if (Object* asc = Asc(s.boss)) Call(asc, "CancelAllAbilities").Invoke();
         Object* boss = s.boss;
@@ -864,6 +868,7 @@ bool SeekPreviewClock(Slot& s,Object* anim,Object* montage,float position,double
 // 裁剪 on the preview's cast: its montage's length recorded (the page's timeline); the part's start jumped to once a
 // cast, and the cast ended (montage blended out, ability cancelled) at the part's end.
 void TrimPreview(Slot& s) {
+    if(preview_pause_.active){if(preview_hold_down_&&preview_pause_.Hold())return;preview_pause_.Release();preview_charge_.holding=false;}
     Object* anim = PreviewAnim(s); if (!anim || preview_clip_) return;
     Call get(anim, "GetCurrentActiveMontage"); Object* montage = get.Invoke() ? get.Get<Object*>("ReturnValue") : nullptr;
     if (!montage || !ue::Alive(montage)) return;
@@ -886,6 +891,10 @@ void TrimPreview(Slot& s) {
         if (++preview_trim_logs_<=12) Logf("BOSS_ASSIST preview trim %.2f-%.2fs of %.2fs (start %s)",r.from,r.from+NpcCombo::TrimSpan(r,preview_length_),preview_length_,clock?"timeline+montage":jump?"montage fallback":"kept");
         return;
     }
+    if(preview_charge_.Step(r.holds,at,r.from,r.from+NpcCombo::TrimSpan(r,preview_length_),preview_hold_down_)){
+        if(SeekPreviewClock(s,anim,montage,at,preview_charge_.at)&&preview_pause_.Begin(s.boss,anim,montage))return;
+        preview_charge_.holding=false;
+    }
     if (r.to > 0 && at >= r.to - 0.005 && !preview_trim_cut_) {
         preview_trim_cut_ = true;
         if (++preview_trim_logs_ <= 6) Logf("BOSS_ASSIST preview trim cut at %.2fs (the part ends at %.2fs)", at, r.to);
@@ -897,9 +906,9 @@ void TrimPreview(Slot& s) {
 void TickPreview(ULONGLONG now) {
     Slot& s = preview_;
     if (s.phase == Phase::Idle) return;
-    if (!SameBoss(s)) { Logf("BOSS_ASSIST preview boss gone (destroyed by the game)"); s = Slot{}; return; }
+    if (!SameBoss(s)) { preview_pause_.Reset();preview_charge_={};Logf("BOSS_ASSIST preview boss gone (destroyed by the game)"); s = Slot{}; return; }
     HoldAI(s);
-    HoldPreviewSpeed(s);
+    if(!preview_pause_.active)HoldPreviewSpeed(s);
     Object* asc = Asc(s.boss);
     bool present = false; uint8_t active = 0;
     if (preview_clip_) active = ClipPlaying(s) ? 1 : 0;
@@ -907,7 +916,7 @@ void TickPreview(ULONGLONG now) {
     KeepShown(s, now, false);
     if (active) { s.seen_active = true; TrimPreview(s); return; }
     if (s.seen_active) {  // a cast ended: back home for the next
-        preview_trim_jumped_ = preview_trim_cut_ = false; preview_trim_wait_ = 0;
+        preview_pause_.Reset();preview_charge_={};preview_trim_jumped_ = preview_trim_cut_ = false; preview_trim_wait_ = 0;
         KeepShown(s, now, true);
         s.seen_active = false; s.tries = 0; preview_next_ = now + kPreviewGapMs; ++preview_loops_;
         if (preview_loops_ <= 3)
@@ -1009,9 +1018,11 @@ void StopPreview() {
 }
 Object* PreviewBoss() { return preview_.phase != Phase::Idle && SameBoss(preview_) ? preview_.boss : nullptr; }
 void PreviewOption(const std::string& what, int value) { if (what == "arm") preview_arm_ = value != 0; }
-void PreviewTrim(int from_ms, int to_ms) {
+void PreviewTrim(int from_ms, int to_ms,const std::vector<int>& holds,bool held) {
+    preview_hold_down_=held;const auto cleaned=NpcCombo::TrimHolds(holds);
     from_ms=NpcCombo::ClampTrim(from_ms); to_ms=NpcCombo::ClampTrim(to_ms);
-    if (from_ms==preview_trim_from_&&to_ms==preview_trim_to_) return;
+    if (from_ms==preview_trim_from_&&to_ms==preview_trim_to_&&cleaned==preview_trim_holds_) return;
+    preview_pause_.Reset();preview_charge_={};preview_trim_holds_=cleaned;
     preview_trim_from_=from_ms; preview_trim_to_=to_ms;
     // Editing either edge (including clearing the range) applies to the current preview.
     preview_trim_dirty_=true; preview_trim_jumped_=preview_trim_cut_=false; preview_trim_wait_=0;

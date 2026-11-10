@@ -65,7 +65,7 @@ constexpr size_t kMaxWeapons = 4; // both hands, two pieces each (e.g. forearm g
 // hero_over_boss: the hero's height over the executing boss's (kGrabScales). The boss weapon is
 // scaled to the current model, skin size * hero_over_boss, and follows its hand; the models and the
 // victim keep their own size and the place the paired timeline gives them.
-void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons = nullptr, size_t weapon_count = 0, const char* move = nullptr, double hero_over_boss = 1);
+void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons = nullptr, size_t weapon_count = 0, const char* move = nullptr, double hero_over_boss = 1, unsigned char* source_ability = nullptr, unsigned char* source_timeline = nullptr);
 void Tick();
 void Finish(bool completed);
 bool Active();

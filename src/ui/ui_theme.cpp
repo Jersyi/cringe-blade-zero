@@ -1,3 +1,4 @@
+#include "ui_paint_buffer.h"
 #include "ui_theme.h"
 #include "ui_assets.h"
 #include "ui_host.h"
@@ -231,24 +232,12 @@ private:
 // Paint into an off-screen bitmap and copy once, so custom-drawn controls never
 // show a half-painted frame while they animate.
 class Buffer {
+    UiPaintBuffer::Frame frame_;
 public:
-    Buffer(HDC target, const RECT& area) : target_(target), area_(area) {
-        dc_ = CreateCompatibleDC(target);
-        bitmap_ = dc_ ? CreateCompatibleBitmap(target, (std::max)(1L, area.right - area.left), (std::max)(1L, area.bottom - area.top)) : nullptr;
-        if (bitmap_) { old_ = SelectObject(dc_, bitmap_); SetViewportOrgEx(dc_, -area.left, -area.top, nullptr); }
-    }
-    ~Buffer() {
-        if (bitmap_) {
-            SetViewportOrgEx(dc_, 0, 0, nullptr);
-            BitBlt(target_, area_.left, area_.top, area_.right - area_.left, area_.bottom - area_.top, dc_, 0, 0, SRCCOPY);
-            SelectObject(dc_, old_); DeleteObject(bitmap_);
-        }
-        if (dc_) DeleteDC(dc_);
-    }
-    HDC dc() const { return bitmap_ ? dc_ : target_; }
-private:
-    HDC target_, dc_ = nullptr; RECT area_; HBITMAP bitmap_ = nullptr; HGDIOBJ old_ = nullptr;
+    Buffer(HWND window,HDC target,const RECT& area):frame_(window,target,(std::max)(1L,area.right),(std::max)(1L,area.bottom),&area){}
+    HDC dc()const{return frame_.dc();}
 };
+
 UINT CaptionFlags(HWND window) {
     // Pages define no mnemonics, so '&' in captions such as "Stop & Return" stays literal.
     UINT flags = DT_VCENTER | DT_NOPREFIX;
@@ -321,7 +310,7 @@ bool DrawButton(NMCUSTOMDRAW* draw) {
     Visual visual = Current(window);
     const bool is_checked = SendMessageW(window, BM_GETCHECK, 0, 0) == BST_CHECKED;
     if (!State(window)) visual = {hot ? 1.0 : 0.0, pressed ? 1.0 : 0.0, focused ? 1.0 : 0.0, is_checked ? 1.0 : 0.0};
-    Buffer buffer(draw->hdc, draw->rc); HDC dc = buffer.dc();
+    Buffer buffer(window, draw->hdc, draw->rc); HDC dc = buffer.dc();
     RECT rectangle = draw->rc, text_rect = rectangle;
     FontScope font(dc, window); SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, enabled ? colors_.text : Mix(colors_.muted, colors_.background, 30));
@@ -486,7 +475,7 @@ void GroupBox(HWND window, HDC dc) {
 // Section heading: accent bar, semibold caption and a hairline to the right edge.
 void SectionStatic(HWND window, HDC target) {
     RECT rectangle{}; GetClientRect(window, &rectangle);
-    Buffer buffer(target, rectangle); HDC dc = buffer.dc();
+    Buffer buffer(window, target, rectangle); HDC dc = buffer.dc();
     Fill(dc, rectangle, colors_.background);
     const std::wstring text = Caption(window);
     FontScope font(dc, window, FontFor(Font::Heading, window, text)); SetBkMode(dc, TRANSPARENT);
@@ -513,7 +502,7 @@ void SectionStatic(HWND window, HDC target) {
 // Card statics show live status text inside a rounded, slightly raised panel.
 void CardStatic(HWND window, HDC target) {
     RECT rectangle{}; GetClientRect(window, &rectangle);
-    Buffer buffer(target, rectangle); HDC dc = buffer.dc();
+    Buffer buffer(window, target, rectangle); HDC dc = buffer.dc();
     Fill(dc, rectangle, colors_.background);
     Rounded(dc, rectangle, Scale(window, 8), Mix(colors_.background, colors_.panel, 70), Mix(colors_.border, colors_.background, 30));
     RECT accent{rectangle.left + 1, rectangle.top + Scale(window, 10), rectangle.left + 1 + Scale(window, 2), rectangle.bottom - Scale(window, 10)};
@@ -565,7 +554,7 @@ ThumbGeometry SkinThumb(const Skin& skin) {
 }
 void PaintSkin(Skin& skin, HDC target) {
     RECT client{}; GetClientRect(skin.window, &client);
-    Buffer buffer(target, client); HDC dc = buffer.dc();
+    Buffer buffer(skin.window, target, client); HDC dc = buffer.dc();
     const COLORREF face = ControlFace(skin.control);
     Fill(dc, client, face);
     const ThumbGeometry g = SkinThumb(skin); if (!g.active) return;
@@ -886,7 +875,7 @@ void RegisterClasses() {
 // keyboard logic; only the paint pass is replaced.
 void PaintList(HWND window, Record& record, HDC target) {
     RECT client{}; GetClientRect(window, &client);
-    Buffer buffer(target, client); HDC dc = buffer.dc();
+    Buffer buffer(window, target, client); HDC dc = buffer.dc();
     const bool enabled = IsWindowEnabled(window) != FALSE;
     const COLORREF face = enabled ? colors_.panel : Mix(colors_.background, colors_.panel, 45);
     Fill(dc, client, face);
@@ -926,7 +915,7 @@ bool ComboSupported(HWND window) {
 void DrawCombo(HWND window, HDC target, bool hover) {
     RECT rectangle{}; GetClientRect(window, &rectangle);
     COMBOBOXINFO info{sizeof(info)}; if (!GetComboBoxInfo(window, &info)) return;
-    Buffer buffer(target, rectangle); HDC dc = buffer.dc();
+    Buffer buffer(window, target, rectangle); HDC dc = buffer.dc();
     const bool enabled = IsWindowEnabled(window) != FALSE, focused = GetFocus() == window || IsChild(window, GetFocus());
     const bool dropped = SendMessageW(window, CB_GETDROPPEDSTATE, 0, 0) != FALSE;
     Visual visual = Current(window); if (!State(window)) visual = {hover ? 1.0 : 0.0, 0, focused ? 1.0 : 0.0, 0};

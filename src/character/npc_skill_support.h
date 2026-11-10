@@ -14,6 +14,12 @@ inline bool OwnMotionFamily(std::string_view profile,std::string_view skeleton) 
     return (profile=="GuiChaiRed"||profile=="GuiChaiRedP2")&&
         (skeleton=="GuiChai_Black_Skeleton"||skeleton=="GuiChai_Red_Skeleton"||skeleton=="GuiChai_Red_P2_Skeleton");
 }
+inline bool AuthoredWeaponIk(std::string_view profile,std::string_view bone) {
+    return (profile=="GuiChaiRed"||profile=="GuiChaiRedP2")&&(bone=="ik_weapon_l"||bone=="ik_weapon_r");
+}
+inline bool MeshSpaceWeaponCopy(std::string_view profile) {
+    return profile=="GuiChaiRed"||profile=="GuiChaiRedP2";
+}
 inline bool RedirectTrace(bool cast_live,bool own_source,bool trace_ability,bool compatible_receiver) {
     return cast_live&&own_source&&trace_ability&&compatible_receiver;
 }

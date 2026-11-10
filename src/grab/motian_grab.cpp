@@ -2322,7 +2322,7 @@ bool StartAttempt(const Context& c) {
         ++shown_count;
     }
     double hero_over_boss=1;for(const GrabScaleData& row:kGrabScales)if(variant.id&&!std::strcmp(row.variant,variant.id)){hero_over_boss=row.hero_over_boss;break;}
-    GrabExtras::Begin(c.pawn,target,shown,shown_count,variant.id,hero_over_boss);
+    GrabExtras::Begin(c.pawn,target,shown,shown_count,variant.id,hero_over_boss,source_instance,timeline.Get<Object*>("ReturnValue"));
     if(!session_.phases.empty())session_.phases.front().admitted=true;
     AcquireSRWLockExclusive(&state_lock); ++state_.activations; ++state_.paired_hits; ReleaseSRWLockExclusive(&state_lock);
     Status(L"%s：原生施放 / 受投双能力已配对；伤害与位移由原 Timeline 负责",variant.name);

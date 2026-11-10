@@ -1,4 +1,4 @@
-// 招式派生 model (npc_combo_model.h): move kinds from GA names, trigger nodes and the hero action tag families,
+﻿// 招式派生 model (npc_combo_model.h): move kinds from GA names, trigger nodes and the hero action tag families,
 // where a press goes (Follow: straight wires, 按键分支 rows and their pauses, intervals), editing (InsertAfter /
 // Remove / Link, branches and the 加速 / 武器属性 modifiers), the play rate, stick direction and the ini text, old
 // texts included.
@@ -175,6 +175,14 @@ int main() {
     Config graph = Linked({{NodeType::Skill, "GA_A"}, {NodeType::Skill, "GA_B"}, {NodeType::Skill, "GA_C"}, {NodeType::Skill, "GA_Free"}});
     const int k = KeyTrigger(graph);
     graph.chain[2].next = -1; graph.chain[static_cast<size_t>(k)].next = 2; graph.chain[2].next = 0; graph.chain[0].next = 1; graph.chain[1].next = 2;
+    // Overlapping routes, cycles, invalid targets and inactive roots preserve
+    // the existing first-trigger result for every node.
+    {uint32_t rng=0x19617u;const auto random=[&](){rng=rng*1664525u+1013904223u;return rng;};
+        for(int trial=0;trial<100;++trial){Config sample;sample.chain.resize(80);
+            for(size_t i=0;i<sample.chain.size();++i){auto& n=sample.chain[i];n=graph.chain[static_cast<size_t>(k)];if(i%7)n.type=NodeType::Skill;
+                n.next=static_cast<int>(random()%90)-5;
+                if(i%11==0){n.type=NodeType::Branch;n.routes.resize(3);for(auto& route:n.routes)route.next=static_cast<int>(random()%90)-5;}}
+            const auto owners=Owners(sample);for(size_t i=0;i<sample.chain.size();++i)Check(owners[i]==TriggerOf(sample,i),"linear ownership matches per-node traversal");}}
     const std::vector<size_t> order = Order(graph, k);
     Check(order.size() == 3 && order[0] == 2 && order[1] == 0 && order[2] == 1, "order follows the wires, the loop back to C ends it, the free node is out");
     const int lt = InsertAfter(graph, -1, TriggerNode(Trigger::Light, 0, 300));
@@ -617,9 +625,9 @@ int main() {
               Decode(wtext).chain[static_cast<size_t>(w)].type == NodeType::WeaponActions && Decode(wtext).chain[static_cast<size_t>(w)].weapon == "Long",
               "saved as O:x,y,weapon,reset,action,next,... and read back");
         const Config odd = Decode(L"E1|O:0,0,_,1200,0,-1,14,-1,9,-1|O:0,0,Long,1200,9");
-        Check(odd.chain[0].type == NodeType::WeaponActions && odd.chain[0].weapon.empty() && odd.chain[0].routes.size() == 1 &&
+        Check(odd.chain[0].type == NodeType::WeaponActions && odd.chain[0].weapon.empty() && odd.chain[0].routes.size() == 2 && !KeysRouteReady(odd.chain[0].routes[0]) &&
               odd.chain[1].type == NodeType::Trigger,
-              "the NPC key / own-keys rows are dropped, no weapon is _, a cut-off O: is skipped");
+              "NPC key dropped; empty own-keys row remains inert; no weapon is _; cut-off O skipped");
         Config gone = wc; Remove(gone, 0);
         Check(gone.chain[static_cast<size_t>(w - 1)].routes[0].next == -1 && gone.chain[static_cast<size_t>(w - 1)].routes[1].next == 0 &&
               gone.chain[static_cast<size_t>(w - 1)].routes[3].next == 1, "removing a move its row fed unwires that row and keeps the others");
@@ -714,9 +722,9 @@ int main() {
         Check(TriggerFor(kd, plain) < 0, "a plain press never starts a 组合键 trigger");
         // 自定义按键: raw keys (keyboard / pad codes), one key, in order, together; 吞掉 saved.
         const int kQ = 'Q', kE = 'E', kLB = kPadKey + 8, kA = kPadKey + 10;
-        Check(ValidRawKey(kQ) && ValidRawKey(0x05) && ValidRawKey(kPadKey + 15) && !ValidRawKey(1) && !ValidRawKey(2) && !ValidRawKey(0xFF) &&
+        Check(ValidRawKey(kQ) && ValidRawKey(0x05) && ValidRawKey(kPadKey + 15) && ValidRawKey(1) && ValidRawKey(2) && ValidRawKey(4) && ValidRawKey(6) && !ValidRawKey(0) && !ValidRawKey(0xFF) &&
               ValidRawKey(kStickKey) && ValidRawKey(kStickKey + 3) && !ValidRawKey(kStickKey + 4) && ValidRouteButton(static_cast<int>(Trigger::Keys)),
-              "raw keys: keyboard / mouse side / 16 pad buttons / 4 left-stick ways, never the left or right mouse button; a branch row may be 自定义按键");
+              "raw keys: keyboard / all five mouse buttons / 16 pad buttons / 4 left-stick ways; a branch row may be 自定义按键");
         // Left-stick ways (上推 / 下推 ...): pad codes after the buttons, read from the stick bits after the button bits.
         const int kUpStick = kStickKey, kDownStick = kStickKey + 1, kSquare = kPadKey + 12;
         Check(IsPadKey(kUpStick) && IsStickKey(kDownStick) && !IsStickKey(kSquare) && PadCodeBits(1u << 12, 2u) == ((1u << 12) | (1u << 17)) &&
@@ -1100,8 +1108,13 @@ int main() {
               "the span ends cursor_at the montage's end when that comes first; a curve runs over the part");
         Node open = trim; open.trim_to = 0; Node trim_late = trim; trim_late.trim_to = 1000;
         Check(TrimOf(open).to == 0 && std::fabs(TrimSpan(TrimOf(open), 3.0) - 1.8) < 1e-9 && TrimOf(trim_late).to == 0, "no end (or one before the start): to the montage's end");
+        tc.chain[2].trim_holds={2000,1500,1500};
         const std::wstring saved_text = Encode(tc);
         const Config again = Decode(saved_text);
+        Check(again.chain[2].trim_holds==std::vector<int>{1500,2000}&&TrimFor(again,1).holds==again.chain[2].trim_holds,"multiple charge points round-trip sorted and deduplicated");
+        for(int n=0;n<1000;++n)Check(Encode(Decode(saved_text))==saved_text,"charge markers survive repeated saves");
+        Check(Decode(L"E1|W:5,5|c:0,0,0|z:0,200,500").chain[0].trim_holds==std::vector<int>{200,500},"charge-only trim is supported");
+        Check(Decode(L"E1|W:5,5|c:0,0,0|z:0,x,500").chain[0].trim_holds.empty(),"invalid charge marker is rejected");
         Check(saved_text.find(L"|c:2,1200,2400") != std::wstring::npos && again.chain[2].type == NodeType::Trim && again.chain[2].trim_from == 1200 && again.chain[2].trim_to == 2400 &&
               again.chain[1].mods[kModTrim] == 2 && again.chain[1].mods[kModSpeed] == 3 && Encode(again) == saved_text, "saved as a 武器属性 with a c: mark, read trim_late with its arrow");
         std::wstring older = saved_text; older.erase(older.find(L"|c:"), std::wstring(L"|c:2,1200,2400").size());
@@ -1248,6 +1261,35 @@ int main() {
         std::printf("INFO 2000-node chain: %zu chars saved, round trip + walk %.0f ms\n", saved_text.size(), ms);
         Check(Decode(std::wstring(L"E1") + [] { std::wstring m; for (int i = 0; i < 10100; ++i) m += L"|S:GA_A,0,0,-1"; return m; }()).chain.size() == kMaxNodes + 1,
               "a broken file with more than kMaxNodes nodes stops there (then the key node)");
+    }
+
+    {
+        Config source;source.chain.resize(10);source.chain[0]=TriggerNode(Trigger::NpcKey,0,0);
+        source.chain[1].type=NodeType::BossSkill;source.chain[1].ability="GA_CopyBoss";source.chain[1].boss="MoTian";source.chain[1].next=4;source.chain[1].group=5;source.chain[1].x=100;source.chain[1].y=200;
+        source.chain[1].mods[kModTrim]=2;source.chain[1].mods[kModBone]=3;source.chain[1].mods[kModDamage]=6;
+        source.chain[2].type=NodeType::Trim;source.chain[2].trim_from=500;source.chain[2].trim_to=2300;source.chain[2].trim_holds={800,1500};
+        source.chain[3].type=NodeType::BoneTransform;source.chain[3].bones=BoneMotion::Feminine();
+        source.chain[4]=BranchNode(0,0);source.chain[4].routes={{L,800,1},{H,0,7}};
+        source.chain[5].type=NodeType::Group;source.chain[5].w=500;source.chain[5].h=400;
+        source.chain[6].type=NodeType::Damage;source.chain[7].ability="GA_Outside";
+        source.chain[8].type=NodeType::Group;source.chain[8].group=5;source.chain[9].ability="GA_Inner";source.chain[9].group=8;
+        const auto copied=CopyNodes(source,{4,0,3,2,1,1,-1,1234});
+        Check(copied.size()==4&&copied[0].ability=="GA_CopyBoss","clipboard filters duplicate/invalid selection and unique key");
+        Check(copied[0].next==3&&copied[0].mods[kModTrim]==1&&copied[0].mods[kModBone]==2&&copied[0].mods[kModDamage]==-1&&copied[0].group==-1,"clipboard remaps exec/modifiers and drops external refs");
+        Check(copied[3].routes[0].next==0&&copied[3].routes[1].next==-1&&copied[3].routes[0].pause_ms==800,"clipboard retains internal branch loop and pause only");
+        Check(copied[1].trim_holds==source.chain[2].trim_holds&&BoneMotion::Encode(copied[2].bones)==BoneMotion::Encode(source.chain[3].bones),"clipboard keeps trim charge points and all bone parameters");
+        const auto group=CopyNodes(source,{5});Check(group.size()==4&&group[0].group==1&&group[2].group==1&&group[3].group==2,"copying a frame includes nested descendants and remaps membership");
+        const auto original=Encode(source);const auto indices=PasteNodes(source,copied,40,60);
+        Check(indices==std::vector<int>({10,11,12,13})&&source.chain[10].next==13&&source.chain[13].routes[0].next==10&&source.chain[10].mods[kModBone]==12,"pasting assigns fresh indices to every internal reference");
+        Check(source.chain[10].x==140&&source.chain[10].y==260&&copied[0].x==100,"pasting offsets geometry without mutating clipboard");
+        Config old=source;old.chain.resize(10);Check(Encode(old)==original,"pasting leaves every original node untouched");
+        Config other;other.chain.push_back(TriggerNode(Trigger::NpcKey,0,0));const auto there=PasteNodes(other,copied,80,90);
+        Check(there.front()==1&&other.chain[1].next==4&&other.chain[4].routes[1].next==-1,"cross-table paste cannot reconnect to unrelated original indices");
+        Config full;full.chain.resize(kMaxNodes-2);Check(PasteNodes(full,copied,0,0).empty()&&full.chain.size()==kMaxNodes-2,"node limit rejects whole paste atomically");
+        Node setting;setting.type=NodeType::PreInput;Check(PasteNodes(other,{setting},0,0).empty(),"unique global settings cannot be pasted");
+        for(int attempt=0;attempt<100;++attempt){const int base=static_cast<int>(other.chain.size());const auto added=PasteNodes(other,copied,attempt*32,attempt*32);
+            Check(added.size()==4&&other.chain[base].next==base+3&&other.chain[base+3].routes[0].next==base,"repeated paste keeps each copied subgraph independent");}
+        const auto decoded=Decode(Encode(other));Check(decoded.chain[1].mods[kModTrim]==2&&decoded.chain[2].trim_holds==copied[1].trim_holds,"pasted trim/bone graph survives persistence");
     }
 
     std::printf("failures=%d\n", failures);

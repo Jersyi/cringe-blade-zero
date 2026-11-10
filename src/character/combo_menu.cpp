@@ -1,3 +1,4 @@
+﻿#include "ui_paint_buffer.h"
 #include "combo_menu.h"
 #include "npc_combo.h"
 #include "npc_retarget.h"
@@ -6,6 +7,7 @@
 #include "test_dummy.h"
 #include "move_preview.h"
 #include "speed_curve_window.h"
+#include "bone_motion_page.h"
 #include "grab_boss.h"
 #include "combo_weapons.h"
 #include "weapon_icons.h"
@@ -19,6 +21,7 @@
 #include <shobjidl.h>
 #include <gdiplus.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -61,12 +64,12 @@ constexpr float kOverviewZoom=.35f;
 // Node geometry in canvas units (96 dpi, zoom 1).
 constexpr int kHeader=28,kRow=24,kPad=8,kPin=6,kGrid=16,kMajor=128;
 enum class Button : int { Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage,
-                          Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirSet,
-                          Count };
+                          Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirSet, BoneTransform,
+                          Copy, Paste, Count };
 // The canvas tools, laid out right to left.
-constexpr Button kTools[]={Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
+constexpr Button kTools[]={Button::Copy,Button::Paste,Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::BoneTransform,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
 // Management stays above the canvas; creation tools belong to the right library.
-constexpr Button kCanvasTools[]={Button::File,Button::SaveFile,Button::SaveAs,Button::Arrange,Button::Frame,Button::Remove,Button::Clear};
+constexpr Button kCanvasTools[]={Button::File,Button::SaveFile,Button::SaveAs,Button::Arrange,Button::Frame,Button::Copy,Button::Paste,Button::Remove,Button::Clear};
 constexpr const wchar_t* kNodeCategories[]={L"起端与流程",L"动作与移动",L"战斗修饰",L"外观变身",L"BOSS 招式"};
 constexpr int NodeCategory(Button b) {
     switch (b) {
@@ -74,7 +77,7 @@ constexpr int NodeCategory(Button b) {
     case Button::BossSkill: case Button::Assist: case Button::Grab: case Button::WeaponMove: case Button::AutoDodge: case Button::Teleport: case Button::Hook: return 1;
     case Button::Speed: case Button::Trim: case Button::Weapon: case Button::Armor: case Button::Interrupt: case Button::Damage:
     case Button::Invincible: case Button::ForceHit: case Button::IgnoreGuard: case Button::KeepChain: case Button::Air: return 2;
-    case Button::Look: case Button::HeroLook: case Button::KeepLook: return 3;
+    case Button::BoneTransform: case Button::Look: case Button::HeroLook: case Button::KeepLook: return 3;
     default: return -1;
     }
 }
@@ -123,7 +126,7 @@ struct DragState { Drag mode=Drag::None; Hit hit; POINT start{},last{}; bool mov
 enum class ItemKind { Move, Interval, AutoDodge, Trigger, Branch, Speed, Weapon, Armor, Interrupt, Grab, Button, GrabMove, BossSkill, BossLook, BossMove, File,
                       WeaponMove, Damage, WeaponPick, WeaponSkill, Group, Teleport, TeleportDist, TeleportLift, ComboKey, ComboMode, RawKey, Invincible,
                       Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain, IgnoreGuard, KeepChain, Assist, Hook, HookMode, Trim,
-                      HookDist, HookSpeed, Air, AirLift, AirHang, Launch, AirSet };
+                      HookDist, HookSpeed, Air, AirLift, AirHang, Launch, AirSet, BoneTransform };
 struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; };
 struct SearchRow { bool header=false; size_t item=0; std::wstring text; };
 struct Search {
@@ -151,6 +154,7 @@ RECT library_{},library_title_{},library_tabs_[2]{},node_categories_[5]{},librar
 int library_tab_=0,node_category_=0,library_pages_[6]{},library_page_count_=1,library_capacity_=1,library_items_=0;
 int LibrarySection() { return library_tab_==1?5:node_category_; }
 int height_=0,selected_=-1,zoom_index_=kZoomOne;
+std::vector<Node> node_clipboard_;int paste_count_=0;
 // Several nodes selected at once (Ctrl / Shift + drag on bare canvas: 框选; Ctrl + click a node adds or drops it):
 // selected_ is one of them. Empty: selected_ alone. They are dragged together and removed together.
 std::vector<int> picked_;
@@ -174,12 +178,28 @@ bool scratch_=false; ULONGLONG paint_logged_=0;
 // what the preview was last asked to play at.
 struct PreviewHover { int32_t skin=-1; std::string ability; RECT anchor{}; ULONGLONG since=0; bool asked=false,none=false,beside=false;
                       int node=-1; int speed=100; std::vector<NpcCombo::CurvePoint> curve; std::string monster,package;
-                      int trim_from=0,trim_to=0; };  // the 裁剪 part (ms of the montage; 0 / 0: all of it)
+                      int trim_from=0,trim_to=0; std::vector<int> trim_holds; BoneMotion::Config bones; };  // the 裁剪 part (ms of the montage; 0 / 0: all of it)
 PreviewHover preview_; MovePreview::Frame preview_frame_; RECT preview_rect_{};
 // The card's picture (page client) as last drawn; the hub's hole over it while the game draws the stage there (live).
 RECT preview_image_{},preview_hole_rect_{}; bool preview_hole_=false;
 DragState drag_;
 Search search_;
+HWND search_input_=nullptr;bool syncing_search_=false;
+constexpr int kSearchInput=0x7b01;
+bool SearchKey(WPARAM key);
+void SyncSearchInput(){if(!search_input_)return;syncing_search_=true;
+    if(UiLayout::Caption(search_input_)!=search_.query)SetWindowTextW(search_input_,search_.query.c_str());
+    syncing_search_=false;}
+void FocusSearch(){if(search_input_&&!UiCursor::HandsOff()){SetFocus(search_input_);SendMessageW(search_input_,EM_SETSEL,static_cast<WPARAM>(-1),-1);}}
+LRESULT CALLBACK SearchInputProc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR){
+    if(msg==WM_GETDLGCODE)return DLGC_WANTALLKEYS|DLGC_WANTCHARS;
+    if(msg==WM_KEYDOWN){
+        if(wp==VK_ESCAPE||wp==VK_RETURN||wp==VK_TAB||wp==VK_UP||wp==VK_DOWN||wp==VK_PRIOR||wp==VK_NEXT){SearchKey(wp);return 0;}
+        if(wp=='A'&&(GetKeyState(VK_CONTROL)&0x8000)){SendMessageW(w,EM_SETSEL,0,-1);return 0;}}
+    if(msg==WM_CHAR&&(wp==VK_RETURN||wp==VK_ESCAPE||wp==VK_TAB))return 0;
+    return DefSubclassProc(w,msg,wp,lp);
+}
+
 // The 加速 multiplier being typed (node -1: none); fresh: the first key typed replaces the text.
 // hold: what is typed: -2 the node's own value, -1 a trigger's 按住 (seconds), else that branch row's 按住.
 struct Edit { int node=-1; std::wstring text; bool fresh=true; int hold=-2; } edit_;
@@ -195,6 +215,17 @@ std::map<int,HFONT> scaled_;
 // measures again), so a chain of thousands of nodes stays quick.
 std::vector<SIZE> sizes_;
 std::vector<int> owners_;
+struct CanvasCache {
+    std::vector<Shape> shapes;std::vector<size_t> order;
+    std::vector<bool> live,fed,modded,pointed;bool graph_valid=false;
+    float pan_x=0,pan_y=0,scale=0;RECT canvas{};
+    uint64_t measurements=0,graph_builds=0,shape_builds=0;
+    void Geometry(){shapes.clear();}
+    void Clear(){Geometry();order.clear();graph_valid=false;}
+} canvas_cache_;
+void DropCanvasCache(){sizes_.clear();owners_.clear();canvas_cache_.Clear();}
+void Repaint(){if(window_)InvalidateRect(window_,nullptr,FALSE);}
+
 
 std::wstring Tr(const wchar_t* text) { return UiI18n::Translate(text?text:L""); }
 UiLayout::Metrics M() { return UiLayout::For(window_); }
@@ -214,8 +245,8 @@ HFONT Scaled(UiTheme::Font role) {
     LOGFONTW logfont{}; GetObjectW(Font(role),sizeof(logfont),&logfont);
     logfont.lfHeight=static_cast<LONG>(std::lround(logfont.lfHeight*Zoom())); if (!logfont.lfHeight) logfont.lfHeight=-1;
     const HFONT font=CreateFontIndirectW(&logfont);
-    scaled_[key]=font?font:Font(role);
-    return scaled_[key];
+    if(font)scaled_[key]=font;
+    return font?font:Font(role);
 }
 Gdiplus::Color Argb(COLORREF color,BYTE alpha=255) { return Gdiplus::Color(alpha,GetRValue(color),GetGValue(color),GetBValue(color)); }
 void RoundedPath(Gdiplus::GraphicsPath& path,float x,float y,float w,float h,float r,bool top_only=false) {
@@ -295,7 +326,7 @@ std::wstring StatusText(const std::wstring& status) {
     const size_t colon=status.find(L'：');
     return colon==std::wstring::npos?Tr(status.c_str()):Tr(status.substr(0,colon+1).c_str())+status.substr(colon+1);
 }
-void Save() { sizes_.clear(); owners_.clear(); if (scratch_) return; if (HasSkin()) { NpcCombo::Save(moves_.profile,config_); seen_generation_=NpcCombo::Generation(); } }
+void Save() { DropCanvasCache(); if (scratch_) return; if (HasSkin()) { NpcCombo::Save(moves_.profile,config_); seen_generation_=NpcCombo::Generation(); } }
 // The looks a BOSS 技能 may take: every NPC look with moves (id, name), read once.
 const std::vector<std::pair<std::string,std::wstring>>& BossLooks() {
     static std::vector<std::pair<std::string,std::wstring>> looks;
@@ -326,17 +357,19 @@ bool IsShaqiId(const std::string& id) { return ComboWeapons::IsShaqi(id); }
 std::wstring WeaponName(const std::string& id) {
     const std::wstring wide(id.begin(),id.end());
     const WeaponIcons::Info info=WeaponIcons::Find(wide.c_str(),IsShaqiId(id));
-    return info.name?std::wstring(info.name):wide;
+    if(!info.name)return wide;
+    for(const auto& other:ComboWeaponsData::kWeapons){if(id==other.id||!other.count)continue;const std::wstring other_id(other.id,other.id+std::strlen(other.id));
+        const auto other_info=WeaponIcons::Find(other_id.c_str(),other.shaqi);if(other_info.name&&!std::wcscmp(info.name,other_info.name))return std::wstring(info.name)+L" · "+wide;}
+    return info.name;
 }
-// The weapons offered: those with abilities, one per name (the game's variants of a weapon share it), main first.
+// Same display name can hide a different granted move set or backpack ID.
+// Keep every native ID; WeaponName disambiguates variants with the same label.
 std::vector<std::pair<std::string,bool>> ListedWeapons() {
-    std::vector<std::pair<std::string,bool>> out; std::vector<std::wstring> names;
+    std::vector<std::pair<std::string,bool>> out;
     for (const bool shaqi:{false,true})
         for (const ComboWeapons::Weapon& w:ComboWeaponsData::kWeapons) {
             if (w.shaqi!=shaqi||!w.count) continue;
-            const std::wstring name=WeaponName(w.id);
-            if (std::find(names.begin(),names.end(),name)!=names.end()) continue;
-            names.push_back(name); out.push_back({w.id,w.shaqi});
+            out.push_back({w.id,w.shaqi});
         }
     return out;
 }
@@ -350,7 +383,7 @@ std::wstring WeaponKindLabel(int kind) { return Tr(kind==ComboWeapons::kLight?L"
 std::wstring MoveText(const std::string& ability);
 std::wstring WeaponMoveText(const std::string& weapon,const std::string& ability) {
     const ComboWeapons::Move* move=ComboWeapons::MoveOf(weapon,ability);
-    const std::wstring name=MoveText(ability);
+    const std::wstring name=(ComboWeapons::HeldAttack(ability)?Tr(L"长按 / 蓄力 · "):L"")+MoveText(ability);
     if (!move||!move->stage[0]) return name;
     std::wstring presses=ComboWeapons::StagePresses(move->stage);
     if (UiI18n::GetLanguage()==UiI18n::Language::English) for (wchar_t& c:presses) c=c==L'重'?L'H':L'L';
@@ -365,12 +398,14 @@ bool WeaponActionsNode(const Node& node) { return node.type==NodeType::WeaponAct
 // keys' game actions are swallowed (toggle2).
 bool KeysTrigger(const Node& node) { return NpcCombo::IsComboTrigger(node)||NpcCombo::IsKeysTrigger(node); }
 bool RawTrigger(const Node& node) { return NpcCombo::IsKeysTrigger(node); }
-// 自定义按键 recording: keys pressed on the page (keyboard, mouse middle / side buttons) or on a pad join the node (or
+// 自定义按键 recording: keyboard, all five mouse buttons and pad presses edit a draft for the node (or
 // its branch row `route`, -1: the node's own keys).
-// route kRecordThen: a 自定义按键 trigger's 继续派生 key (one key, then the recording ends).
+// route kRecordThen: one 继续派生 key. Enter commits; Esc discards every kind of draft.
 constexpr int kRecordThen=-5;
-struct Recording { int node=-1; int route=-1; unsigned pad_was=0; bool pad_seeded=false; };
+struct Recording { int node=-1; int route=-1; unsigned pad_was=0; bool pad_seeded=false;
+    std::vector<int> draft; const std::vector<int>* target=nullptr; uint64_t generation=0; };
 Recording record_;
+const std::vector<int>& DisplayKeys(const std::vector<int>& keys){return record_.node>=0&&record_.target==&keys?record_.draft:keys;}
 // A pad button by the pad in use (Xbox or PlayStation names), or both for the list.
 std::wstring PadLabel(int code,bool ps) {
     static const wchar_t* const kXbox[NpcCombo::kPadBits+NpcCombo::kStickWays]={L"方向键上",L"方向键下",L"方向键左",L"方向键右",L"Start",L"Back",L"L3",L"R3",
@@ -385,6 +420,8 @@ std::wstring PadBothLabel(int code) {
 }
 std::wstring KeyboardLabel(int vk) {
     switch (vk) {
+    case VK_LBUTTON: return Tr(L"鼠标左键");
+    case VK_RBUTTON: return Tr(L"鼠标右键");
     case VK_MBUTTON: return Tr(L"鼠标中键");
     case VK_XBUTTON1: return Tr(L"鼠标侧键 1");
     case VK_XBUTTON2: return Tr(L"鼠标侧键 2");
@@ -417,7 +454,7 @@ std::wstring KeysText(const Node& node) { return KeysText(node.keys,node.chord,R
 // A 自定义组合键 / 自定义按键 trigger's 继续派生 field (field4): what takes its chain on after the first move.
 std::wstring ButtonLabel(int button);
 std::wstring ThenText(const Node& node,bool recording) {
-    if (recording) return Tr(L"继续派生：按下一个键…");
+    if (recording) return Tr(L"继续派生：")+(record_.draft.empty()?Tr(L"按下一个键…"):RawKeyLabel(record_.draft.front()))+Tr(L"（回车确认，Esc 取消）");
     if (!NpcCombo::HasThen(node)) return Tr(RawTrigger(node)?L"继续派生：再按原按键":L"继续派生：再按原组合键");
     const int key=NpcCombo::ThenRawKey(node);
     return Tr(L"继续派生：")+(key>=0?RawKeyLabel(key):ButtonLabel(node.then));
@@ -427,7 +464,7 @@ std::wstring ThenText(const Node& node,bool recording) {
 // (together) or "→" (in order) between two. Heights and widths in pixels.
 constexpr int kKeyIcon=18;  // icon height in canvas units (a field is kRow-4 high)
 bool PsPad() { return UiHotkeys::ActivePad()==UiHotkeys::Device::PlayStation; }
-bool MouseKey(int code) { return code==VK_MBUTTON||code==VK_XBUTTON1||code==VK_XBUTTON2; }
+bool MouseKey(int code) { return code==VK_LBUTTON||code==VK_RBUTTON||code==VK_MBUTTON||code==VK_XBUTTON1||code==VK_XBUTTON2; }
 UiHotkeys::Chord KeyChord(int code) {
     UiHotkeys::Chord chord;
     if (NpcCombo::IsPadKey(code)) { chord.device=PsPad()?UiHotkeys::Device::PlayStation:UiHotkeys::Device::Xbox; chord.buttons=1u<<(code-NpcCombo::kPadKey); }
@@ -468,10 +505,11 @@ int DrawKeyIcons(HDC dc,const RECT& rect,const std::vector<int>& keys,bool chord
 }
 // A keys field (the node's or a branch row's): icons, or the hint while there are none (or too few to work), and the
 // "▾"; while recording the "录制中" note first.
-void KeysField(HDC dc,const RECT& inner,const std::vector<int>& keys,bool chord,bool raw,bool recording,bool set,UiTheme::Font font,COLORREF text,COLORREF muted) {
+void KeysField(HDC dc,const RECT& inner,const std::vector<int>& stored_keys,bool chord,bool raw,bool recording,bool set,UiTheme::Font font,COLORREF text,COLORREF muted) {
+    const auto& keys=DisplayKeys(stored_keys);
     const size_t least=raw?1:NpcCombo::kComboKeysMin;
     if (keys.empty()||keys.size()<least) {
-        const std::wstring hint=recording?Tr(L"录制中：按键盘或手柄上的键（Esc 结束）")+(keys.empty()?L"":L" · "+KeysText(keys,chord,raw)):KeysText(keys,chord,raw);
+        const std::wstring hint=recording?Tr(L"录制中：键盘、鼠标或手柄（回车确认，Esc 取消）")+(keys.empty()?L"":L" · "+KeysText(keys,chord,raw)):KeysText(keys,chord,raw);
         Label(dc,hint+L"  ▾",inner,Scaled(font),set?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); return;
     }
     const int arrow=Px(14);RECT area=inner;
@@ -485,7 +523,8 @@ void KeysField(HDC dc,const RECT& inner,const std::vector<int>& keys,bool chord,
     Label(dc,L"▾",tail,Scaled(font),set?text:muted,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
 }
 // Canvas units the keys' icons take (at kKeyIcon), with room for the "▾" (and the 录制中 note while recording).
-int KeyIconsUnits(HDC dc,const std::vector<int>& keys,bool raw,bool recording,UiTheme::Font font) {
+int KeyIconsUnits(HDC dc,const std::vector<int>& stored_keys,bool raw,bool recording,UiTheme::Font font) {
+    const auto& keys=DisplayKeys(stored_keys);
     const size_t least=raw?1:NpcCombo::kComboKeysMin;
     if (keys.empty()||keys.size()<least) return 0;
     const int px=KeyIconsWidth(dc,keys,raw,Px(kKeyIcon));
@@ -500,8 +539,8 @@ std::wstring KeysModeText(size_t count,bool chord,int window,bool raw) {
 std::wstring KeysModeText(const Node& node) { return KeysModeText(node.keys.size(),node.chord,node.window,RawTrigger(node)); }
 // A branch row's keys and mode (a 自定义按键 row's mode also says whether its keys' game actions are swallowed).
 bool RawRoute(const NpcCombo::Route& route) { return route.button==static_cast<int>(Trigger::Keys); }
-std::wstring RouteModeText(const NpcCombo::Route& route) {
-    std::wstring text=KeysModeText(route.keys.size(),route.chord,route.window,RawRoute(route));
+std::wstring RouteModeText(const NpcCombo::Route& route,bool weapon=false) {
+    std::wstring text=weapon&&route.chord&&route.keys.size()>1?Tr(L"一起按 · 可先按住格挡"):KeysModeText(route.keys.size(),route.chord,route.window,RawRoute(route));
     if (RawRoute(route)) text+=L" · "+Tr(route.swallow?L"吞掉原动作":L"不吞掉");
     return text;
 }
@@ -515,7 +554,7 @@ KeySpec PickedKeys(int node,int route,int part) {
     if (KeysTrigger(n)&&(route==-2||route==-3)) {
         k.keys=&n.keys; k.chord=&n.chord; k.window=&n.window; k.swallow=&n.swallow; k.raw=RawTrigger(n); k.what=route==-2?1:2; return k;
     }
-    if (n.type==NodeType::Branch&&route>=0&&static_cast<size_t>(route)<n.routes.size()&&(part==1||part==2)&&NpcCombo::KeysRoute(n.routes[static_cast<size_t>(route)])) {
+    if (NpcCombo::HasRows(n)&&route>=0&&static_cast<size_t>(route)<n.routes.size()&&(part==1||part==2)&&NpcCombo::KeysRoute(n.routes[static_cast<size_t>(route)])) {
         NpcCombo::Route& r=n.routes[static_cast<size_t>(route)];
         k.keys=&r.keys; k.chord=&r.chord; k.window=&r.window; k.swallow=&r.swallow; k.raw=RawRoute(r); k.row=true; k.what=part;
     }
@@ -528,16 +567,11 @@ std::wstring ActionsWeaponText(const Node& node) {
     if (node.air_set) return Tr(L"主角在空中时");
     return node.weapon.empty()?Tr(L"选择武器"):Tr(L"武器：")+WeaponName(node.weapon);
 }
-void Invalidate() { sizes_.clear(); owners_.clear(); if (window_) InvalidateRect(window_,nullptr,FALSE); }
+void Invalidate() { DropCanvasCache(); Repaint(); }
 // The trigger whose chain reaches node `index` (NpcCombo::TriggerOf for every node at once; -1: none).
 int ChainOf(size_t index) {
     if (owners_.size()!=config_.chain.size()) {
-        owners_.assign(config_.chain.size(),-1);
-        for (size_t t=0;t<config_.chain.size();++t) {
-            if (!NpcCombo::StartsChain(config_.chain[t])) continue;
-            if (owners_[t]<0) owners_[t]=static_cast<int>(t);
-            for (const size_t i:NpcCombo::Order(config_,static_cast<int>(t))) if (owners_[i]<0) owners_[i]=static_cast<int>(t);
-        }
+        owners_=NpcCombo::Owners(config_);
     }
     return index<owners_.size()?owners_[index]:-1;
 }
@@ -626,12 +660,13 @@ void Rejoin(HDC dc,int index) {
     FitFrames(dc,index);
 }
 // Paint order: frames first (outer under inner), then every other node in chain order; hit tests go the other way.
-std::vector<size_t> PaintOrder() {
+const std::vector<size_t>& PaintOrder() {
+    if(canvas_cache_.order.size()==config_.chain.size())return canvas_cache_.order;
     std::vector<size_t> frames,others;
     for (size_t i=0;i<config_.chain.size();++i) (IsFrame(static_cast<int>(i))?frames:others).push_back(i);
     std::stable_sort(frames.begin(),frames.end(),[](size_t a,size_t b){ return NpcCombo::GroupDepth(config_,static_cast<int>(a))<NpcCombo::GroupDepth(config_,static_cast<int>(b)); });
     frames.insert(frames.end(),others.begin(),others.end());
-    return frames;
+    canvas_cache_.order=std::move(frames);return canvas_cache_.order;
 }
 // A node's place in its frame's order (1-based; 0: in no frame).
 int StepNumber(size_t index) {
@@ -668,6 +703,7 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Trigger: return Tr(node.trigger==static_cast<int>(Trigger::NpcKey)?L"按键":L"替换按键");
     case NodeType::Branch: return Tr(L"按键分支");
     case NodeType::Speed: return Tr(L"加速");
+    case NodeType::BoneTransform: return Tr(L"骨骼变换");
     case NodeType::Weapon: return Tr(L"武器属性");
     case NodeType::Armor: return Tr(L"霸体");
     case NodeType::Invincible: return Tr(L"无敌");
@@ -710,18 +746,29 @@ std::wstring HoldText(int ms) {
     if (NpcCombo::ClampHold(ms)<=0) return Tr(L"点按");
     wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"按住 %.1f s").c_str(),NpcCombo::ClampHold(ms)/1000.0); return text;
 }
-// 裁剪: the length of the BOSS 技能 it cuts (s; 0 until a preview or a cast tells it).
-float TrimClip(size_t index) {
-    const Node* source=At(NpcCombo::TrimmedBy(config_,static_cast<int>(index)));
-    return source?NpcCombo::Clip(source->ability):0.f;
+// A shared trim follows the playing linked skill, then selection/preview, then
+// its first owner. The displayed source identifies which montage length is used.
+int TrimSource(size_t index){
+    const auto linked=[&](int source){return At(source)&&At(source)->type==NodeType::BossSkill&&NpcCombo::ModOf(config_,source,NpcCombo::kModTrim)==static_cast<int>(index);};
+    if(run_.running&&run_.profile==moves_.profile&&linked(run_.node))return run_.node;
+    if(linked(selected_))return selected_;
+    if(linked(preview_.node))return preview_.node;
+    return NpcCombo::TrimmedBy(config_,static_cast<int>(index));
 }
+float TrimClip(size_t index) {const Node* source=At(TrimSource(index));return source?NpcCombo::Clip(source->ability):0.f;}
 std::wstring TrimEndText(const Node& node) { return node.trim_to>0?Seconds(NpcCombo::ClampTrim(node.trim_to)/1000.0):Tr(L"放完"); }
-// The part that plays, on the move's length (a start past the length: all of it, as the game plays it).
+std::wstring TrimSourceText(size_t index){
+    const Node* source=At(TrimSource(index));if(!source)return Tr(L"未连接技能");
+    const std::string short_name=NpcCombo::ShortName(source->ability);
+    return Tr(L"来源：")+std::wstring(short_name.begin(),short_name.end());
+}
+// Match actual playback: a start outside this montage leaves the whole move.
 std::wstring TrimBarText(size_t index) {
     const float clip=TrimClip(index);
-    if (!(clip>0)) return Tr(NpcCombo::TrimmedBy(config_,static_cast<int>(index))<0?L"连上 BOSS 技能后显示它的长度":L"招式长度：悬停预览或放一次后显示");
+    if (!(clip>0)) return Tr(TrimSource(index)<0?L"裁后时长：未连接技能":L"裁后时长：待读取原始长度");
     NpcCombo::TrimRange r=NpcCombo::TrimOf(config_.chain[index]); if (r.from>=clip) r={};
-    wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"%.2f–%.2f s（共 %.2f s）").c_str(),r.from,r.from+NpcCombo::TrimSpan(r,clip),static_cast<double>(clip));
+    const double span=NpcCombo::TrimSpan(r,clip);
+    wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"裁后 %.2f s · %.2f–%.2f s").c_str(),span,r.from,r.from+span);
     return text;
 }
 // 钩子 modes: 0 勾过来, 1 勾过去, 2 自动 (the target's guard picks it when it plays).
@@ -769,30 +816,10 @@ int Feeder(int index) {
 }
 // A move's speed in percent (its own 加速 nodes, else its chain's).
 int MoveSpeed(size_t index) { return NpcCombo::SpeedFor(config_,ChainOf(index),static_cast<int>(index)); }
-// What an interval does to the move before it, once that move has played once.
+// An interval waits after the preceding node's derivation gate; it never
+// stretches that node's animation to fill its own duration.
 std::wstring IntervalNote(size_t index) {
-    if (!Wired(index)) return Tr(L"未接入派生链");
-    int at=static_cast<int>(index),before=-1; bool branch=false;
-    std::vector<bool> seen(config_.chain.size(),false);
-    while (true) {
-        seen[static_cast<size_t>(at)]=true;
-        const int feeder=Feeder(at);
-        if (feeder<0||seen[static_cast<size_t>(feeder)]) break;
-        const Node& n=config_.chain[static_cast<size_t>(feeder)];
-        if (NpcCombo::StartsChain(n)) return Tr(L"第一次按键后等待");
-        if (n.type==NodeType::Branch) branch=true;
-        else if (NpcCombo::IsMove(n)) { before=feeder; break; }
-        at=feeder;
-    }
-    const Node* move=At(before);
-    const float length=move&&move->type==NodeType::Skill?NpcCombo::Length(move->ability):0.f;
-    if (branch||!(length>0)) return Tr(L"上一招开始后，到时再按才接下一招");
-    const double lasts=length*100.0/MoveSpeed(static_cast<size_t>(before));
-    const int total=NpcCombo::SharedWait(config_,before);
-    wchar_t text[64]{};
-    if (total>lasts*1020) _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"上一招慢放 ×%.2f").c_str(),lasts*1000.0/total);
-    else _snwprintf_s(text,_countof(text),_TRUNCATE,L"%s",Tr(L"到时按键提前接下一招").c_str());
-    return text;
+    return Tr(Wired(index)?L"前招到派生点（未设则放完）后开始等待，不改变前招速度":L"未接入派生链");
 }
 // What the nodes pointing at a modifier get from it, in words.
 std::wstring ModifierNote(size_t index) {
@@ -808,7 +835,7 @@ std::wstring ModifierNote(size_t index) {
         const NpcCombo::TrimRange r=NpcCombo::TrimOf(node); const float clip=TrimClip(index);
         if (node.trim_to>0&&node.trim_to<=node.trim_from) return Tr(L"结束不晚于开始：放到这一招结尾");
         if (clip>0&&r.from>=clip) { wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"开始晚于这一招的长度 %.2f s：整招照常播放").c_str(),static_cast<double>(clip)); return text; }
-        if (clip>0) return Tr(L"拖动两端裁剪 · 数值上滚轮微调");
+        if (clip>0) return Tr(L"右键增删停留点 · 预览按住空格");
         if (!r.on) return Tr(L"从头放到结尾：调开始或结束来裁剪");
         wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招 BOSS 技能只播放这一段").c_str(),from.nodes); return text;
     }
@@ -913,10 +940,11 @@ std::wstring NodeNote(size_t index) {
         return wired?Tr(L"瞬身变成这个 Boss，派生链结束后保持"):Tr(L"未连接");
     case NodeType::HeroLook: return wired?Tr(L"瞬身变回主角，派生链结束后保持"):Tr(L"未连接");
     case NodeType::PreInput: return Tr(node.ms>0?L"招式中提前按的键保留这么久，没接上就清除":L"提前按的键一直保留到接上招式");
+    case NodeType::BoneTransform: return node.bones.on?L"已启用 · "+std::to_wstring(node.bones.rows.size())+L" 根骨骼":L"未启用 · 点击详细编辑";
     case NodeType::AirDefault: return Tr(node.on?L"空中放出、没连滞空的招式按这里升高、滞空":L"已关闭：空中放招不额外升高、滞空");
     case NodeType::WeaponActions:
-        if (node.air_set) return Tr(L"主角在空中按下面的键时，改放连接的招式");
-        return Tr(node.weapon.empty()?L"先选择武器":L"拿这把武器时，下面的动作改放连接的招式");
+        if (node.air_set) return Tr(L"空中点按 / 按住下面的键，改放连接的招式");
+        return Tr(node.weapon.empty()?L"先选择武器":L"点按 / 按住分开连线；同键优先匹配已达到的最长时间");
     default: break;
     }
     if (node.ability.empty()||!MoveOfSkin(node.ability)) return Tr(L"不属于当前外观");
@@ -930,6 +958,7 @@ std::wstring NodeNote(size_t index) {
 }
 // Width and height in canvas units (measured: NodeSize keeps them).
 SIZE MeasureNode(HDC dc,size_t index) {
+    ++canvas_cache_.measurements;
     const Node& node=config_.chain[index];
     if (node.type==NodeType::Trigger) {
         const bool key=node.trigger==static_cast<int>(Trigger::NpcKey),execution=ExecutionTrigger(node);
@@ -973,8 +1002,9 @@ SIZE MeasureNode(HDC dc,size_t index) {
         // The weapon, the reset time, a note, a row per action (its field, x, its own output), then "+ 添加动作".
         int wide=(std::max)(Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,(std::max)(Units(dc,UiTheme::Font::Body,ActionsWeaponText(node)+L"  ▾")+60,
                                                                                    Units(dc,UiTheme::Font::Small,NodeNote(index))+34));
-        for (const NpcCombo::Route& route:node.routes) wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,ButtonLabel(route.button)+L" ▾")+100);
-        return {std::clamp(wide,340,520),kHeader+kRow*(static_cast<int>(node.routes.size())+4)+kPad};
+        int extra=0;for (const NpcCombo::Route& route:node.routes){wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,ButtonLabel(route.button)+L" ▾")+116+StepperUnits(RouteHoldUnits(dc)));
+            if(NpcCombo::KeysRoute(route)){++extra;wide=(std::max)(wide,KeyIconsUnits(dc,route.keys,RawRoute(route),false,UiTheme::Font::Small)+Units(dc,UiTheme::Font::Small,RouteModeText(route,true))+100);}}
+        return {std::clamp(wide,500,900),kHeader+kRow*(static_cast<int>(node.routes.size())+extra+4)+kPad};
     }
     if (node.type==NodeType::Group) return {NpcCombo::ClampGroupW(node.w),NpcCombo::ClampGroupH(node.h)};
     const int title=Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,note=Units(dc,UiTheme::Font::Small,NodeNote(index))+34;
@@ -990,8 +1020,9 @@ SIZE MeasureNode(HDC dc,size_t index) {
     if (node.type==NodeType::Trim) {  // 开始于, 结束于 (steppers), the part on the move's length, a note
         const int labels=(std::max)(Units(dc,UiTheme::Font::Small,Tr(L"开始于")),Units(dc,UiTheme::Font::Small,Tr(L"结束于")))+150;
         const int bar=Units(dc,UiTheme::Font::Small,TrimBarText(index))+40;
-        return {std::clamp((std::max)((std::max)(title,note),(std::max)(labels,bar)),300,460),kHeader+kRow*5+kPad};
+        return {std::clamp((std::max)((std::max)(title,note),(std::max)(labels,bar)),300,460),kHeader+kRow*6+kPad};
     }
+    if(node.type==NodeType::BoneTransform)return {320,kHeader+kRow*3+kPad};
     if (node.type==NodeType::Speed) {
         const int curve=Units(dc,UiTheme::Font::Small,Tr(L"曲线调节"))+Units(dc,UiTheme::Font::Small,Tr(L"编辑曲线…"))+80;
         return {std::clamp((std::max)((std::max)(title,note),curve),240,360),kHeader+kRow*3+kPad};
@@ -1085,6 +1116,7 @@ Shape NodeShape(HDC dc,size_t index) {
         const RECT line=Row(s.rect,0); const int b=line.bottom-line.top;
         s.minus={line.left,line.top,line.left+b,line.bottom}; s.plus={line.right-b,line.top,line.right,line.bottom};
         s.value={s.minus.right+Px(4),line.top,s.plus.left-Px(4),line.bottom};
+    } else if(node.type==NodeType::BoneTransform){s.field=Row(s.rect,1);
     } else if (node.type==NodeType::Speed) {
         // Row 0: the multiplier (a stepper), or under 曲线调节 the curve's picture (a click opens its window); row 1: the
         // 曲线调节 checkbox and 编辑曲线…; row 2: the note.
@@ -1098,7 +1130,7 @@ Shape NodeShape(HDC dc,size_t index) {
         s.toggle={row.left,row.top,split,row.bottom}; s.field={split+Px(6),row.top,row.right,row.bottom};
     } else if (node.type==NodeType::Trim) {
         // Row 0: 开始于 (a stepper); row 1: 结束于 (a stepper, as a trigger's 按住); row 2: the part on the move's length;
-        // row 3: range times (clear of the handles); row 4: the note.
+        // row 3: kept duration/range; row 4: source skill; row 5: the note.
         const auto trim_row=[&](int row,RECT& minus,RECT& value,RECT& plus){
             const RECT line=Row(s.rect,row); const int b=line.bottom-line.top;
             minus={line.right-Px(124),line.top,line.right-Px(124)+b,line.bottom}; plus={line.right-b,line.top,line.right,line.bottom};
@@ -1159,8 +1191,13 @@ Shape NodeShape(HDC dc,size_t index) {
         for (size_t k=0;k<node.routes.size();++k) {
             RouteShape route; const RECT line=Row(s.rect,at++); const int b=line.bottom-line.top,right=s.rect.right-Px(30);
             route.remove={right-b,line.top,right,line.bottom};
-            route.field={line.left,line.top,route.remove.left-Px(8),line.bottom};
+            route.hplus={route.remove.left-Px(8)-b,line.top,route.remove.left-Px(8),line.bottom};
+            route.hvalue={route.hplus.left-Px(4)-Px(RouteHoldUnits(dc)),line.top,route.hplus.left-Px(4),line.bottom};
+            route.hminus={route.hvalue.left-Px(4)-b,line.top,route.hvalue.left-Px(4),line.bottom};
+            route.field={line.left,line.top,route.hminus.left-Px(8),line.bottom};
             route.out={s.rect.right-Px(13),(line.top+line.bottom)/2};
+            if(NpcCombo::KeysRoute(node.routes[k])){const RECT keys=Row(s.rect,at++);const int split=keys.left+Px(16)+(right-keys.left-Px(16))*11/20;
+                route.has_keys=true;route.keys={keys.left+Px(16),keys.top,split-Px(3),keys.bottom};route.mode={split+Px(3),keys.top,right,keys.bottom};}
             s.routes.push_back(route);
         }
         const RECT add=Row(s.rect,at);
@@ -1203,6 +1240,37 @@ std::vector<int> Selection() {
     for (const int i:picked_) if (At(i)&&std::find(out.begin(),out.end(),i)==out.end()) out.push_back(i);
     if (out.empty()&&At(selected_)) out.push_back(selected_);
     return out;
+}
+// Clipboard stays within the panel process and can be pasted into another table.
+float ToolsBottom();
+void Refresh(bool force);
+void CopySelection(){
+    Refresh(false);
+    if(!HasSkin())return;
+    const auto selection=Selection();int skipped=0;
+    for(int index:selection)if(At(index)&&!NpcCombo::ClipboardNode(*At(index)))++skipped;
+    auto copied=NpcCombo::CopyNodes(config_,selection);
+    if(copied.empty()){DebugHub::Notify(Tr(L"请选择可复制的节点；按键、预输入和空中释放是唯一节点，不能复制。").c_str());return;}
+    node_clipboard_=std::move(copied);paste_count_=0;
+    wchar_t notice[192]{};_snwprintf_s(notice,_countof(notice),_TRUNCATE,Tr(L"已复制 %zu 个节点（跳过 %d 个唯一节点）；Ctrl+V 粘贴，外部连线不复制。").c_str(),node_clipboard_.size(),skipped);
+    DebugHub::Notify(notice);Invalidate();
+}
+void PasteSelection(){
+    Refresh(false);
+    if(!HasSkin()||node_clipboard_.empty())return;
+    const int top=canvas_.top+static_cast<int>(std::lround(ToolsBottom()));
+    POINT anchor=cursor_;if(!PtInRect(&canvas_,anchor)||anchor.y<top)anchor={(canvas_.left+canvas_.right)/2,top+M().S(48)};
+    int min_x=NpcCombo::kCanvasLimit,min_y=NpcCombo::kCanvasLimit;for(const auto& node:node_clipboard_){min_x=(std::min)(min_x,node.x);min_y=(std::min)(min_y,node.y);}
+    const int offset=32*(std::min)(paste_count_+1,1000);
+    const int dx=NpcCombo::ClampPosition(static_cast<int>(ToCanvasX(anchor.x)))-min_x+offset,dy=NpcCombo::ClampPosition(static_cast<int>(ToCanvasY(anchor.y)))-min_y+offset;
+    auto added=NpcCombo::PasteNodes(config_,node_clipboard_,dx,dy);
+    if(added.empty()){DebugHub::Notify(Tr(L"无法粘贴：节点数量已到保护上限。").c_str());return;}
+    ++paste_count_;picked_=std::move(added);selected_=picked_.back();Save();Layout();Invalidate();
+    wchar_t notice[128]{};_snwprintf_s(notice,_countof(notice),_TRUNCATE,Tr(L"已粘贴 %zu 个节点，内部连线和参数已保留。").c_str(),picked_.size());DebugHub::Notify(notice);
+}
+bool ClipboardKey(WPARAM key,bool control){
+    if(!control||(key!='C'&&key!='V')||search_.open||edit_.node>=0||record_.node>=0||drag_.mode!=Drag::None)return false;
+    if(key=='C')CopySelection();else PasteSelection();return true;
 }
 // The 框选 box on the page, from the press to the pointer.
 RECT BoxRect() { return {(std::min)(drag_.start.x,drag_.last.x),(std::min)(drag_.start.y,drag_.last.y),(std::max)(drag_.start.x,drag_.last.x),(std::max)(drag_.start.y,drag_.last.y)}; }
@@ -1308,7 +1376,20 @@ void RemoveSelected() {
 // 编辑曲线…: the node's curve in its own window (曲线调节 turns on with it). The window reads the node back every
 // tick and writes it (saved when a drag or click is over); it closes when the node goes (removed, another chain or
 // file loaded).
+void OpenBones(int index){
+    if(!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::BoneTransform)return;
+    SpeedCurveWindow::Close("bone editor");const std::string profile=moves_.profile;
+    BoneMotionPage::Host host;
+    host.read=[index,profile](BoneMotion::Config& bones,std::wstring& title){
+        if(moves_.profile!=profile||!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::BoneTransform)return false;
+        bones=config_.chain[static_cast<size_t>(index)].bones;title=L"骨骼变换 · 节点 "+std::to_wstring(index+1);return true;};
+    host.write=[index,profile](const BoneMotion::Config& bones){
+        if(moves_.profile!=profile||!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::BoneTransform)return;
+        config_.chain[static_cast<size_t>(index)].bones=BoneMotion::Clean(bones);Save();Layout();Invalidate();};
+    BoneMotionPage::Open(window_,index,std::move(host));
+}
 void OpenCurve(int index) {
+    BoneMotionPage::Close();
     if (!At(index)||config_.chain[static_cast<size_t>(index)].type!=NodeType::Speed) return;
     Node& node=config_.chain[static_cast<size_t>(index)];
     if (!node.curve||node.points.size()<2) { node.curve=true; if (node.points.size()<2) node.points=NpcCombo::DefaultCurve(node.speed); Save(); Layout(); }
@@ -1336,7 +1417,7 @@ void OpenCurve(int index) {
     SpeedCurveWindow::Open(window_,index,std::move(host));
 }
 // The curve window goes with its node (a removal shifts the indexes; another chain or file replaces them).
-void CloseCurve(const char* why) { if (SpeedCurveWindow::EditedNode()>=0) SpeedCurveWindow::Close(why); }
+void CloseCurve(const char* why) { BoneMotionPage::Close(); if (SpeedCurveWindow::EditedNode()>=0) SpeedCurveWindow::Close(why); }
 // combo curve: the first 加速 node's window opened as a click on it does (曲线调节 turns on with it), or a test curve
 // (never saved) when the chain has none; where it sits. combo curve close puts that node's 曲线调节 and points back.
 struct CurveTest { int node=-1; std::string profile; bool curve=false; std::vector<NpcCombo::CurvePoint> points; } curve_test_;
@@ -1407,7 +1488,7 @@ int* HoldOf(int index,int row) {
     if (!At(index)) return nullptr;
     Node& node=config_.chain[static_cast<size_t>(index)];
     if (row<0) return node.type==NodeType::Trigger?&node.hold_ms:node.type==NodeType::Trim?&node.trim_to:nullptr;  // a 裁剪's 结束于
-    return node.type==NodeType::Branch&&static_cast<size_t>(row)<node.routes.size()?&node.routes[static_cast<size_t>(row)].hold_ms:nullptr;
+    return NpcCombo::HasRows(node)&&static_cast<size_t>(row)<node.routes.size()?&node.routes[static_cast<size_t>(row)].hold_ms:nullptr;
 }
 void NudgeHold(int index,int dir,int row) {
     int* hold=HoldOf(index,row); if (!hold||!dir) return;
@@ -1716,6 +1797,7 @@ void SearchItems() {
             add({ItemKind::Interrupt,Tr(L"允许中断"),flow});  // a grab takes 允许中断 only (the boss body plays it out)
             return;
         }
+        add({ItemKind::BoneTransform,Tr(L"骨骼变换"),flow});
         add({ItemKind::Speed,Tr(L"加速"),flow});
         add({ItemKind::Armor,Tr(L"霸体"),flow});
         add({ItemKind::Invincible,Tr(L"无敌"),flow});
@@ -1773,7 +1855,7 @@ void SearchItems() {
         } else for (const auto& [id,name]:BossLooks()) { Item item{ItemKind::BossLook,name,Tr(L"外观")}; item.ability=id; add(item); }
         return;
     }
-    if (search_.pick_node>=0&&At(search_.pick_node)&&WeaponActionsNode(config_.chain[static_cast<size_t>(search_.pick_node)])) {
+    if (search_.pick_node>=0&&At(search_.pick_node)&&search_.pick_part==0&&WeaponActionsNode(config_.chain[static_cast<size_t>(search_.pick_node)])) {
         // A 武器派生修改's weapon (route -1), or a row's action: the hero's actions (处决 takes the quick ones too unless a
         // 简易处决 row is there).
         if (search_.pick_route<0) {
@@ -1783,9 +1865,10 @@ void SearchItems() {
         const bool air=config_.chain[static_cast<size_t>(search_.pick_node)].air_set;
         const std::wstring group=Tr(air?L"在空中按哪个键":L"改哪个动作");
         if (air) { Item item{ItemKind::Button,ButtonLabel(static_cast<int>(Trigger::NpcKey)),group}; item.trigger=static_cast<int>(Trigger::NpcKey); add(item); }
-        for (const Trigger t:NpcCombo::kTriggerOrder) if (air?NpcCombo::ValidAirAction(static_cast<int>(t)):NpcCombo::ValidWeaponAction(static_cast<int>(t))) {
+        for (const Trigger t:NpcCombo::kTriggerOrder) if (!NpcCombo::OwnKeysTrigger(static_cast<int>(t))&&(air?NpcCombo::ValidAirAction(static_cast<int>(t)):NpcCombo::ValidWeaponAction(static_cast<int>(t)))) {
             Item item{ItemKind::Button,ButtonLabel(static_cast<int>(t)),group}; item.trigger=static_cast<int>(t); add(item);
         }
+        for(const Trigger t:{Trigger::Combo,Trigger::Keys}){Item item{ItemKind::Button,ButtonLabel(static_cast<int>(t)),Tr(L"特殊组合输入")};item.trigger=static_cast<int>(t);add(item);}
         return;
     }
     if (search_.pick_node>=0&&At(search_.pick_node)) {
@@ -1840,7 +1923,7 @@ void SearchItems() {
         const bool raw=RawTrigger(node);
         Item own{ItemKind::ThenKey,Tr(raw?L"再按原按键（默认）":L"再按原组合键（默认）"),Tr(L"继续派生")}; own.trigger=NpcCombo::kThenOwn; add(own);
         if (raw) {
-            Item record{ItemKind::ThenKey,Tr(L"录制一个键：按键盘、鼠标侧键、手柄上的键或推左摇杆"),Tr(L"录制")}; record.trigger=-4; add(record);
+            Item record{ItemKind::ThenKey,Tr(L"录制一个键：键盘、鼠标五键、手柄或左摇杆（回车确认）"),Tr(L"录制")}; record.trigger=-4; add(record);
             const std::wstring pad=Tr(L"手柄按键");
             for (int bit=0;bit<NpcCombo::kPadBits+NpcCombo::kStickWays;++bit) { Item item{ItemKind::ThenKey,PadBothLabel(NpcCombo::kPadKey+bit),pad}; item.trigger=NpcCombo::kThenRaw+NpcCombo::kPadKey+bit; add(item); }
         }
@@ -1855,7 +1938,7 @@ void SearchItems() {
         if (spec.what==1&&spec.raw) {
             // Recording (keyboard / mouse / pad), the pad's buttons by name, then undo / clear / done.
             if (keys.size()<NpcCombo::kComboKeysMax) {
-                Item record{ItemKind::RawKey,Tr(L"录制按键：按键盘、鼠标侧键、手柄上的键或推左摇杆"),Tr(L"录制")}; record.trigger=-4; add(record);
+                Item record{ItemKind::RawKey,Tr(L"录制按键：键盘、鼠标五键、手柄或左摇杆（回车确认）"),Tr(L"录制")}; record.trigger=-4; add(record);
                 wchar_t group[96]{}; _snwprintf_s(group,_countof(group),_TRUNCATE,Tr(L"手柄按键（%zu / %zu）").c_str(),keys.size(),NpcCombo::kComboKeysMax);
                 for (int bit=0;bit<NpcCombo::kPadBits+NpcCombo::kStickWays;++bit) { Item item{ItemKind::RawKey,PadBothLabel(NpcCombo::kPadKey+bit),group}; item.trigger=NpcCombo::kPadKey+bit; add(item); }
             }
@@ -1879,7 +1962,8 @@ void SearchItems() {
             return;
         }
         // How the keys are pressed: together, or in order with the longest gap between two (a few values, or typed).
-        add({ItemKind::ComboMode,Tr(L"一起按（150 毫秒内同时按下）"),Tr(L"一起按")});
+        const bool weapon_keys=spec.row&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::WeaponActions;
+        add({ItemKind::ComboMode,Tr(weapon_keys?L"一起按（可先按住格挡，再按另一键）":L"一起按（150 毫秒内同时按下）"),Tr(L"一起按")});
         search_.items.back().trigger=0;
         const std::wstring order=Tr(L"按顺序按：两键间隔不超过");
         wchar_t typed_text[64]{}; wchar_t* end=nullptr; const long typed=std::wcstol(search_.query.c_str(),&end,10);
@@ -1962,7 +2046,8 @@ void SearchItems() {
     const std::wstring flow=Tr(L"流程"),buttons=Tr(L"替换主角按键");
     add({ItemKind::Interval,Tr(L"间隔"),flow});
     add({ItemKind::Branch,Tr(L"按键分支"),flow});
-    add({ItemKind::Speed,Tr(L"加速"),flow});
+    add({ItemKind::BoneTransform,Tr(L"骨骼变换"),flow});
+        add({ItemKind::Speed,Tr(L"加速"),flow});
     add({ItemKind::Armor,Tr(L"霸体"),flow});
     add({ItemKind::Invincible,Tr(L"无敌"),flow});
     add({ItemKind::IgnoreGuard,Tr(L"无视防御"),flow});
@@ -2066,6 +2151,7 @@ void SearchLayout() {
     search_.rect={x,y,x+w,y+h};
     search_.edit={x+m.S(8),y+m.S(8),x+w-m.S(8),y+edit_h};
     search_.list={x+m.S(4),y+edit_h+m.S(4),x+w-m.S(4),y+h-m.S(6)};
+    if(search_input_){const int pad=m.S(6);SetWindowPos(search_input_,HWND_TOP,search_.edit.left+pad,search_.edit.top+m.S(3),search_.edit.right-search_.edit.left-2*pad,search_.edit.bottom-search_.edit.top-m.S(6),SWP_NOACTIVATE);ShowWindow(search_input_,search_.open?SW_SHOWNA:SW_HIDE);SyncSearchInput();}
 }
 void SearchEnsureVisible();
 void OpenSearch(POINT at,int from,int into,int from_out) {
@@ -2075,7 +2161,7 @@ void OpenSearch(POINT at,int from,int into,int from_out) {
     search_.pick_node=-1; search_.pick_route=-1; search_.pick_part=0; search_.mod_from=-1; search_.mode=0;
     search_.x=ToCanvasX(at.x); search_.y=ToCanvasY(at.y);
     SearchItems(); SearchFilter(); SearchLayout();
-    SetFocus(window_); Invalidate();
+    FocusSearch(); Invalidate();
 }
 // The button list under a trigger's field (route -1) or a branch row's field (part 0; 1 its keys, 2 how they are pressed).
 void OpenPicker(int node,int route,int part) {
@@ -2108,11 +2194,11 @@ void OpenChainSearch() {
     SearchItems(); SearchFilter();
     for (size_t r=0;r<search_.rows.size();++r)
         if (!search_.rows[r].header&&search_.items[search_.rows[r].item].trigger==pinned_) { search_.selected=static_cast<int>(r); break; }
-    SearchLayout(); SearchEnsureVisible(); SetFocus(window_); Invalidate();
+    SearchLayout(); SearchEnsureVisible(); FocusSearch(); Invalidate();
 }
-void CloseSearch() { if (search_.open) { search_.open=false; Invalidate(); } }
+void CloseSearch() { if (search_.open) { search_.open=false;if(search_input_)ShowWindow(search_input_,SW_HIDE);if(!UiCursor::HandsOff())SetFocus(window_);Invalidate(); } }
 // Windows' own Save As window, opened in combos\ on the active file's name with the .combo type. The page's search box
-// never got typed names (the hub's dialog navigation takes the page's WM_CHAR), the system window does. Modal to the
+// uses a dedicated native edit for search now; Save As remains a standard system dialog. Modal to the
 // game window (no clicks reach the game or the hub while it is open), with its own message loop on this thread; it has
 // a caption, so the activation guard lets it take focus, and the game is active again when it closes.
 // Empty: cancelled, or no dialog.
@@ -2179,37 +2265,42 @@ void SearchMove(int step) {
     search_.keyed=true; SearchEnsureVisible(); Invalidate();
 }
 // Adds the picked row's node where the search opened (wired when it came from a wire), or sets the picked button.
-// 自定义按键 recording: on until Esc, a left click, the page hidden or six keys.
-void StopRecording(const wchar_t* note) {
+// Recording is a transaction: draft changes never reach runtime or disk before Enter.
+void StopRecording(const wchar_t* note,bool commit=false) {
     if (record_.node<0) return;
+    bool changed=false;
+    if(commit&&At(record_.node)&&record_.generation==NpcCombo::Generation()){
+        if(record_.route==kRecordThen){
+            Node& node=config_.chain[static_cast<size_t>(record_.node)];
+            if(RawTrigger(node)&&!record_.draft.empty()){const int value=NpcCombo::kThenRaw+record_.draft.front();changed=node.then!=value;node.then=value;}
+        }else{
+            const KeySpec spec=PickedKeys(record_.node,record_.route>=0?record_.route:-2,record_.route>=0?1:0);
+            if(spec.keys&&spec.raw&&spec.keys==record_.target){changed=*spec.keys!=record_.draft;*spec.keys=record_.draft;}
+        }
+    }else if(commit)note=L"配置已变化，录制已取消";
     record_={};
-    if (note) DebugHub::Notify(Tr(note).c_str());
-    Invalidate();
+    if(changed)Save();
+    if(note)DebugHub::Notify(Tr(note).c_str());
+    Layout();Invalidate();
 }
 void StartRecording(int node,int route=-1) {
     if (route==kRecordThen) { if (!At(node)||!RawTrigger(config_.chain[static_cast<size_t>(node)])) return; }
     else { const KeySpec spec=PickedKeys(node,route>=0?route:-2,route>=0?1:0); if (!spec.keys||!spec.raw) return; }
-    CloseSearch(); CommitEdit();
-    record_={}; record_.node=node; record_.route=route;
-    {const UiHotkeys::PadLevel pad=UiHotkeys::CurrentPad(); record_.pad_was=NpcCombo::PadCodeBits(pad.buttons,pad.stick);}
-    record_.pad_seeded=true;  // a pad button (or stick way) held now is no press
-    SetFocus(window_);
-    DebugHub::Notify(Tr(route==kRecordThen?L"录制中：按下继续派生要用的键，Esc 或点击页面取消":L"录制中：按下要加入的键，Esc 或点击页面结束").c_str());
-    Layout(); Invalidate();
+    StopRecording(nullptr);CloseSearch();CommitEdit();
+    record_={};record_.node=node;record_.route=route;record_.generation=NpcCombo::Generation();
+    if(route!=kRecordThen){const KeySpec spec=PickedKeys(node,route>=0?route:-2,route>=0?1:0);record_.target=spec.keys;record_.draft=*spec.keys;}
+    {const UiHotkeys::PadLevel pad=UiHotkeys::CurrentPad();record_.pad_was=NpcCombo::PadCodeBits(pad.buttons,pad.stick);}
+    record_.pad_seeded=true;
+    if(IsWindowVisible(window_)&&!UiCursor::HandsOff())SetFocus(window_);
+    DebugHub::Notify(Tr(L"录制中：键盘、鼠标或手柄（回车确认，Esc 取消）").c_str());
+    Layout();Invalidate();
 }
 void RecordKey(int code) {
-    if (record_.node<0||!At(record_.node)||!NpcCombo::ValidRawKey(code)) return;
-    if (record_.route==kRecordThen) {
-        Node& node=config_.chain[static_cast<size_t>(record_.node)];
-        if (!RawTrigger(node)) { StopRecording(nullptr); return; }
-        node.then=NpcCombo::kThenRaw+code; StopRecording(L"已设为继续派生键"); Save(); Layout(); Invalidate(); return;
-    }
-    const KeySpec spec=PickedKeys(record_.node,record_.route>=0?record_.route:-2,record_.route>=0?1:0);
-    if (!spec.keys||!spec.raw) { StopRecording(nullptr); return; }
-    std::vector<int>& keys=*spec.keys;
-    if (keys.size()<NpcCombo::kComboKeysMax) keys.push_back(code);
-    Save(); Layout(); Invalidate();
-    if (keys.size()>=NpcCombo::kComboKeysMax) StopRecording(L"已录满 6 个键，录制结束");
+    if(record_.node<0||!At(record_.node)||!NpcCombo::ValidRawKey(code)||code==VK_RETURN||code==VK_ESCAPE)return;
+    if(record_.route==kRecordThen)record_.draft={code};
+    else if(record_.draft.size()<NpcCombo::kComboKeysMax)record_.draft.push_back(code);
+    else{DebugHub::Notify(Tr(L"已录满 6 个键，回车确认或 Esc 取消").c_str());return;}
+    Layout();Invalidate();
 }
 void SearchPick(int row) {
     if (row<0||static_cast<size_t>(row)>=search_.rows.size()||search_.rows[static_cast<size_t>(row)].header) return;
@@ -2358,6 +2449,7 @@ void SearchPick(int row) {
     case ItemKind::AutoDodge: node.type=NodeType::AutoDodge; break;
     case ItemKind::Trigger: node=NpcCombo::TriggerNode(static_cast<Trigger>(item.trigger),0,0); break;
     case ItemKind::Branch: node=NpcCombo::BranchNode(0,0); break;
+    case ItemKind::BoneTransform: node=NpcCombo::ModifierNode(NodeType::BoneTransform,0,0);node.bones.on=true;break;
     case ItemKind::Speed: node=NpcCombo::ModifierNode(NodeType::Speed,0,0); break;
     case ItemKind::Weapon: node=NpcCombo::ModifierNode(NodeType::Weapon,0,0); break;
     case ItemKind::Armor: node=NpcCombo::ModifierNode(NodeType::Armor,0,0); break;
@@ -2398,6 +2490,8 @@ int SearchRowAt(POINT p) {
 // ---- buttons and clicks --------------------------------------------------------------------------
 void PressButton(Button button) {
     switch (button) {
+    case Button::Copy: CopySelection();return;
+    case Button::Paste: PasteSelection();return;
     case Button::Toggle: config_.enabled=!config_.enabled; Save(); break;
     case Button::Toast: {
         const bool on=!NpcCombo::ShowToast(); NpcCombo::SetShowToast(on);
@@ -2411,6 +2505,7 @@ void PressButton(Button button) {
     }
     case Button::Interval: { Node node; node.type=NodeType::Interval; node.ms=NpcCombo::kIntervalDefault; Append(node); return; }
     case Button::Branch: Append(NpcCombo::BranchNode(0,0)); return;
+    case Button::BoneTransform: AddModifier(NodeType::BoneTransform);return;
     case Button::Speed: AddModifier(NodeType::Speed); return;
     case Button::Weapon: AddModifier(NodeType::Weapon); return;
     case Button::Armor: AddModifier(NodeType::Armor); return;
@@ -2544,7 +2639,7 @@ void Click(const Hit& hit) {
     case Part::RouteField: Select(hit.index); OpenPicker(hit.index,hit.sub); return;
     case Part::RouteKeys: Select(hit.index); OpenPicker(hit.index,hit.sub,1); return;
     case Part::RouteMode: Select(hit.index); OpenPicker(hit.index,hit.sub,2); return;
-    case Part::NodeField: Select(hit.index); if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::Speed) { OpenCurve(hit.index); return; }
+    case Part::NodeField: Select(hit.index); if(At(hit.index)&&At(hit.index)->type==NodeType::BoneTransform){OpenBones(hit.index);return;} if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::Speed) { OpenCurve(hit.index); return; }
         if (!IsKey(hit.index)) OpenPicker(hit.index,-1); return;
     case Part::NodeField2: {
         Select(hit.index);
@@ -2597,6 +2692,7 @@ std::wstring ButtonText(Button button) {
     case Button::Dummy: return Tr(dummy_present_?L"移除测试木桩":L"召唤测试木桩");
     case Button::Interval: return Tr(L"+ 间隔");
     case Button::Branch: return Tr(L"+ 按键分支");
+    case Button::BoneTransform: return Tr(L"+ 骨骼变换");
     case Button::Speed: return Tr(L"+ 加速");
     case Button::Weapon: return Tr(L"+ 武器属性");
     case Button::Armor: return Tr(L"+ 霸体");
@@ -2627,6 +2723,8 @@ std::wstring ButtonText(Button button) {
     case Button::AddTrigger: return Tr(L"+ 替换按键");
     case Button::Arrange: return Tr(L"整理");
     case Button::Frame: return Tr(L"显示全部");
+    case Button::Copy: return Tr(L"复制");
+    case Button::Paste: return Tr(L"粘贴");
     case Button::Remove: return Tr(L"删除");
     case Button::Clear: return Tr(L"清空");
     default: return {};
@@ -2640,7 +2738,7 @@ std::wstring TabText(const Tab& tab) {
 // Top to bottom: the skin and the chain switch, the kind tabs, one horizontal strip of the tab's moves, then the
 // canvas taking every pixel that is left (the hub gives the page at least the visible height), then one status line.
 void Layout() {
-    sizes_.clear(); owners_.clear(); widths_.clear();
+    DropCanvasCache(); widths_.clear();
     if (!window_) return;
     RECT client{}; GetClientRect(window_,&client);
     const auto m=M(); const int pad=m.Margin(),gap=m.S(8),width=(std::max)(m.S(720),static_cast<int>(client.right));
@@ -2748,7 +2846,7 @@ void Layout() {
     const int minimum=y+min_canvas+m.S(6)+footer_h+m.S(10);
     const std::wstring key=UiHotkeys::Hint(UiHotkeys::Action::NpcSkill);
     wchar_t hint[1024]{};
-    _snwprintf_s(hint,_countof(hint),_TRUNCATE,Tr(L"每按一次 %s（或被替换的主角按键）放下一招；招式中按下的键会记住，到它的派生点（未设则放完）时接上 · 按键分支：按不同的键、或在可接下一招后停顿再按，接不同的招 · 从起端节点或招式左侧的圆点拉箭头到加速 / 霸体 / 允许中断 / 武器属性：起端节点＝整条链，招式＝只这一招，武器属性只接起端节点 · 点加速的倍数或招式的派生点可直接输入 · Tab / 右键搜索添加 · 从引脚拉线连接，拉到空白处搜索并接上，Alt + 点引脚断开 · 空白处拖动平移，按住 Ctrl / Shift 拖动框选（选中的节点一起拖动、一起删除），Ctrl + 点节点加选 / 取消 · 滚轮缩放 · Home 显示全部").c_str(),key.c_str());
+    _snwprintf_s(hint,_countof(hint),_TRUNCATE,Tr(L"每按一次 %s（或被替换的主角按键）放下一招；招式中按下的键会记住，到它的派生点（未设则放完）时接上 · 按键分支：按不同的键、或在可接下一招后停顿再按，接不同的招 · 从起端节点或招式左侧的圆点拉箭头到加速 / 霸体 / 允许中断 / 武器属性：起端节点＝整条链，招式＝只这一招，武器属性只接起端节点 · 点加速的倍数或招式的派生点可直接输入 · Tab / 右键搜索添加 · 从引脚拉线连接，拉到空白处搜索并接上，Alt + 点引脚断开 · 空白处拖动平移，按住 Ctrl / Shift 拖动框选（选中的节点一起拖动、一起删除），Ctrl+C / Ctrl+V 复制粘贴，Ctrl + 点节点加选 / 取消 · 滚轮缩放 · Home 显示全部").c_str(),key.c_str());
     hint_text_=hint;
     ReleaseDC(window_,dc);
     if (search_.open) SearchLayout();
@@ -2773,6 +2871,8 @@ bool UpdateTrimDrag(POINT p) {
     int from=0,to=0; TrimBounds(node,clip,from,to);
     const double t=std::clamp(double(p.x-bar.left)/(std::max)(1L,bar.right-bar.left),0.0,1.0);
     const int ms=t>=1?clip:static_cast<int>(std::lround(t*clip/NpcCombo::kTrimStep))*NpcCombo::kTrimStep;
+    if(drag_.sub>=2){const size_t at=static_cast<size_t>(drag_.sub-2);if(at>=node.trim_holds.size())return false;
+        const int value=std::clamp(ms,from,(std::max)(from,to-1));const bool changed=node.trim_holds[at]!=value;node.trim_holds[at]=value;drag_.moved|=changed;drag_.last=p;Invalidate();return changed;}
     if (drag_.sub==0) from=std::clamp(ms,0,(std::max)(0,to-step));
     else to=std::clamp(ms,(std::min)(clip,from+step),clip);
     const int end=to>=clip?0:to;
@@ -2788,13 +2888,38 @@ bool PrepareTrimDrag(int index,POINT p) {
     const double start=bar.left+double(bar.right-bar.left)*from/clip,end=bar.left+double(bar.right-bar.left)*to/clip;
     drag_={}; drag_.mode=Drag::Trim; drag_.index=index; drag_.start=drag_.last=p; drag_.trim_bar=bar; drag_.trim_clip=clip;
     drag_.sub=std::fabs(p.x-start)<std::fabs(p.x-end)?0:1;
+    for(size_t i=0;i<At(index)->trim_holds.size();++i){const double x=bar.left+double(bar.right-bar.left)*At(index)->trim_holds[i]/clip;if(std::fabs(p.x-x)<=Px(7)){drag_.sub=static_cast<int>(i)+2;break;}}
     hot_={Part::NodeTrimBar,index}; Select(index);
-    if ((std::min)(std::fabs(p.x-start),std::fabs(p.x-end))>Px(8)) UpdateTrimDrag(p);
+    if (drag_.sub<2&&(std::min)(std::fabs(p.x-start),std::fabs(p.x-end))>Px(8)) UpdateTrimDrag(p);
     return true;
 }
 
+// Right click empty timeline: add. Right click a marker: remove. Left drag moves it.
+bool ToggleTrimHold(int index,POINT p){
+    if(!At(index)||At(index)->type!=NodeType::Trim)return false;
+    const int clip=TrimLength(index);if(clip<=0)return false;
+    const HDC dc=GetDC(window_);const RECT bar=TrimTrack(NodeShape(dc,static_cast<size_t>(index)).field2);ReleaseDC(window_,dc);
+    if(bar.right<=bar.left)return false;auto& node=config_.chain[static_cast<size_t>(index)];
+    for(size_t i=0;i<node.trim_holds.size();++i){const double x=bar.left+double(bar.right-bar.left)*node.trim_holds[i]/clip;if(std::fabs(p.x-x)<=Px(7)){node.trim_holds.erase(node.trim_holds.begin()+static_cast<std::ptrdiff_t>(i));Save();Invalidate();return true;}}
+    if(node.trim_holds.size()>=32){DebugHub::Notify(L"每个裁剪最多 32 个按住停留点。");return true;}
+    int from=0,to=0;TrimBounds(node,clip,from,to);
+    const double t=std::clamp(double(p.x-bar.left)/(bar.right-bar.left),0.0,1.0);
+    const int ms=std::clamp(static_cast<int>(std::lround(t*clip/NpcCombo::kTrimStep))*NpcCombo::kTrimStep,from,(std::max)(from,to-1));
+    node.trim_holds.push_back(ms);node.trim_holds=NpcCombo::TrimHolds(node.trim_holds);Save();Invalidate();return true;
+}
+
+const std::vector<Shape>& CanvasShapes(HDC dc){
+    auto& cache=canvas_cache_;
+    if(cache.shapes.size()!=config_.chain.size()||cache.pan_x!=pan_x_||cache.pan_y!=pan_y_||cache.scale!=Scale()||!EqualRect(&cache.canvas,&canvas_)){
+        cache.shapes.clear();cache.shapes.reserve(config_.chain.size());
+        for(size_t i=0;i<config_.chain.size();++i)cache.shapes.push_back(NodeShape(dc,i));
+        cache.pan_x=pan_x_;cache.pan_y=pan_y_;cache.scale=Scale();cache.canvas=canvas_;++cache.shape_builds;
+    }
+    return cache.shapes;
+}
+
 // ---- hit testing ---------------------------------------------------------------------------------
-bool Near(POINT a,POINT b,int r) { return (a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)<=r*r; }
+bool Near(POINT a,POINT b,int r) { const int64_t x=int64_t(a.x)-b.x,y=int64_t(a.y)-b.y;return x*x+y*y<=int64_t(r)*r; }
 Hit HitTest(POINT p) {
     const auto in=[&](const RECT& r){return PtInRect(&r,p)!=FALSE;};
     if (search_.open&&in(search_.rect)) return {Part::Search,SearchRowAt(p)};
@@ -2818,10 +2943,11 @@ Hit HitTest(POINT p) {
     const HDC dc=GetDC(window_);
     const int pin=(std::max)(M().S(9),Px(kPin+4));
     Hit hit{Part::Canvas,-1};
-    const std::vector<size_t> order=PaintOrder();
+    const auto& order=PaintOrder();
+    const auto& shapes=CanvasShapes(dc);
     for (size_t k=order.size();k-->0&&hit.part==Part::Canvas;) {
         const size_t n=order[k];
-        const Node& node=config_.chain[n]; const Shape s=NodeShape(dc,n); RECT grown=s.rect; InflateRect(&grown,pin,0);
+        const Node& node=config_.chain[n]; const Shape& s=shapes[n]; RECT grown=s.rect; InflateRect(&grown,pin,0);
         if (!in(grown)) continue;
         const int i=static_cast<int>(n);
         if (node.type==NodeType::Group) {
@@ -2864,6 +2990,7 @@ Hit HitTest(POINT p) {
         else if (node.type==NodeType::Hook&&in(s.field3)) hit={Part::NodeField3,i};
         else if (node.type==NodeType::Speed&&in(s.toggle)) hit={Part::NodeToggle,i};
         else if (NpcCombo::TakesOwnLook(node)&&in(s.toggle)) hit={Part::NodeToggle,i};
+        else if(node.type==NodeType::BoneTransform&&in(s.field))hit={Part::NodeField,i};
         else if (node.type==NodeType::Speed&&in(s.field)) hit={Part::NodeField,i};
         else if (node.type==NodeType::Speed&&node.curve&&in(s.field2)) hit={Part::NodeField2,i};
         else if (node.type==NodeType::Grab&&in(s.field)) hit={Part::NodeField,i};
@@ -2924,14 +3051,12 @@ template<class Draw> void Buffered(HWND window,HDC printed,Draw draw) {
     PAINTSTRUCT paint{}; const HDC target=printed?printed:BeginPaint(window,&paint);
     RECT client{}; GetClientRect(window,&client);
     const int width=(std::max)(1L,client.right),height=(std::max)(1L,client.bottom);
-    const HDC dc=CreateCompatibleDC(target);
-    const HBITMAP bitmap=dc?CreateCompatibleBitmap(target,width,height):nullptr;
-    const HGDIOBJ old=bitmap?SelectObject(dc,bitmap):nullptr;
-    const HDC surface=bitmap?dc:target;
-    FillRect(surface,&client,UiTheme::Background()); SetBkMode(surface,TRANSPARENT);
-    { Gdiplus::Graphics graphics(surface); graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias); draw(surface,graphics,client); }
-    if (bitmap) { BitBlt(target,0,0,width,height,dc,0,0,SRCCOPY); SelectObject(dc,old); DeleteObject(bitmap); }
-    if (dc) DeleteDC(dc);
+    {
+        UiPaintBuffer::Frame buffer(window,target,width,height,printed?nullptr:&paint.rcPaint);
+        const HDC surface=buffer.dc();
+        if(surface){FillRect(surface,&client,UiTheme::Background());SetBkMode(surface,TRANSPARENT);
+            Gdiplus::Graphics graphics(surface);graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);draw(surface,graphics,client);}
+    }
     if (!printed) EndPaint(window,&paint);
 }
 void DrawButton(HDC dc,Gdiplus::Graphics& graphics,Button button,bool on=false,bool enabled=true) {
@@ -3114,9 +3239,7 @@ void DrawSearch(HDC dc,Gdiplus::Graphics& graphics) {
     Rounded(graphics,search_.rect,static_cast<float>(m.S(10)),UiTheme::Mix(panel,UiTheme::Base(),15),255,UiTheme::Mix(UiTheme::Border(),accent,35),255,1.5f);
     Rounded(graphics,search_.edit,static_cast<float>(m.S(7)),UiTheme::Base(),255,accent,255);
     RECT input=search_.edit; InflateRect(&input,-m.S(10),0);
-    const bool empty=search_.query.empty();
-    const bool caret=(GetTickCount64()/530)%2==0;
-    Label(dc,empty?Tr(L"搜索招式、间隔、替换按键…"):search_.query+(caret?L"▏":L" "),input,Font(UiTheme::Font::Body),empty?muted:text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+    if(!search_input_)Label(dc,search_.query,input,Font(UiTheme::Font::Body),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
     const int row_h=m.S(26),visible=SearchVisible();
     const int saved=SaveDC(dc);
     IntersectClipRect(dc,search_.list.left,search_.list.top,search_.list.right,search_.list.bottom);
@@ -3189,10 +3312,20 @@ void TrimBar(HDC dc,Gdiplus::Graphics& graphics,const RECT& bar,size_t index,boo
             Rounded(graphics,handle,static_cast<float>(Px(2)),UiTheme::Mix(hue,UiTheme::Text(),30),255,UiTheme::Base(),255);
         }
     }
+    if(clip>0){const RECT track=TrimTrack(bar);int ordinal=0;
+        for(int ms:NpcCombo::TrimHolds(config_.chain[index].trim_holds)){++ordinal;if(ms>clip*1000)continue;
+            const LONG x=track.left+static_cast<LONG>(std::lround((track.right-track.left)*ms/(clip*1000.0)));
+            const auto range=NpcCombo::TrimOf(config_.chain[index]);const bool enabled=ms>=range.from*1000&&ms<(range.from+NpcCombo::TrimSpan(range,clip))*1000;
+            RECT mark{x-Px(7),bar.top+Px(1),x+Px(7),bar.bottom-Px(1)};
+            Rounded(graphics,mark,static_cast<float>(Px(3)),enabled?UiTheme::Accent():UiTheme::MutedText(),255,UiTheme::Base(),255);
+            Label(dc,std::to_wstring(ordinal),mark,Scaled(UiTheme::Font::Small),UiTheme::Base(),DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+        }
+    }
     RECT inner=bar; InflateRect(&inner,-Px(7),0);
     if (!(clip>0)) Label(dc,TrimBarText(index),inner,Scaled(UiTheme::Font::Small),UiTheme::MutedText(),DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
 }
 void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
+    RECT dirty{};GetClipBox(dc,&dirty);RECT canvas_dirty{};if(!IntersectRect(&canvas_dirty,&dirty,&canvas_))return;
     const auto m=M(); const COLORREF base=UiTheme::Base(),border=UiTheme::Border(),text=UiTheme::Text(),muted=UiTheme::MutedText(),accent=UiTheme::Accent();
     Rounded(graphics,canvas_,static_cast<float>(m.S(10)),base,255,0,0);
     const int saved=SaveDC(dc);
@@ -3218,7 +3351,9 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
     }
     // Which nodes play: reached from a trigger that is on; a modifier when a node pointing at it does.
     const size_t count=config_.chain.size();
-    std::vector<bool> live(count,false),fed(count,false),modded(count,false),pointed(count,false);
+    auto& live=canvas_cache_.live;auto& fed=canvas_cache_.fed;auto& modded=canvas_cache_.modded;auto& pointed=canvas_cache_.pointed;
+    if(!canvas_cache_.graph_valid){
+    live.assign(count,false);fed.assign(count,false);modded.assign(count,false);pointed.assign(count,false);
     for (size_t t=0;t<count;++t) {
         const Node& n=config_.chain[t];
         if (!NpcCombo::StartsChain(n)) continue;
@@ -3240,11 +3375,12 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
         const int mod=NpcCombo::ModOf(config_,static_cast<int>(i),slot);
         if (mod>=0&&live[i]) live[static_cast<size_t>(mod)]=true;
     }
-    std::vector<Shape> shapes; shapes.reserve(count);
-    for (size_t i=0;i<count;++i) shapes.push_back(NodeShape(dc,i));
-    const std::vector<size_t> order=PaintOrder();
+        canvas_cache_.graph_valid=true;++canvas_cache_.graph_builds;
+    }
+    const auto& shapes=CanvasShapes(dc);
+    const auto& order=PaintOrder();
     // Only what reaches the canvas is drawn (a chain of thousands of nodes stays quick).
-    const auto visible=[&](const RECT& r){ RECT overlap{}; return IntersectRect(&overlap,&r,&canvas_)!=FALSE; };
+    const auto visible=[&](const RECT& r){ RECT overlap{}; return IntersectRect(&overlap,&r,&canvas_dirty)!=FALSE; };
     const auto span=[](POINT a,POINT b,int pad){ return RECT{(std::min)(a.x,b.x)-pad,(std::min)(a.y,b.y)-pad,(std::max)(a.x,b.x)+pad,(std::max)(a.y,b.y)+pad}; };
     const bool overview=Overview();
     // 组合 frames under everything: a tinted body, the header with its pins, its 派生点, the size handle.
@@ -3439,10 +3575,18 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                 Rounded(graphics,rs.field,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),row_hue,row_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),row_hue,30),255);
                 RECT row_inner=rs.field; InflateRect(&row_inner,-Px(6),0);
                 Label(dc,ButtonLabel(route.button)+L" ▾",row_inner,Scaled(UiTheme::Font::Small),route.next>=0?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+                {const bool editing=edit_.node==index&&edit_.hold==row,caret=(GetTickCount64()/530)%2==0;
+                    StepperAt(dc,graphics,rs.hminus,rs.hvalue,rs.hplus,editing?edit_.text+(caret?L"▏":L" ")+L" s":HoldText(route.hold_ms),Hit{Part::RouteHoldMinus,index,row},Hit{Part::RouteHoldPlus,index,row},Hit{Part::RouteHoldValue,index,row},UiTheme::Font::Small);
+                    if(editing)Rounded(graphics,rs.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));}
                 const bool remove_hot=hot_==Hit{Part::RouteRemove,index,row};
                 Rounded(graphics,rs.remove,static_cast<float>(Px(5)),remove_hot?UiTheme::Danger():UiTheme::Mix(UiTheme::Base(),UiTheme::Danger(),12),255,UiTheme::Mix(UiTheme::Border(),UiTheme::Danger(),30),255);
                 Label(dc,L"×",rs.remove,Scaled(UiTheme::Font::Small),remove_hot?RGB(255,255,255):text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
                 ExecPin(graphics,rs.out,route.next>=0,hot_==Hit{Part::RouteOut,index,row},live[i]?text:muted);
+                if(rs.has_keys){const bool raw=RawRoute(route),recording=record_.node==index&&record_.route==row;
+                    for(const auto& [rect,part,value]:{std::tuple<RECT,Part,std::wstring>{rs.keys,Part::RouteKeys,std::wstring()},std::tuple<RECT,Part,std::wstring>{rs.mode,Part::RouteMode,RouteModeText(route,true)}}){
+                        Rounded(graphics,rect,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,hot_==Hit{part,index,row}?28:10),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);RECT inner2=rect;InflateRect(&inner2,-Px(6),0);
+                        if(part==Part::RouteKeys)KeysField(dc,inner2,route.keys,route.chord,raw,recording,recording||NpcCombo::KeysRouteReady(route),UiTheme::Font::Small,text,muted);
+                        else Label(dc,value+L" ▾",inner2,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);}}
             }
             const bool add_hot=hot_==Hit{Part::RouteAdd,index};
             Rounded(graphics,s.add,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),accent,add_hot?24:6),255,UiTheme::Mix(UiTheme::Border(),accent,30),255);
@@ -3487,6 +3631,14 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             Rounded(graphics,s.add,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),accent,add_hot?24:6),255,UiTheme::Mix(UiTheme::Border(),accent,30),255);
             Label(dc,Tr(L"+ 添加按键"),s.add,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
             break;
+        }
+        case NodeType::BoneTransform: {
+            Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            std::wstring brief;for(size_t b=0;b<node.bones.rows.size()&&b<2;++b){if(b)brief+=L" · ";brief+=std::wstring(node.bones.rows[b].bone.begin(),node.bones.rows[b].bone.end());}
+            if(node.bones.rows.size()>2)brief+=L" …";if(brief.empty())brief=L"尚未添加骨骼";
+            Label(dc,brief,Row(s.rect,0),Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            Rounded(graphics,s.field,static_cast<float>(Px(4)),UiTheme::Mix(UiTheme::Base(),accent,15),255,UiTheme::Border(),255);
+            Label(dc,L"详细编辑…",s.field,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);Label(dc,NodeNote(i),Row(s.rect,2),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);break;
         }
         case NodeType::Speed: {
             Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
@@ -3541,8 +3693,9 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                       Hit{Part::NodeHoldMinus,index},Hit{Part::NodeHoldPlus,index},Hit{Part::NodeHoldValue,index});
             if (editing_to) Rounded(graphics,s.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
             TrimBar(dc,graphics,s.field2,i,pointed[i]);
-            if (TrimClip(i)>0) Label(dc,TrimBarText(i),Row(s.rect,3),Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
-            Label(dc,NodeNote(i),Row(s.rect,4),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            Label(dc,TrimBarText(i),Row(s.rect,3),Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+            Label(dc,TrimSourceText(i),Row(s.rect,4),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            Label(dc,NodeNote(i),Row(s.rect,5),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
         }
         case NodeType::KeepChain: {  // its own wait for the next press (in place of the trigger's reset time)
@@ -3865,7 +4018,7 @@ void Paint(HDC printed=nullptr) {
             graphics.ResetClip(); RestoreDC(dc,saved);
         }
         const bool any=At(selected_)&&!IsKey(selected_)&&!IsSettingAt(selected_);
-        if (HasSkin()) for (const Button b:kTools) DrawButton(dc,graphics,b,false,b==Button::AutoDodge?!moves_.dodges.empty():b!=Button::Remove||any);
+        if (HasSkin()) for (const Button b:kTools) DrawButton(dc,graphics,b,false,b==Button::AutoDodge?!moves_.dodges.empty():b==Button::Copy?!Selection().empty():b==Button::Paste?!node_clipboard_.empty():b!=Button::Remove||any);
         if (search_.open) DrawSearch(dc,graphics);
         // A move being dragged from the strip.
         if (drag_.mode==Drag::Pill&&drag_.moved&&drag_.index>=0&&static_cast<size_t>(drag_.index)<pills_.size()) {
@@ -3898,6 +4051,7 @@ void Paint(HDC printed=nullptr) {
 // ---- input ---------------------------------------------------------------------------------------
 // The applied skin, its moves and its saved chains; a new skin starts with nothing selected and the view framed.
 void Refresh(bool force) {
+    if(record_.node>=0){if(!force&&record_.generation==NpcCombo::Generation())return;StopRecording(nullptr);}
     const NpcRetarget::Snapshot snapshot=NpcRetarget::GetSnapshot();
     const NpcCombo::Files files=NpcCombo::GetFiles();
     if (force||files.serial!=files_serial_) {
@@ -3910,7 +4064,7 @@ void Refresh(bool force) {
     if (snapshot.chain!=game_chain_) { game_chain_=snapshot.chain; Layout(); }
     const int32_t want=pinned_==kFollowGame?snapshot.chain:pinned_;
     if (force||want!=skin_) {
-        skin_=want; scratch_=false; Select(-1); drag_={}; search_.open=false; edit_={}; picked_.clear();
+        skin_=want; scratch_=false; Select(-1); drag_={}; CloseSearch(); edit_={}; picked_.clear();
         if (!NpcRetarget::GetSkinMoves(skin_,moves_)) moves_={};
         config_=HasSkin()?NpcCombo::Load(moves_.profile):NpcCombo::Config{}; CloseCurve("another chain shown");
         seen_generation_=NpcCombo::Generation(); framed_=false; Layout();
@@ -3924,7 +4078,7 @@ void Refresh(bool force) {
         if (NpcRetarget::GetSkinMoves(-1,fresh)&&fresh.skills!=moves_.skills) { moves_=fresh; Layout(); }
     }
     const NpcCombo::Run run=NpcCombo::GetRun();
-    if (run.serial!=run_serial_) { run_serial_=run.serial; run_=run; Invalidate(); }
+    if (run.serial!=run_serial_) { run_serial_=run.serial; run_=run; Repaint(); }
     const uint64_t weapon=NpcCombo::LastWeapon().serial;
     if (weapon!=weapon_serial_) { weapon_serial_=weapon; Invalidate(); }
 }
@@ -3983,7 +4137,7 @@ void DragMove(POINT p) {
     }
     else if (drag_.mode==Drag::Pan) { pan_x_+=static_cast<float>(p.x-drag_.last.x); pan_y_+=static_cast<float>(p.y-drag_.last.y); if (search_.open) SearchLayout(); }
     drag_.last=p;
-    Invalidate();
+    if(drag_.mode==Drag::Trim)Invalidate();else{canvas_cache_.Geometry();Repaint();}
 }
 void DragEnd(POINT p) {
     if (drag_.mode==Drag::Trim&&Moved(p)) UpdateTrimDrag(p);
@@ -3997,7 +4151,7 @@ void DragEnd(POINT p) {
         Invalidate(); return;
     }
     switch (done.mode) {
-    case Drag::Trim: Save(); Invalidate(); break;
+    case Drag::Trim: if(At(done.index))config_.chain[static_cast<size_t>(done.index)].trim_holds=NpcCombo::TrimHolds(At(done.index)->trim_holds); Save(); Invalidate(); break;
     case Drag::Node: {
         const HDC dc=GetDC(window_);
         drag_.index=done.index; const std::vector<int> movers=DragMovers(); drag_.index=-1;
@@ -4098,7 +4252,7 @@ void PressAt(POINT p,bool alt,WPARAM keys=0) {
     if (edit_.node>=0&&!same_value) CommitEdit();  // a click elsewhere keeps the typed value
     pressed_=hit;
     switch (hit.part) {
-    case Part::Search: SearchPick(hit.index); return;
+    case Part::Search: if(hit.index<0)FocusSearch();else SearchPick(hit.index);return;
     case Part::NodeTrimBar: if (PrepareTrimDrag(hit.index,p)) SetCapture(window_); break;
     case Part::Pill: BeginDrag(Drag::Pill,hit,p,hit.index); break;
     case Part::WeaponRow: BeginDrag(Drag::WeaponRow,hit,p,hit.index); break;
@@ -4126,7 +4280,7 @@ bool SearchKey(WPARAM key) {
     case VK_DOWN: SearchMove(1); return true;
     case VK_PRIOR: SearchMove(-SearchVisible()); return true;
     case VK_NEXT: SearchMove(SearchVisible()); return true;
-    case VK_BACK: if (!search_.query.empty()) { search_.query.pop_back(); SearchFilter(); Invalidate(); } return true;
+    case VK_BACK: if (!search_.query.empty()) { search_.query.pop_back(); SearchFilter(); SyncSearchInput();Invalidate(); } return true;
     default: return true;  // every other key belongs to the search box while it is open
     }
 }
@@ -4150,12 +4304,12 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
         if (drag_.mode!=Drag::None) { DragMove(p); return 0; }
         cursor_=p;
         const Hit hit=HitTest(p);
-        if (!(hit==hot_)) { hot_=hit; Invalidate(); }
-        if (search_.open) { const int row=SearchRowAt(p); if (row!=search_.hot) { search_.hot=row; if (row>=0) search_.keyed=false; Invalidate(); } }
+        if (!(hit==hot_)) { hot_=hit; Repaint(); }
+        if (search_.open) { const int row=SearchRowAt(p); if (row!=search_.hot) { search_.hot=row; if (row>=0) search_.keyed=false; Repaint(); } }
         TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,window,0}; TrackMouseEvent(&track);
         return 0;
     }
-    case WM_MOUSELEAVE: if (drag_.mode==Drag::None) { hot_={}; search_.hot=-1; Invalidate(); } return 0;
+    case WM_MOUSELEAVE: if (drag_.mode==Drag::None) { hot_={}; search_.hot=-1; Repaint(); } return 0;
     case WM_SETCURSOR:
         if (LOWORD(lparam)==HTCLIENT) {
             const Part part=hot_.part;
@@ -4167,16 +4321,17 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
             if (part!=Part::None&&part!=Part::Canvas) { SetCursor(LoadCursorW(nullptr,IDC_HAND)); return TRUE; }
         }
         break;
-    case WM_LBUTTONDOWN:
-        if (record_.node>=0) { StopRecording(L"录制结束"); return 0; }
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+        if (record_.node>=0) { RecordKey(VK_LBUTTON); return 0; }
         PressAt({GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)},GetKeyState(VK_MENU)<0,wparam); return 0;
-    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
-        if (record_.node>=0) { if (message==WM_XBUTTONDOWN) RecordKey(GET_XBUTTON_WPARAM(wparam)==XBUTTON1?VK_XBUTTON1:VK_XBUTTON2); return TRUE; }
+    case WM_XBUTTONDOWN: case WM_XBUTTONDBLCLK: case WM_XBUTTONUP:
+        if (record_.node>=0) { if (message!=WM_XBUTTONUP) RecordKey(GET_XBUTTON_WPARAM(wparam)==XBUTTON1?VK_XBUTTON1:VK_XBUTTON2); return TRUE; }
         break;
     case WM_LBUTTONUP: pressed_={}; if (drag_.mode!=Drag::None&&!drag_.right) DragEnd({GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)}); return 0;
-    case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
-        if (record_.node>=0) { if (message==WM_MBUTTONDOWN) RecordKey(VK_MBUTTON); else StopRecording(L"录制结束"); return 0; }
+    case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: {
+        if (record_.node>=0) { RecordKey(message==WM_MBUTTONDOWN||message==WM_MBUTTONDBLCLK?VK_MBUTTON:VK_RBUTTON); return 0; }
         const POINT p{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)};
+        if(message==WM_RBUTTONDOWN){const Hit hit=HitTest(p);if(hit.part==Part::NodeTrimBar&&ToggleTrimHold(hit.index,p))return 0;}
         SetFocus(window);
         if (search_.open&&!PtInRect(&search_.rect,p)) CloseSearch();
         if (HasSkin()&&PtInRect(&canvas_,p)&&drag_.mode==Drag::None) BeginDrag(Drag::Pan,{},p,-1,message==WM_RBUTTONDOWN);
@@ -4185,6 +4340,7 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
     case WM_RBUTTONUP: case WM_MBUTTONUP: if (drag_.mode==Drag::Pan) DragEnd({GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)}); return 0;
     case WM_CAPTURECHANGED: if (drag_.mode!=Drag::None&&reinterpret_cast<HWND>(lparam)!=window) { const bool save=drag_.mode==Drag::Trim&&drag_.moved; drag_={}; if (save) Save(); Invalidate(); } return 0;
     case WM_MOUSEWHEEL: {
+        if(record_.node>=0)return 0; // a wheel delta is not a held button
         POINT p{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)}; ScreenToClient(window,&p);
         const int steps=GET_WHEEL_DELTA_WPARAM(wparam)>0?1:-1;
         if (search_.open&&PtInRect(&search_.rect,p)) {
@@ -4199,34 +4355,44 @@ LRESULT CALLBACK Proc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
     }
     case WM_GETDLGCODE: return DLGC_WANTARROWS|DLGC_WANTTAB|DLGC_WANTCHARS|(search_.open||edit_.node>=0||record_.node>=0?DLGC_WANTALLKEYS:0);
     case WM_SYSKEYDOWN:
-        if (record_.node>=0) { if (!(lparam&(1<<30))) RecordKey(static_cast<int>(wparam)); return 0; }
+        if (record_.node>=0) { if(wparam==VK_ESCAPE)StopRecording(L"录制已取消");else if(wparam==VK_RETURN&&!(lparam&(1<<30)))StopRecording(L"录制已确认",true);else if (!(lparam&(1<<30))) RecordKey(static_cast<int>(wparam)); return 0; }
         break;
     case WM_CHAR:
         if (edit_.node>=0) { EditChar(static_cast<wchar_t>(wparam)); return 0; }
-        if (search_.open&&wparam>=32&&wparam!=127) { search_.query.push_back(static_cast<wchar_t>(wparam)); SearchFilter(); Invalidate(); }
+        if (search_.open&&wparam>=32&&wparam!=127) { search_.query.push_back(static_cast<wchar_t>(wparam)); SearchFilter(); SyncSearchInput();Invalidate(); }
         return 0;
     case WM_KEYDOWN:
         if (record_.node>=0) {
-            if (wparam==VK_ESCAPE) StopRecording(L"录制结束");
+            if (wparam==VK_ESCAPE) StopRecording(L"录制已取消");
+            else if(wparam==VK_RETURN&&!(lparam&(1<<30)))StopRecording(L"录制已确认",true);
             else if (!(lparam&(1<<30))) RecordKey(static_cast<int>(wparam));  // not a held key's repeat
             return 0;
         }
         if (EditKey(wparam)) return 0;
         if (SearchKey(wparam)) return 0;
+        if(ClipboardKey(wparam,(GetKeyState(VK_CONTROL)&0x8000)!=0))return 0;
         if (wparam==VK_TAB) { POINT p=cursor_; if (!PtInRect(&canvas_,p)) p={(canvas_.left+canvas_.right)/2,(canvas_.top+canvas_.bottom)/3}; OpenSearch(p); return 0; }
         if (wparam==VK_DELETE||wparam==VK_BACK) { RemoveSelected(); return 0; }
         if (wparam==VK_HOME) { Frame(); return 0; }
         if ((wparam==VK_UP||wparam==VK_DOWN)&&At(selected_)) { Nudge(selected_,wparam==VK_UP?1:-1); return 0; }
         break;
-    case WM_COMMAND: if (LOWORD(wparam)==IDCANCEL) { if (record_.node>=0) { StopRecording(L"录制结束"); return 0; } if (edit_.node>=0) { CancelEdit(); return 0; } if (search_.open) { CloseSearch(); return 0; } DebugHub::Hide(); return 0; } break;
-    case WM_CLOSE: DebugHub::Hide(); return 0;
-    case WM_DESTROY: window_=nullptr; return 0;
+    case WM_COMMAND: if(LOWORD(wparam)==kSearchInput&&HIWORD(wparam)==EN_CHANGE){if(!syncing_search_&&search_.open){search_.query=UiLayout::Caption(search_input_);SearchFilter();Invalidate();}return 0;} if (LOWORD(wparam)==IDCANCEL) { if (record_.node>=0) { StopRecording(L"录制已取消"); return 0; } if (edit_.node>=0) { CancelEdit(); return 0; } if (search_.open) { CloseSearch(); return 0; } DebugHub::Hide(); return 0; } break;
+    case WM_CLOSE: StopRecording(nullptr);DebugHub::Hide(); return 0;
+    case WM_DESTROY: record_={};window_=nullptr; return 0;
     default: break;
     }
     return DefWindowProcW(window,message,wparam,lparam);
 }
 }
 
+bool HandleRecordingMessage(const MSG& message){
+    if(record_.node<0||!window_)return false;
+    if((message.message>=WM_KEYFIRST&&message.message<=WM_KEYLAST)||(message.message>=WM_MOUSEFIRST&&message.message<=WM_MOUSELAST)){
+        SendMessageW(window_,message.message,message.wParam,message.lParam);return true;
+    }
+    return false;
+}
+bool OwnsTextMessage(const MSG& message){if(message.hwnd==window_&&message.message==WM_KEYDOWN&&(message.wParam=='C'||message.wParam=='V')&&(GetKeyState(VK_CONTROL)&0x8000)&&!search_.open&&edit_.node<0&&record_.node<0)return true;return search_.open&&search_input_&&message.hwnd==search_input_&&((message.message>=WM_KEYFIRST&&message.message<=WM_KEYLAST)||(message.message>=WM_IME_STARTCOMPOSITION&&message.message<=WM_IME_COMPOSITION));}
 HWND CreatePage(HWND parent) {
     if (!parent) return nullptr;
     if (!window_) {
@@ -4235,6 +4401,9 @@ HWND CreatePage(HWND parent) {
         if (!RegisterClassExW(&cls)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return nullptr;
         window_=CreateWindowExW(0,kClass,L"招式派生",WS_CHILD|WS_TABSTOP,0,0,800,650,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
         if (!window_) return nullptr;
+        search_input_=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,0,0,10,24,window_,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchInput)),GetModuleHandleW(nullptr),nullptr);
+        SendMessageW(search_input_,EM_SETLIMITTEXT,256,0);SendMessageW(search_input_,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"搜索招式、节点、按键…"));
+        SendMessageW(search_input_,WM_SETFONT,reinterpret_cast<WPARAM>(UiTheme::GetFont(UiTheme::Font::Body,window_)),FALSE);SetWindowSubclass(search_input_,SearchInputProc,1,0);
         language_=UiI18n::GetLanguage();
         DebugHub::Attach(window_,parent,720,600);
     }
@@ -4266,17 +4435,19 @@ bool SearchMoveRow(int32_t& skin,std::string& ability,RECT& anchor) {
 // The move a 加速 node speeds up, for its preview: the first move pointing at it, else the first move of a trigger
 // pointing at it (-1: none).
 int MoveUnderSpeed(int speed_node) {
+    const int slot=At(speed_node)&&At(speed_node)->type==NodeType::BoneTransform?NpcCombo::kModBone:NpcCombo::kModSpeed;
     const auto move=[&](int i){ const Node* n=At(i); return n&&((n->type==NodeType::Skill&&!n->ability.empty())||(NpcCombo::PicksBossMove(*n)&&!n->ability.empty()&&!n->boss.empty())); };
-    for (size_t i=0;i<config_.chain.size();++i) if (config_.chain[i].mods[NpcCombo::kModSpeed]==speed_node&&move(static_cast<int>(i))) return static_cast<int>(i);
+    for (size_t i=0;i<config_.chain.size();++i) if (config_.chain[i].mods[static_cast<size_t>(slot)]==speed_node&&move(static_cast<int>(i))) return static_cast<int>(i);
     for (size_t i=0;i<config_.chain.size();++i)
-        if (config_.chain[i].mods[NpcCombo::kModSpeed]==speed_node&&NpcCombo::StartsChain(config_.chain[i])&&move(config_.chain[i].next)) return config_.chain[i].next;
+        if (config_.chain[i].mods[static_cast<size_t>(slot)]==speed_node&&NpcCombo::StartsChain(config_.chain[i])&&move(config_.chain[i].next)) return config_.chain[i].next;
     return -1;
 }
 bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int& index) {
     beside=false; index=-1;
     if (test_hover_.on&&test_hover_.node>=0) {  // a BOSS 技能 card, or a 裁剪 card (its move)
         const Node* hovered=At(test_hover_.node);
-        const int source=hovered&&hovered->type==NodeType::Trim?NpcCombo::TrimmedBy(config_,test_hover_.node):test_hover_.node;
+        const int source=hovered&&hovered->type==NodeType::Trim?NpcCombo::TrimmedBy(config_,test_hover_.node):
+            hovered&&(hovered->type==NodeType::BoneTransform||hovered->type==NodeType::Speed)?MoveUnderSpeed(test_hover_.node):test_hover_.node;
         const Node* n=At(source); if (!n||!NpcCombo::PicksBossMove(*n)||n->ability.empty()||n->boss.empty()) return false;
         skin=BossLookRow(n->boss); ability=n->ability; index=source;
         const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(test_hover_.node)).rect; ReleaseDC(window_,dc);
@@ -4292,14 +4463,14 @@ bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int&
     if (hot_.part==Part::Pill&&hot_.index>=0&&static_cast<size_t>(hot_.index)<pills_.size()) {
         skin=skin_; ability=pills_[static_cast<size_t>(hot_.index)].ability; anchor=pills_[static_cast<size_t>(hot_.index)].rect; return skin>=0&&!ability.empty(); }
     // A 加速 card (or its open curve window's node) shows the move it speeds up, at its speed.
-    const bool on_speed=hot_.index>=0&&At(hot_.index)&&config_.chain[static_cast<size_t>(hot_.index)].type==NodeType::Speed&&
-                        (hot_.part==Part::Node||hot_.part==Part::NodeField2||hot_.part==Part::NodeValue);
-    if (on_speed||(SpeedCurveWindow::EditedNode()>=0&&hot_.part==Part::None&&At(SpeedCurveWindow::EditedNode()))) {
-        const int from=on_speed?hot_.index:SpeedCurveWindow::EditedNode(),move=MoveUnderSpeed(from);
-        const Node* n=At(move); if (!n) return false;
-        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss); ability=n->ability; index=move;
-        const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(from)).rect; ReleaseDC(window_,dc);
-        return skin>=0;
+    const int bone_editor=BoneMotionPage::EditedNode();
+    const bool on_speed=hot_.index>=0&&At(hot_.index)&&(At(hot_.index)->type==NodeType::Speed||At(hot_.index)->type==NodeType::BoneTransform)&&
+                        (hot_.part==Part::Node||hot_.part==Part::NodeField||hot_.part==Part::NodeField2||hot_.part==Part::NodeValue);
+    const int editor=bone_editor>=0?bone_editor:SpeedCurveWindow::EditedNode();
+    if(on_speed||(editor>=0&&hot_.part==Part::None&&At(editor))){
+        const int from=on_speed?hot_.index:editor,move=MoveUnderSpeed(from);const Node* n=At(move);if(!n)return false;
+        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss);ability=n->ability;index=move;
+        const HDC dc=GetDC(window_);anchor=NodeShape(dc,static_cast<size_t>(from)).rect;ReleaseDC(window_,dc);return skin>=0;
     }
     // A 裁剪 card (its steppers too) shows the BOSS 技能 it cuts, only its part, as the chain plays it.
     if (hot_.index>=0&&At(hot_.index)&&config_.chain[static_cast<size_t>(hot_.index)].type==NodeType::Trim&&hot_.part>=Part::Node&&hot_.part<=Part::NodeTrimBar) {
@@ -4350,17 +4521,20 @@ void UpdatePreview() {
     if (skin!=preview_.skin||ability!=preview_.ability) { HidePreview(); preview_.skin=skin; preview_.ability=ability; preview_.since=now; }
     // The move's 加速 (its curve too), as the chain plays it: a change goes to the playing preview at once.
     // Its 裁剪 too: only that part plays, the 加速 (and its curve) over it.
-    int speed=100,trim_from=0,trim_to=0; std::vector<NpcCombo::CurvePoint> curve;
+    int speed=100,trim_from=0,trim_to=0; std::vector<int> trim_holds;std::vector<NpcCombo::CurvePoint> curve;
     if (index>=0) {
         const int trigger=NpcCombo::TriggerOf(config_,static_cast<size_t>(index));
         const Node* mod=NpcCombo::SpeedNodeFor(config_,trigger,index);
         if (NpcCombo::CurveOn(mod)) curve=mod->points; else speed=NpcCombo::SpeedFor(config_,trigger,index);
         const NpcCombo::TrimRange trim=NpcCombo::TrimFor(config_,index);
+        trim_holds=trim.holds;
         if (trim.on) { trim_from=static_cast<int>(std::lround(trim.from*1000)); trim_to=static_cast<int>(std::lround(trim.to*1000)); }
     }
-    const bool changed=speed!=preview_.speed||trim_from!=preview_.trim_from||trim_to!=preview_.trim_to||curve.size()!=preview_.curve.size()||
+    BoneMotion::Config bones;
+    if(index>=0){const int mod=NpcCombo::ModFor(config_,NpcCombo::TriggerOf(config_,static_cast<size_t>(index)),index,NpcCombo::kModBone);if(mod>=0)bones=config_.chain[static_cast<size_t>(mod)].bones;}
+    const bool changed=trim_holds!=preview_.trim_holds||BoneMotion::Encode(bones)!=BoneMotion::Encode(preview_.bones)||speed!=preview_.speed||trim_from!=preview_.trim_from||trim_to!=preview_.trim_to||curve.size()!=preview_.curve.size()||
                        !std::equal(curve.begin(),curve.end(),preview_.curve.begin(),[](const NpcCombo::CurvePoint& a,const NpcCombo::CurvePoint& b){ return a.t==b.t&&a.speed==b.speed; });
-    preview_.node=index; preview_.speed=speed; preview_.curve=curve; preview_.trim_from=trim_from; preview_.trim_to=trim_to;
+    preview_.trim_holds=trim_holds;preview_.bones=bones; preview_.node=index; preview_.speed=speed; preview_.curve=curve; preview_.trim_from=trim_from; preview_.trim_to=trim_to;
     if (!EqualRect(&anchor,&preview_.anchor)||beside!=preview_.beside) { preview_.anchor=anchor; preview_.beside=beside; if (preview_.asked) Invalidate(); }
     if (!preview_.asked&&!preview_.none&&now>=preview_.since+kPreviewDelayMs) {
         std::string monster,package;
@@ -4369,9 +4543,9 @@ void UpdatePreview() {
             const MotianGrab::Variant* v=NodeGrab([&]{ Node n; n.ability=ability.substr(std::strlen(kGrabPrefix)); return n; }());
             if (!v||!NpcRetarget::GrabPreviewMonster(v->boss_id,v->source,monster)||(package=MotianGrab::PreviewMontage(v->index)).empty()) { preview_.none=true; return; }
         } else if (!NpcRetarget::MovePreviewSubject(skin,ability,monster,package)) { preview_.none=true; return; }  // the hero's moves: none
-        MovePreview::Show(monster,package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to); preview_.asked=true; preview_.monster=monster; preview_.package=package; preview_frame_={}; Invalidate();
+        MovePreview::Show(monster,package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to,preview_.bones,preview_.trim_holds); preview_.asked=true; preview_.monster=monster; preview_.package=package; preview_frame_={}; Invalidate();
     } else if (preview_.asked&&changed&&!preview_.monster.empty()) {
-        MovePreview::Show(preview_.monster,preview_.package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to); Invalidate();
+        MovePreview::Show(preview_.monster,preview_.package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to,preview_.bones,preview_.trim_holds); Invalidate();
     }
     if (preview_.asked&&MovePreview::Latest(preview_frame_,preview_frame_.serial)) InvalidateRect(window_,&preview_rect_,FALSE);
     SyncLiveView();
@@ -4447,7 +4621,7 @@ void ApplyScratch() {
     const bool asked=scratch_asked_; const std::string ask=scratch_ask_; const int zoom=zoom_ask_; scratch_asked_=false; zoom_ask_=0;
     ReleaseSRWLockExclusive(&scratch_lock_);
     if (asked&&HasSkin()) {
-        CloseCurve("a test chain shown"); Select(-1); drag_={}; search_.open=false; edit_={}; picked_.clear();
+        CloseCurve("a test chain shown"); Select(-1); drag_={}; CloseSearch(); edit_={}; picked_.clear();
         if (ask=="off") {
             scratch_=false; config_=NpcCombo::Load(moves_.profile); seen_generation_=NpcCombo::Generation();
             Logf("COMBO_SCRATCH off: the look's chain again");
@@ -4475,9 +4649,9 @@ void ApplyScratch() {
             Frame(false); framed_=true;
             const HDC dc=GetDC(window_);
             const auto shapes=[&]{ size_t sum=0; for (size_t i=0;i<config_.chain.size();++i) sum+=static_cast<size_t>(NodeShape(dc,i).rect.right); return sum; };
-            sizes_.clear(); owners_.clear(); widths_.clear();
+            DropCanvasCache(); widths_.clear();
             QueryPerformanceCounter(&t2); size_t sum=shapes(); QueryPerformanceCounter(&t3);
-            sizes_.clear(); owners_.clear(); sum+=shapes(); QueryPerformanceCounter(&t4);
+            DropCanvasCache(); sum+=shapes(); QueryPerformanceCounter(&t4);
             LARGE_INTEGER t5{}; sum+=shapes(); QueryPerformanceCounter(&t5);
             ReleaseDC(window_,dc);
             Logf("COMBO_SCRATCH layout %.1f ms; every card's shape: %.1f ms measuring all text, %.1f ms re-measured (widths kept), %.2f ms with the sizes kept (%zu)",
@@ -4519,6 +4693,7 @@ bool HandleCommand(const char* arguments) {
 void SetLogger(void (*log)(const char*)) { log_=log; }
 void Tick() {
     if (const LONG curve=InterlockedExchange(&test_curve_,0)) TestCurve(curve==2);
+    BoneMotionPage::TickEditor(window_);
     SpeedCurveWindow::Tick(window_);  // closes itself when the page is hidden
     static int curve_shown=-1;  // the node whose curve window was open at the last tick (COMBO_CURVE lines)
     if (const int now=SpeedCurveWindow::EditedNode(); now!=curve_shown) {
@@ -4526,7 +4701,7 @@ void Tick() {
         else Logf("COMBO_CURVE window closed node=%d: %s",curve_shown,SpeedCurveWindow::LastClose());
         curve_shown=now;
     }
-    if (!window_||!IsWindowVisible(window_)) { if (record_.node>=0) record_={}; if (preview_.asked||preview_.since) HidePreview(); return; }
+    if (!window_||!IsWindowVisible(window_)) { if (record_.node>=0) StopRecording(nullptr); if (preview_.asked||preview_.since) HidePreview(); return; }
     ApplyScratch();
     UpdatePreview();
     if (record_.node>=0) {  // a pad press joins the recorded keys (every worker tick)
@@ -4546,9 +4721,26 @@ void Tick() {
         if (dummy.present!=dummy_present_) { dummy_present_=dummy.present; Layout(); Invalidate(); }
     }
     if (drag_.mode==Drag::None&&!search_.open&&edit_.node<0) Refresh(false);
-    if (search_.open||edit_.node>=0) Invalidate();  // the caret blinks
+    if (search_.open||edit_.node>=0) Repaint();  // the caret blinks
 }
 namespace Probe {
+void RefreshData(){Refresh(false);}
+void PickNodes(const std::vector<int>& nodes){picked_.clear();for(int node:nodes)if(At(node))picked_.push_back(node);selected_=picked_.empty()?-1:picked_.back();}
+bool ClipboardShortcut(int key){return ClipboardKey(key,true);}
+size_t ClipboardCount(){return node_clipboard_.size();}
+std::wstring TrimDurationText(int index){return At(index)?TrimBarText(static_cast<size_t>(index)):L"";}
+std::wstring TrimSourceLabel(int index){return At(index)?TrimSourceText(static_cast<size_t>(index)):L"";}
+// Hidden-host performance fixtures only; never saved or sent to the game.
+void PerformanceFixture(int count) {
+    config_=NpcCombo::Decode(L"E1");config_.placed=true;scratch_=true;framed_=true;
+    config_.chain.resize(static_cast<size_t>(std::clamp(count,10,10000)));
+    for(size_t i=0;i<config_.chain.size();++i){auto& n=config_.chain[i];n={};n.type=NodeType::Skill;n.ability=moves_.skills.empty()?"GA_Test":moves_.skills.front();n.x=static_cast<int>(i%100)*360;n.y=static_cast<int>(i/100)*230;n.next=i+1<config_.chain.size()?static_cast<int>(i)+1:-1;}
+    const auto seed=NpcCombo::Decode(L"E1");config_.chain[0]=seed.chain[static_cast<size_t>(NpcCombo::KeyTrigger(seed))];config_.chain[0].next=1;config_.chain[0].x=0;config_.chain[0].y=0;
+    zoom_index_=3;pan_x_=20;pan_y_=60;selected_=-1;picked_.clear();hot_={};Layout();Invalidate();
+}
+void PerformanceStats(uint64_t& measures,uint64_t& graphs,uint64_t& shapes){measures=canvas_cache_.measurements;graphs=canvas_cache_.graph_builds;shapes=canvas_cache_.shape_builds;}
+void PerformanceHover(POINT p){SendMessageW(window_,WM_MOUSEMOVE,0,MAKELPARAM(p.x,p.y));}
+void PerformancePan(int dx){pan_x_+=static_cast<float>(dx);Repaint();}
 int Key() { return NpcCombo::KeyTrigger(config_); }
 POINT Header(int node) {
     if (node<0) node=Key();
@@ -4575,6 +4767,8 @@ POINT Middle(const RECT& r) { return {(r.left+r.right)/2,(r.top+r.bottom)/2}; }
 POINT RouteOut(int node,int route) { return ShapeOf(node).routes.at(static_cast<size_t>(route)).out; }
 POINT RouteField(int node,int route) { return Middle(ShapeOf(node).routes.at(static_cast<size_t>(route)).field); }
 POINT RoutePlus(int node,int route) { return Middle(ShapeOf(node).routes.at(static_cast<size_t>(route)).plus); }
+POINT RouteHoldPoint(int node,int route){return Middle(ShapeOf(node).routes.at(static_cast<size_t>(route)).hvalue);}
+void RoutePicker(int node,int route,int part){OpenPicker(node,route,part);}
 POINT RouteKeys(int node,int route) { const RouteShape r=ShapeOf(node).routes.at(static_cast<size_t>(route)); return r.has_keys?Middle(r.keys):POINT{-1,-1}; }
 POINT RouteMode(int node,int route) { const RouteShape r=ShapeOf(node).routes.at(static_cast<size_t>(route)); return r.has_keys?Middle(r.mode):POINT{-1,-1}; }
 POINT RouteAdd(int node) { return Middle(ShapeOf(node).add); }
@@ -4610,6 +4804,9 @@ RECT Canvas() { return canvas_; }
 POINT Tool(int button) { const RECT r=buttons_[button]; return {(r.left+r.right)/2,(r.top+r.bottom)/2}; }
 int Zoom() { return static_cast<int>(std::lround(kZooms[zoom_index_]*100)); }
 bool SearchOpen() { return search_.open; }
+HWND SearchInput(){return search_input_;}
+std::wstring SearchQuery(){return search_.query;}
+void SearchAt(POINT at){OpenSearch(at);}
 size_t Picked() { return Selection().size(); }
 bool PickedNode(int node) { const std::vector<int> s=Selection(); return std::find(s.begin(),s.end(),node)!=s.end(); }
 bool Empty(POINT p) { return HitTest(p).part==Part::Canvas; }
@@ -4661,6 +4858,8 @@ POINT Header() { return Middle(header_); }
 std::string EditedProfile() { return moves_.profile; }
 POINT Toggle2(int node) { return Middle(ShapeOf(node).toggle2); }
 POINT Toggle(int node) { return Middle(ShapeOf(node).toggle); }
+void RecordAt(int node,int route){StartRecording(node,route);}
+std::vector<int> RecordingKeys(){return record_.draft;}
 int RecordingNode() { return record_.node; }
 int RecordingRoute() { return record_.node>=0?record_.route:-1; }
 void ScrollWeapons(int pixels) { library_tab_=1; Layout(); ScrollStrip(pixels>0?1:-1); }
@@ -4674,11 +4873,15 @@ int LibraryPageCount() { return library_page_count_; }
 int ToolCategory(int button) { return NodeCategory(static_cast<Button>(button)); }
 RECT ToolBox(int button) { return button>=0&&button<static_cast<int>(Button::Count)?buttons_[button]:RECT{}; }
 void TrimPreviewAt(int node) { hot_={Part::NodeTrimBar,node}; UpdatePreview(); preview_.since=GetTickCount64()-kPreviewDelayMs; UpdatePreview(); }
+void BonePreviewAt(int node) { hot_={Part::Node,node}; UpdatePreview(); preview_.since=GetTickCount64()-kPreviewDelayMs; UpdatePreview(); }
+void BoneEditor(int node) { OpenBones(node); }
 RECT TrimBarBox(int node) { return ShapeOf(node).field2; }
 POINT HoldValuePoint(int node) { return Middle(ShapeOf(node).hvalue); }
 bool ValueWheel(POINT p,int direction) { return WheelValue(HitTest(p),direction); }
 bool TrimBegin(int node,POINT p) { return HitTest(p)==Hit{Part::NodeTrimBar,node}&&PrepareTrimDrag(node,p); }
 void TrimMove(POINT p) { DragMove(p); }
+bool TrimHoldToggle(int node,POINT p){return ToggleTrimHold(node,p);}
+std::vector<int> TrimHoldPoints(int node){return At(node)?At(node)->trim_holds:std::vector<int>{};}
 void TrimEnd(POINT p) { DragEnd(p); }
 int TrimValue(int node,bool end) { return At(node)?(end?At(node)->trim_to:At(node)->trim_from):-1; }
 POINT Resize(int node) { return Middle(ShapeOf(node).resize); }
@@ -4689,6 +4892,7 @@ void Shutdown() {
     SpeedCurveWindow::Close();
     HidePreview();
     if (window_) DestroyWindow(window_);
-    window_=nullptr; pills_.clear(); tabs_.clear(); skin_=-1; pinned_=kFollowGame; game_chain_=-1; moves_={}; config_={}; search_={}; DropFonts();
+    node_clipboard_.clear();paste_count_=0;
+    window_=nullptr; search_input_=nullptr;pills_.clear(); tabs_.clear(); skin_=-1; pinned_=kFollowGame; game_chain_=-1; moves_={}; config_={}; search_={}; DropFonts();
 }
 }

@@ -1,6 +1,8 @@
-#pragma once
+﻿#pragma once
 #include <windows.h>
 #include <string>
+#include <vector>
+#include <cstdint>
 
 // UI worker only. Hub page 招式派生: a canvas with a right-side weapon / node library; node types and Boss move
 // kinds are grouped inside the node tab. The Blueprint-style canvas holds
@@ -12,6 +14,10 @@ namespace ComboMenu {
 HWND CreatePage(HWND parent);
 void Tick();
 void Shutdown();
+// Route text/navigation directly before the hub's dialog traversal.
+bool OwnsTextMessage(const MSG& message);
+// Consume recording input before hub navigation/dialog keys, including mouse buttons over other controls.
+bool HandleRecordingMessage(const MSG& message);
 // Worker thread, the command file's "combo ...": "menu" shows the page; "preview <look row> <move, 1-based>" holds
 // that move's 招式预览 card up (top middle of the canvas) as if the mouse rested on it; "preview off" lets it go;
 // "handsoff on|off": an open hub leaves the real mouse alone (tests in the background); "curve [close]" opens the
@@ -20,12 +26,24 @@ bool HandleCommand(const char* arguments);
 void SetLogger(void (*log)(const char*));
 // Screen points (page client coordinates) for the offline preview's scripted mouse checks.
 namespace Probe {
+void RefreshData(); // explicit hidden-host driver for the same production refresh
+void PickNodes(const std::vector<int>& nodes);
+bool ClipboardShortcut(int key);
+size_t ClipboardCount();
+std::wstring TrimDurationText(int node);
+std::wstring TrimSourceLabel(int node);
+void PerformanceFixture(int count);
+void PerformanceStats(uint64_t& measures,uint64_t& graphs,uint64_t& shapes);
+void PerformanceHover(POINT p);
+void PerformancePan(int dx);
 POINT Header(int node);      // -1: the NPC key node
 POINT Pin(int node, bool out);
 POINT Field(int node);       // a trigger's kind field (opens the button picker); a 投技 node's grab field
 POINT RouteOut(int node, int route);    // a branch row's output pin
 POINT RouteField(int node, int route);  // a branch row's button field
 POINT RoutePlus(int node, int route);   // a branch row's pause +
+POINT RouteHoldPoint(int node,int route);
+void RoutePicker(int node,int route,int part=0);
 POINT RouteKeys(int node, int route);   // a 自定义组合键 / 自定义按键 row's keys field ({-1,-1}: the row has none)
 POINT RouteMode(int node, int route);   // that row's mode field (in order / together; a 自定义按键 row's 吞掉 too)
 POINT RouteAdd(int node);               // a branch's "+ 添加按键"
@@ -50,6 +68,9 @@ POINT Tool(int button);      // ComboMenu's Button order: Toggle, Interval, AddT
                              // AutoDodge (29, 按摇杆方向闪避), IgnoreGuard (30, 无视防御), KeepChain (31, 保持派生)
 int Zoom();                  // percent
 bool SearchOpen();
+HWND SearchInput();
+std::wstring SearchQuery();
+void SearchAt(POINT at);
 size_t Picked();              // nodes selected now (框选 / Ctrl + click; one node selected alone: 1)
 bool PickedNode(int node);    // is that node among them
 bool Empty(POINT p);          // bare canvas there
@@ -69,6 +90,8 @@ POINT Header();                  // the 派生表 header (a click lists the chai
 std::string EditedProfile();     // the profile whose chain the page edits now
 POINT Toggle2(int node);         // a 自定义按键 trigger's 吞掉 checkbox
 POINT Toggle(int node);          // a trigger's 启用 checkbox; a 加速's 曲线调节 checkbox (Field: its 编辑曲线…)
+void RecordAt(int node,int route=-1); // hidden-test setup; does not focus a hidden page
+std::vector<int> RecordingKeys(); // draft only, never a saved config
 int RecordingNode();             // the 自定义按键 node recording keys (-1: none)
 int RecordingRoute();            // its branch row recording keys (-1: none, or the node's own keys; -5: its 继续派生 key)
 void ScrollWeapons(int pixels);  // turns the weapon list page (test setup)
@@ -84,11 +107,15 @@ int ToolCategory(int button);
 RECT ToolBox(int button);
 // Direct trim probes: no focus/capture; end/wheel use normal saves (isolated test folder required).
 void TrimPreviewAt(int node);
+void BonePreviewAt(int node);
+void BoneEditor(int node);
 RECT TrimBarBox(int node);
 POINT HoldValuePoint(int node);
 bool ValueWheel(POINT p,int direction);
 bool TrimBegin(int node,POINT p);
 void TrimMove(POINT p);
+bool TrimHoldToggle(int node,POINT p);
+std::vector<int> TrimHoldPoints(int node);
 void TrimEnd(POINT p);
 int TrimValue(int node,bool end);
 POINT Resize(int node);  // a 组合 frame's size handle

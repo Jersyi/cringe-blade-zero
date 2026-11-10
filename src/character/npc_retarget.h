@@ -3,8 +3,12 @@
 #include <string>
 #include <vector>
 #include "ue_runtime.h"
+#include "bone_motion_model.h"
 
 namespace NpcRetarget {
+// Game thread: final displayed body, and active combo modifier (never the hidden animation driver).
+ue::Object* BoneBody();
+BoneMotion::Config BoneEdits();
 using Logger = void (*)(const char*);
 // Game-thread adapter: cancel queued/reapply outfit intent and synchronously
 // release its owned temporary session. True must mean verified release, rather

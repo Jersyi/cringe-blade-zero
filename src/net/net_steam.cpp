@@ -82,7 +82,7 @@ struct Api {
 
 // ---- our messages ---------------------------------------------------------------------------------------------------
 constexpr uint32_t kMagic = 0x305a4250;  // "PBZ0"
-constexpr uint16_t kProtocol = 3;  // 2: montages instead of ability starts; 3: the hero's parts and pose (NetPuppet)
+constexpr uint16_t kProtocol = 8;  // 4: FX; 5: typed Niagara values; 6: chain splines; 7: reference-pose weapon rendering; 8: projectile scenes up to 512 parts.
 enum : uint8_t { kHello = 1, kPing = 2, kPong = 3, kState = 4, kMontage = 6, kParts = 7, kPose = 8 };
 #pragma pack(push, 1)
 struct Header { uint32_t magic = kMagic; uint16_t version = kProtocol; uint8_t type = 0, flags = 0; };
