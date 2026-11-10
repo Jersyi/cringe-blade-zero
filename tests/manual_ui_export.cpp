@@ -74,7 +74,8 @@ int wmain(int argc,wchar_t** argv){
         EnsureKey(c);EnsurePreInput(c);EnsureAirDefault(c);
         for(size_t i=2;i<c.chain.size();++i){c.chain[i].x=950;c.chain[i].y=450+static_cast<int>(i)*180;}
         Save(moves.profile,c);RefreshData();ZoomTo(125);Library(0,2);
-        Show(0);
+        // Resolve first-paint content widths before reading the node's crop bounds.
+        Show(0);Capture(page_,isolated/L"layout.png");
         RECT r=NodeRect(0);InflateRect(&r,5,5);Capture(page_,output/(std::string("node_")+name+".png"),&r);
         if(count++)manifest<<",";manifest<<"\""<<name<<"\"";
         if(n.type==NodeType::BoneTransform){
