@@ -35,10 +35,14 @@ struct NodeClock {
     }
     bool BufferExpired(uint64_t now,uint64_t press,int keep,int total,int prefix,int pause,bool branch)const{
         if(keep<=0)return false;
-        // A plain pre-input still has a finite lifetime while an animation
-        // cannot yield. Intentional path delays start only on arrival.
-        if(total<=0&&pause<=0)return now>press+static_cast<uint64_t>(keep);
-        if(!open)return false;
+        // 预输入 is one rule for every path: before the derivation gate a press
+        // lives `keep` ms from the press (from the move's start when it came
+        // while the move loaded), whatever follows the move. A press still
+        // alive when the gate opens waits out the intervals / branch pause after
+        // the gate (they spend none of it) and expires `keep` ms after it could play.
+        const uint64_t limit=press+static_cast<uint64_t>(keep);
+        if(!open)return now>limit;
+        if(reached>limit)return true;  // the gate opened too late: never revived
         const uint64_t due=Due(press,total,prefix,pause,branch);
         return now>(due>press?due:press)+static_cast<uint64_t>(keep);
     }

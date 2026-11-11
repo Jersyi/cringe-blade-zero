@@ -170,7 +170,8 @@ inline bool Fires(Trigger trigger, unsigned bits) {
 // parry) it, so its hits land with their damage and hit reactions (the game's CharacterState.AIState.CanNotDeflect). PreInput
 // (预输入, ms = kPreInputMin..kPreInputMax, 0: never) is the chain's own setting, one fixed node per chain that cannot be
 // removed and takes no wires: a press made while a move plays is kept that long for the move's 派生点 (counted from the
-// press, or from the end of the intervals / the branch row's pause it waits for), then cleared. WeaponActions
+// press, whatever path it takes), then cleared; one still kept at the 派生点 waits out the intervals / the branch row's
+// pause after it and is cleared that long after it could play. WeaponActions
 // (武器派生修改, `weapon` = a backpack id, ms = its reset time as a trigger's) starts chains as a trigger does, for one
 // weapon: a row per hero action (`routes`: button = a Trigger of the hero's actions, next = its output); while that
 // weapon is the hero's main weapon, that action (完美闪避, 处决, 简易处决, 格挡 ...) is cut and the row's wire plays
@@ -848,7 +849,8 @@ inline bool Matches(int button, const Press& press) {
 // intervals on the way (ms from that move's start, or from the press after a trigger), the button the chain is on
 // after it and the pause of the branch row taken (0: none). `button` is the one the chain is on now: a wire straight
 // to a move means the same button again. A branch takes the row of the pressed button whose pause has passed
-// (since_ms: since the press before, the last press the chain took; -1: none), the longest such pause when several
+// (since_ms: since arriving at the branch on this visit, the move before at its 派生点 or end plus the intervals
+// before the branch, ComboPlayback::NodeClock; -1: not there yet, or a chain starting), the longest such pause when several
 // do; an unwired row never matches. A 自定义组合键 / 自定义按键 row matches only its own keys (Press::branch / row).
 // branch, row: the branch row the hop took (-1: none). assists: the BOSS 援护 nodes the press passed on its way to
 // `move` (they are called in as it plays); a press that meets nothing to play after a 援护 has that 援护 as its move.
@@ -1114,14 +1116,16 @@ inline bool TooEarly(const Config& config, int from, int button, const Press& pr
     return Follow(config, from, button, press, since_ms).move < 0 && Follow(config, from, button, press, kPauseMax).move >= 0;
 }
 // ---- 预输入与停顿 ----
-// A branch row's pause counts from the press before: the last press the chain took (one that started the chain, or
-// kept or replaced its next move). The chain keeps one press (预输入). Until it plays - the move before reaches its
-// 派生点 or ends, the intervals on the way are over, a kept pause row's pause is over - every newer press that leads
-// somewhere takes its place (the last press wins); a press that leads nowhere leaves it. A press too early for
-// every row of its button (no row now, one after a longer pause) is kept for the shortest such pause and plays then
-// unless a newer press comes; it is not the press before of the next one. After a move the chain waits for the next
-// press the trigger's reset time, and while a branch row waits for its pause, until that pause plus at least
-// kPauseGraceMs after the press before.
+// A branch row's pause counts from arriving at the branch on this visit: the move before reaching its 派生点 (or its
+// end) plus the intervals before the branch; a loading move or an earlier press spends none of it. The chain keeps
+// one press (预输入). Until it plays - the move before reaches its 派生点 or ends, the intervals on the way are over,
+// a kept pause row's pause is over - every newer press that leads somewhere takes its place (the last press wins);
+// a press that leads nowhere leaves it. Before the 派生点 a kept press lives the chain's 预输入 ms from the press,
+// whatever path it takes; one still alive at the 派生点 waits out the intervals and pause after it (they spend none
+// of it). A press too early for every row of its button (no row now, one after a longer pause) is kept for the
+// shortest such pause and plays then unless a newer press comes. After a move the chain waits for the next press the
+// trigger's reset time from the move's end, and with a branch row waiting for its pause, until that pause (from
+// arriving) plus the larger of the reset time and kPauseGraceMs (ComboPlayback::NodeClock::Deadline).
 constexpr int kPauseGraceMs = 1500;
 // The shortest pause after which this press leads somewhere, and where (move -1: it never does). since_ms as Follow.
 struct Later { Hop hop; int pause_ms = 0; };
@@ -1141,7 +1145,7 @@ inline Later NextPause(const Config& config, int from, int button, const Press& 
     }
     return {};
 }
-// What a press does from `from`, since_ms after the press before: a move now (Follow), or - too early for every row of
+// What a press does from `from`, since_ms after arriving at the branch (as Follow): a move now (Follow), or - too early for every row of
 // its button - the move it reaches once the shortest such pause is over (later, ready_in_ms from now).
 struct Decision { Hop hop; bool later = false; int ready_in_ms = 0; };
 inline Decision Decide(const Config& config, int from, int button, const Press& press, int since_ms) {
@@ -1153,20 +1157,10 @@ inline Decision Decide(const Config& config, int from, int button, const Press& 
     decision.hop = later.hop; decision.later = true; decision.ready_in_ms = later.pause_ms - (std::max)(since_ms, 0);
     return decision;
 }
-// The press before for the next press, after this one at `now`: a press that keeps or replaces a move now; a press
-// kept for its pause leaves the one before.
+// The press before (the logs, and what a cleared 预输入 restores), after this one at `now`: a press that keeps or
+// replaces a move now; a press kept for its pause leaves the one before. Pauses do not count from it.
 inline uint64_t PressBefore(uint64_t last_press, const Decision& decision, uint64_t now) {
     return decision.hop.move >= 0 && !decision.later ? now : last_press;
-}
-// Until when the chain takes the next press after a move ended at `ended` (later: it resets): the reset time, and
-// with a branch row waiting for a pause (max_pause, from MaxPause) that pause plus the larger of the reset time and
-// kPauseGraceMs after the press before.
-inline uint64_t WaitUntil(uint64_t ended, uint64_t last_press, int reset_ms, int max_pause) {
-    const uint64_t reset = static_cast<uint64_t>(ClampReset(reset_ms));
-    uint64_t until = ended + reset;
-    if (max_pause > 0 && last_press)
-        until = (std::max)(until, last_press + static_cast<uint64_t>(ClampPause(max_pause)) + (std::max)(reset, static_cast<uint64_t>(kPauseGraceMs)));
-    return until;
 }
 // Does any move follow `from` on the wires (else the chain is over after it)?
 inline bool Continues(const Config& config, int from) {

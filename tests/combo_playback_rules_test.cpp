@@ -36,10 +36,19 @@ int main() {
         ComboPlayback::NodeClock clock;
         check(clock.BufferExpired(1401,1000,400,0,0,0,false),"plain pre-input expires during an uninterruptible animation");
         check(!clock.BufferExpired(1400,1000,400,0,0,0,false),"plain pre-input includes its deadline");
-        check(!clock.BufferExpired(20000,1000,400,500,0,1000,true),"intentional pause cannot expire before arrival");
+        check(clock.BufferExpired(20000,1000,400,500,0,1000,true)&&clock.BufferExpired(1401,1000,400,500,0,1000,true)&&clock.BufferExpired(1401,1000,400,800,0,0,false),
+              "before the gate a press kept for a pause or an interval expires as a plain one");
+        check(!clock.BufferExpired(1400,1000,400,500,0,1000,true)&&!clock.BufferExpired(1400,1000,400,800,0,0,false),"before the gate every path keeps the press 预输入 ms");
         check(clock.Elapsed(10000)==-1&&clock.Due(100,500,0,1000,true)==UINT64_MAX,"loading cannot spend branch pause or expire pre-input");
         clock.Reach(10000);clock.Reach(11000);
         check(clock.BufferExpired(10000,9000,400,0,0,0,false),"opening the derivation gate never revives expired plain input");
+        check(clock.BufferExpired(10001,9000,400,800,500,1000,true)&&clock.BufferExpired(10001,9000,400,800,0,0,false),"nor a press kept for an interval or a pause");
+        check(!clock.BufferExpired(11200,9700,400,800,0,0,false)&&clock.BufferExpired(11201,9700,400,800,0,0,false),
+              "alive at the gate: the interval spends none of it, it expires 预输入 after it could play");
+        check(!clock.BufferExpired(12200,9700,400,800,500,1000,true)&&clock.BufferExpired(12201,9700,400,800,500,1000,true),
+              "alive at the gate: prefix, pause and trailing interval spend none of it");
+        check(!clock.BufferExpired(10400,9700,400,0,0,0,false)&&clock.BufferExpired(10401,9700,400,0,0,0,false),
+              "a plain press alive at the gate, still held back (a grab), expires 预输入 after the gate");
         check(clock.Elapsed(10500,500)==0&&clock.Elapsed(10499,500)==-1,"branch starts after the preceding interval");
         check(clock.reached==10000,"repeated polls never restart the current visit");
         check(clock.Due(9000,800,500,1000,true)==11800,"early buffered input waits prefix, pause and trailing interval sequentially");

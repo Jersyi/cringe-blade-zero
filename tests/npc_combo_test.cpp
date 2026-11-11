@@ -3,6 +3,7 @@
 // Remove / Link, branches and the 加速 / 武器属性 modifiers), the play rate, stick direction and the ini text, old
 // texts included.
 #include "npc_combo_model.h"
+#include "combo_playback_rules.h"
 #include "grab_boss.h"
 #include <chrono>
 #include <cstdio>
@@ -107,7 +108,8 @@ int main() {
         Check(!TooEarly(late, 1, L, light, 500) && Follow(late, 1, L, light, kPauseMax).move == -1, "a press no row takes leads nowhere, it is not early");
     }
     {
-        // 停顿从上一次按键算起; 预输入 keeps one press (the last one wins); a press too early for its pause row is kept.
+        // 停顿从到达分支算起 (since_ms: the move before at its 派生点 or end, plus the intervals before the branch; -1: not
+        // there yet); 预输入 keeps one press (the last one wins); a press too early for its pause row is kept.
         Config pt;  // 0 light trigger -> 1 A -> 2 branch {light -> 3 B, light after 1 s -> 4 C, heavy after 1 s -> 5 D}
         pt.chain.push_back(TriggerNode(Trigger::Light, 0, 0));
         pt.chain.push_back({NodeType::Skill, "GA_A"});
@@ -118,40 +120,45 @@ int main() {
         pt.chain.push_back({NodeType::Skill, "GA_D"});
         pt.chain[0].next = 1; pt.chain[1].next = 2;
         EnsureKey(pt);
-        // The 11-06 14:31 case: A plays 1.5 s; a light press 1.1 s after the press that played A, while A still plays.
-        Decision d = Decide(pt, 1, L, light, 1100);
-        Check(d.hop.move == 4 && !d.later && d.hop.pause_ms == 1000, "a press during the move 1.1 s after the press before takes the 1 s row (kept for A's 派生点 or end)");
+        Decision d = Decide(pt, 1, L, light, -1);
+        Check(d.hop.move == 3 && !d.later, "before A's 派生点 (not at the branch yet) a light press takes the quick row: no pause counts while A cannot be cut");
+        d = Decide(pt, 1, L, light, 1100);
+        Check(d.hop.move == 4 && !d.later && d.hop.pause_ms == 1000, "a press 1.1 s after arriving at the branch takes the 1 s row");
         d = Decide(pt, 1, L, light, 400);
-        Check(d.hop.move == 3 && !d.later && d.hop.pause_ms == 0, "a press during the move 0.4 s after the press before takes the quick row");
+        Check(d.hop.move == 3 && !d.later && d.hop.pause_ms == 0, "a press 0.4 s after arriving takes the quick row");
         Check(Decide(pt, 1, L, light, 1000).hop.move == 4 && Decide(pt, 1, L, light, 999).hop.move == 3, "exactly at the pause: the pause row; 1 ms short of it: the quick row");
         d = Decide(pt, 1, L, heavy, 600);
         Check(d.hop.move == 5 && d.later && d.ready_in_ms == 400 && d.hop.pause_ms == 1000,
-              "heavy has only a 1 s row: a heavy press 0.6 s after the press before is kept and plays D in 0.4 s");
+              "heavy has only a 1 s row: a heavy press 0.6 s after arriving is kept and plays D in 0.4 s");
         d = Decide(pt, 1, L, heavy, 1000);
-        Check(d.hop.move == 5 && !d.later && d.ready_in_ms == 0, "a heavy press exactly at the pause plays D at once (or at A's 派生点 while A plays)");
+        Check(d.hop.move == 5 && !d.later && d.ready_in_ms == 0, "a heavy press exactly at the pause plays D at once");
         Check(Decide(pt, 1, L, key, 600).hop.move == -1 && !Decide(pt, 1, L, key, 600).later && Decide(pt, 3, L, light, 5000).hop.move == -1,
               "a press no row takes, or after the end of a chain, leads nowhere (not kept)");
         Check(NextPause(pt, 1, L, heavy, 600).pause_ms == 1000 && NextPause(pt, 1, L, heavy, 1000).hop.move == -1, "the next pause of a press is one it has not reached yet");
-        // The press before: the light press at 10.0 s played A; mashing keeps the quick row, a pause takes the 1 s row.
-        uint64_t before = 10000;
+        // The press before (logs, what a cleared 预输入 restores): A was played by a press at 9.0 s and reaches its 派生点
+        // (arrives at the branch) at 10.0 s. Mashing does not hold the quick row: the time since arriving picks the row.
+        uint64_t before = 9000;
         d = Decide(pt, 1, L, light, 400); before = PressBefore(before, d, 10400);
-        Check(d.hop.move == 3 && before == 10400, "a light press at 10.4 s keeps B and is the press before for the next one");
-        d = Decide(pt, 1, L, light, 700); before = PressBefore(before, d, 11100);
-        Check(d.hop.move == 3 && before == 11100, "mashing on (11.1 s, 0.7 s after the press before) replaces it with B again: the last press wins");
-        d = Decide(pt, 1, L, light, 1200); before = PressBefore(before, d, 12300);
-        Check(d.hop.move == 4 && before == 12300, "a light press 1.2 s after the one before (A still playing) replaces B with C");
+        Check(d.hop.move == 3 && before == 10400, "a light press at 10.4 s (0.4 s after arriving) keeps B and is the press before for the next one");
+        d = Decide(pt, 1, L, light, 700); before = PressBefore(before, d, 10700);
+        Check(d.hop.move == 3 && before == 10700, "mashing on at 10.7 s replaces it with B again: the last press wins");
+        d = Decide(pt, 1, L, light, 1200); before = PressBefore(before, d, 11200);
+        Check(d.hop.move == 4 && before == 11200, "a light press at 11.2 s (1.2 s after arriving, however often it was pressed) replaces B with C");
         const uint64_t heavy_before = before;
-        d = Decide(pt, 1, L, heavy, 300); before = PressBefore(before, d, 12600);
-        Check(d.hop.move == 5 && d.later && d.ready_in_ms == 700 && before == heavy_before, "an early heavy press replaces C with D for 13.3 s and leaves the press before");
-        // The window after the move: A pressed at 10.0 s, ended at 11.5 s, reset 0.4 s.
-        const uint64_t press = 10000, ended = 11500;
-        const uint64_t until = WaitUntil(ended, press, 400, MaxPause(pt, 1));
-        Check(MaxPause(pt, 1) == 1000 && until == press + 1000 + kPauseGraceMs, "with a 1 s row the chain waits until 1 s + 1.5 s after the press before (12.5 s)");
-        Check(WaitUntil(ended, press, 400, 0) == ended + 400, "without a pause row: the reset time after the move");
-        Check(WaitUntil(10500, press, 2000, 1000) == press + 1000 + 2000 && WaitUntil(ended, 8000, 400, 1000) == ended + 400,
-              "a reset time over 1.5 s is the grace; never shorter than the reset time after the move");
-        Check(12400 <= until && 12600 > until && Decide(pt, 1, L, light, 2400).hop.move == 4,
-              "a light press at 12.4 s is inside the window (C); one at 12.6 s is beyond it: the chain has reset (it starts at A again)");
+        d = Decide(pt, 1, L, heavy, 300); before = PressBefore(before, d, 20300);
+        Check(d.hop.move == 5 && d.later && d.ready_in_ms == 700 && before == heavy_before,
+              "on another visit an early heavy press (0.3 s after arriving) is kept for D in 0.7 s and leaves the press before");
+        // The window after the move: A reaches its 派生点 (arrives at the branch) at 11.0 s, ends at 11.5 s, reset 0.4 s.
+        const uint64_t arrived = 11000, ended = 11500;
+        ComboPlayback::NodeClock at_branch; at_branch.Reach(arrived);
+        const uint64_t until = at_branch.Deadline(ended, 400, SharedWait(pt, 1), MaxPause(pt, 1), kPauseGraceMs);
+        Check(MaxPause(pt, 1) == 1000 && until == arrived + 1000 + kPauseGraceMs, "with a 1 s row the chain waits until 1 s + 1.5 s after arriving at the branch (13.5 s)");
+        Check(at_branch.Deadline(ended, 400, 0, 0, kPauseGraceMs) == ended + 400, "without a pause row: the reset time after the move");
+        ComboPlayback::NodeClock early; early.Reach(8000);
+        Check(at_branch.Deadline(ended, 2000, 0, 1000, kPauseGraceMs) == arrived + 1000 + 2000 && early.Deadline(ended, 400, 0, 1000, kPauseGraceMs) == ended + 400,
+              "a reset time over 1.5 s is the window after the pause; never shorter than the reset time after the move");
+        Check(13400 <= until && 13600 > until && Decide(pt, 1, L, light, 2400).hop.move == 4,
+              "a light press at 13.4 s (2.4 s after arriving) is inside the window (C); one at 13.6 s is beyond it: the chain has reset (it starts at A again)");
     }
     tree.chain[3].routes[2].next = -1;
     Check(Follow(tree, 2, L, light, 2100).move == 4 && MaxPause(tree, 2) == 0, "an unwired row never matches and keeps nothing waiting");

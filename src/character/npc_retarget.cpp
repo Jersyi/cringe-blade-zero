@@ -6464,8 +6464,9 @@ void Queue(const ComboPress& where,ULONGLONG now,const char* source,bool hold) {
          where.since,hop.pause_ms,replaced,later,hold?" (after the move)":"");
     if(QueuedReady(now))PlayHop(hop,now);
 }
-// Pre-input lifetime begins only when the selected path can play. A deliberate
-// interval/pause and loading time cannot expire the buffered press in advance.
+// 预输入: before the 派生点 a buffered press lives 预输入 ms from the press (from the move's start when it came while the
+// move loaded), whatever path it takes; one still alive at the 派生点 waits out the intervals / branch pause after it
+// and expires 预输入 ms after it could play (ComboPlayback::NodeClock::BufferExpired).
 ULONGLONG QueuedDue(){return (std::max)(combo_.queued_at,QueuedPathDue());}
 bool PreInputExpired(ULONGLONG now){
     if(charge_pause_.active)return false;
@@ -7173,7 +7174,8 @@ void DriveCombo() {
             if(skill_.handle>0||TeleportBusy()||HookAnchorBusy())return;}
         if(group_.index>=0&&group_.step+1<group_.steps.size())return;  // the 组合 goes on (StepDone)
         // The move ended with no press ready: the chain waits reset_ms for the next one; a branch row's pause keeps it
-        // until that pause plus at least kPauseGraceMs after the press before (NpcCombo::WaitUntil).
+        // until that pause, counted from arriving at the branch (the 派生点 plus the intervals before it), plus the larger
+        // of reset_ms and kPauseGraceMs (ComboPlayback::NodeClock::Deadline).
         const int ended=combo_.playing;
         EndSpeed("move-ended");EndTrim("the move ended");
         combo_.phase=P::Idle;combo_.playing=-1;
