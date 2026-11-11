@@ -476,6 +476,17 @@ inline std::string RawKeyToken(int code) {
     std::snprintf(text, sizeof(text), "vk:0x%02X", code & 0xFF);
     return text;
 }
+// The NPC skill key's chord is part of these 自定义按键 keys: every one of its pad buttons (pad: the chord's PadButton
+// bits) is among the keys' pad buttons, or (pad 0) its keyboard key is one of the keys. Pressing such keys fires that
+// hotkey as well (11-11: keys R3 -> L3 and the PlayStation NPC skill key L3 + R3).
+inline bool ChordInKeys(const std::vector<int>& keys, unsigned pad, unsigned key) {
+    unsigned bits = 0; bool has = false;
+    for (const int k : keys) {
+        if (IsPadKey(k)) { if (!IsStickKey(k)) bits |= 1u << (k - kPadKey); }
+        else if (key && static_cast<unsigned>(k) == key) has = true;
+    }
+    return pad ? (pad & ~bits) == 0 : has;
+}
 inline int ClampGroupW(int w) { return std::clamp(w, kGroupMinW, kGroupMaxSize); }
 inline int ClampGroupH(int h) { return std::clamp(h, kGroupMinH, kGroupMaxSize); }
 inline bool ValidButton(int button) { return button >= 0 && button < static_cast<int>(Trigger::Count); }

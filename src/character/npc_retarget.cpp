@@ -318,6 +318,7 @@ NpcCutscene::Playback cutscene_playback_;
 TrimChargeRuntime::Pause charge_pause_;
 struct SkillCast { Identity asc,ability_class;int32_t handle=0;ULONGLONG started=0,relock_until=0;uint32_t relocks=0;std::string name;bool seen_active=false,owned=false,bare=false,lock_known=false;unsigned char lock[16]{}; };
 SkillCast skill_;NpcBodyCollision::SkillRound skill_round_;std::vector<Identity> skill_pins_;volatile LONG skill_request_=0;
+volatile LONG skill_request_pad_=0;  // the pad buttons held when the NPC skill key fired (RequestSkill): which chord fired it
 // The NPC skill key's random pick: the curated first tier of a skin's moves (11-05 tables list every castable boss
 // move after it, for the combo page and the audit).
 size_t RandomCount(const NpcSkillSet& set){return set.random_count&&set.random_count<set.skill_count?set.random_count:set.skill_count;}
@@ -7684,6 +7685,28 @@ bool PressNpcKey() {
     const HoldStart held=PressOrHold({0,true},"npc-key",HoldKind::NpcKey,0);
     return held.waiting||held.taken;  // waiting: the hold decides (EndHold casts the skill when the chain does not take it)
 }
+// Would the chain take the NPC skill key now (a next move, or a chain it starts)?
+bool NpcKeyLeads(){
+    if(!ComboReady())return false;
+    NpcCombo::Press press;press.key=true;
+    return WhereTo(press,GetTickCount64()).hop.move>=0;
+}
+// The NPC skill key fired by a chord that is part of a 自定义按键 watched now (a trigger, or the rows / 继续派生 key of
+// the chain going on; NpcCombo::ChordInKeys): those keys fire the hotkey as well. 11-11: keys [R3 -> L3] with the
+// PlayStation NPC skill key L3 + R3 - each hotkey press that came in before the keys and that the chain did not take
+// ended the chain ("unmatched", 39 in two sessions), and the keys started it again from its first move. Such a press
+// that the chain does not take is part of the keys: no cast, no reset. which: the keys (the log).
+bool NpcKeyInRawKeys(std::string& which){
+    if(!ComboReady())return false;
+    const unsigned held=static_cast<unsigned>(InterlockedCompareExchange(&skill_request_pad_,0,0));
+    const unsigned pad=UiHotkeys::Get(UiHotkeys::Action::NpcSkill,UiHotkeys::ActivePad()).buttons;
+    const bool by_pad=pad!=0&&(pad&~held)==0;
+    const unsigned key=by_pad?0u:UiHotkeys::Get(UiHotkeys::Action::NpcSkill,UiHotkeys::Device::Keyboard).key;
+    if(!by_pad&&!key)return false;
+    for(const KeyWatch& w:KeyWatches(true))
+        if(NpcCombo::ChordInKeys(w.keys,by_pad?pad:0u,key)){which=NpcCombo::RawKeysToken(w);return true;}
+    return false;
+}
 // ---- 自定义组合键 ------------------------------------------------------------------------------------
 // A 组合键 trigger starts its chain (or, while that chain goes on, takes its next move) when its keys are pressed in
 // order, each within its window of the one before, or together within kChordMs. The hero's buttons are read from the
@@ -10778,7 +10801,11 @@ void Tick() {
     // the random round. Without a look: the hero's own chain (owner -1: its BOSS 技能 / 援护 / hero moves); nothing
     // else happens when that chain does not take the press.
     if (InterlockedExchange(&skill_request_, 0) && !cutscene_host_) {
-        if (active_) { if (!PressNpcKey()) CastSkill(); }
+        std::string keys;
+        if (NpcKeyInRawKeys(keys) && !NpcKeyLeads())
+            Logf("NPC_COMBO npc key: its chord is part of 自定义按键 [%s] and the chain takes no 按键 press here: left to those keys (no cast, the chain stays at node=%d)",
+                 keys.c_str(), combo_.cursor);
+        else if (active_) { if (!PressNpcKey()) CastSkill(); }
         else if (!PressNpcKey()) Logf("NPC_COMBO npc key without a look: the hero's chain takes no 按键 press now (ready=%d)", combo_.owner == -1 ? 1 : 0);
     }
     if (const LONG pick = InterlockedExchange(&cast_request_, 0); pick > 0 && active_ && !cutscene_host_ && !CastExact(static_cast<size_t>(pick - 1))) Logf("NPC_SKILL cast %ld refused: no skin / busy / no such skill", pick);
@@ -10995,6 +11022,7 @@ bool SetSkillDamageMultiplier(float multiplier) {
 // The NPC skill key, with or without a look: a look's chain / random round, or the hero's own chain (its 按键 node).
 bool RequestSkill() {
     if (InterlockedCompareExchange(&disabled_, 0, 0)) return false;
+    InterlockedExchange(&skill_request_pad_, static_cast<LONG>(UiHotkeys::CurrentPad().buttons));  // the chord that fired it
     InterlockedExchange(&skill_request_, 1); return true;
 }
 unsigned char* GrabDisplay(double& size) {

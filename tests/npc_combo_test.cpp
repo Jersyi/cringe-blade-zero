@@ -1252,6 +1252,16 @@ int main() {
         so.chain[static_cast<size_t>(AirDefaultNode(so))].on = false;
         Check(!OwnAirFor(so, sart, true).on, "空中释放 off: the hero's skills fall as before");
     }
+    // The NPC skill key's chord inside 自定义按键 keys (11-11: keys [R3 -> L3], the PlayStation NPC skill key L3 + R3).
+    {
+        const int kr3 = kPadKey + 7, kl3 = kPadKey + 6, ktri = kPadKey + 13;
+        const unsigned kchord = (1u << 6) | (1u << 7);
+        Check(ChordInKeys({kr3, kl3}, kchord, 0) && ChordInKeys({kl3, ktri, kr3}, kchord, 0),
+              "every button of the L3 + R3 chord is among the keys: pressing them fires the NPC skill key too");
+        Check(!ChordInKeys({kr3, ktri}, kchord, 0) && !ChordInKeys({kStickKey, kr3}, kchord, 0), "a button of the chord missing (a stick push is no L3): not part of the keys");
+        Check(ChordInKeys({0x58, 0x43}, 0, 0x58) && !ChordInKeys({0x47}, 0, 0x58) && !ChordInKeys({kr3, kl3}, 0, 0x58), "keyboard: the chord's key among the keys");
+        Check(!ChordInKeys({kr3, kl3}, 0, 0), "no chord: nothing");
+    }
     // No node limit in use: 2000 nodes are added, saved, read trim_late and walked, quickly.
     {
         const auto t0 = std::chrono::steady_clock::now();
