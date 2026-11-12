@@ -217,7 +217,8 @@ inline bool Fires(Trigger trigger, unsigned bits) {
 // one button has rows with holds, its press waits: the longest hold is taken the moment it is reached, otherwise the
 // longest hold reached when the button is let go (a tap: none).
 enum class NodeType : int { Skill, Interval, Trigger, AutoDodge, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, WeaponMove, Damage, Group, Teleport,
-                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirDefault, BoneTransform };
+                            Invincible, Look, HeroLook, KeepLook, ForceHit, PreInput, WeaponActions, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirDefault, BoneTransform,
+                            BossEffect };
 // One row of a branch: a press of `button` (a Trigger, the NPC key included) at least pause_ms after the press
 // before it goes on to `next`. A 自定义组合键 / 自定义按键 row is pressed with its own keys, as such a trigger is: `keys`
 // (the hero's buttons / keyboard, mouse and pad keys) in order (each within `window` ms, default kKeyWindowDefault)
@@ -228,7 +229,7 @@ struct Route { int button = static_cast<int>(Trigger::Light); int pause_ms = 0; 
 // The modifier slots of a node's `mods`: the 加速, 霸体, 武器属性, 允许中断, 伤害倍率, 无敌, 保留变身, 强制受击, 无视防御,
 // 保持派生, 裁剪 and 滞空 node it points at (-1 none).
 enum ModSlot : int { kModSpeed, kModArmor, kModWeapon, kModInterrupt, kModDamage, kModInvincible, kModKeepLook, kModForceHit, kModIgnoreGuard, kModKeepChain, kModTrim,
-                     kModAir, kModBone, kModSlots };
+                     kModAir, kModBone, kModEffect, kModSlots };
 // Every slot empty (-1), however many slots there are.
 inline constexpr std::array<int, kModSlots> NoMods() { std::array<int, kModSlots> mods{}; for (size_t i = 0; i < mods.size(); ++i) mods[i] = -1; return mods; }
 // A node on the page's canvas: x, y its top-left (96-dpi units); next the node its exec output is wired to (-1
@@ -247,6 +248,19 @@ constexpr int kLaunchMin = 0, kLaunchMax = 1500, kLaunchDefault = 300, kLaunchSt
 inline int ClampAirLift(int cm) { return std::clamp(cm, kAirLiftMin, kAirLiftMax); }
 inline int ClampAirHang(int percent) { return std::clamp(percent, kAirHangMin, kAirHangMax); }
 inline int ClampLaunch(int cm) { return std::clamp(cm, kLaunchMin, kLaunchMax); }
+// BOSS 特效: one of the game's battle effects (kNpcBossEffects: `boss` its folder, `ability` its name) played when the
+// move it is wired from starts (from a start: each move of its chains; from a 组合: each of its moves), at fx_place,
+// for as long as the move plays (one that ends by itself ends sooner). Its damage: fx_damage percent of the max health
+// of each enemy within fx_radius cm of the effect, fx_hits times kEffectHitGapMs apart from its start (0 %: none).
+enum class EffectPlace : int { Weapon, Hero, Front, Target, Count };
+constexpr int kEffectDamageMin = 0, kEffectDamageMax = 100, kEffectDamageNew = 10;
+constexpr int kEffectRadiusMin = 100, kEffectRadiusMax = 2000, kEffectRadiusNew = 400, kEffectRadiusStep = 50;
+constexpr int kEffectHitsMin = 1, kEffectHitsMax = 10, kEffectHitsNew = 1;
+constexpr int kEffectHitGapMs = 300, kEffectFrontCm = 300;
+inline int ClampEffectPlace(int place) { return place >= 0 && place < static_cast<int>(EffectPlace::Count) ? place : 0; }
+inline int ClampEffectDamage(int percent) { return std::clamp(percent, kEffectDamageMin, kEffectDamageMax); }
+inline int ClampEffectRadius(int cm) { return std::clamp(cm, kEffectRadiusMin, kEffectRadiusMax); }
+inline int ClampEffectHits(int hits) { return std::clamp(hits, kEffectHitsMin, kEffectHitsMax); }
 // 组合: its frame on the canvas (96-dpi units) and how deep frames may sit in one another.
 constexpr int kGroupMinW = 300, kGroupMinH = 180, kGroupNewW = 460, kGroupNewH = 300, kGroupMaxSize = 4000, kGroupDepthMax = 4;
 struct Node {
@@ -269,12 +283,15 @@ struct Node {
     // at 100. Kept when the curve is switched off (so switching it on again brings it back).
     bool curve = false;
     // BOSS 技能 / 投技's 不变身: the hero keeps the look it has; the move's animation plays on it (retargeted: the hero's
-    // own bone lengths, the move's rotations) instead of taking the boss's look behind the blink.
+    // own bone lengths, the move's rotations) instead of taking the boss's look behind the blink. On a trigger or a
+    // 武器派生修改 it is 整体不变身: every BOSS 技能 and 投技 of the chains it starts plays so (OwnLookFor).
     bool own_look = false;
     bool hook_self = false;  // 钩子: 勾过去 (the hero pulls itself to the target); false: 勾过来 (the target is pulled over)
     bool hook_auto = false;  // 钩子: 自动 (勾过来 a target whose guard is broken, else 勾过去); hook_self is what it plays as
     int hook_dist = 1500, hook_speed = 100;  // 钩子: the farthest aim it takes (cm) and its speed (percent): kHookDist*, kHookSpeed*
     int hold_ms = 0;  // a trigger's 按住: how long its button must be held to start the chain (0: any press)
+    // BOSS 特效: where (EffectPlace), its damage (percent of max health), radius (cm) and hits.
+    int fx_place = 0, fx_damage = kEffectDamageNew, fx_radius = kEffectRadiusNew, fx_hits = kEffectHitsNew;
     bool air_set = false;  // 武器派生修改 as 空中派生: its rows take the presses made in the air (no weapon)
     // 裁剪: the part of the BOSS 技能 pointing at it that plays, in its montage's own time (ms): from trim_from to trim_to
     // (0, or not after trim_from: to its end).
@@ -562,14 +579,15 @@ inline bool EmptyMove(const Node& node) {
 inline bool IsModifier(const Node& node) {
     return node.type == NodeType::Speed || node.type == NodeType::Weapon || node.type == NodeType::Armor || node.type == NodeType::Interrupt ||
            node.type == NodeType::Damage || node.type == NodeType::Invincible || node.type == NodeType::KeepLook || node.type == NodeType::ForceHit ||
-           node.type == NodeType::IgnoreGuard || node.type == NodeType::KeepChain || node.type == NodeType::Trim || node.type == NodeType::Air || node.type == NodeType::BoneTransform;
+           node.type == NodeType::IgnoreGuard || node.type == NodeType::KeepChain || node.type == NodeType::Trim || node.type == NodeType::Air || node.type == NodeType::BoneTransform ||
+           node.type == NodeType::BossEffect;
 }
 // A modifier's slot in `mods` (-1: not a modifier).
 inline int SlotOf(NodeType type) {
     return type == NodeType::Speed ? kModSpeed : type == NodeType::Armor ? kModArmor : type == NodeType::Weapon ? kModWeapon : type == NodeType::Interrupt ? kModInterrupt :
            type == NodeType::Damage ? kModDamage : type == NodeType::Invincible ? kModInvincible : type == NodeType::KeepLook ? kModKeepLook :
            type == NodeType::ForceHit ? kModForceHit : type == NodeType::IgnoreGuard ? kModIgnoreGuard : type == NodeType::KeepChain ? kModKeepChain : type == NodeType::Trim ? kModTrim :
-           type == NodeType::Air ? kModAir : type == NodeType::BoneTransform ? kModBone : -1;
+           type == NodeType::Air ? kModAir : type == NodeType::BoneTransform ? kModBone : type == NodeType::BossEffect ? kModEffect : -1;
 }
 // A move 滞空 / 空中释放 act on: one the hero casts and moves in (not a 钩子 or a 瞬移, which carry the hero their own
 // way, nor a 投技, a 援护 or a look change).
@@ -596,6 +614,7 @@ inline bool ModifierFits(const std::vector<Node>& chain, int from, int mod) {
     if (target.type == NodeType::KeepLook) return StartsChain(source) || source.type == NodeType::BossSkill || source.type == NodeType::Group;
     if (target.type == NodeType::Trim) return TakesTrim(source);  // its own montage's part
     if (target.type == NodeType::Air) return StartsChain(source) || TakesAir(source) || source.type == NodeType::Group;
+    if (target.type == NodeType::BossEffect) return StartsChain(source) || source.type == NodeType::Group || (IsMove(source) && source.type != NodeType::Look && source.type != NodeType::HeroLook);
     if (source.type == NodeType::Grab) return target.type == NodeType::Interrupt;
     return StartsChain(source) ||
            (target.type != NodeType::Weapon && IsMove(source) && source.type != NodeType::Grab && source.type != NodeType::Look && source.type != NodeType::HeroLook);
@@ -604,6 +623,8 @@ inline bool ModifierFits(const std::vector<Node>& chain, int from, int mod) {
 inline bool IsLookChange(const Node& node) { return node.type == NodeType::Look || node.type == NodeType::HeroLook; }
 // Nodes with a 不变身 choice: a BOSS 技能 or a 投技 (both take a boss's look by default).
 inline bool TakesOwnLook(const Node& node) { return node.type == NodeType::BossSkill || node.type == NodeType::Grab; }
+// Nodes whose own_look is saved: those, and the chain starts (a trigger, a 武器派生修改: 整体不变身).
+inline bool SavesOwnLook(const Node& node) { return TakesOwnLook(node) || node.type == NodeType::Trigger || node.type == NodeType::WeaponActions; }
 // Can node `from` point at any modifier (has the pin for it)?
 inline bool TakesModifiers(const Node& node) { return StartsChain(node) || (IsMove(node) && !IsLookChange(node)); }
 // A node chains start from (a trigger or a 武器派生修改): no exec wire goes into it.
@@ -734,6 +755,31 @@ inline int TriggerOf(const Config& config, size_t node) {
         for (const size_t i : Order(config, static_cast<int>(t))) if (i == node) return static_cast<int>(t);
     }
     return -1;
+}
+// Does a BOSS 技能 / 投技 `move` of the chain `trigger` started play 不变身: its own, or its start's 整体不变身?
+inline bool OwnLookFor(const Config& config, int trigger, int move) {
+    const int count = static_cast<int>(config.chain.size());
+    if (move < 0 || move >= count || !TakesOwnLook(config.chain[static_cast<size_t>(move)])) return false;
+    if (config.chain[static_cast<size_t>(move)].own_look) return true;
+    return trigger >= 0 && trigger < count && StartsChain(config.chain[static_cast<size_t>(trigger)]) && config.chain[static_cast<size_t>(trigger)].own_look;
+}
+// Does a BOSS 技能 / 投技 play 不变身 whichever chain plays it: its own, or every start whose wires reach it (or a 组合
+// it sits in) is 整体不变身 (one at least). The page's hint and the look preload go by it.
+inline bool OwnLookEverywhere(const Config& config, size_t node) {
+    if (node >= config.chain.size() || !TakesOwnLook(config.chain[node])) return false;
+    if (config.chain[node].own_look) return true;
+    std::vector<int> holders{static_cast<int>(node)};
+    for (int at = config.chain[node].group, depth = 0; at >= 0 && static_cast<size_t>(at) < config.chain.size() && depth <= kGroupDepthMax;
+         at = config.chain[static_cast<size_t>(at)].group, ++depth) holders.push_back(at);
+    bool any = false;
+    for (size_t t = 0; t < config.chain.size(); ++t) {
+        if (!StartsChain(config.chain[t])) continue;
+        const std::vector<size_t> order = Order(config, static_cast<int>(t));
+        if (std::none_of(order.begin(), order.end(), [&](size_t i) { return std::find(holders.begin(), holders.end(), static_cast<int>(i)) != holders.end(); })) continue;
+        if (!config.chain[t].own_look) return false;
+        any = true;
+    }
+    return any;
 }
 // All first-trigger owners in one traversal. An earlier trigger's reachable
 // subgraph is already complete, so later triggers never need to walk it again.
@@ -867,6 +913,13 @@ inline bool Matches(int button, const Press& press) {
 // `move` (they are called in as it plays); a press that meets nothing to play after a 援护 has that 援护 as its move.
 // hold_ms: the 按住 of the branch row the hop took (0: none).
 struct Hop { int move = -1; int wait_ms = 0; int button = 0; int pause_ms = 0; int branch = -1, row = -1; std::vector<int> assists; int hold_ms = 0; };
+// 派生显示 简略: the presses that take the chain on from `from` (the node it is at; `button`: the one it is on), each
+// with the move it plays. A wire on to a move is `button` again; a 按键分支 there gives a row each (its button, 按住
+// and pause; a 自定义组合键 / 自定义按键 row's keys are the branch's row); a 武器派生修改 a row each. Intervals and bad
+// names on the way are passed, so are 援护 (a 援护 with nothing after it, or a branch after it, is the move). At most
+// `limit` (the first rows).
+struct NextInput { int button = 0; int move = -1; int hold_ms = 0; int pause_ms = 0; int branch = -1, row = -1; };
+inline std::vector<NextInput> NextInputs(const Config& config, int from, int button, size_t limit = 8);
 // Is this row's press its keys (a 自定义组合键 / 自定义按键 row), and are they enough to press (2 to 6 buttons; 1 to 6 keys)?
 inline bool KeysRoute(const Route& route) { return OwnKeysTrigger(route.button); }
 inline bool KeysRouteReady(const Route& route) {
@@ -895,6 +948,45 @@ inline int WeaponActionsRow(const Node& node, const Press& press, int node_index
             (ActionRank(route.button) == ActionRank(node.routes[static_cast<size_t>(best)].button) && ClampHold(route.hold_ms) > ClampHold(node.routes[static_cast<size_t>(best)].hold_ms))) best = static_cast<int>(r);
     }
     return best;
+}
+inline std::vector<NextInput> NextInputs(const Config& config, int from, int button, size_t limit) {
+    std::vector<NextInput> out;
+    const int count = static_cast<int>(config.chain.size());
+    if (from < 0 || from >= count) return out;
+    // Where a wire from `i` leads: a move, a 按键分支 (none after a 援护), or -1.
+    const auto reach = [&](int i) {
+        std::vector<bool> seen(config.chain.size(), false);
+        int assist = -1;
+        while (i >= 0 && i < count && !seen[static_cast<size_t>(i)]) {
+            seen[static_cast<size_t>(i)] = true;
+            const Node& node = config.chain[static_cast<size_t>(i)];
+            if (node.type == NodeType::Interval || EmptyMove(node)) { i = node.next; continue; }
+            if (node.type == NodeType::Assist) { assist = i; i = node.next; continue; }
+            if (node.type == NodeType::Branch) return assist >= 0 ? assist : i;
+            if (IsMove(node)) return i;
+            break;
+        }
+        return assist;
+    };
+    const auto rows = [&](int at) {
+        const Node& node = config.chain[static_cast<size_t>(at)];
+        for (size_t r = 0; r < node.routes.size() && out.size() < limit; ++r) {
+            const Route& route = node.routes[r];
+            if (route.next < 0) continue;
+            const int move = reach(route.next);
+            if (move < 0 || config.chain[static_cast<size_t>(move)].type == NodeType::Branch) continue;
+            NextInput in; in.button = route.button; in.move = move; in.hold_ms = ClampHold(route.hold_ms);
+            in.pause_ms = node.type == NodeType::Branch ? ClampPause(route.pause_ms) : 0; in.branch = at; in.row = static_cast<int>(r);
+            out.push_back(in);
+        }
+    };
+    const Node& origin = config.chain[static_cast<size_t>(from)];
+    if (HasRows(origin)) { rows(from); return out; }
+    const int to = reach(origin.next);
+    if (to < 0 || limit == 0) return out;
+    if (config.chain[static_cast<size_t>(to)].type == NodeType::Branch) { rows(to); return out; }
+    NextInput in; in.button = button; in.move = to; out.push_back(in);
+    return out;
 }
 inline Hop Follow(const Config& config, int from, int button, const Press& press, int since_ms) {
     const int count = static_cast<int>(config.chain.size());
@@ -1394,6 +1486,7 @@ inline int KeepChainFor(const Config& config, int trigger, int at) {
 // trigger points at one)? Only a BOSS 技能 takes a look of its own.
 inline bool KeepLookFor(const Config& config, int trigger, int move) {
     if (move < 0 || static_cast<size_t>(move) >= config.chain.size() || config.chain[static_cast<size_t>(move)].type != NodeType::BossSkill) return false;
+    if (OwnLookFor(config, trigger, move)) return false;  // 不变身 takes no look to keep
     return ModFor(config, trigger, move, kModKeepLook) >= 0;
 }
 // May a move of `trigger`'s chain be cut at any time (the move, a frame it sits in or the trigger points at a
@@ -1417,6 +1510,13 @@ inline int ForceLaunchFor(const Config& config, int trigger, int move) {
 // 滞空 for a move of `trigger`'s chain: the 滞空 node it points at (else its frames', else the trigger's); with none,
 // the 空中释放 values when it is cast in the air (`airborne`) and 空中释放 is on. `fixed`: those are 空中释放's.
 struct AirSet { bool on = false, fixed = false; int self_lift = 0, self_hang = 0, foe_lift = 0, foe_hang = 0; };
+// The BOSS 特效 a move of `trigger`'s chain plays (its own, its frames', else the trigger's; -1: none or not picked).
+inline int EffectFor(const Config& config, int trigger, int move) {
+    if (move < 0 || static_cast<size_t>(move) >= config.chain.size()) return -1;
+    const int mod = ModFor(config, trigger, move, kModEffect);
+    if (mod < 0 || config.chain[static_cast<size_t>(mod)].type != NodeType::BossEffect || config.chain[static_cast<size_t>(mod)].ability.empty()) return -1;
+    return mod;
+}
 inline AirSet AirFor(const Config& config, int trigger, int move, bool airborne) {
     AirSet set;
     if (move < 0 || static_cast<size_t>(move) >= config.chain.size() || !TakesAir(config.chain[static_cast<size_t>(move)])) return set;
@@ -1627,7 +1727,8 @@ inline std::wstring Encode(const Config& config) {
         case NodeType::KeepChain: text += "|k:" + std::to_string(ClampKeepChain(node.ms)) + "," + pos(node); break;
         case NodeType::PreInput: text += "|J:" + std::to_string(ClampPreInput(node.ms)) + "," + pos(node); break;
         // An unwired 间隔 in an older build; the "f:" / "j:" marks below make them 滞空 / 空中释放 again.
-        case NodeType::BoneTransform: case NodeType::Air: case NodeType::AirDefault: text += "|I:" + std::to_string(kIntervalDefault) + "," + pos(node) + ",-1"; break;
+        case NodeType::BoneTransform: case NodeType::Air: case NodeType::AirDefault: case NodeType::BossEffect:
+            text += "|I:" + std::to_string(kIntervalDefault) + "," + pos(node) + ",-1"; break;
         case NodeType::Grab: text += "|G:" + at(node) + (GrabMoveId(node.ability) ? "," + node.ability : std::string()); break;
         case NodeType::Assist:
             text += "|a:" + (AbilityName(node.boss) ? node.boss : std::string("_")) + "," + (AbilityName(node.ability) ? node.ability : std::string("_")) + "," + at(node);
@@ -1671,9 +1772,9 @@ inline std::wstring Encode(const Config& config) {
     // b:node~config. Older readers keep an inert, unwired interval and ignore its modifier link.
     for(size_t i=0;i<config.chain.size();++i)if(config.chain[i].type==NodeType::BoneTransform)
         text+="|b:"+std::to_string(i)+"~"+BoneMotion::Encode(config.chain[i].bones);
-    // 不变身 marks: "h:node" (an older build ignores them; the node keeps its look change there).
+    // 不变身 marks: "h:node", on a start node 整体不变身 (an older build ignores them; the node keeps its look change there).
     for (size_t i = 0; i < config.chain.size(); ++i)
-        if (TakesOwnLook(config.chain[i]) && config.chain[i].own_look) text += "|h:" + std::to_string(i);
+        if (SavesOwnLook(config.chain[i]) && config.chain[i].own_look) text += "|h:" + std::to_string(i);
     // 钩子 marks: "g:node" (an older build plays the 武器派生 it is written as).
     for (size_t i = 0; i < config.chain.size(); ++i) if (config.chain[i].type == NodeType::Hook) text += "|g:" + std::to_string(i);
     // 空中派生 marks: "s:node" (an older build reads a 武器派生修改 with no weapon, which takes nothing).
@@ -1695,6 +1796,11 @@ inline std::wstring Encode(const Config& config) {
     for (size_t i = 0; i < config.chain.size(); ++i) {
         const Node& node = config.chain[i];
         if (node.type == NodeType::Air) text += "|f:" + std::to_string(i) + "," + air(node);
+        // BOSS 特效: "x:node,folder,name,place,damage,radius,hits" (an older build keeps an unwired 间隔).
+        if (node.type == NodeType::BossEffect)
+            text += "|x:" + std::to_string(i) + "," + (AbilityName(node.boss) ? node.boss : std::string("_")) + "," + (AbilityName(node.ability) ? node.ability : std::string("_")) + "," +
+                    std::to_string(ClampEffectPlace(node.fx_place)) + "," + std::to_string(ClampEffectDamage(node.fx_damage)) + "," + std::to_string(ClampEffectRadius(node.fx_radius)) + "," +
+                    std::to_string(ClampEffectHits(node.fx_hits));
         if (node.type == NodeType::AirDefault) text += "|j:" + std::to_string(i) + "," + (node.on ? "1," : "0,") + air(node);
         if (node.type == NodeType::ForceHit && ClampLaunch(node.launch) != kLaunchDefault) text += "|u:" + std::to_string(i) + "," + std::to_string(ClampLaunch(node.launch));
     }
@@ -1735,6 +1841,7 @@ inline Config Decode(const std::wstring& wide) {
     struct AirMark { int node = -1; bool fixed = false, on = true; int lift = 0, hang = 0, foe_lift = 0, foe_hang = 0; };
     std::vector<AirMark> airs;  // 滞空 / 空中释放 (written as 间隔)
     std::vector<std::pair<int, int>> launches;  // 强制受击 击飞 heights
+    std::vector<Node> effects;  // BOSS 特效 (written as 间隔): x the node, its folder, name and numbers
     std::vector<std::pair<int, std::string>> frames;  // 组合 -> its nodes ("3;4;7")
     const auto place = [](Node& node, const std::vector<std::string>& f, size_t first) {
         node.x = ClampPosition(std::atoi(f[first].c_str())); node.y = ClampPosition(std::atoi(f[first + 1].c_str())); node.next = std::atoi(f[first + 2].c_str());
@@ -1776,6 +1883,14 @@ inline Config Decode(const std::wstring& wide) {
             mark.lift = ClampAirLift(std::atoi(f[first].c_str())); mark.hang = ClampAirHang(std::atoi(f[first + 1].c_str()));
             mark.foe_lift = ClampAirLift(std::atoi(f[first + 2].c_str())); mark.foe_hang = ClampAirHang(std::atoi(f[first + 3].c_str()));
             airs.push_back(mark);
+        } else if (part[0] == 'x') {
+            const std::vector<std::string> f = Split(part.substr(2), ',');
+            if (f.size() != 7 || f[0].empty() || f[0].find_first_not_of("0123456789") != std::string::npos || f[0].size() > 6 || effects.size() >= kMaxNodes) continue;
+            Node fx; fx.type = NodeType::BossEffect; fx.x = std::atoi(f[0].c_str());
+            fx.boss = AbilityName(f[1]) ? f[1] : std::string(); fx.ability = AbilityName(f[2]) ? f[2] : std::string();
+            fx.fx_place = ClampEffectPlace(std::atoi(f[3].c_str())); fx.fx_damage = ClampEffectDamage(std::atoi(f[4].c_str()));
+            fx.fx_radius = ClampEffectRadius(std::atoi(f[5].c_str())); fx.fx_hits = ClampEffectHits(std::atoi(f[6].c_str()));
+            effects.push_back(fx);
         } else if (part[0] == 'u') {
             const std::vector<std::string> f = Split(part.substr(2), ',');
             if (f.size() == 2) launches.push_back({std::atoi(f[0].c_str()), ClampLaunch(std::atoi(f[1].c_str()))});
@@ -2003,6 +2118,13 @@ inline Config Decode(const std::wstring& wide) {
         node.type = a.fixed ? NodeType::AirDefault : NodeType::Air; node.ms = 0; node.on = a.on;
         node.air_lift = a.lift; node.air_hang = a.hang; node.air_foe_lift = a.foe_lift; node.air_foe_hang = a.foe_hang;
     }
+    for (const Node& fx : effects) {  // x holds the node's index
+        if (fx.x < 0 || fx.x >= count) continue;
+        Node& node = config.chain[static_cast<size_t>(fx.x)];
+        if (node.type != NodeType::Interval || node.next >= 0) continue;
+        node.type = NodeType::BossEffect; node.ms = 0; node.boss = fx.boss; node.ability = fx.ability;
+        node.fx_place = fx.fx_place; node.fx_damage = fx.fx_damage; node.fx_radius = fx.fx_radius; node.fx_hits = fx.fx_hits;
+    }
     for (const auto& [i, cm] : launches)
         if (i >= 0 && i < count && config.chain[static_cast<size_t>(i)].type == NodeType::ForceHit) config.chain[static_cast<size_t>(i)].launch = cm;
     // 空中派生: its rows the air's (the NPC key too, no execution); a 武器派生修改's the weapon's.
@@ -2042,7 +2164,7 @@ inline Config Decode(const std::wstring& wide) {
             if (CanJoin(config, i, frame)) config.chain[static_cast<size_t>(i)].group = frame;
         }
     }
-    for (const int i : own_looks) if (i >= 0 && i < count && TakesOwnLook(config.chain[static_cast<size_t>(i)])) config.chain[static_cast<size_t>(i)].own_look = true;
+    for (const int i : own_looks) if (i >= 0 && i < count && SavesOwnLook(config.chain[static_cast<size_t>(i)])) config.chain[static_cast<size_t>(i)].own_look = true;
     for (const int i : hooks) {
         if (i < 0 || i >= count) continue;
         Node& node = config.chain[static_cast<size_t>(i)];

@@ -738,14 +738,30 @@ size_t GiveRequiredTags(const Slot& s) {
     return ok ? missing.size() : 0;
 }
 // Pawns the preview boss left (instigated or owned by it, not there when it came).
+// Every actor the preview boss owns or instigated: its summons, and what its moves left on the stage (projectiles,
+// effect and decal actors that outlive the boss: the next move's preview showed them).
 void RemoveLeftovers(Object* boss) {
-    size_t removed = 0;
-    for (Object* pawn : Pawns()) {
-        if (pawn == boss || std::find(preview_world_pawns_.begin(), preview_world_pawns_.end(), pawn) != preview_world_pawns_.end()) continue;
-        if (Property(pawn, "Instigator") != boss && Property(pawn, "Owner") != boss) continue;
-        if (Call(pawn, "K2_DestroyActor").Invoke()) ++removed;
+    size_t removed = 0, pawns = 0;
+    Context context;
+    Object* actor_class = ue::FindObject("/Script/Engine.Actor"), *pawn_class = ue::FindObject("/Script/Engine.Pawn");
+    Call all(ue::Default("/Script/Engine.Default__GameplayStatics"), "GetAllActorsOfClass");
+    if (ContextNow(context) && actor_class && all.Set("WorldContextObject", context.world).Set("ActorClass", actor_class).Invoke()) {
+        const Array list = all.Get<Array>("OutActors");
+        std::vector<Object*> leftovers;
+        for (int32_t i = 0; list.data && i < list.num && i < 65536; ++i) {
+            Object* a = static_cast<Object**>(list.data)[i];
+            if (!a || a == boss || !ue::Alive(a)) continue;
+            if (Property(a, "Instigator") != boss && Property(a, "Owner") != boss) continue;
+            if (std::find(preview_world_pawns_.begin(), preview_world_pawns_.end(), a) != preview_world_pawns_.end()) continue;
+            leftovers.push_back(a);
+        }
+        ue::Free(list.data);
+        for (Object* a : leftovers) {
+            const bool pawn = pawn_class && ue::IsA(a, pawn_class);
+            if (ue::Alive(a) && Call(a, "K2_DestroyActor").Invoke()) { ++removed; if (pawn) ++pawns; }
+        }
     }
-    if (removed) Logf("BOSS_ASSIST preview removed %zu pawns of its boss", removed);
+    if (removed) Logf("BOSS_ASSIST preview removed %zu actors of its boss (%zu pawns)", removed, pawns);
     preview_world_pawns_.clear();
 }
 void DestroyPreviewBoss(Slot& s) {
@@ -905,7 +921,7 @@ void TrimPreview(Slot& s) {
         preview_trim_cut_ = true;
         if (++preview_trim_logs_ <= 6) Logf("BOSS_ASSIST preview trim cut at %.2fs (the part ends at %.2fs)", at, r.to);
         Call(anim, "Montage_Stop").Set("InBlendOutTime", 0.12f).Set("Montage", montage).Invoke();
-        if (Object* asc = Asc(s.boss); asc && s.handle > 0) Call(asc, "CancelAbilityHandle").Set("AbilityHandle", s.handle).Invoke();
+        if (Object* asc = Asc(s.boss); asc && s.handle > 0) NpcRetarget::CancelAbilitySpec(asc, s.handle);
     }
 }
 // The preview's boss: cast, then back on its spot facing the target, kPreviewGapMs, cast again.

@@ -34,6 +34,9 @@ bool Request(Action action, int32_t entry = -1);
 // (kNpcSkillSets) in random rounds on the hero's own ASC, locked on the nearest enemy; while one runs
 // the boss's weapons hang on the NPC display and the hero's weapons are hidden. False when no skin is active.
 bool RequestSkill();
+// Game thread: cancels the ability spec `handle` running on `asc` (K2_CancelAbility on its active instances; the ASC's
+// CancelAbilityHandle is no UFUNCTION in this build, a call by name does nothing). True when an instance was cancelled.
+bool CancelAbilitySpec(ue::Object* asc, int32_t handle);
 // Any thread, no engine calls. NPC skill damage ([NpcSkill] DamageMultiplier, kSkillDamageMin..Max,
 // default 3): every health drop of a hostile pawn while a skin's boss skill runs, and for the effects it
 // leaves up to 2 s after, is scaled to this many times the native damage. 1 = the boss's own damage.

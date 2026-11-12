@@ -26,6 +26,44 @@ inline bool IsPoseJump(double position,double destination){
     return std::isfinite(destination)&&destination>=0&&
         !(position>=0&&std::isfinite(position)&&std::abs(destination-position)<0.1);
 }
+// 取景: where the eye goes for the shown model. Axes of a view rotation (degrees): forward, right, up.
+template<class V> struct Axes { V f,r,u; };
+template<class V> Axes<V> ViewAxes(double yaw_deg,double pitch_deg){
+    constexpr double k=3.14159265358979323846/180.0;
+    const double cy=std::cos(yaw_deg*k),sy=std::sin(yaw_deg*k),cp=std::cos(pitch_deg*k),sp=std::sin(pitch_deg*k);
+    return {V{cp*cy,cp*sy,sp},V{-sy,cy,0},V{-sp*cy,-sp*sy,cp}};
+}
+template<class V> double Dot(const V& a,const V& b){return a.x*b.x+a.y*b.y+a.z*b.z;}
+template<class V> double Length(const V& a){return std::sqrt(Dot(a,a));}
+template<class V> V ToLocal(const Axes<V>& a,const V& w){return {Dot(w,a.f),Dot(w,a.r),Dot(w,a.u)};}
+template<class V> V ToWorld(const Axes<V>& a,const V& l){
+    return {a.f.x*l.x+a.r.x*l.y+a.u.x*l.z,a.f.y*l.x+a.r.y*l.y+a.u.y*l.z,a.f.z*l.x+a.r.z*l.y+a.u.z*l.z};
+}
+// How far away a model `size` cm tall fills `fill` of the view's height (hfov: horizontal field of view in degrees,
+// aspect: width / height).
+inline double FrameDistance(double size,double hfov,double aspect,double fill){
+    constexpr double k=3.14159265358979323846/360.0;
+    if(!(hfov>10&&hfov<170))hfov=90;
+    if(!(aspect>0.3&&aspect<5))aspect=16.0/9.0;
+    if(!(fill>0.05&&fill<=1))fill=0.6;
+    const double half_v=std::tan(hfov*k)/aspect;
+    return size>0?size/(2*half_v*fill):0;
+}
+// The eye's place from the body in the view's axes: the game camera's own relation (`native`, measured with no offset
+// on) pushed out along itself to at least `distance`; a relation too short to have a direction is straight behind.
+template<class V> V FrameRelation(const V& native,double distance){
+    const double len=Length(native);
+    if(len<50)return V{-(std::max)(distance,50.0),0,0};
+    const double k=distance>len?distance/len:1;
+    return {native.x*k,native.y*k,native.z*k};
+}
+// A world relation (eye - body) raised so the eye looks down on the body by at least min_down degrees: never from below.
+template<class V> V LookDownAtLeast(V rel,double min_down_deg){
+    const double flat=std::sqrt(rel.x*rel.x+rel.y*rel.y);
+    const double lowest=flat*std::tan(min_down_deg*3.14159265358979323846/180.0);
+    if(rel.z<lowest)rel.z=lowest;
+    return rel;
+}
 // Pose displacement, not camera-to-body distance, drives the pivot. A jump can
 // bring the body close to the eye in open air; that is not a shortened camera arm.
 template<class Vector> Vector DesiredOffset(double dx,double dy,double dz){

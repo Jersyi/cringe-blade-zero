@@ -14,6 +14,10 @@ namespace ComboMenu {
 HWND CreatePage(HWND parent);
 void Tick();
 void Shutdown();
+// 派生显示: the chain going on in the game's top-right corner (NpcCombo::ChainHud: 详细 / 简略). UI worker, every tick,
+// whether or not the page is open; HudShutdown with the other overlays.
+void HudTick();
+void HudShutdown();
 // Route text/navigation directly before the hub's dialog traversal.
 bool OwnsTextMessage(const MSG& message);
 // Consume recording input before hub navigation/dialog keys, including mouse buttons over other controls.
@@ -26,6 +30,9 @@ bool HandleCommand(const char* arguments);
 void SetLogger(void (*log)(const char*));
 // Screen points (page client coordinates) for the offline preview's scripted mouse checks.
 namespace Probe {
+// 派生显示 offline (no window): the overlay for the page's chain at that place, 32-bit premultiplied pixels (cursor -1:
+// 待命 at the trigger; a trigger that is no node: the panel for a set with no chain).
+bool HudPixels(int mode,int trigger,int cursor,int playing,int queued,unsigned long long wait_left_ms,std::vector<uint32_t>& pixels,int& width,int& height,long long since_ms=-1);
 void RefreshData(); // explicit hidden-host driver for the same production refresh
 void PickNodes(const std::vector<int>& nodes);
 bool ClipboardShortcut(int key);
@@ -98,6 +105,12 @@ int RecordingRoute();            // its branch row recording keys (-1: none, or 
 void ScrollWeapons(int pixels);  // turns the weapon list page (test setup)
 // Hidden-window layout probes: no input injection, focus, mouse capture or file writes.
 void Library(int tab, int category);
+void LibraryFrom(const std::string& look);  // the BOSS 招式 list's 招式来源 ("" this table's look; test setup)
+RECT LibraryFromBox();
+void LibraryFromList(bool open);            // opens / closes the 招式来源 list (manual shot)
+std::vector<std::string> LibraryMoves();    // the moves the BOSS 招式 list holds now (every page)
+int AddLibraryMove(size_t index);           // what a click on that move does; the new node's index (-1: none)
+std::string NodeSummary(int index);          // "type|boss|ability" ("" no such node)
 RECT LibraryBox();
 RECT LibraryTabBox(int tab);
 RECT LibraryCategoryBox(int category);

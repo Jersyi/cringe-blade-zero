@@ -52,6 +52,7 @@ struct Stage {
 };
 Stage stage_;
 std::string monster_, ability_;  // what the preview boss plays now
+Object* effect_ = nullptr; Name effect_name_{}; ULONGLONG effect_at_ = 0;  // 特效预览: the effect on the stage, when it was spawned
 bool framed_ = false; ULONGLONG next_read_ = 0, retry_at_ = 0; double exposure_ = 1; uint32_t reads_ = 0, read_fails_ = 0;
 Object* engine_ = nullptr;
 // 实时预览: the game draws the stage itself, every frame, where the page's card shows it (Place): a UMG image (a
@@ -75,6 +76,8 @@ constexpr double kStageKeepClearCm = 15000;  // pawns this close to the stage ar
 bool keep_culling_ = false, culling_paused_ = false;
 bool fx_scan_ = false;            // `preview fx`: one scan of the effect components near the stage, logged
 std::vector<Object*> fx_lod_;     // the boss's effect components given the camera's LOD distance
+int cut_frames_ = 0;              // captures still marked as camera cuts after a switch (FreshPicture)
+bool cut_missing_ = false;        // the capture has no bCameraCutThisFrame (logged once)
 ULONGLONG fx_log_at_ = 0;
 
 void Logf(const char* format, ...) {
@@ -117,13 +120,15 @@ template<class T> bool Put(Object* object, const char* property, const T& value)
     const int32_t offset = ue::At<int32_t>(reinterpret_cast<void*>(field), ue::layout::kPropOffset);
     std::memcpy(reinterpret_cast<unsigned char*>(object) + offset, &value, sizeof(value)); return true;
 }
-// A bool property at `base` (a bitfield one too: FBoolProperty's FieldSize, ByteOffset, ByteMask, FieldMask at 0x70..0x73).
+// A bool property at `base` (a bitfield one too: FBoolProperty's FieldSize, ByteOffset, ByteMask, FieldMask at 0x70..0x73;
+// a uint32 bitfield has FieldSize 4, and its bit is in the byte at ByteOffset).
 bool PutBoolAt(unsigned char* base, uintptr_t field, bool value) {
-    if (!base || !field || ue::At<uint8_t>(reinterpret_cast<void*>(field), 0x70) != 1) return false;
+    const uint8_t field_size = base && field ? ue::At<uint8_t>(reinterpret_cast<void*>(field), 0x70) : 0;
+    if (field_size != 1 && field_size != 2 && field_size != 4 && field_size != 8) return false;
     const int32_t offset = ue::At<int32_t>(reinterpret_cast<void*>(field), ue::layout::kPropOffset);
     const uint8_t byte_offset = ue::At<uint8_t>(reinterpret_cast<void*>(field), 0x71), byte_mask = ue::At<uint8_t>(reinterpret_cast<void*>(field), 0x72),
                   mask = ue::At<uint8_t>(reinterpret_cast<void*>(field), 0x73);
-    if (byte_offset > 7 || !mask || !byte_mask) return false;
+    if (byte_offset >= field_size || !mask || !byte_mask) return false;
     uint8_t& byte = base[offset + byte_offset];
     byte = static_cast<uint8_t>((byte & ~mask) | (value ? byte_mask : 0)); return true;
 }
@@ -440,6 +445,66 @@ void ScanEffects() {
     });
     Logf("MOVE_PREVIEW fx scan components=%d nearStage=%d active=%d culling=%s: %s", total, close_by, active, culling_paused_ ? "paused" : "on", list.c_str());
 }
+// The stage's picture started afresh (on every switch): the capture keeps its view's history between frames (temporal
+// anti-aliasing, eye adaptation: bAlwaysPersistRenderingState), and while the hub is open with no preview the paused
+// world does not tick the capture, so the target kept the last effect's frame. Shown again, the picture began with that
+// frame and its history faded it out over the next effect (user 11-12: "预览还是有上一个的特效残留"). Now the target is
+// blanked, the history dropped (GetViewState frees it for a capture with neither flag set: one CaptureScene so), and the
+// next few captures are camera cuts. Returns what took ("cleared=1 history=1 cut=1").
+std::string FreshPicture() {
+    if (!stage_.built) return "no stage";
+    Object* rendering = ue::Default("/Script/Engine.Default__KismetRenderingLibrary");
+    const bool cleared = stage_.target && ue::Alive(stage_.target) &&
+        Call(rendering, "ClearRenderTarget2D").Set("WorldContextObject", stage_.world).Set("TextureRenderTarget", stage_.target).Set("ClearColor", LinearColor{0, 0, 0, 1}).Invoke();
+    bool history = false;
+    if (stage_.component && ue::Alive(stage_.component)) {
+        const bool off = PutBool(stage_.component, "bAlwaysPersistRenderingState", false) && PutBool(stage_.component, "bCaptureEveryFrame", false);
+        history = off && Call(stage_.component, "CaptureScene").Invoke();
+        PutBool(stage_.component, "bCaptureEveryFrame", true); PutBool(stage_.component, "bAlwaysPersistRenderingState", true);
+    }
+    cut_frames_ = cut_missing_ ? 0 : 4;
+    return std::string("cleared=") + (cleared ? "1" : "0") + " history=" + (history ? "1" : "0") + " cut=" + (cut_missing_ ? "0" : "1");
+}
+// A switch's camera cuts, one a frame (the capture resets the flag at every capture).
+void HoldCut() {
+    if (cut_frames_ <= 0 || !stage_.component || !ue::Alive(stage_.component)) return;
+    if (PutBool(stage_.component, "bCameraCutThisFrame", true)) { --cut_frames_; return; }
+    cut_frames_ = 0; cut_missing_ = true;
+    Logf("MOVE_PREVIEW capture has no bCameraCutThisFrame: the dropped history alone starts the picture afresh");
+}
+// Every effect still playing on the stage (within 60 m of it), stopped at once with its particles: the last move's
+// effects spawned at a spot (owned by no actor, or outliving the boss) stayed on in the next preview; and the picture
+// started afresh (FreshPicture). `why` is logged, with the first effects that were still on.
+void ClearStageEffects(const char* why) {
+    if (!stage_.built) return;
+    Object* niagara = Class("/Script/Niagara.NiagaraComponent"), *cascade = Class("/Script/Engine.ParticleSystemComponent");
+    const Vector& o = stage_.origin;
+    std::vector<std::pair<Object*, bool>> found;
+    ue::ForEachObject([&](Object* object) {
+        const bool n = niagara && ue::IsA(object, niagara), p = !n && cascade && ue::IsA(object, cascade);
+        if ((!n && !p) || ue::IsTemplate(object) || !ue::Alive(object)) return true;
+        Call where(object, "K2_GetComponentLocation"); if (!where.Invoke()) return true;
+        const Vector v = where.Get<Vector>("ReturnValue");
+        const double d = std::sqrt((v.x - o.x) * (v.x - o.x) + (v.y - o.y) * (v.y - o.y) + (v.z - o.z) * (v.z - o.z));
+        if (d < 6000) found.emplace_back(object, n);
+        return true;
+    });
+    int stopped = 0, on = 0; std::string names;
+    for (const auto& [fx, n] : found) {
+        if (!ue::Alive(fx)) continue;
+        Call active(fx, "IsActive");
+        if (active.Invoke() && active.Get<bool>("ReturnValue") && ++on <= 3) {
+            Call owner(fx, "GetOwner"); Object* who = owner.Invoke() ? owner.Get<Object*>("ReturnValue") : nullptr;
+            names += Text(Property(fx, n ? "Asset" : "Template")) + "@" + Text(who) + " ";
+        }
+        if (n) { if (!Call(fx, "DeactivateImmediate").Invoke()) Call(fx, "Deactivate").Invoke(); }
+        else { Call(fx, "KillParticlesForced").Invoke(); Call(fx, "Deactivate").Invoke(); }
+        ++stopped;
+    }
+    fx_lod_.clear();
+    const std::string picture = FreshPicture();
+    Logf("MOVE_PREVIEW stage effects stopped (%s): %d, %d still on%s%s; picture afresh %s", why, stopped, on, on ? ": " : "", names.c_str(), picture.c_str());
+}
 bool WidgetAlive() { return widget_ && ue::Alive(widget_) && ue::NameOf(widget_) == widget_name_ && image_ && ue::Alive(image_); }
 void DropWidget(const char* why) {
     if (!widget_) return;
@@ -579,6 +644,31 @@ void Read(Object* context_object) {
     frame_.pixels.swap(out); frame_.status.clear(); ++frame_.serial;
     ReleaseSRWLockExclusive(&lock_);
 }
+bool EffectAlive() { return effect_ && ue::Alive(effect_) && ue::NameOf(effect_) == effect_name_; }
+void DropEffect() {
+    if (EffectAlive()) Call(effect_, "DestroyComponent").Set("bPromoteChildren", false).Invoke();
+    effect_ = nullptr; effect_name_ = {}; effect_at_ = 0;
+}
+// The capture at its first place (the stage's front), as Build puts it.
+void FrontCamera() {
+    if (!stage_.capture || !ue::Alive(stage_.capture)) return;
+    const Vector at{stage_.origin.x, stage_.origin.y - 900, stage_.origin.z + 300};
+    Call(stage_.capture, "K2_SetActorLocationAndRotation").Set("NewLocation", at).Set("NewRotation", Rotator{-10, 90, 0}).Set("bSweep", false).Set("bTeleport", true).Invoke();
+}
+// 特效预览: the effect again when the last one is over or kEffectRepeatMs on, in the middle of the stage.
+void PlayEffect(const std::string& path, ULONGLONG now) {
+    if (EffectAlive() && now < effect_at_ + kEffectRepeatMs) return;
+    DropEffect();
+    Object* system = LoadAsset(path.c_str());
+    if (!system) { SetStatus(L"这个特效无法载入"); return; }
+    Call spawn(ue::Default("/Script/Niagara.Default__NiagaraFunctionLibrary"), "SpawnSystemAtLocation");
+    if (spawn.Set("WorldContextObject", stage_.world).Set("SystemTemplate", system).Set("Location", Vector{stage_.origin.x, stage_.origin.y, stage_.origin.z + 5})
+            .Set("Rotation", Rotator{0, 0, 0}).Set("Scale", Vector{1, 1, 1}).Set("bAutoDestroy", true).Set("bAutoActivate", true).Set("PoolingMethod", uint8_t{0})
+            .Set("bPreCullCheck", false).Invoke()) effect_ = spawn.Get<Object*>("ReturnValue");
+    if (effect_ && !ue::Alive(effect_)) effect_ = nullptr;
+    effect_name_ = effect_ ? ue::NameOf(effect_) : Name{}; effect_at_ = now;
+    SetStatus(effect_ ? L"" : L"这个特效无法播放");
+}
 void Tick() {
     if (disabled_) return;
     std::string monster, ability; bool shown = false; ULONGLONG hidden_at = 0;
@@ -589,7 +679,8 @@ void Tick() {
     if(!shown)BossAssist::PreviewTrim(trim_from,trim_to,holds,false);
     const ULONGLONG now = GetTickCount64();
     if (!shown) {
-        if (!monster_.empty()) { BossAssist::StopPreview(); monster_.clear(); ability_.clear(); framed_ = false; fx_lod_.clear(); }
+        if (!monster_.empty()) { if (monster_ != kEffectStage) BossAssist::StopPreview(); monster_.clear(); ability_.clear(); framed_ = false; ClearStageEffects("hidden"); }
+        DropEffect();
         DropWidget("hidden"); Unfreeze(); SetLive(false);
         if (culling_paused_) { Context context; if (ContextNow(context)) PauseCulling(context.world, false); }
         if (stage_.built && now > hidden_at + kStageKeepMs) Teardown("hidden");
@@ -605,13 +696,30 @@ void Tick() {
         if (!Build(context)) { retry_at_ = now + kRetryMs; SetStatus(L"预览场景无法创建"); return; }
     }
     PauseCulling(context.world, !keep_culling_);  // before the boss's first cast: no effect of it is culled at birth
+    if (monster == kEffectStage) {  // 特效预览: no boss
+        if (monster_ != monster || ability_ != ability) {
+            if (!monster_.empty() && monster_ != kEffectStage) BossAssist::StopPreview();
+            DropEffect(); ClearStageEffects("next effect"); monster_ = monster; ability_ = ability; framed_ = false; FrontCamera(); SetStatus(L"正在载入特效…");
+        }
+        PlayEffect(ability, now);
+        RECT view{}; int source = -1;
+        AcquireSRWLockShared(&lock_); view = view_; source = source_override_; ReleaseSRWLockShared(&lock_);
+        const bool live = view.right > view.left && view.bottom > view.top && ShowLive(context, view);
+        if (!live && widget_) DropWidget("no picture rect");
+        SetLive(live);
+        if (stage_.component && ue::Alive(stage_.component)) Put(stage_.component, "CaptureSource", static_cast<uint8_t>(source >= 0 ? source : live ? kLiveSource : kReadSource));
+        HoldCut();
+        if (now >= next_read_) { next_read_ = now + kReadMs; if (!live) Read(context.world); }
+        return;
+    }
+    if (monster_ == kEffectStage) { DropEffect(); ClearStageEffects("effect left"); monster_.clear(); ability_.clear(); FrontCamera(); }
     if (monster != monster_ || ability != ability_) {
         // The hub's pause is lifted for the preview later this frame (HubPause after us): the boss is made on a running
         // world (one spawned and cast while paused may never start its move).
         bool paused = false;
         { Call get(ue::Default("/Script/Engine.Default__GameplayStatics"), "IsGamePaused"); if (get.Set("WorldContextObject", context.world).Invoke()) paused = get.Get<bool>("ReturnValue"); }
         if (paused) { SetStatus(L"正在载入招式…"); return; }
-        BossAssist::StopPreview(); framed_ = false; monster_ = monster; ability_ = ability; fx_lod_.clear(); fx_log_at_ = now + 1500;
+        BossAssist::StopPreview(); ClearStageEffects("next move"); framed_ = false; monster_ = monster; ability_ = ability; fx_log_at_ = now + 1500;
         SetStatus(L"正在载入招式…");
         const double at[3] = {stage_.origin.x + kBossX, stage_.origin.y, stage_.origin.z};
         if (!BossAssist::StartPreview(monster, ability, at, 0, stage_.dummy)) { SetStatus(L"这一招无法预览"); return; }
@@ -628,6 +736,7 @@ void Tick() {
     if (!live && widget_) DropWidget("no picture rect");
     SetLive(live);
     if (stage_.component && ue::Alive(stage_.component)) Put(stage_.component, "CaptureSource", static_cast<uint8_t>(source >= 0 ? source : live ? kLiveSource : kReadSource));
+    HoldCut();
     if (now >= next_read_) { next_read_ = now + kReadMs; if (!live) Read(context.world); if (boss) HoldEffects(boss, now); }
     if (fx_scan_) { fx_scan_ = false; ScanEffects(); }
 }

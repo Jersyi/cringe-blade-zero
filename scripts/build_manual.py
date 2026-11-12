@@ -192,27 +192,6 @@ def parse_body(lines):
     flush();return out
 
 
-def supplement_cards():
-    layout=(ROOT/'src/supplement/supplement_layout.h').read_text(encoding='utf-8-sig')
-    generated=(ROOT/'src/generated/debug_supplement_playseq.generated.h').read_text(encoding='utf-8-sig')
-    by_key={}
-    for match in re.finditer(r'inline constexpr Card (\w+)\[\] = \{\n(.*?)\n};',layout+'\n'+generated,re.S):
-        cards=[]
-        for line in match[2].splitlines():
-            values=re.findall(r'L"((?:[^"\\]|\\.)*)"',line)
-            if len(values)<2:continue
-            title,note,*options=values
-            cards.append({'title':title,'note':note,'options':options})
-        by_key[match[1]]=cards
-    sections=[]
-    for m in re.finditer(r'\{L"([^"]+)", L"([^"]*)", (k\w+), std::size\(',layout):
-        sections.append({'name':m[1],'note':m[2],'cards':by_key[m[3]]})
-    assert len(sections)==11
-    assert sum(len(s['cards']) for s in sections)==91
-    assert sum(len(c['options']) for s in sections for c in s['cards'])==482
-    return sections
-
-
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--output',type=Path,default=ROOT/'output/pdf/豪之刃MOD功能与节点手册.pdf')
@@ -223,7 +202,7 @@ def main():
     enum=re.search(r'enum class NodeType : int \{(.*?)\};',model,re.S)[1]
     types=[x.strip() for x in enum.split(',')]
     documented=re.findall(r'<!-- node: (\w+) -->',text)
-    assert len(types)==30 and len(documented)==30 and set(types)==set(documented),'Node coverage mismatch'
+    assert types and len(documented)==len(types) and set(types)==set(documented),'Node coverage mismatch'
     images=re.findall(r'!\[[^\]]*\]\((manual_images/[\w.]+)\)',text)
     assert all(f'manual_images/node_{name}.png' in images for name in types),'Node image coverage mismatch'
     assert all((ROOT/'docs'/path).is_file() for path in images),'Missing image'
@@ -236,26 +215,14 @@ def main():
         if i:story.append(PageBreak())
         h=Paragraph(safe(title),STYLES['h1']);h.section_key=f'section_{i}'
         story.extend([h,*parse_body(body.splitlines())])
-    cards=supplement_cards();story.append(PageBreak())
-    h=Paragraph('附录：调试补充卡片全索引',STYLES['h1']);h.section_key='supplement_index';story.append(h)
-    story.append(Paragraph('自动核对当前目录：11 个分区、91 张卡片、482 个选项。下表列出全部卡片和用途；地图序列的具体选项以游戏内搜索列表为准。',STYLES['body']))
-    for section in cards:
-        story.append(Paragraph(safe(section['name']),STYLES['h2']))
-        rows=[['卡片 / 功能','说明与可选操作']]
-        for card in section['cards']:
-            options=' / '.join(card['options']) if section['name']!='过场播放' else f"{len(card['options'])} 个序列子选项，支持按名称搜索。"
-            note='；'.join(x for x in [card['note'],options] if x)
-            rows.append([card['title'],note.replace('\\n',' ').replace('\\r',' ')])
-        story.extend([table(rows,[WIDTH*.28,WIDTH*.72]),Spacer(1,12)])
     args.output.parent.mkdir(parents=True,exist_ok=True)
     doc=ManualDoc(args.output);doc.multiBuild(story)
     audit={'node_types':types,'documented_types':documented,'node_coverage':True,'sections':doc.entries,
-           'supplement_sections':len(cards),'supplement_cards':91,'supplement_options':482,
            'images':images,'node_image_coverage':True,'ui_image_count':sum('/ui_' in name for name in images),
            'markdown_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
            'pdf_sha256':hashlib.sha256(args.output.read_bytes()).hexdigest(),'pages':doc.page}
     args.output.with_suffix('.coverage.json').write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf-8')
-    print(json.dumps({'output':str(args.output),'pages':doc.page,'nodes':len(documented),'supplement_cards':91},ensure_ascii=False))
+    print(json.dumps({'output':str(args.output),'pages':doc.page,'nodes':len(documented)},ensure_ascii=False))
 
 
 if __name__=='__main__':main()

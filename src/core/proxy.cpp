@@ -313,6 +313,20 @@ void NotifyUnsupported(const std::wstring& directory) {
     UiLoadBanner::Shutdown(); UiI18n::Shutdown();
 }
 
+// No PBZDebugMenu.ini yet (a first install, or the file deleted): every feature starts off (user 11-12: "没有Ini的情况下
+// 默认所有功能关闭"). Every other switch already defaults off; the ones below default on, so they are written off before
+// anything reads them: 关闭自适应扳机 (PadTriggers), 打开面板时暂停游戏 (HubPause), 派生提示 (NpcCombo), 黑伤处决改为
+// 魔渊擒拿 (MotianGrab). The standalone triggers-only DLL keeps no ini and stays forced off.
+void SeedSettingsOff(const std::wstring& ini) {
+    if (ini.empty() || GetFileAttributesW(ini.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    static const wchar_t* const kOff[][2] = {{L"Controller", L"ForceAdaptiveTriggersOff"}, {L"Hub", L"PauseGame"}, {L"NpcCombo", L"ShowToast"}, {L"Grab", L"TangExecution"}};
+    int written = 0;
+    for (const auto& entry : kOff) if (WritePrivateProfileStringW(entry[0], entry[1], L"0", ini.c_str())) ++written;
+    char line[160]{};
+    _snprintf_s(line, _TRUNCATE, "SETTINGS no PBZDebugMenu.ini: created with every feature off (%d of %zu default-on switches written)", written, std::size(kOff));
+    Log(line);
+}
+
 DWORD WINAPI Worker(void*) {
     InterlockedExchange(&worker_status, 1);
     wchar_t module_path[32768]{}, executable[32768]{};
@@ -324,6 +338,7 @@ DWORD WINAPI Worker(void*) {
     GetModuleFileNameW(nullptr, executable, 32768);
     const wchar_t* filename = wcsrchr(executable, L'\\'); filename = filename ? filename + 1 : executable;
     if (_wcsicmp(filename, L"PBZ.exe")) { Log("UNSUPPORTED_HOST; no data writes"); InterlockedExchange(&worker_status, 0x100); return 0; }
+    SeedSettingsOff(log_path.empty() ? std::wstring() : log_path.substr(0, log_path.find_last_of(L"\\/") + 1) + L"PBZDebugMenu.ini");
     // Trigger hooks need no game layout, so they keep working on builds the checks below refuse.
     PadTriggers::Attach(&LogLine, (log_path.substr(0, log_path.find_last_of(L"\\/") + 1) + L"PBZDebugMenu.ini").c_str());
     const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
@@ -445,6 +460,7 @@ DWORD WINAPI Worker(void*) {
         UiLoadBanner::Tick();
         GearWidget::Tick();
         SkillToast::Tick();
+        ComboMenu::HudTick();  // 派生显示
         BossMenu::Tick();
         BossAIMenu::Tick();
         NpcMenu::Tick();
@@ -476,7 +492,7 @@ DWORD WINAPI Worker(void*) {
     }
     BoneMotionPage::Shutdown();
     WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown(); DonatePage::Shutdown(); NetPage::Shutdown(); ComboMenu::Shutdown();
-    SkillToast::Shutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
+    SkillToast::Shutdown(); ComboMenu::HudShutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
     UiLoadBanner::Shutdown(); UiGlass::Shutdown(); UiI18n::Shutdown(); UiTheme::Shutdown();
     return 0;
 }

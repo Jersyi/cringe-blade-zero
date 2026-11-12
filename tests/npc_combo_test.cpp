@@ -1262,6 +1262,106 @@ int main() {
         Check(ChordInKeys({0x58, 0x43}, 0, 0x58) && !ChordInKeys({0x47}, 0, 0x58) && !ChordInKeys({kr3, kl3}, 0, 0x58), "keyboard: the chord's key among the keys");
         Check(!ChordInKeys({kr3, kl3}, 0, 0), "no chord: nothing");
     }
+    // 整体不变身 on a chain start (11-12): its chains' BOSS 技能 and 投技 keep the look; saved as "h:" on the start.
+    {
+        Config oc;
+        oc.chain.push_back(TriggerNode(Trigger::Light, 0, 0));    // 0
+        Node boss; boss.type = NodeType::BossSkill; boss.boss = "MoTian"; boss.ability = "GA_MoTian_Skill_03"; boss.x = 300;
+        oc.chain.push_back(boss);                                  // 1
+        Node frame; frame.type = NodeType::Group; frame.x = 600; frame.w = kGroupNewW; frame.h = kGroupNewH;
+        oc.chain.push_back(frame);                                 // 2: a 组合 after it
+        Node inner = boss; inner.ability = "GA_MoTian_Skill_04"; inner.group = 2; inner.x = 620; inner.y = 40;
+        oc.chain.push_back(inner);                                 // 3: inside the 组合
+        oc.chain.push_back(TriggerNode(Trigger::Heavy, 0, 300));  // 4: another start, into the same move
+        oc.chain[0].next = 1; oc.chain[1].next = 2; oc.chain[4].next = 1;
+        Check(!OwnLookFor(oc, 0, 1) && !OwnLookEverywhere(oc, 1) && !OwnLookEverywhere(oc, 3), "整体不变身 is off by default");
+        oc.chain[0].own_look = true;
+        Check(OwnLookFor(oc, 0, 1) && OwnLookFor(oc, 0, 3), "a start's 整体不变身 covers its chain's BOSS 技能, inside a 组合 too");
+        Check(!OwnLookFor(oc, 4, 1), "another start without it: the move changes look there");
+        Check(!OwnLookEverywhere(oc, 1) && !OwnLookEverywhere(oc, 3), "the other start reaches both (the 组合 through the move): not everywhere");
+        Check(!OwnLookFor(oc, 0, 0) && !OwnLookFor(oc, 0, 2), "only a BOSS 技能 / 投技 takes it");
+        oc.chain[4].own_look = true;
+        Check(OwnLookEverywhere(oc, 1) && OwnLookEverywhere(oc, 3), "both starts have it: neither move changes look");
+        Check(Encode(oc).find(L"|h:0") != std::wstring::npos && Encode(oc).find(L"|h:4") != std::wstring::npos, "整体不变身 is written as h: on each start");
+        const Config read = Decode(Encode(oc));
+        Check(read.chain.size() >= oc.chain.size() && read.chain[0].own_look && read.chain[4].own_look && !read.chain[1].own_look && !read.chain[3].own_look,
+              "整体不变身 is saved and read back on the starts only");
+        Config own = oc; own.chain[0].own_look = own.chain[4].own_look = false; own.chain[1].own_look = true;
+        Check(OwnLookFor(own, 4, 1) && OwnLookEverywhere(own, 1) && !OwnLookFor(own, 4, 3), "a node's own 不变身 still holds alone");
+        oc.chain[1].mods[kModKeepLook] = static_cast<int>(oc.chain.size()); Node keep; keep.type = NodeType::KeepLook; oc.chain.push_back(keep);
+        Check(!KeepLookFor(oc, 0, 1), "保留变身 under 整体不变身: no look taken, none kept");
+    }
+    // 派生显示 简略 (11-12): NextInputs lists the presses that take the chain on, each with its move.
+    {
+        Config nc;
+        nc.chain.push_back(TriggerNode(Trigger::Light, 0, 0));    // 0
+        Node skill; skill.type = NodeType::Skill; skill.ability = "GA_A_Skill_01";
+        nc.chain.push_back(skill);                                 // 1
+        Node gap; gap.type = NodeType::Interval; gap.ms = 200;
+        nc.chain.push_back(gap);                                   // 2: an interval on the way
+        Node branch = BranchNode(0, 0);
+        branch.routes = {{static_cast<int>(Trigger::Light), 0, 4}, {static_cast<int>(Trigger::Heavy), 300, 5}, {static_cast<int>(Trigger::Keys), 0, 6}, {static_cast<int>(Trigger::AnyDodge), 0, -1}};
+        branch.routes[1].hold_ms = 500; branch.routes[2].keys = {0x01, 0x02}; branch.routes[2].chord = true;
+        nc.chain.push_back(branch);                                // 3
+        Node a = skill; a.ability = "GA_A_Skill_02"; nc.chain.push_back(a);   // 4
+        Node e = skill; e.ability = "GA_A_Skill_03"; nc.chain.push_back(e);   // 5
+        Node empty; empty.type = NodeType::Skill;                  // 6: an empty move, passed on to 7
+        nc.chain.push_back(empty);
+        Node d = skill; d.ability = "GA_A_Skill_04"; nc.chain.push_back(d);   // 7
+        nc.chain[0].next = 1; nc.chain[1].next = 2; nc.chain[2].next = 3; nc.chain[6].next = 7;
+        const int hud_light = static_cast<int>(Trigger::Light);
+        const auto start = NextInputs(nc, 0, hud_light);
+        Check(start.size() == 1 && start[0].move == 1 && start[0].button == hud_light && start[0].branch < 0, "a start: its button again, into its first move");
+        const auto rows = NextInputs(nc, 1, hud_light);
+        Check(rows.size() == 3, "a branch after the interval: a press per wired row (the unwired one left out)");
+        Check(rows.size() == 3 && rows[0].move == 4 && rows[0].button == hud_light && rows[0].hold_ms == 0 && rows[0].pause_ms == 0 && rows[0].branch == 3 && rows[0].row == 0,
+              "row 0: 轻攻击 into its move");
+        Check(rows.size() == 3 && rows[1].move == 5 && rows[1].button == static_cast<int>(Trigger::Heavy) && rows[1].hold_ms == 500 && rows[1].pause_ms == 300,
+              "row 1: 重攻击 with its 按住 and pause");
+        Check(rows.size() == 3 && rows[2].move == 7 && rows[2].row == 2, "row 2: an empty move is passed on to the next");
+        Check(NextInputs(nc, 1, hud_light, 2).size() == 2, "at most `limit` presses");
+        Check(NextInputs(nc, 3, hud_light).size() == 3, "at a branch: its rows");
+        Check(NextInputs(nc, 4, hud_light).empty() && NextInputs(nc, -1, hud_light).empty() && NextInputs(nc, 99, hud_light).empty(), "the end, or no node: nothing");
+        Config wc = nc; Node wa = WeaponActionsNode(0, 0); wa.routes[1].next = 4; wc.chain.push_back(wa);
+        const auto wrows = NextInputs(wc, 8, hud_light);
+        Check(wrows.size() == 1 && wrows[0].move == 4 && wrows[0].button == static_cast<int>(Trigger::Execution) && wrows[0].pause_ms == 0,
+              "a 武器派生修改 start: a press per wired row, no pause");
+    }
+    // BOSS 特效 (11-12): a modifier from a move, a start or a 组合; saved as an unwired 间隔 plus an "x:" mark.
+    {
+        Config ec;
+        ec.chain.push_back(TriggerNode(Trigger::Light, 0, 0));    // 0
+        Node boss; boss.type = NodeType::BossSkill; boss.boss = "MoTian"; boss.ability = "GA_MoTian_Skill_03";
+        ec.chain.push_back(boss);                                  // 1
+        Node look; look.type = NodeType::Look; look.boss = "MoTian";
+        ec.chain.push_back(look);                                  // 2
+        Node fx = ModifierNode(NodeType::BossEffect, 300, 200); fx.boss = "MuXiaoKui"; fx.ability = "NS_MuXiaoKui_Test_001";
+        fx.fx_place = static_cast<int>(EffectPlace::Front); fx.fx_damage = 25; fx.fx_radius = 650; fx.fx_hits = 3;
+        ec.chain.push_back(fx);                                    // 3
+        Node fx2 = ModifierNode(NodeType::BossEffect, 300, 400);
+        ec.chain.push_back(fx2);                                   // 4: not picked yet
+        ec.chain[0].next = 1; ec.chain[1].next = 2;
+        Check(IsModifier(ec.chain[3]) && SlotOf(NodeType::BossEffect) == kModEffect, "BOSS 特效 is a modifier with its own slot");
+        Check(ModifierFits(ec.chain, 1, 3) && ModifierFits(ec.chain, 0, 3) && !ModifierFits(ec.chain, 2, 3), "a move or a start takes it, a 变身 does not");
+        Check(EffectFor(ec, 0, 1) < 0, "none wired: none");
+        Check(LinkModifier(ec, 0, 3) && EffectFor(ec, 0, 1) == 3, "from the start: each move of its chain");
+        Check(LinkModifier(ec, 1, 4) && EffectFor(ec, 0, 1) < 0, "the move's own (not picked yet) wins and plays nothing");
+        ec.chain[4].boss = "AHua"; ec.chain[4].ability = "NS_AHua_Flower_001";
+        Check(EffectFor(ec, 0, 1) == 4, "picked: the move's own");
+        const std::wstring fx_text = Encode(ec);
+        Check(fx_text.find(L"|x:3,MuXiaoKui,NS_MuXiaoKui_Test_001,2,25,650,3") != std::wstring::npos, "written as an x: mark");
+        const Config fx_back = Decode(fx_text);
+        Check(fx_back.chain.size() >= 5 && fx_back.chain[3].type == NodeType::BossEffect && fx_back.chain[3].boss == "MuXiaoKui" && fx_back.chain[3].ability == "NS_MuXiaoKui_Test_001" &&
+              fx_back.chain[3].fx_place == 2 && fx_back.chain[3].fx_damage == 25 && fx_back.chain[3].fx_radius == 650 && fx_back.chain[3].fx_hits == 3, "read fx_back with its numbers");
+        Check(fx_back.chain.size() >= 5 && EffectFor(fx_back, 0, 1) == 4 && ModOf(fx_back, 0, kModEffect) == 3, "its wires read fx_back");
+        std::wstring old = fx_text; const size_t mark = old.find(L"|x:3,"); old.erase(mark, old.find(L'|', mark + 1) - mark);
+        const Config older = Decode(old);
+        Check(older.chain.size() >= 5 && older.chain[3].type == NodeType::Interval && older.chain[3].next < 0 && EffectFor(older, 0, 1) == 4,
+              "without its mark (an older build's view): an unwired 间隔, no wire to it");
+        const Config stray = Decode(L"E1|x:0,a,b,9,999,1,99");
+        Check(std::none_of(stray.chain.begin(), stray.chain.end(), [](const Node& n) { return n.type == NodeType::BossEffect; }) && ClampEffectPlace(9) == 0 && ClampEffectDamage(999) == 100 && ClampEffectRadius(1) == 100 && ClampEffectHits(99) == 10,
+              "a mark with no node is dropped; numbers are clamped");
+    }
     // No node limit in use: 2000 nodes are added, saved, read trim_late and walked, quickly.
     {
         const auto t0 = std::chrono::steady_clock::now();

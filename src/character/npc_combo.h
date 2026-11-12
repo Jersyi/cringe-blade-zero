@@ -56,4 +56,39 @@ WeaponInfo LastWeapon();
 // [NpcCombo] ShowToast, default on; the NPC skill key's own casts keep theirs). Any thread.
 bool ShowToast();
 void SetShowToast(bool on);
+// 派生显示: where the chain going on is, as the game thread runs it, for the overlay in the game's top-right corner
+// (ComboMenu::HudTick). profile: whose chains run (also with no chain going on); trigger: the node the chain started
+// at (-1: no chain); cursor: the node it is at (the move
+// that played last, a 组合, or the start); playing: the move playing (-1: none; a 组合's step); queued: the move a kept
+// press plays next (-1: none); button: the button the chain is on; wait_until: while it waits for the next press, when
+// it gives up (GetTickCount64; 0: not waiting); at: when it was published (the game thread does so on every change and
+// four times a second; an old one means the runner stopped).
+// branch_at: when the pause of the branch after the cursor counts from (0: not yet). hold_down: a press waiting while
+// its button is held (按住) went down then (0: none), hold_press is it. The overlay picks the row a press takes with them.
+struct ChainState { std::string profile; int trigger = -1, cursor = -1, playing = -1, queued = -1, button = 0; unsigned long long wait_until = 0, at = 0;
+                    unsigned long long branch_at = 0, hold_down = 0; Press hold_press; };
+void PublishChain(const ChainState& state);
+ChainState GetChain();
+// 派生显示 mode (PBZDebugMenu.ini [NpcCombo] ChainHud): kHudOff (default), kHudDetailed (详细: the whole chain as a
+// thumbnail, where it is lit) or kHudSimple (简略: the keys that take it on next and their moves). Any thread.
+enum : int { kHudOff = 0, kHudDetailed = 1, kHudSimple = 2 };
+int ChainHud();
+void SetChainHud(int mode);
+// 镜头跟随 (PBZDebugMenu.ini [NpcCombo] ViewTarget): the bone the 视角跟随 camera looks at, kViewPelvis (default),
+// kViewNeck or kViewHead. Any thread; cached (the game thread reads it every frame).
+enum : int { kViewPelvis = 0, kViewNeck = 1, kViewHead = 2 };
+int ViewTarget();
+void SetViewTarget(int target);
+// 派生页的技能伤害 / 投技伤害 (PBZDebugMenu.ini [NpcCombo] ChainSkillDamage, ChainGrabDamage, ChainGrabValue): the
+// damage of the BOSS 技能 and 投技 a chain plays, in place of the NPC 技能 page's and the 投技 page's (moves the chain
+// does not play keep those). Skill: 0 follows the NPC 技能 page, else x kChainSkillMin..kChainSkillMax of the boss's own
+// damage. Grab: mode kGrabFollow follows the 投技 page, else GrabExtras::Damage (0 原生, 1 倍率 value x, 2 at least
+// value % of max health per hit). Any thread; cached.
+constexpr float kChainSkillMin = 0.1f, kChainSkillMax = 10.0f;
+float ChainSkillDamage();
+void SetChainSkillDamage(float value);
+enum : int { kGrabFollow = -1 };
+struct ChainGrab { int mode = kGrabFollow; float value = 0; };
+ChainGrab ChainGrabDamage();
+void SetChainGrabDamage(const ChainGrab& grab);
 }

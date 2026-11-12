@@ -73,6 +73,22 @@ int main(){
     check(camera==263,"late component acquisition restores current offset without rebasing the pose");
     for(uint64_t visit=20;visit<1020;++visit)
         check(!SameCast(5,visit,41,1000,5,visit+1,41,1000),"loop visits never carry the old trimmed pose baseline");
+    // 取景: axes round trip, distance by size, relation pushed out along itself, never looking up from below.
+    for(int yaw=-180;yaw<=180;yaw+=45)for(int pitch=-60;pitch<=60;pitch+=30){
+        const auto a=ViewAxes<Vec>(yaw,pitch);const Vec w{123,-45,67};const Vec back=ToWorld(a,ToLocal(a,w));
+        check(near(back.x,w.x)&&near(back.y,w.y)&&near(back.z,w.z),"view axes convert world and local both ways");
+        check(near(Length(a.f),1)&&near(Length(a.u),1)&&std::abs(Dot(a.f,a.u))<1e-9,"view axes are orthonormal");
+    }
+    check(near(FrameDistance(180,90,16.0/9.0,0.6),180/(2*0.5625*0.6)),"frame distance fills 60% of the view height");
+    check(FrameDistance(800,90,16.0/9.0,0.6)>FrameDistance(250,90,16.0/9.0,0.6)*3,"a bigger model is framed from farther away");
+    check(near(FrameDistance(180,0,0,0),FrameDistance(180,90,16.0/9.0,0.6)),"bad fov, aspect or fill fall back to defaults");
+    {   const Vec native{-350,40,90};
+        const Vec same=FrameRelation(native,200);check(near(same.x,-350)&&near(same.z,90),"a model the native camera already frames keeps its framing");
+        const Vec pushed=FrameRelation(native,1200);check(near(Length(pushed),1200)&&near(pushed.y/pushed.x,native.y/native.x),"a big model pushes the eye out along the native relation");
+        const Vec none=FrameRelation(Vec{1,0,0},500);check(near(none.x,-500)&&none.z==0,"no native relation: straight behind");
+        const Vec low=LookDownAtLeast(Vec{-400,0,-300},10);check(near(low.z,400*std::tan(10*3.14159265358979323846/180)),"an eye below the body is raised to look down");
+        const Vec high=LookDownAtLeast(Vec{-400,0,200},10);check(near(high.z,200),"an eye already above stays");
+    }
     std::printf("{\"checks\":%d,\"failures\":%d,\"runtime\":false}\n",checks,failures);
     return failures?1:0;
 }

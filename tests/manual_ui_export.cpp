@@ -5,6 +5,7 @@
 #include "settings_store.h"
 #include "bone_motion_page.h"
 #include "weapon_icons.h"
+#include "npc_boss_effects.h"
 #include <filesystem>
 #include <fstream>
 
@@ -43,8 +44,8 @@ int wmain(int argc,wchar_t** argv){
     using namespace NpcCombo;using namespace ComboMenu::Probe;
     NpcRetarget::SkinMoves moves;NpcRetarget::GetSkinMoves(0,moves);
     NpcCombo::RecordClip(moves.skills.front(),4.0f);
-    constexpr const char* names[]={"Skill","Interval","Trigger","AutoDodge","Branch","Speed","Weapon","Armor","Interrupt","Grab","BossSkill","WeaponMove","Damage","Group","Teleport","Invincible","Look","HeroLook","KeepLook","ForceHit","PreInput","WeaponActions","IgnoreGuard","KeepChain","Assist","Hook","Trim","Air","AirDefault","BoneTransform"};
-    static_assert(std::size(names)==static_cast<size_t>(NodeType::BoneTransform)+1);
+    constexpr const char* names[]={"Skill","Interval","Trigger","AutoDodge","Branch","Speed","Weapon","Armor","Interrupt","Grab","BossSkill","WeaponMove","Damage","Group","Teleport","Invincible","Look","HeroLook","KeepLook","ForceHit","PreInput","WeaponActions","IgnoreGuard","KeepChain","Assist","Hook","Trim","Air","AirDefault","BoneTransform","BossEffect"};
+    static_assert(std::size(names)==static_cast<size_t>(NodeType::BossEffect)+1);
     const auto make=[&](NodeType type){
         Node n;n.type=type;n.x=200;n.y=180;n.ability=moves.skills.front();
         if(IsModifier(n))n=ModifierNode(type,200,180);
@@ -61,6 +62,8 @@ int wmain(int argc,wchar_t** argv){
         if(type==NodeType::PreInput)n.ms=300;
         if(type==NodeType::BoneTransform)n.bones=BoneMotion::Feminine();
         if(type==NodeType::Group){n.w=460;n.h=240;}
+        if(type==NodeType::BossEffect){n.boss="MoYuan";n.ability=kNpcBossEffects[0].name;for(const auto& e:kNpcBossEffects)if(std::string(e.folder)=="MoYuan"){n.ability=e.name;break;}
+            n.fx_place=static_cast<int>(EffectPlace::Front);n.fx_damage=15;n.fx_radius=500;n.fx_hits=3;}
         return n;
     };
     std::ofstream manifest(output/L"nodes.json");manifest<<"{\"offline\":true,\"real_ui_renderer\":true,\"nodes\":[";
@@ -101,7 +104,52 @@ int wmain(int argc,wchar_t** argv){
     overview.chain[static_cast<size_t>(PreInputNode(overview))].x=80;overview.chain[static_cast<size_t>(PreInputNode(overview))].y=680;
     overview.chain[static_cast<size_t>(AirDefaultNode(overview))].x=430;overview.chain[static_cast<size_t>(AirDefaultNode(overview))].y=680;
     Save(moves.profile,overview);RefreshData();ZoomTo(100);Show(0);
-    Library(0,2);Capture(page_,output/L"ui_combo.png");Library(1,0);Capture(page_,output/L"ui_weapons.png");Library(0,0);SearchAt({520,260});Capture(page_,output/L"ui_search.png");
+    Library(0,2);Capture(page_,output/L"ui_combo.png");
+    {   // 招式来源: another boss's moves in the BOSS 招式 list, its list open.
+        std::string other;for(const NpcRetarget::Entry& e:NpcRetarget::GetSnapshot().entries){NpcRetarget::SkinMoves m;if(e.id!=EditedProfile()&&NpcRetarget::GetSkinMoves(e.index,m)&&!m.skills.empty()){other=e.id;break;}}
+        Library(0,4);LibraryFrom(other);LibraryFromList(true);Capture(page_,output/L"ui_boss_source.png");LibraryFromList(false);LibraryFrom("");Library(0,2);
+    }
+    Library(1,0);Capture(page_,output/L"ui_weapons.png");Library(0,0);SearchAt({520,260});Capture(page_,output/L"ui_search.png");
+    {   // 派生显示: a chain (轻攻击 -> move -> branch: 轻攻击 / 重攻击 按住 / 自定义按键 -> moves; one into a 组合), both modes.
+        const auto move=[&](size_t k,int x,int y){Node n=make(NodeType::BossSkill);n.ability=moves.skills[k%moves.skills.size()];n.x=x;n.y=y;return n;};
+        Config hud;hud.placed=true;
+        hud.chain.push_back(TriggerNode(Trigger::Light,40,200));                 // 0
+        hud.chain.push_back(move(0,420,200));                                    // 1
+        Node branch=BranchNode(820,200);branch.routes={{static_cast<int>(Trigger::Light),0,3},{static_cast<int>(Trigger::Heavy),300,4},{static_cast<int>(Trigger::Keys),0,5},
+                                                       {static_cast<int>(Trigger::Light),800,4}};  // 轻攻击 now or after a 0.8 s 停顿
+        branch.routes[1].hold_ms=500;branch.routes[2].keys={VK_LBUTTON,VK_RBUTTON};branch.routes[2].chord=true;
+        hud.chain.push_back(branch);                                             // 2
+        hud.chain.push_back(move(1,1420,40));                                    // 3
+        hud.chain.push_back(move(2,1420,260));                                   // 4
+        Node frame;frame.type=NodeType::Group;frame.x=1420;frame.y=480;frame.w=460;frame.h=420;
+        hud.chain.push_back(frame);                                              // 5
+        hud.chain.push_back(move(3,1440,520));hud.chain.back().group=5;          // 6
+        hud.chain.push_back(move(4,1440,710));hud.chain.back().group=5;          // 7
+        hud.chain.push_back(TriggerNode(Trigger::Heavy,40,1200));                // 8: another start (其他起手)
+        hud.chain.push_back(move(5,420,1200));                                   // 9
+        Node raw_start=TriggerNode(Trigger::Keys,40,1500);raw_start.keys={'Q',VK_LBUTTON}; // 10: a 自定义按键 start [Q -> LMB]
+        hud.chain.push_back(raw_start);hud.chain.push_back(move(6,420,1500));        // 11
+        hud.chain[0].next=1;hud.chain[1].next=2;hud.chain[6].next=7;hud.chain[8].next=9;hud.chain[10].next=11;
+        EnsureKey(hud);EnsurePreInput(hud);EnsureAirDefault(hud);
+        for(size_t i=12;i<hud.chain.size();++i){hud.chain[i].x=40;hud.chain[i].y=1900+static_cast<int>(i)*160;}
+        Save(moves.profile,hud);RefreshData();
+        CLSID png{};if(!CLSIDFor(L"image/png",&png))std::exit(3);
+        const auto shot=[&](int mode,int cursor,int playing,int queued,unsigned long long wait,const wchar_t* name,int trigger=0,long long since=-1){
+            std::vector<uint32_t> pixels;int w=0,h=0;
+            if(!HudPixels(mode,trigger,cursor,playing,queued,wait,pixels,w,h,since))std::exit(10);
+            Gdiplus::Bitmap layer(w,h,w*4,PixelFormat32bppPARGB,reinterpret_cast<BYTE*>(pixels.data()));
+            Gdiplus::Bitmap scene(w+40,h+40,PixelFormat32bppARGB);{Gdiplus::Graphics g(&scene);g.Clear(Gdiplus::Color(255,58,64,72));g.DrawImage(&layer,20,20,w,h);}
+            if(scene.Save((output/name).c_str(),&png,nullptr)!=Gdiplus::Ok)std::exit(11);
+        };
+        shot(NpcCombo::kHudDetailed,1,1,-1,0,L"ui_hud_detailed.png");            // the first move playing
+        shot(NpcCombo::kHudDetailed,1,-1,4,0,L"ui_hud_detailed_kept.png");       // waiting at it, a 重攻击 press kept
+        shot(NpcCombo::kHudSimple,1,-1,-1,600,L"ui_hud_simple.png");             // waiting for the next press: a 轻攻击 now takes the tap row
+        shot(NpcCombo::kHudSimple,1,-1,-1,600,L"ui_hud_simple_pause.png",0,1000); // 1 s on: the 停顿 row
+        shot(NpcCombo::kHudSimple,1,1,4,0,L"ui_hud_simple_kept.png");            // playing, a press kept
+        shot(NpcCombo::kHudDetailed,-1,-1,-1,0,L"ui_hud_detailed_idle.png");     // 待命: no chain going on
+        shot(NpcCombo::kHudSimple,-1,-1,-1,0,L"ui_hud_simple_idle.png");
+        shot(NpcCombo::kHudSimple,-1,-1,-1,0,L"ui_hud_empty.png",-1);            // a set with no chain
+    }
     RECT after{};GetClipCursor(&after);const bool hidden=!IsWindowVisible(host_)&&!IsWindowVisible(page_)&&GetCapture()!=page_;
     manifest<<"],\"count\":"<<count<<",\"hidden\":"<<(hidden?"true":"false")<<",\"foreground_unchanged\":"<<(foreground==GetForegroundWindow()?"true":"false")<<"}";manifest.close();
     ComboMenu::Shutdown();DestroyWindow(host_);WeaponIcons::Shutdown();UiTheme::Shutdown();

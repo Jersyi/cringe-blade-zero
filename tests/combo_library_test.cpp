@@ -97,6 +97,36 @@ int wmain(int argc,wchar_t** argv) {
         }
     }
     check(NpcCombo::Generation()==generation,"changing library pages never saves or edits nodes");
+    {  // 招式来源: another boss's moves are added as its BOSS 技能; this table's own stay 当前外观招式
+        UiI18n::SetLanguage(UiI18n::Language::SimplifiedChinese);
+        SetWindowPos(host_,nullptr,0,0,1440,720,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        SetWindowPos(page_,nullptr,0,0,1440,720,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        const std::string own=EditedProfile();std::string other;NpcRetarget::SkinMoves other_moves;
+        for (const NpcRetarget::Entry& e:NpcRetarget::GetSnapshot().entries)
+            if (e.id!=own&&NpcRetarget::GetSkinMoves(e.index,other_moves)&&other_moves.skills.size()>1) { other=e.id; break; }
+        check(!other.empty(),"a second boss with moves exists for the source test");
+        Library(0,2); check(LibraryFromBox().right==LibraryFromBox().left,"招式来源 only shows in the BOSS 招式 list");
+        Library(0,4); LibraryFrom("");
+        const RECT rail=LibraryBox(),box=LibraryFromBox();
+        check(contains(rail,box),"招式来源 dropdown fits the right library");
+        NpcRetarget::SkinMoves own_moves; bool own_row=false;
+        for (const NpcRetarget::Entry& e:NpcRetarget::GetSnapshot().entries) if (e.id==own) own_row=NpcRetarget::GetSkinMoves(e.index,own_moves);
+        if (!own_row) NpcRetarget::GetSkinMoves(-1,own_moves);  // the hero's table
+        check(LibraryMoves().size()==own_moves.skills.size()+own_moves.dodges.size(),"own source lists the table's skills and dodges");
+        LibraryFrom(other);
+        check(LibraryMoves()==other_moves.skills,"another boss's source lists exactly its skills");
+        const auto before=NpcCombo::Generation();
+        const int added=AddLibraryMove(1);
+        check(added>=0&&NodeSummary(added)==std::to_string(static_cast<int>(NpcCombo::NodeType::BossSkill))+"|"+other+"|"+other_moves.skills[1],
+              "a move of another boss becomes that boss's BOSS 技能");
+        check(NpcCombo::Generation()>before,"adding a move saves the chain");
+        LibraryFrom(own);  // the table's own look picked: its own moves again
+        check(LibraryMoves().size()==own_moves.skills.size()+own_moves.dodges.size(),"picking the table's own look lists its moves");
+        const int own_added=AddLibraryMove(0);
+        check(own_added>=0&&NodeSummary(own_added).rfind(std::to_string(static_cast<int>(NpcCombo::NodeType::Skill))+"|",0)==0,"a move of the table's look stays a 当前外观招式");
+        LibraryFrom("no-such-look"); check(LibraryMoves().size()==own_moves.skills.size()+own_moves.dodges.size(),"an unknown look falls back to the table's moves");
+        LibraryFrom("");
+    }
     BonePreviewAt(bone_index);
     check(BoneMotion::Encode(preview_bones_)==BoneMotion::Encode(bones.bones),"bone hover passes every row to skill preview");
     for(int height:{480,720}){

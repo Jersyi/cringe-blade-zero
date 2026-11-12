@@ -4,6 +4,7 @@
 !.gitignore
 !README.md
 !CHANGELOG.md
+!更新内容.txt
 !CMakeLists.txt
 !build.ps1
 !*.cpp
@@ -17,6 +18,7 @@
 !docs/PAK_WORKFLOW.md
 !scripts/update_port.py
 !scripts/make_mount_pak.py
+!scripts/gen_boss_effects.py
 !scripts/requirements-port.txt
 !installer/install.ps1
 !installer/Install.bat

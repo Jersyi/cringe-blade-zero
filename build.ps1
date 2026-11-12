@@ -62,9 +62,10 @@ Donate（自愿）
 
 说明
   MOD 只在匹配的 PBZ.exe 版本上启用（Steam 版和 WeGame 版，启动时校验 SHA-256）。游戏更新后版本不符时，不读写游戏数据，
-  只保留关闭自适应扳机，并在画面上方提示“豪之刃 未适配当前游戏”。
-  设置保存在 DLL 旁的 PBZDebugMenu.ini，日志写在 PBZDebugMenu.log。
-  更新内容见同目录的 CHANGELOG.md。
+  只保留自适应扳机开关，并在画面上方提示“豪之刃 未适配当前游戏”。
+  设置保存在 DLL 旁的 PBZDebugMenu.ini，日志写在 PBZDebugMenu.log。第一次启动（还没有 PBZDebugMenu.ini）时
+  所有功能默认关闭，需要哪个就在面板里打开。
+  这一版更新了什么、修复了什么，见同目录的 更新内容.txt。
   仅用于单机游戏，与游戏开发商无关。
 
 构建 $name
@@ -73,7 +74,7 @@ $files = [ordered]@{
     "$name/version.dll"               = Join-Path $buildRoot 'Release\version.dll'
     "$name/triggers_only/version.dll" = Join-Path $buildRoot 'triggers_only\version.dll'
     "$name/EnvCheck.exe"              = Join-Path $buildRoot 'Release\EnvCheck.exe'
-    "$name/CHANGELOG.md"              = Join-Path $projectRoot 'CHANGELOG.md'
+    "$name/更新内容.txt"              = Join-Path $projectRoot '更新内容.txt'  # for players; CHANGELOG.md stays in the repo
     "$name/THIRD_PARTY_NOTICES.md"    = Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'
     "$name/licenses/UUEPBS-LICENSE-STATUS.txt" = Join-Path $projectRoot 'licenses\UUEPBS-LICENSE-STATUS.txt'
     "$name/docs/WEAPON_DERIVATIONS.md" = Join-Path $projectRoot 'docs\WEAPON_DERIVATIONS.md'

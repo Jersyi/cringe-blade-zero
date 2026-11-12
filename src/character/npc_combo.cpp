@@ -3,6 +3,8 @@
 #include "settings_store.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <iterator>
@@ -15,6 +17,7 @@ std::map<std::string, Config> configs_;
 std::map<std::string, float> lengths_, clips_;
 volatile LONG64 generation_ = 1;
 Run run_;
+ChainState chain_;
 WeaponInfo weapon_;
 Logger logger_ = nullptr;
 constexpr wchar_t kSection[] = L"NpcCombo";
@@ -139,11 +142,17 @@ bool SameFolder(const std::wstring& a, const std::wstring& b) {
 }
 void Changed() { configs_.clear(); InterlockedIncrement64(&generation_); ++store_.serial; }
 constexpr wchar_t kShowToast[] = L"ShowToast";
+constexpr wchar_t kChainHud[] = L"ChainHud";
+constexpr wchar_t kViewTargetKey[] = L"ViewTarget";
+constexpr wchar_t kChainSkill[] = L"ChainSkillDamage";
+constexpr wchar_t kChainGrabMode[] = L"ChainGrabDamage";
+constexpr wchar_t kChainGrabValue[] = L"ChainGrabValue";
 // Lock held. The chains kept in the ini before .combo files, as default.combo (first run only: an empty folder).
 void Migrate() {
     ComboFile::Set set;
     for (const std::wstring& key : SettingsStore::Keys(kSection)) {
-        if (key.find(L'#') != std::wstring::npos || !_wcsicmp(key.c_str(), L"File") || !_wcsicmp(key.c_str(), L"ShowToast")) continue;
+        if (key.find(L'#') != std::wstring::npos || !_wcsicmp(key.c_str(), L"File") || !_wcsicmp(key.c_str(), L"ShowToast") || !_wcsicmp(key.c_str(), L"ChainHud") || !_wcsicmp(key.c_str(), kViewTargetKey) ||
+            !_wcsicmp(key.c_str(), kChainSkill) || !_wcsicmp(key.c_str(), kChainGrabMode) || !_wcsicmp(key.c_str(), kChainGrabValue)) continue;
         const std::string profile = Narrow(key);
         const std::wstring text = ReadIniText(key);
         if (ComboFile::ProfileName(profile) && !text.empty()) set[profile] = text;
@@ -361,6 +370,61 @@ void RecordWeapon(const std::wstring& name, float scale, bool ok) {
 }
 WeaponInfo LastWeapon() { AcquireSRWLockShared(&lock_); WeaponInfo copy = weapon_; ReleaseSRWLockShared(&lock_); return copy; }
 bool ShowToast() { return SettingsStore::GetBool(kSection, kShowToast, true); }
+void PublishChain(const ChainState& state) { AcquireSRWLockExclusive(&lock_); chain_ = state; ReleaseSRWLockExclusive(&lock_); }
+ChainState GetChain() { AcquireSRWLockShared(&lock_); ChainState copy = chain_; ReleaseSRWLockShared(&lock_); return copy; }
+int ChainHud() { return std::clamp(SettingsStore::GetInt(kSection, kChainHud, kHudOff), static_cast<int>(kHudOff), static_cast<int>(kHudSimple)); }
+void SetChainHud(int mode) {
+    mode = std::clamp(mode, static_cast<int>(kHudOff), static_cast<int>(kHudSimple));
+    if (mode == ChainHud()) return;
+    SettingsStore::PutInt(kSection, kChainHud, mode); Log("NPC_COMBO chain hud=%d", mode);
+}
+std::atomic<int> view_target_{-1};  // -1: not read yet
+int ViewTarget() {
+    int target = view_target_.load();
+    if (target < 0) { target = std::clamp(SettingsStore::GetInt(kSection, kViewTargetKey, kViewPelvis), static_cast<int>(kViewPelvis), static_cast<int>(kViewHead)); view_target_.store(target); }
+    return target;
+}
+void SetViewTarget(int target) {
+    target = std::clamp(target, static_cast<int>(kViewPelvis), static_cast<int>(kViewHead));
+    if (target == ViewTarget()) return;
+    view_target_.store(target); SettingsStore::PutInt(kSection, kViewTargetKey, target); Log("NPC_COMBO view target=%d", target);
+}
+// The overrides are read on the game thread every frame (ScaleSkillDamage): kept here once read.
+namespace {
+std::atomic<bool> chain_damage_read_{false};
+std::atomic<float> chain_skill_{0.f}, chain_grab_value_{0.f};
+std::atomic<int> chain_grab_mode_{kGrabFollow};
+float SanitizeSkill(float value) { return std::isfinite(value) && value > 0 ? std::clamp(value, kChainSkillMin, kChainSkillMax) : 0.f; }
+ChainGrab SanitizeGrab(ChainGrab g) {
+    if (g.mode < 0 || g.mode > 2) return {};
+    if (!std::isfinite(g.value)) g.value = 0;
+    if (g.mode == 1) g.value = std::clamp(g.value, .1f, 30.f);
+    else if (g.mode == 2) g.value = std::clamp(g.value, 1.f, 100.f);
+    else g.value = 0;
+    return g;
+}
+void ReadChainDamage() {
+    if (chain_damage_read_.load(std::memory_order_acquire)) return;
+    chain_skill_.store(SanitizeSkill(SettingsStore::GetFloat(kSection, kChainSkill, 0.f)), std::memory_order_relaxed);
+    const ChainGrab g = SanitizeGrab({SettingsStore::GetInt(kSection, kChainGrabMode, kGrabFollow), SettingsStore::GetFloat(kSection, kChainGrabValue, 0.f)});
+    chain_grab_mode_.store(g.mode, std::memory_order_relaxed); chain_grab_value_.store(g.value, std::memory_order_relaxed);
+    chain_damage_read_.store(true, std::memory_order_release);
+}
+}
+float ChainSkillDamage() { ReadChainDamage(); return chain_skill_.load(std::memory_order_relaxed); }
+void SetChainSkillDamage(float value) {
+    ReadChainDamage(); value = SanitizeSkill(value);
+    if (value == chain_skill_.exchange(value, std::memory_order_relaxed)) return;
+    SettingsStore::PutFloat(kSection, kChainSkill, value); Log("NPC_COMBO chain skill damage=%.2f (0: the NPC skill page's)", value);
+}
+ChainGrab ChainGrabDamage() { ReadChainDamage(); return {chain_grab_mode_.load(std::memory_order_relaxed), chain_grab_value_.load(std::memory_order_relaxed)}; }
+void SetChainGrabDamage(const ChainGrab& grab) {
+    ReadChainDamage(); const ChainGrab g = SanitizeGrab(grab), was = ChainGrabDamage();
+    if (g.mode == was.mode && g.value == was.value) return;
+    chain_grab_mode_.store(g.mode, std::memory_order_relaxed); chain_grab_value_.store(g.value, std::memory_order_relaxed);
+    SettingsStore::PutInt(kSection, kChainGrabMode, g.mode); SettingsStore::PutFloat(kSection, kChainGrabValue, g.value);
+    Log("NPC_COMBO chain grab damage mode=%d value=%.2f (-1: the grab page's)", g.mode, g.value);
+}
 void SetShowToast(bool on) {
     if (on == ShowToast()) return;
     SettingsStore::PutBool(kSection, kShowToast, on); Log("NPC_COMBO show toast=%d", on ? 1 : 0);

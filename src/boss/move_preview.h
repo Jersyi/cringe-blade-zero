@@ -21,6 +21,10 @@ void Initialize(Logger logger);
 // Any thread. monster / ability: package paths (kNpcSkillSets); Show again with the same pair keeps it going (a new
 // speed takes effect at once). speed: the move's 加速 (percent); curve: its 曲线调节 (2+ points: the speed over each cast).
 // trim_from / trim_to: its 裁剪 (ms of its montage; 0 / 0: all of it), updated on the current cast (timeline + montage seek).
+// 特效预览 (BOSS 特效): Show(kEffectStage, effect object path) plays that Niagara system on the stage again and again
+// (kEffectRepeatMs), no boss; the camera stays at the stage's front.
+constexpr const char* kEffectStage = "#effect";
+constexpr unsigned long long kEffectRepeatMs = 3000;
 void Show(const std::string& monster, const std::string& ability, int speed = 100, const std::vector<NpcCombo::CurvePoint>& curve = {}, int trim_from = 0, int trim_to = 0, const BoneMotion::Config& bones = {}, const std::vector<int>& holds = {});
 void Hide();
 // Any thread: the newest frame (kWidth x kHeight BGRA, top row first) when its serial is newer than `serial`; status:

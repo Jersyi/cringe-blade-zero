@@ -17,6 +17,9 @@
 #include "ui_i18n.h"
 #include "ui_layout.h"
 #include "ui_theme.h"
+#include "ui_motion.h"
+#include "ui_surface.h"
+#include "npc_boss_effects.h"
 #include <objidl.h>
 #include <shobjidl.h>
 #include <gdiplus.h>
@@ -65,9 +68,11 @@ constexpr float kOverviewZoom=.35f;
 constexpr int kHeader=28,kRow=24,kPad=8,kPin=6,kGrid=16,kMajor=128;
 enum class Button : int { Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage,
                           Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirSet, BoneTransform,
-                          Copy, Paste, Count };
+                          Copy, Paste, Hud, SkillDamage, GrabDamage, BossEffect, ViewTarget, Count };  // Hud: 派生显示 (关 / 详细 / 简略), beside 派生提示;
+                                                                                // ViewTarget: 镜头跟随 (骨盆 / 脖子 / 头部), beside 派生显示;
+                                                                                // SkillDamage / GrabDamage: 派生页的技能伤害 / 投技伤害
 // The canvas tools, laid out right to left.
-constexpr Button kTools[]={Button::Copy,Button::Paste,Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::BoneTransform,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
+constexpr Button kTools[]={Button::Copy,Button::Paste,Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::BossEffect,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::BoneTransform,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
 // Management stays above the canvas; creation tools belong to the right library.
 constexpr Button kCanvasTools[]={Button::File,Button::SaveFile,Button::SaveAs,Button::Arrange,Button::Frame,Button::Copy,Button::Paste,Button::Remove,Button::Clear};
 constexpr const wchar_t* kNodeCategories[]={L"起端与流程",L"动作与移动",L"战斗修饰",L"外观变身",L"BOSS 招式"};
@@ -76,7 +81,7 @@ constexpr int NodeCategory(Button b) {
     case Button::AddTrigger: case Button::Branch: case Button::AirSet: case Button::WeaponActions: case Button::Interval: case Button::Group: return 0;
     case Button::BossSkill: case Button::Assist: case Button::Grab: case Button::WeaponMove: case Button::AutoDodge: case Button::Teleport: case Button::Hook: return 1;
     case Button::Speed: case Button::Trim: case Button::Weapon: case Button::Armor: case Button::Interrupt: case Button::Damage:
-    case Button::Invincible: case Button::ForceHit: case Button::IgnoreGuard: case Button::KeepChain: case Button::Air: return 2;
+    case Button::Invincible: case Button::ForceHit: case Button::IgnoreGuard: case Button::KeepChain: case Button::Air: case Button::BossEffect: return 2;
     case Button::BoneTransform: case Button::Look: case Button::HeroLook: case Button::KeepLook: return 3;
     default: return -1;
     }
@@ -95,7 +100,9 @@ enum class Part : int {
     None, Button, Pill, Tab, StripLeft, StripRight, Canvas, Search, WeaponRow, LibraryTab, NodeCategory,
     Node, NodeIn, NodeOut, NodeMinus, NodePlus, NodeValue, NodeField, NodeField2, NodeField3, NodeField4, NodeToggle, NodeToggle2, NodeHoldMinus, NodeHoldPlus, NodeHoldValue, NodeTrimBar,
     GroupResize, NodeRemove,
-    RouteField, RouteMinus, RoutePlus, RouteValue, RouteHoldMinus, RouteHoldPlus, RouteHoldValue, RouteRemove, RouteAdd, RouteOut, ModOut, ModIn, RouteKeys, RouteMode, Header
+    RouteField, RouteMinus, RoutePlus, RouteValue, RouteHoldMinus, RouteHoldPlus, RouteHoldValue, RouteRemove, RouteAdd, RouteOut, ModOut, ModIn, RouteKeys, RouteMode, Header,
+    NodeToggle3,  // a chain start's 整体不变身
+    LibraryBoss   // the BOSS 招式 list's 招式来源 dropdown
 };
 // sub: a branch's route row (-1 otherwise).
 struct Hit { Part part=Part::None; int index=-1; int sub=-1; bool operator==(const Hit& o) const { return part==o.part&&index==o.index&&sub==o.sub; } };
@@ -109,6 +116,7 @@ struct Tab { int kind=-1; RECT rect{}; size_t count=0; };  // kind -1: every mov
 struct RouteShape { RECT field{},minus{},value{},plus{},remove{},keys{},mode{},hminus{},hvalue{},hplus{}; POINT out{}; bool has_keys=false; };
 struct Shape {
     RECT rect{},header{},remove{},minus{},value{},plus{},field{},field2{},field3{},field4{},toggle{},toggle2{},add{},resize{}; POINT in{},out{},mod_out{},mod_in{};
+    RECT toggle3{};  // a chain start's 整体不变身 (its last row)
     RECT hminus{},hvalue{},hplus{};  // a trigger's 按住 stepper (has_hold)
     bool has_in=false,has_out=false,has_mod_out=false,has_mod_in=false,has_hold=false; std::vector<RouteShape> routes;
 };
@@ -126,12 +134,15 @@ struct DragState { Drag mode=Drag::None; Hit hit; POINT start{},last{}; bool mov
 enum class ItemKind { Move, Interval, AutoDodge, Trigger, Branch, Speed, Weapon, Armor, Interrupt, Grab, Button, GrabMove, BossSkill, BossLook, BossMove, File,
                       WeaponMove, Damage, WeaponPick, WeaponSkill, Group, Teleport, TeleportDist, TeleportLift, ComboKey, ComboMode, RawKey, Invincible,
                       Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain, IgnoreGuard, KeepChain, Assist, Hook, HookMode, Trim,
-                      HookDist, HookSpeed, Air, AirLift, AirHang, Launch, AirSet, BoneTransform };
-struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; };
+                      HookDist, HookSpeed, Air, AirLift, AirHang, Launch, AirSet, BoneTransform, ChainSkill, ChainGrab,
+                      BossEffect, FxFolder, FxPick, FxPlace, FxDamage, FxRadius, FxHits, MoveSource };
+// value: a ChainSkill's multiplier (0: follow the NPC 技能 page), a ChainGrab's (trigger: its mode, kGrabFollow: follow the 投技 page).
+struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; float value=0; };
 struct SearchRow { bool header=false; size_t item=0; std::wstring text; };
 struct Search {
-    bool open=false; RECT rect{},edit{},list{}; float x=0,y=0; int from=-1,into=-1,from_out=0,pick_node=-1,pick_route=-1,mod_from=-1,mode=0; // mode 1 files, 2 save-as
+    bool open=false; RECT rect{},edit{},list{}; float x=0,y=0; int from=-1,into=-1,from_out=0,pick_node=-1,pick_route=-1,mod_from=-1,mode=0; // mode 1 files, 2 save-as, 3 派生表, 4 技能伤害, 5 投技伤害
     int pick_part=0;  // a branch row's field (pick_route >= 0): 0 its button, 1 its keys, 2 how they are pressed
+    // mode 6: the BOSS 招式 list's 招式来源 (this table's look or another boss)
     std::wstring query; std::vector<Item> items; std::vector<SearchRow> rows; int selected=-1,scroll=0,hot=-1;
     bool keyed=false;  // the selection was last moved with the keys (招式预览 follows it while the mouse is off the list)
 };
@@ -153,6 +164,10 @@ int category_=-1;
 RECT library_{},library_title_{},library_tabs_[2]{},node_categories_[5]{},library_list_{},library_page_label_{},library_section_{},library_category_title_{};
 int library_tab_=0,node_category_=0,library_pages_[6]{},library_page_count_=1,library_capacity_=1,library_items_=0;
 int LibrarySection() { return library_tab_==1?5:node_category_; }
+// The BOSS 招式 list's source, the 招式来源 dropdown above its tabs (user 11-12): "" this table's own look; another look's
+// id lists that boss's moves, and one of them clicked or dragged in becomes a BOSS 技能 of that boss, so the hero's table
+// or any boss's can take other bosses' skills straight from the list. Kept while other tables are shown.
+std::string library_boss_;RECT library_boss_box_{};
 int height_=0,selected_=-1,zoom_index_=kZoomOne;
 std::vector<Node> node_clipboard_;int paste_count_=0;
 // Several nodes selected at once (Ctrl / Shift + drag on bare canvas: 框选; Ctrl + click a node adds or drops it):
@@ -345,6 +360,14 @@ std::wstring BossLookName(const std::string& id) {
     return std::wstring(id.begin(),id.end());
 }
 int32_t BossLookRow(const std::string& id) { for (const NpcRetarget::Entry& e:NpcRetarget::GetSnapshot().entries) if (e.id==id) return e.index; return -1; }
+// The other look the BOSS 招式 list shows ("" when it shows this table's own moves).
+std::string LibraryBoss() { return library_boss_.empty()||library_boss_==moves_.profile||BossLookRow(library_boss_)<0?std::string():library_boss_; }
+// The node a move of the BOSS 招式 list adds: this table's move (当前外观招式), or another boss's as its BOSS 技能.
+Node LibraryNode(const std::string& ability) {
+    Node node; node.ability=ability;
+    const std::string boss=LibraryBoss(); if (!boss.empty()) { node.type=NodeType::BossSkill; node.boss=boss; }
+    return node;
+}
 COLORREF BossColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(206,92,64),UiTheme::Text(),12); }
 // BOSS 援护: a boss of its own beside the hero.
 COLORREF AssistColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(214,158,52),UiTheme::Text(),12); }
@@ -726,6 +749,7 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Hook: return Tr(L"钩子");
     case NodeType::Trim: return Tr(L"裁剪");
     case NodeType::Air: return Tr(L"滞空");
+    case NodeType::BossEffect: return Tr(L"BOSS 特效");
     case NodeType::AirDefault: return Tr(L"空中释放");
     default: return MoveText(node.ability);
     }
@@ -740,6 +764,57 @@ std::wstring CardTitle(size_t index) {
     }
     if (const int step=StepNumber(index)) title=std::to_wstring(step)+L". "+title;
     return title;
+}
+// BOSS 特效's places and fields (route -1 source, -2 effect, -3 place, -4 damage, -5 radius, -6 hits).
+std::wstring FxPlaceText(int place) {
+    switch (static_cast<NpcCombo::EffectPlace>(NpcCombo::ClampEffectPlace(place))) {
+    case NpcCombo::EffectPlace::Weapon: return Tr(L"武器上（跟随武器）");
+    case NpcCombo::EffectPlace::Hero: return Tr(L"主角脚下（跟随主角）");
+    case NpcCombo::EffectPlace::Front: return Tr(L"主角前方 3 米（锁定时朝向目标）");
+    default: return Tr(L"锁定目标身上（跟随；未锁定：最近的敌人）");
+    }
+}
+// A BOSS 特效 folder as the page names it: the look's name when the folder is a look's id, else its alias
+// (NpcBossEffects::FolderAlias), else the id.
+std::wstring FxFolderName(const std::string& folder) {
+    if (const wchar_t* alias=NpcBossEffects::FolderAlias(folder)) return alias;
+    static std::unordered_map<std::string,std::wstring> looks;  // every look's id -> name (static data: offline too)
+    if (looks.empty()) { NpcRetarget::SkinMoves m; for (int32_t row=0;row<1024&&NpcRetarget::GetSkinMoves(row,m);++row) looks.emplace(m.profile,m.name); }
+    if (const auto it=looks.find(folder);it!=looks.end()) return it->second;
+    return std::wstring(folder.begin(),folder.end());
+}
+std::wstring FxFieldText(const Node& node,int route) {
+    wchar_t text[96]{};
+    switch (route) {
+    case -1: return node.boss.empty()?Tr(L"选择特效来源"):Tr(L"来源：")+FxFolderName(node.boss);
+    case -2: {
+        const NpcBossEffect* e=NpcBossEffects::Find(node.ability);
+        if (!e) return node.ability.empty()?Tr(L"选择特效"):Tr(L"（这个版本没有此特效）");
+        const std::string n=NpcBossEffects::ShortName(*e); return Tr(L"特效：")+std::wstring(n.begin(),n.end());
+    }
+    case -3: return Tr(L"位置：")+FxPlaceText(node.fx_place);
+    case -4:
+        if (NpcCombo::ClampEffectDamage(node.fx_damage)==0) return Tr(L"伤害：无（只放特效）");
+        _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"伤害：每段 %d%% 最大生命").c_str(),NpcCombo::ClampEffectDamage(node.fx_damage)); return text;
+    case -5: _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"范围：半径 %.1f 米").c_str(),NpcCombo::ClampEffectRadius(node.fx_radius)/100.0); return text;
+    default: _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"段数：%d 段（每 0.3 秒一段）").c_str(),NpcCombo::ClampEffectHits(node.fx_hits)); return text;
+    }
+}
+// 派生页的技能伤害: "×2", "×1（Boss 原伤害）".
+std::wstring ChainSkillText(float v) {
+    wchar_t text[64]{};
+    if (std::fabs(v-1.f)<1e-3f) _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"×%g（Boss 原伤害）").c_str(),static_cast<double>(v));
+    else _snwprintf_s(text,_countof(text),_TRUNCATE,L"×%g",static_cast<double>(v));
+    return text;
+}
+// 派生页的投技伤害: "原生伤害", "×4.5", "每段至少 30% 最大生命".
+std::wstring ChainGrabText(const NpcCombo::ChainGrab& g) {
+    if (g.mode==NpcCombo::kGrabFollow) return Tr(L"跟随投技页");
+    if (g.mode==0) return Tr(L"原生伤害");
+    wchar_t text[64]{};
+    if (g.mode==1) _snwprintf_s(text,_countof(text),_TRUNCATE,L"×%g",static_cast<double>(g.value));
+    else _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"每段至少 %g%% 最大生命").c_str(),static_cast<double>(g.value));
+    return text;
 }
 // 按住: "点按" (any press) or how long the button must be held.
 std::wstring HoldText(int ms) {
@@ -852,6 +927,11 @@ std::wstring ModifierNote(size_t index) {
         else _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招打中的敌人被强制%s").c_str(),from.nodes,kind.c_str());
         return text;
     }
+    if (node.type==NodeType::BossEffect) {
+        if (node.ability.empty()) return Tr(L"先选择特效");
+        if (from.triggers) return Tr(L"整条链：每一招开始时放这个特效");
+        wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招开始时放这个特效").c_str(),from.nodes); return text;
+    }
     if (node.type==NodeType::Air) {
         if (from.triggers) return Tr(L"整条链：主角和打中的敌人按这里升高、滞空");
         wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招：主角和打中的敌人按这里升高、滞空").c_str(),from.nodes); return text;
@@ -902,12 +982,26 @@ std::wstring GrabField(const Node& node) {
     const MotianGrab::Variant* v=NodeGrab(node);
     return v?GrabName(*v):Tr(node.ability.empty()?L"选择投技":L"所选投技已不可用");
 }
-std::wstring GrabNote(const Node& node) {
+// A chain start's 整体不变身 row, and the hint a BOSS 技能 / 投技 card shows when its starts play it 不变身.
+std::wstring ChainOwnLookText(bool on) {
+    return Tr(on?L"整体不变身：这条链的 BOSS 技能、投技都不换外观":L"整体不变身（这条链的 BOSS 技能、投技）");
+}
+bool ChainOwnLook(size_t index) {
+    return index<config_.chain.size()&&!config_.chain[index].own_look&&NpcCombo::OwnLookEverywhere(config_,index);
+}
+std::wstring OwnLookText(size_t index) {
+    const Node& node=config_.chain[index];
+    if (ChainOwnLook(index)) return Tr(L"不变身：起端已设整体不变身");
+    return Tr(node.own_look?L"不变身：动作套到当前外观上":L"不变身（动作套到主角）");
+}
+std::wstring GrabNote(size_t index) {
+    const Node& node=config_.chain[index];
     if (node.ability.empty()) return Tr(L"选一个投技；没选时按键跳过这个节点");
     const MotianGrab::Variant* v=NodeGrab(node);
     if (!v) return Tr(L"所选投技已不可用，请重新选择");
     // The hero takes the look of the grab's boss for it (none when no look plays that boss).
-    const std::wstring look=Tr(node.own_look?L"不变身":NpcRetarget::SkinForGrab(v->boss_id,v->source)>=0?L"投时变身为该 Boss":L"这个 Boss 没有外观，不变身");
+    const bool own=node.own_look||NpcCombo::OwnLookEverywhere(config_,index);  // its own 不变身, or its starts' 整体不变身
+    const std::wstring look=Tr(own?L"不变身":NpcRetarget::SkinForGrab(v->boss_id,v->source)>=0?L"投时变身为该 Boss":L"这个 Boss 没有外观，不变身");
     const MotianGrab::Snapshot& grab=GrabState();
     if (grab.chain_variant==v->index) return Tr(grab.chain_prepared?L"已预载":L"预载中")+L" · "+look;
     return look+L" · "+Tr(L"不受投技页设置影响");
@@ -927,13 +1021,13 @@ std::wstring NodeNote(size_t index) {
     case NodeType::AutoDodge: return moves_.dodges.empty()?Tr(L"这个外观没有闪避"):wired?Tr(L"按摇杆方向选 Boss 闪避"):Tr(L"未连接");
     case NodeType::Trigger: return {};
     case NodeType::Branch: return Tr(L"上一招后按哪个键（点按或按住），接哪一招");
-    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: case NodeType::KeepChain: case NodeType::Trim: case NodeType::Air: return ModifierNote(index);
+    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: case NodeType::KeepChain: case NodeType::Trim: case NodeType::Air: case NodeType::BossEffect: return ModifierNote(index);
     case NodeType::WeaponMove: {
         if (!wired) return Tr(L"未连接");
         return Tr(L"拿这把武器放这一招，放完换回");
     }
-    case NodeType::Grab: return wired?GrabNote(node):GrabNote(node)+L" · "+Tr(L"未连接");
-    case NodeType::BossSkill: return wired?Tr(L"瞬身变身放这一招，放完变回"):Tr(L"未连接");
+    case NodeType::Grab: return wired?GrabNote(index):GrabNote(index)+L" · "+Tr(L"未连接");
+    case NodeType::BossSkill: return wired?Tr(node.own_look||NpcCombo::OwnLookEverywhere(config_,index)?L"在当前外观上放这一招（不变身）":L"瞬身变身放这一招，放完变回"):Tr(L"未连接");
     case NodeType::Assist: return wired?Tr(L"Boss 瞬移到目标身前放这一招，主角照常行动"):Tr(L"未连接");
     case NodeType::Look:
         if (node.boss.empty()) return Tr(L"选择要变成的 Boss");
@@ -963,7 +1057,8 @@ SIZE MeasureNodeBody(HDC dc,size_t index) {
         int field=(key?KeyUnits(dc):Units(dc,UiTheme::Font::Body,ButtonLabel(node.trigger)))+100;
         if (execution) field=(std::max)(field,Units(dc,UiTheme::Font::Body,ExecutionWeaponText(node)+L"  ▾")+60);
         // The 按住 row: its label, then its stepper with the whole value in view.
-        const int hold=10+Units(dc,UiTheme::Font::Small,Tr(L"按住多久才触发"))+6+TriggerHoldUnits(dc)+10;
+        const int hold=(std::max)(10+Units(dc,UiTheme::Font::Small,Tr(L"按住多久才触发"))+6+TriggerHoldUnits(dc)+10,
+                                  Units(dc,UiTheme::Font::Small,ChainOwnLookText(true))+50);  // + 整体不变身
         if (KeysTrigger(node)) {
             // The keys as icons: the card grows with them (up to six keys of any kind).
             const bool recording=record_.node==static_cast<int>(index)&&record_.route==-1;
@@ -973,9 +1068,9 @@ SIZE MeasureNodeBody(HDC dc,size_t index) {
             // The keys field is the row less 26 units each side and 7 px inside: icons need that much more.
             field=(std::max)(field,(std::max)(keys+(icons>0?70:60),Units(dc,UiTheme::Font::Body,KeysModeText(node)+L"  ▾")+60));
             field=(std::max)(field,Units(dc,UiTheme::Font::Body,ThenText(node,then_recording)+L"  ▾")+60);  // 继续派生
-            return {std::clamp((std::max)(field,hold),300,(std::max)(icons>0?900:480,hold)),kHeader+kRow*(RawTrigger(node)?8:7)+kPad};  // + 按住
+            return {std::clamp((std::max)(field,hold),300,(std::max)(icons>0?900:480,hold)),kHeader+kRow*(RawTrigger(node)?9:8)+kPad};  // + 按住, 整体不变身
         }
-        return {std::clamp((std::max)(field,hold),260,(std::max)(350,hold)),kHeader+kRow*(key?3:execution?5:4)+kPad};  // + 按住
+        return {std::clamp((std::max)(field,hold),260,(std::max)(350,hold)),kHeader+kRow*(key?4:execution?6:5)+kPad};  // + 按住, 整体不变身
     }
     if (node.type==NodeType::Branch) {
         // A row each; a 自定义组合键 / 自定义按键 row two (its keys under it).
@@ -1000,9 +1095,10 @@ SIZE MeasureNodeBody(HDC dc,size_t index) {
         // The weapon, the reset time, a note, a row per action (its field, x, its own output), then "+ 添加动作".
         int wide=(std::max)(Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,(std::max)(Units(dc,UiTheme::Font::Body,ActionsWeaponText(node)+L"  ▾")+60,
                                                                                    Units(dc,UiTheme::Font::Small,NodeNote(index))+34));
+        wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,ChainOwnLookText(true))+50);  // 整体不变身
         int extra=0;for (const NpcCombo::Route& route:node.routes){wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,ButtonLabel(route.button)+L" ▾")+116+StepperUnits(RouteHoldUnits(dc)));
             if(NpcCombo::KeysRoute(route)){++extra;wide=(std::max)(wide,KeyIconsUnits(dc,route.keys,RawRoute(route),false,UiTheme::Font::Small)+Units(dc,UiTheme::Font::Small,RouteModeText(route,true))+100);}}
-        return {std::clamp(wide,500,900),kHeader+kRow*(static_cast<int>(node.routes.size())+extra+4)+kPad};
+        return {std::clamp(wide,500,900),kHeader+kRow*(static_cast<int>(node.routes.size())+extra+5)+kPad};  // + 整体不变身
     }
     if (node.type==NodeType::Group) return {NpcCombo::ClampGroupW(node.w),NpcCombo::ClampGroupH(node.h)};
     const int title=Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,note=Units(dc,UiTheme::Font::Small,NodeNote(index))+34;
@@ -1052,6 +1148,11 @@ SIZE MeasureNodeBody(HDC dc,size_t index) {
         int field=Units(dc,UiTheme::Font::Body,Tr(NpcCombo::HitKindLabel(node.hit))+L"  ▾")+60;
         if (LaunchShown(node)) field=(std::max)(field,Units(dc,UiTheme::Font::Body,LaunchText(NpcCombo::kLaunchMax)+L"  ▾")+60);
         return {std::clamp((std::max)((std::max)(title,note),field),240,400),kHeader+kRow*(LaunchShown(node)?3:2)+kPad};
+    }
+    if (node.type==NodeType::BossEffect) {  // its source, effect, place, damage, radius and hits; a note
+        int field=0;
+        for (int route=-1;route>=-6;--route) field=(std::max)(field,Units(dc,UiTheme::Font::Body,FxFieldText(node,route)+L"  ▾")+90);
+        return {std::clamp((std::max)((std::max)(title,note),field),280,520),kHeader+kRow*7+kPad};
     }
     if (AirNode(node)) {  // 空中释放: its switch; then the four values and a note
         int field=0;
@@ -1176,6 +1277,8 @@ Shape NodeShape(HDC dc,size_t index) {
         stepper(0);  // its 派生点 under the header; the nodes below; the size handle in the corner
         const int h=Px(16);
         s.resize={s.rect.right-h,s.rect.bottom-h,s.rect.right,s.rect.bottom};
+    } else if (node.type==NodeType::BossEffect) {  // toggle / toggle2: its radius and hits fields
+        s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26); s.field3=Row(s.rect,2,26); s.field4=Row(s.rect,3,26); s.toggle=Row(s.rect,4,26); s.toggle2=Row(s.rect,5,26);
     } else if (node.type==NodeType::Air) {
         s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26); s.field3=Row(s.rect,2,26); s.field4=Row(s.rect,3,26);  // then a note
     } else if (node.type==NodeType::AirDefault) {
@@ -1198,6 +1301,7 @@ Shape NodeShape(HDC dc,size_t index) {
         const int hold_w=Px(TriggerHoldUnits(dc));
         s.hminus={line.right-hold_w,line.top,line.right-hold_w+b,line.bottom}; s.hplus={line.right-b,line.top,line.right,line.bottom};
         s.hvalue={s.hminus.right+Px(4),line.top,s.hplus.left-Px(4),line.bottom}; s.has_hold=true;
+        s.toggle3=Row(s.rect,hold_row+1);  // 整体不变身
     } else if (node.type==NodeType::WeaponActions) {
         // The weapon, the reset time, a note, then a row per action (its field, x, its own output) and "+ 添加动作".
         s.field=Row(s.rect,0,26);
@@ -1217,6 +1321,7 @@ Shape NodeShape(HDC dc,size_t index) {
         }
         const RECT add=Row(s.rect,at);
         s.add={add.left,add.top,add.left+Px(132),add.bottom};
+        s.toggle3=Row(s.rect,at+1);  // 整体不变身
     } else if (node.type==NodeType::Branch) {
         // Rows: the note, one per route (button field, pause stepper, x, its own output; a 自定义组合键 / 自定义按键
         // row's keys and mode on a line under it), then "+ 添加按键". The 按住 and pause boxes fit their widest values.
@@ -1830,6 +1935,7 @@ void SearchItems() {
         if (At(search_.mod_from)) {
             const Node& from=config_.chain[static_cast<size_t>(search_.mod_from)];
             if (NpcCombo::StartsChain(from)||NpcCombo::TakesAir(from)||from.type==NodeType::Group) add({ItemKind::Air,Tr(L"滞空"),flow});
+            if (NpcCombo::ModifierFits([&]{ std::vector<Node> two{from,NpcCombo::ModifierNode(NodeType::BossEffect,0,0)}; return two; }(),0,1)) add({ItemKind::BossEffect,Tr(L"BOSS 特效"),flow});
         }
         return;
     }
@@ -1837,6 +1943,31 @@ void SearchItems() {
         // The .combo files in combos\ (the active one first).
         for (const std::wstring& name:files_.names) if (name==files_.active) add({ItemKind::File,name,Tr(L"当前文件")});
         for (const std::wstring& name:files_.names) if (name!=files_.active) add({ItemKind::File,name,Tr(L"combos 文件夹")});
+        return;
+    }
+    if (search_.mode==6) {
+        // 招式来源: this table's own look, or a boss whose moves the list then shows (added as BOSS 技能).
+        Item own{ItemKind::MoveSource,Tr(L"本表外观")+L"（"+Tr(moves_.name.c_str())+L"）",Tr(L"招式来源")}; add(own);
+        for (const auto& [id,name]:BossLooks()) {
+            if (id==moves_.profile) continue;
+            Item item{ItemKind::MoveSource,Tr(name.c_str()),Tr(L"其他 Boss（加为 BOSS 技能）")}; item.ability=id; add(item);
+        }
+        return;
+    }
+    if (search_.mode==4) {
+        // 派生页的技能伤害: follow the NPC 技能 page, or a multiplier of the boss's own damage.
+        const std::wstring group=Tr(L"派生链的 BOSS 技能伤害");
+        Item follow{ItemKind::ChainSkill,Tr(L"跟随 NPC 技能页"),group}; add(follow);
+        for (const float v:{.5f,1.f,1.5f,2.f,3.f,5.f,8.f,10.f}) { Item item{ItemKind::ChainSkill,ChainSkillText(v),group}; item.value=v; add(item); }
+        return;
+    }
+    if (search_.mode==5) {
+        // 派生页的投技伤害: follow the 投技 page, the grab's own damage, a multiplier, or at least a share of max health.
+        const std::wstring group=Tr(L"派生链的投技伤害");
+        Item follow{ItemKind::ChainGrab,Tr(L"跟随投技页"),group}; follow.trigger=NpcCombo::kGrabFollow; add(follow);
+        Item native{ItemKind::ChainGrab,Tr(L"原生伤害"),group}; native.trigger=0; add(native);
+        for (const float v:{2.f,4.5f,10.f,15.f,20.f,30.f}) { Item item{ItemKind::ChainGrab,ChainGrabText({1,v}),group}; item.trigger=1; item.value=v; add(item); }
+        for (const float v:{10.f,20.f,30.f,50.f,100.f}) { Item item{ItemKind::ChainGrab,ChainGrabText({2,v}),group}; item.trigger=2; item.value=v; add(item); }
         return;
     }
     if (search_.mode==3) {
@@ -1905,6 +2036,47 @@ void SearchItems() {
             }
             return;
         }
+    }
+    if (search_.pick_node>=0&&At(search_.pick_node)&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::BossEffect) {
+        // BOSS 特效: route -1 its source folder, -2 its effect (that folder's), -3 place, -4 damage, -5 radius, -6 hits.
+        const Node& node=config_.chain[static_cast<size_t>(search_.pick_node)];
+        const int route=search_.pick_route;
+        if (route==-1) {
+            for (const std::string& folder:NpcBossEffects::Folders()) {
+                const std::wstring wide(folder.begin(),folder.end()),name=FxFolderName(folder);
+                const bool own=folder=="Common"||folder=="Weapon"||folder=="ShachiWeapon"||folder=="Hun";
+                Item item{ItemKind::FxFolder,name,Tr(own?L"通用与主角":L"BOSS 与敌人")}; item.ability=folder; item.keys=Lower(name+L" "+wide); add(item);
+            }
+            std::stable_sort(search_.items.begin(),search_.items.end(),[](const Item& a,const Item& b){ return a.group<b.group; });  // BOSS 与敌人 first (B before 通)
+            return;
+        }
+        if (route==-2) {
+            for (const NpcBossEffect& e:kNpcBossEffects) {
+                if (!node.boss.empty()&&node.boss!=e.folder) continue;
+                const std::string short_name=NpcBossEffects::ShortName(e);
+                Item item{ItemKind::FxPick,std::wstring(short_name.begin(),short_name.end()),FxFolderName(e.folder)};
+                item.ability=e.name; item.keys=Lower(std::wstring(item.ability.begin(),item.ability.end())); add(item);
+            }
+            return;
+        }
+        if (route==-3) {
+            for (int p=0;p<static_cast<int>(NpcCombo::EffectPlace::Count);++p) { Item item{ItemKind::FxPlace,FxPlaceText(p),Tr(L"特效位置")}; item.trigger=p; add(item); }
+            return;
+        }
+        const ItemKind kind=route==-4?ItemKind::FxDamage:route==-5?ItemKind::FxRadius:ItemKind::FxHits;
+        Node probe=node;
+        const auto text=[&](int v){ if (kind==ItemKind::FxDamage) probe.fx_damage=v; else if (kind==ItemKind::FxRadius) probe.fx_radius=v; else probe.fx_hits=v; return FxFieldText(probe,route); };
+        wchar_t* end=nullptr; const double typed=search_.query.empty()?-1:std::wcstod(search_.query.c_str(),&end);
+        if (!search_.query.empty()&&end&&!*end&&typed>=0) {  // percent, metres or hits
+            const int value=static_cast<int>(std::lround(kind==ItemKind::FxRadius?typed*100:typed));
+            Item item{kind,Tr(L"自定义：")+text(value),Tr(L"输入的数值")}; item.trigger=std::clamp(value,0,1000000); add(item);
+            search_.items.back().keys=Lower(search_.query);
+        }
+        const std::vector<int> presets=kind==ItemKind::FxDamage?std::vector<int>{0,5,10,15,20,30,50,100}:
+                                       kind==ItemKind::FxRadius?std::vector<int>{200,300,400,600,800,1000,1500,2000}:std::vector<int>{1,2,3,4,5,6,8,10};
+        const std::wstring group=Tr(kind==ItemKind::FxDamage?L"每段伤害（最大生命的百分比）":kind==ItemKind::FxRadius?L"伤害范围":L"伤害段数");
+        for (const int v:presets) { Item item{kind,text(v),group}; item.trigger=v; add(item); }
+        return;
     }
     if (search_.pick_node>=0&&At(search_.pick_node)&&(AirNode(config_.chain[static_cast<size_t>(search_.pick_node)])||
                                                       (LaunchShown(config_.chain[static_cast<size_t>(search_.pick_node)])&&search_.pick_route==-2))) {
@@ -2069,6 +2241,7 @@ void SearchItems() {
     add({ItemKind::KeepLook,Tr(L"保留变身"),flow});
     add({ItemKind::ForceHit,Tr(L"强制受击"),flow});
     add({ItemKind::Air,Tr(L"滞空"),flow});
+    add({ItemKind::BossEffect,Tr(L"BOSS 特效"),flow});
     add({ItemKind::Interrupt,Tr(L"允许中断"),flow});
     add({ItemKind::KeepChain,Tr(L"保持派生"),flow});
     add({ItemKind::Weapon,Tr(L"武器属性"),flow});
@@ -2126,6 +2299,18 @@ void SearchFilter() {
             // The keys' list starts on its first key; the mode's on what the node (or row) has now.
             const int want=spec.what==2?(*spec.chord?0:NpcCombo::ClampKeyWindow(*spec.window)):spec.raw?-4:static_cast<int>(Trigger::Light);
             for (size_t r=0;r<search_.rows.size();++r) if (!search_.rows[r].header&&search_.items[search_.rows[r].item].trigger==want) { search_.selected=static_cast<int>(r); break; }
+            search_.scroll=0; return;
+        }
+        if (node.type==NodeType::BossEffect) {
+            const int route=search_.pick_route;
+            const std::string want_name=route==-1?node.boss:route==-2?node.ability:std::string();
+            const int want=route==-3?NpcCombo::ClampEffectPlace(node.fx_place):route==-4?NpcCombo::ClampEffectDamage(node.fx_damage):
+                           route==-5?NpcCombo::ClampEffectRadius(node.fx_radius):NpcCombo::ClampEffectHits(node.fx_hits);
+            for (size_t r=0;r<search_.rows.size();++r) {
+                if (search_.rows[r].header) continue;
+                const Item& it=search_.items[search_.rows[r].item];
+                if (route>=-2?it.ability==want_name:it.trigger==want) { search_.selected=static_cast<int>(r); break; }
+            }
             search_.scroll=0; return;
         }
         if (AirNode(node)||(LaunchShown(node)&&search_.pick_route==-2)) {
@@ -2200,6 +2385,31 @@ void OpenFileSearch(int mode) {
     SearchItems(); SearchFilter(); SearchLayout(); Invalidate();
 }
 void OpenFiles() { OpenFileSearch(1); }
+// 派生页的技能伤害 (mode 4) / 投技伤害 (mode 5): the presets under the button, the value in use selected.
+void OpenDamageSearch(int mode) {
+    const RECT b=buttons_[static_cast<int>(mode==4?Button::SkillDamage:Button::GrabDamage)];
+    OpenSearch({b.left,canvas_.top+M().S(8)},-1,-1,0);
+    if (!search_.open) return;
+    search_.mode=mode; SearchItems(); SearchFilter();
+    const float skill=NpcCombo::ChainSkillDamage(); const NpcCombo::ChainGrab grab=NpcCombo::ChainGrabDamage();
+    for (size_t r=0;r<search_.rows.size();++r) {
+        if (search_.rows[r].header) continue;
+        const Item& item=search_.items[search_.rows[r].item];
+        const bool now=mode==4?std::fabs(item.value-skill)<1e-3f:item.trigger==grab.mode&&(grab.mode<=0||std::fabs(item.value-grab.value)<1e-3f);
+        if (now) { search_.selected=static_cast<int>(r); break; }
+    }
+    SearchLayout(); SearchEnsureVisible(); Invalidate();
+}
+// The 招式来源 list (mode 6) beside the dropdown, on the source shown now.
+void OpenSourceSearch() {
+    OpenSearch({canvas_.right,library_boss_box_.top},-1,-1,0);
+    if (!search_.open) return;
+    search_.mode=6; SearchItems(); SearchFilter();
+    const std::string now=LibraryBoss();
+    for (size_t r=0;r<search_.rows.size();++r)
+        if (!search_.rows[r].header&&search_.items[search_.rows[r].item].ability==now) { search_.selected=static_cast<int>(r); break; }
+    SearchLayout(); SearchEnsureVisible(); Invalidate();
+}
 // The 派生表 list under the header, on the one edited now.
 void OpenChainSearch() {
     CommitEdit();
@@ -2323,6 +2533,25 @@ void SearchPick(int row) {
     const float x=search_.x,y=search_.y; const int from=search_.from,into=search_.into,from_out=search_.from_out,pick=search_.pick_node,route=search_.pick_route,mod_from=search_.mod_from;
     const int part=search_.pick_part;
     CloseSearch();
+    if (item.kind==ItemKind::MoveSource) {
+        library_boss_=item.ability; category_=-1; library_pages_[4]=0;
+        DebugHub::Notify((library_boss_.empty()?Tr(L"BOSS 招式列表：本表外观的招式"):
+                          Tr(L"BOSS 招式列表：")+Tr(BossLookName(library_boss_).c_str())+Tr(L" 的技能（点击或拖到画布，加为 BOSS 技能）")).c_str());
+        Layout(); Invalidate(); return;
+    }
+    if (item.kind==ItemKind::ChainSkill) {
+        NpcCombo::SetChainSkillDamage(item.value);
+        DebugHub::Notify((item.value>0?Tr(L"派生链放的 BOSS 技能伤害：")+ChainSkillText(item.value)+Tr(L"（代替 NPC 技能页的设置）"):
+                                       Tr(L"派生链放的 BOSS 技能伤害跟随 NPC 技能页")).c_str());
+        Layout(); Invalidate(); return;
+    }
+    if (item.kind==ItemKind::ChainGrab) {
+        NpcCombo::SetChainGrabDamage({item.trigger,item.value});
+        const NpcCombo::ChainGrab now=NpcCombo::ChainGrabDamage();
+        DebugHub::Notify((now.mode!=NpcCombo::kGrabFollow?Tr(L"派生链放的投技伤害：")+ChainGrabText(now)+Tr(L"（代替投技页的设置）"):
+                                                         Tr(L"派生链放的投技伤害跟随投技页")).c_str());
+        Layout(); Invalidate(); return;
+    }
     if (item.kind==ItemKind::File) {
         if (NpcCombo::SelectFile(item.label)) DebugHub::Notify((Tr(L"已载入派生文件：")+item.label+L".combo").c_str());
         else DebugHub::Notify(StatusText(NpcCombo::GetFiles().status).c_str());
@@ -2361,6 +2590,29 @@ void SearchPick(int row) {
         if (item.trigger==2) NpcCombo::SetHookAuto(config_.chain[static_cast<size_t>(pick)]);
         else NpcCombo::SetHookMode(config_.chain[static_cast<size_t>(pick)],item.trigger==1);
         Select(pick); Save(); Layout(); Invalidate(); return;
+    }
+    if (item.kind==ItemKind::FxFolder||item.kind==ItemKind::FxPick||item.kind==ItemKind::FxPlace||item.kind==ItemKind::FxDamage||item.kind==ItemKind::FxRadius||item.kind==ItemKind::FxHits) {
+        if (!At(pick)||config_.chain[static_cast<size_t>(pick)].type!=NodeType::BossEffect) return;
+        Node& target=config_.chain[static_cast<size_t>(pick)];
+        bool next=false;  // a new folder: its effect next
+        switch (item.kind) {
+        case ItemKind::FxFolder: {
+            const NpcBossEffect* now=NpcBossEffects::Find(target.ability);
+            if (target.boss!=item.ability) { target.boss=item.ability; if (!now||item.ability!=now->folder) { target.ability.clear(); next=true; } }
+            break;
+        }
+        case ItemKind::FxPick: { const NpcBossEffect* e=NpcBossEffects::Find(item.ability); if (!e) return; target.ability=e->name; target.boss=e->folder; break; }
+        case ItemKind::FxPlace: target.fx_place=NpcCombo::ClampEffectPlace(item.trigger); break;
+        case ItemKind::FxDamage: {
+            const int v=NpcCombo::ClampEffectDamage(item.trigger); if (v!=item.trigger) DebugHub::Notify(Tr(L"每段伤害在 0% 到 100% 之间，已调整。").c_str()); target.fx_damage=v; break; }
+        case ItemKind::FxRadius: {
+            const int v=NpcCombo::ClampEffectRadius(item.trigger); if (v!=item.trigger) DebugHub::Notify(Tr(L"伤害范围在 1 到 20 米之间，已调整。").c_str()); target.fx_radius=v; break; }
+        default: {
+            const int v=NpcCombo::ClampEffectHits(item.trigger); if (v!=item.trigger) DebugHub::Notify(Tr(L"段数在 1 到 10 之间，已调整。").c_str()); target.fx_hits=v; break; }
+        }
+        Select(pick); Save(); Layout(); Invalidate();
+        if (next) OpenPicker(pick,-2);
+        return;
     }
     if (item.kind==ItemKind::AirLift||item.kind==ItemKind::AirHang||item.kind==ItemKind::Launch) {
         if (!At(pick)) return;
@@ -2474,6 +2726,7 @@ void SearchPick(int row) {
     case ItemKind::KeepLook: node=NpcCombo::ModifierNode(NodeType::KeepLook,0,0); break;
     case ItemKind::ForceHit: node=NpcCombo::ModifierNode(NodeType::ForceHit,0,0); break;
     case ItemKind::Air: node=NpcCombo::ModifierNode(NodeType::Air,0,0); break;
+    case ItemKind::BossEffect: node=NpcCombo::ModifierNode(NodeType::BossEffect,0,0); break;
     case ItemKind::Interrupt: node=NpcCombo::ModifierNode(NodeType::Interrupt,0,0); break;
     case ItemKind::Grab: node.type=NodeType::Grab; break;
     case ItemKind::BossSkill: node.type=NodeType::BossSkill; break;
@@ -2493,7 +2746,8 @@ void SearchPick(int row) {
     const bool exec=!NpcCombo::StartsChain(node)&&!NpcCombo::IsModifier(node);
     const int index=Place(node,x,y,exec?from:-1,exec?into:-1,from_out);
     if (index>=0&&mod_from>=0&&NpcCombo::LinkModifier(config_,mod_from,index)) { Save(); Invalidate(); }
-    if (index>=0&&(node.type==NodeType::WeaponMove||node.type==NodeType::Grab||node.type==NodeType::Look||node.type==NodeType::Assist||(WeaponActionsNode(node)&&!node.air_set))) OpenPicker(index,-1);  // its weapon / grab / look at once
+    if (index>=0&&(node.type==NodeType::WeaponMove||node.type==NodeType::Grab||node.type==NodeType::Look||node.type==NodeType::Assist||node.type==NodeType::BossEffect||
+                   (WeaponActionsNode(node)&&!node.air_set))) OpenPicker(index,-1);  // its weapon / grab / look at once
     if (index>=0&&KeysTrigger(node)) OpenPicker(index,-2);  // a 组合键: its keys at once
 }
 int SearchRowAt(POINT p) {
@@ -2513,6 +2767,20 @@ void PressButton(Button button) {
         DebugHub::Notify(Tr(on?L"派生提示已打开：派生链放招时右下角显示招式名":L"派生提示已关闭：派生链放招时右下角不再显示招式名").c_str());
         Layout(); Invalidate(); return;
     }
+    case Button::Hud: {  // 派生显示: 关 -> 详细 -> 简略 -> 关
+        const int mode=(NpcCombo::ChainHud()+1)%3; NpcCombo::SetChainHud(mode);
+        DebugHub::Notify(Tr(mode==NpcCombo::kHudDetailed?L"派生显示：详细（右上角显示整条派生链的缩略图，当前位置实时高亮）":
+                            mode==NpcCombo::kHudSimple?L"派生显示：简略（右上角显示接下来可以按的键和对应招式）":L"派生显示已关闭").c_str());
+        Layout(); Invalidate(); return;
+    }
+    case Button::ViewTarget: {  // 镜头跟随: 骨盆 -> 脖子 -> 头部 -> 骨盆
+        const int target=(NpcCombo::ViewTarget()+1)%3; NpcCombo::SetViewTarget(target);
+        DebugHub::Notify(Tr(target==NpcCombo::kViewNeck?L"镜头跟随：脖子（招式中镜头盯着模型的脖子）":
+                            target==NpcCombo::kViewHead?L"镜头跟随：头部（招式中镜头盯着模型的头部）":L"镜头跟随：骨盆（招式中镜头盯着模型的骨盆）").c_str());
+        Layout(); Invalidate(); return;
+    }
+    case Button::SkillDamage: if (search_.open&&search_.mode==4) CloseSearch(); else OpenDamageSearch(4); return;
+    case Button::GrabDamage: if (search_.open&&search_.mode==5) CloseSearch(); else OpenDamageSearch(5); return;
     case Button::Dummy: {  // 测试木桩: the game thread spawns / removes it; the label follows its snapshot (Tick)
         const bool present=TestDummy::GetSnapshot().present; TestDummy::Request(!present);
         if (!present) DebugHub::Notify(Tr(L"测试木桩：在主角面前召唤一个不移动、不攻击、锁血的小怪，用来试派生链").c_str());
@@ -2530,6 +2798,7 @@ void PressButton(Button button) {
     case Button::KeepLook: AddModifier(NodeType::KeepLook); return;
     case Button::ForceHit: AddModifier(NodeType::ForceHit); return;
     case Button::Air: AddModifier(NodeType::Air); return;
+    case Button::BossEffect: AddModifier(NodeType::BossEffect); if (At(selected_)&&config_.chain[static_cast<size_t>(selected_)].type==NodeType::BossEffect) OpenPicker(selected_,-1); return;
     case Button::Interrupt: AddModifier(NodeType::Interrupt); return;
     case Button::Grab: {
         // A 投技 after the selected move; its grab is picked at once.
@@ -2631,7 +2900,8 @@ void Click(const Hit& hit) {
     switch (hit.part) {
     case Part::Button: PressButton(static_cast<Button>(hit.index)); return;
     case Part::Header: if (search_.open&&search_.mode==3) CloseSearch(); else OpenChainSearch(); return;
-    case Part::Pill: if (hit.index>=0&&static_cast<size_t>(hit.index)<pills_.size()) { Node node; node.ability=pills_[static_cast<size_t>(hit.index)].ability; Append(node); } return;
+    case Part::Pill: if (hit.index>=0&&static_cast<size_t>(hit.index)<pills_.size()) Append(LibraryNode(pills_[static_cast<size_t>(hit.index)].ability)); return;
+    case Part::LibraryBoss: if (search_.open&&search_.mode==6) CloseSearch(); else OpenSourceSearch(); return;
     case Part::LibraryTab: if (hit.index>=0&&hit.index<2) { library_tab_=hit.index; hot_={}; Layout(); } return;
     case Part::NodeCategory: if (hit.index>=0&&hit.index<5) { node_category_=hit.index; hot_={}; Layout(); } return;
     case Part::Tab: if (hit.index>=0&&static_cast<size_t>(hit.index)<tabs_.size()) { category_=tabs_[static_cast<size_t>(hit.index)].kind; library_pages_[4]=0; Layout(); } return;
@@ -2661,18 +2931,20 @@ void Click(const Hit& hit) {
         const Node* n=At(hit.index);
         if (n&&n->type==NodeType::Speed) { OpenCurve(hit.index); return; }
         if (n&&((NpcCombo::PicksBossMove(*n)&&!n->boss.empty())||(n->type==NodeType::WeaponMove&&!n->weapon.empty())||ExecutionTrigger(*n)||KeysTrigger(*n)||
-                 n->type==NodeType::Teleport||n->type==NodeType::Hook||AirNode(*n)||LaunchShown(*n))) OpenPicker(hit.index,-2);
+                 n->type==NodeType::Teleport||n->type==NodeType::Hook||AirNode(*n)||LaunchShown(*n)||n->type==NodeType::BossEffect)) OpenPicker(hit.index,-2);
         return;
     }
     case Part::NodeField3: Select(hit.index);
         if (At(hit.index)&&(KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])||config_.chain[static_cast<size_t>(hit.index)].type==NodeType::Hook||
-                            AirNode(config_.chain[static_cast<size_t>(hit.index)]))) OpenPicker(hit.index,-3);
+                            AirNode(config_.chain[static_cast<size_t>(hit.index)])||config_.chain[static_cast<size_t>(hit.index)].type==NodeType::BossEffect)) OpenPicker(hit.index,-3);
         return;
     case Part::NodeField4: Select(hit.index);
-        if (At(hit.index)&&(KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])||AirNode(config_.chain[static_cast<size_t>(hit.index)]))) OpenPicker(hit.index,-4);
+        if (At(hit.index)&&(KeysTrigger(config_.chain[static_cast<size_t>(hit.index)])||AirNode(config_.chain[static_cast<size_t>(hit.index)])||
+                            config_.chain[static_cast<size_t>(hit.index)].type==NodeType::BossEffect)) OpenPicker(hit.index,-4);
         return;
     case Part::WeaponRow: AddWeaponNode(hit.index); return;
     case Part::NodeToggle:
+        if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::BossEffect) { Select(hit.index); OpenPicker(hit.index,-5); return; }  // its radius
         if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::AirDefault) {  // 空中释放 on / off
             Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)]; n.on=!n.on;
             DebugHub::Notify(Tr(n.on?L"空中释放已打开：空中放出的招式按它升高、滞空":L"空中释放已关闭：空中放出的招式照常下落").c_str());
@@ -2688,8 +2960,16 @@ void Click(const Hit& hit) {
         }
         if (At(hit.index)) { Select(hit.index); config_.chain[static_cast<size_t>(hit.index)].on=!config_.chain[static_cast<size_t>(hit.index)].on; Save(); } break;
     case Part::NodeToggle2:
+        if (At(hit.index)&&config_.chain[static_cast<size_t>(hit.index)].type==NodeType::BossEffect) { Select(hit.index); OpenPicker(hit.index,-6); return; }  // its hits
         if (At(hit.index)&&RawTrigger(config_.chain[static_cast<size_t>(hit.index)])) {
             Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)]; n.swallow=!n.swallow; Save();
+        }
+        break;
+    case Part::NodeToggle3:  // a chain start's 整体不变身
+        if (At(hit.index)&&NpcCombo::StartsChain(config_.chain[static_cast<size_t>(hit.index)])) {
+            Select(hit.index); Node& n=config_.chain[static_cast<size_t>(hit.index)]; n.own_look=!n.own_look;
+            DebugHub::Notify(Tr(n.own_look?L"整体不变身已打开：这条链的 BOSS 技能、投技都套到当前外观上":L"整体不变身已关闭：各 BOSS 技能、投技按自己的设置").c_str());
+            Save(); Layout();
         }
         break;
     case Part::NodeRemove: picked_.clear(); Select(hit.index); RemoveSelected(); return;  // that node alone
@@ -2704,6 +2984,10 @@ std::wstring ButtonText(Button button) {
     switch (button) {
     case Button::Toggle: return Tr(config_.enabled?L"派生链：开":L"派生链：关");
     case Button::Toast: return Tr(NpcCombo::ShowToast()?L"派生提示：开":L"派生提示：关");
+    case Button::SkillDamage: { const float v=NpcCombo::ChainSkillDamage(); return Tr(L"技能伤害：")+(v>0?ChainSkillText(v):Tr(L"跟随"))+L" ▾"; }
+    case Button::GrabDamage: { const NpcCombo::ChainGrab g=NpcCombo::ChainGrabDamage(); return Tr(L"投技伤害：")+(g.mode!=NpcCombo::kGrabFollow?ChainGrabText(g):Tr(L"跟随"))+L" ▾"; }
+    case Button::Hud: { const int mode=NpcCombo::ChainHud(); return Tr(mode==NpcCombo::kHudDetailed?L"派生显示：详细":mode==NpcCombo::kHudSimple?L"派生显示：简略":L"派生显示：关"); }
+    case Button::ViewTarget: { const int t=NpcCombo::ViewTarget(); return Tr(t==NpcCombo::kViewNeck?L"镜头跟随：脖子":t==NpcCombo::kViewHead?L"镜头跟随：头部":L"镜头跟随：骨盆"); }
     case Button::Dummy: return Tr(dummy_present_?L"移除测试木桩":L"召唤测试木桩");
     case Button::Interval: return Tr(L"+ 间隔");
     case Button::Branch: return Tr(L"+ 按键分支");
@@ -2717,6 +3001,7 @@ std::wstring ButtonText(Button button) {
     case Button::KeepLook: return Tr(L"+ 保留变身");
     case Button::ForceHit: return Tr(L"+ 强制受击");
     case Button::Air: return Tr(L"+ 滞空");
+    case Button::BossEffect: return Tr(L"+ BOSS 特效");
     case Button::Interrupt: return Tr(L"+ 允许中断");
     case Button::Grab: return Tr(L"+ 投技");
     case Button::BossSkill: return Tr(L"+ BOSS 技能");
@@ -2768,10 +3053,19 @@ void Layout() {
     buttons_[static_cast<int>(Button::Toggle)]={right-toggle_w,y,right,y+row};
     const int toast_w=button_w(Button::Toast);  // 派生提示: the notice in the game's bottom-right corner
     buttons_[static_cast<int>(Button::Toast)]={right-toggle_w-gap-toast_w,y,right-toggle_w-gap,y+row};
+    const int hud_w=button_w(Button::Hud);  // 派生显示: the chain in the game's top-right corner
+    buttons_[static_cast<int>(Button::Hud)]={right-toggle_w-toast_w-2*gap-hud_w,y,right-toggle_w-toast_w-2*gap,y+row};
+    const int view_w=button_w(Button::ViewTarget);  // 镜头跟随: the bone the 视角跟随 camera looks at
+    const int view_right=right-toggle_w-toast_w-hud_w-3*gap;
+    buttons_[static_cast<int>(Button::ViewTarget)]={view_right-view_w,y,view_right,y+row};
     const int dummy_w=button_w(Button::Dummy);  // 测试木桩: a mob that stands still and does not die, to try chains on
-    const int dummy_right=right-toggle_w-toast_w-2*gap;
+    const int dummy_right=view_right-view_w-gap;
     buttons_[static_cast<int>(Button::Dummy)]={dummy_right-dummy_w,y,dummy_right,y+row};
-    header_={pad,y,dummy_right-dummy_w-gap,y+row};
+    // 派生页的技能伤害 / 投技伤害: what the chain's BOSS 技能 and 投技 deal, over the other pages'.
+    const int grab_w=button_w(Button::GrabDamage),skill_w=button_w(Button::SkillDamage),grab_right=dummy_right-dummy_w-gap;
+    buttons_[static_cast<int>(Button::GrabDamage)]={grab_right-grab_w,y,grab_right,y+row};
+    buttons_[static_cast<int>(Button::SkillDamage)]={grab_right-grab_w-gap-skill_w,y,grab_right-grab_w-gap,y+row};
+    header_={pad,y,(std::max)(pad+m.S(80),grab_right-grab_w-skill_w-2*gap),y+row};
     header_.right=(std::min)(header_.right,pad+static_cast<LONG>(Extent(dc,HasSkin()?strong:body,HeaderText()).cx)+m.S(20));
     y+=row+m.S(10);
     const int footer_h=m.S(24),min_canvas=m.S(460),panel=m.S(264);
@@ -2799,9 +3093,16 @@ void Layout() {
     strip_right_={edge-m.S(32),pager_y,edge,pager_y+m.S(28)};
     library_page_label_={strip_left_.right+m.S(4),pager_y,strip_right_.left-m.S(4),pager_y+m.S(28)};
     std::vector<std::pair<Kind,std::string>> all;
+    library_boss_box_={};
     if (HasSkin()&&LibrarySection()==4) {
-        for (const std::string& d:moves_.dodges) all.push_back({Kind::Dodge,d});
-        for (const std::string& ability:moves_.skills) all.push_back({NpcCombo::Classify(ability),ability});
+        library_boss_box_={left,ly,edge,ly+m.S(28)}; ly+=m.S(34);
+        NpcRetarget::SkinMoves other;const std::string boss=LibraryBoss();
+        if (!boss.empty()&&NpcRetarget::GetSkinMoves(BossLookRow(boss),other))
+            for (const std::string& ability:other.skills) all.push_back({NpcCombo::Classify(ability),ability});  // a BOSS 技能 takes no dodge
+        else {
+            for (const std::string& d:moves_.dodges) all.push_back({Kind::Dodge,d});
+            for (const std::string& ability:moves_.skills) all.push_back({NpcCombo::Classify(ability),ability});
+        }
         std::vector<Tab> wanted{{-1,{},all.size()}};
         for (int k=0;k<static_cast<int>(Kind::Count);++k) {
             const size_t count=static_cast<size_t>(std::count_if(all.begin(),all.end(),[k](const auto& a){return static_cast<int>(a.first)==k;}));
@@ -2940,11 +3241,16 @@ Hit HitTest(POINT p) {
     if (search_.open&&in(search_.rect)) return {Part::Search,SearchRowAt(p)};
     if (HasSkin()&&in(buttons_[static_cast<int>(Button::Toggle)])) return {Part::Button,static_cast<int>(Button::Toggle)};
     if (in(buttons_[static_cast<int>(Button::Toast)])) return {Part::Button,static_cast<int>(Button::Toast)};
+    if (in(buttons_[static_cast<int>(Button::Hud)])) return {Part::Button,static_cast<int>(Button::Hud)};
+    if (in(buttons_[static_cast<int>(Button::ViewTarget)])) return {Part::Button,static_cast<int>(Button::ViewTarget)};
+    if (in(buttons_[static_cast<int>(Button::SkillDamage)])) return {Part::Button,static_cast<int>(Button::SkillDamage)};
+    if (in(buttons_[static_cast<int>(Button::GrabDamage)])) return {Part::Button,static_cast<int>(Button::GrabDamage)};
     if (in(buttons_[static_cast<int>(Button::Dummy)])) return {Part::Button,static_cast<int>(Button::Dummy)};
     if (in(header_)) return {Part::Header,-1};
     for (int i=0;i<2;++i) if (in(library_tabs_[i])) return {Part::LibraryTab,i};
     for (int i=0;i<5;++i) if (in(node_categories_[i])) return {Part::NodeCategory,i};
     if (HasSkin()) for (const Button b:kTools) if (in(buttons_[static_cast<int>(b)])) return {Part::Button,static_cast<int>(b)};
+    if (in(library_boss_box_)) return {Part::LibraryBoss,-1};
     for (size_t i=0;i<tabs_.size();++i) if (in(tabs_[i].rect)) return {Part::Tab,static_cast<int>(i)};
     if (library_pages_[LibrarySection()]>0&&in(strip_left_)) return {Part::StripLeft,-1};
     if (library_pages_[LibrarySection()]+1<library_page_count_&&in(strip_right_)) return {Part::StripRight,-1};
@@ -3013,6 +3319,12 @@ Hit HitTest(POINT p) {
         else if (node.type==NodeType::Look&&in(s.field)) hit={Part::NodeField,i};
         else if (node.type==NodeType::ForceHit&&in(s.field)) hit={Part::NodeField,i};
         else if (LaunchShown(node)&&in(s.field2)) hit={Part::NodeField2,i};
+        else if (node.type==NodeType::BossEffect&&in(s.field)) hit={Part::NodeField,i};
+        else if (node.type==NodeType::BossEffect&&in(s.field2)) hit={Part::NodeField2,i};
+        else if (node.type==NodeType::BossEffect&&in(s.field3)) hit={Part::NodeField3,i};
+        else if (node.type==NodeType::BossEffect&&in(s.field4)) hit={Part::NodeField4,i};
+        else if (node.type==NodeType::BossEffect&&in(s.toggle)) hit={Part::NodeToggle,i};
+        else if (node.type==NodeType::BossEffect&&in(s.toggle2)) hit={Part::NodeToggle2,i};
         else if (node.type==NodeType::AirDefault&&in(s.toggle)) hit={Part::NodeToggle,i};
         else if (AirNode(node)&&in(s.field)) hit={Part::NodeField,i};
         else if (AirNode(node)&&in(s.field2)) hit={Part::NodeField2,i};
@@ -3030,6 +3342,7 @@ Hit HitTest(POINT p) {
         else if (KeysTrigger(node)&&in(s.field4)) hit={Part::NodeField4,i};
         else if (node.type==NodeType::Trigger&&!IsKey(i)&&in(s.toggle)) hit={Part::NodeToggle,i};
         else if (RawTrigger(node)&&in(s.toggle2)) hit={Part::NodeToggle2,i};
+        else if (NpcCombo::StartsChain(node)&&in(s.toggle3)) hit={Part::NodeToggle3,i};
         else if (NpcCombo::HasRows(node)) {
             hit={Part::Node,i};
             for (size_t r=0;r<s.routes.size();++r) {
@@ -3119,6 +3432,7 @@ COLORREF ModColor(NodeType type) {
     if (type==NodeType::Damage) return UiTheme::Mix(RGB(226,72,112),UiTheme::Text(),15);
     if (type==NodeType::Trim) return UiTheme::Mix(RGB(172,196,64),UiTheme::Text(),15);
     if (type==NodeType::Air) return UiTheme::Mix(RGB(80,176,236),UiTheme::Text(),15);
+    if (type==NodeType::BossEffect) return UiTheme::Mix(RGB(232,120,64),UiTheme::Text(),15);
     return UiTheme::AccentBlue();
 }
 COLORREF GrabColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(190,104,170),UiTheme::Text(),15); }
@@ -3506,6 +3820,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                           Hit{Part::NodeHoldMinus,index},Hit{Part::NodeHoldPlus,index},Hit{Part::NodeHoldValue,index});
                 if (editing) Rounded(graphics,s.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
             }
+            CheckRow(dc,graphics,s.toggle3,node.own_look,hot_==Hit{Part::NodeToggle3,index},ChainOwnLookText(node.own_look));
             if (!key) {
                 const int box=s.toggle.bottom-s.toggle.top-Px(4);
                 const RECT check{s.toggle.left,s.toggle.top+Px(2),s.toggle.left+box,s.toggle.top+Px(2)+box};
@@ -3606,6 +3921,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             const bool add_hot=hot_==Hit{Part::RouteAdd,index};
             Rounded(graphics,s.add,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),accent,add_hot?24:6),255,UiTheme::Mix(UiTheme::Border(),accent,30),255);
             Label(dc,Tr(L"+ 添加动作"),s.add,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+            CheckRow(dc,graphics,s.toggle3,node.own_look,hot_==Hit{Part::NodeToggle3,index},ChainOwnLookText(node.own_look));
             break;
         }
         case NodeType::Branch: {
@@ -3810,7 +4126,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             const int cancel=NpcCombo::ClampCancel(node.ms);
             Stepper(dc,graphics,s,index,editing?edit_.text+(caret?L"▏":L" ")+L" s":cancel?Seconds(cancel/1000.0):Tr(L"放完"));
             if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
-            CheckRow(dc,graphics,s.toggle,node.own_look,hot_==Hit{Part::NodeToggle,index},Tr(node.own_look?L"不变身：动作套到当前外观上":L"不变身（动作套到主角）"));
+            CheckRow(dc,graphics,s.toggle,node.own_look||ChainOwnLook(i),hot_==Hit{Part::NodeToggle,index},OwnLookText(i));
             break;
         }
         case NodeType::Look: {
@@ -3821,6 +4137,23 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             Label(dc,(node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss))+L"  ▾",inner,Scaled(UiTheme::Font::Body),node.boss.empty()?muted:text,
                   DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            break;
+        }
+        case NodeType::BossEffect: {
+            // BOSS 特效: its six fields (source, effect, place, damage, radius, hits), then a note.
+            const COLORREF hue=ModColor(node.type);
+            Card(dc,graphics,s,hue,CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            const auto field=[&](const RECT& r,Part part,int route){
+                const bool field_hot=hot_==Hit{part,index};
+                const bool unset=(route==-1&&node.boss.empty())||(route==-2&&node.ability.empty());
+                const bool off=route<=-5&&NpcCombo::ClampEffectDamage(node.fx_damage)==0;  // no damage: radius and hits unused
+                Rounded(graphics,r,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),hue,field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),hue,30),255);
+                RECT inner=r; InflateRect(&inner,-Px(7),0);
+                Label(dc,FxFieldText(node,route)+L"  ▾",inner,Scaled(UiTheme::Font::Body),unset||off?muted:text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            };
+            field(s.field,Part::NodeField,-1); field(s.field2,Part::NodeField2,-2); field(s.field3,Part::NodeField3,-3);
+            field(s.field4,Part::NodeField4,-4); field(s.toggle,Part::NodeToggle,-5); field(s.toggle2,Part::NodeToggle2,-6);
+            Label(dc,NodeNote(i),Row(s.rect,6),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
         }
         case NodeType::ForceHit: case NodeType::Air: case NodeType::AirDefault: {
@@ -3862,7 +4195,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                 Label(dc,GrabField(node)+L"  ▾",inner,Scaled(UiTheme::Font::Body),NodeGrab(node)?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             }
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
-            CheckRow(dc,graphics,s.toggle,node.own_look,hot_==Hit{Part::NodeToggle,index},Tr(node.own_look?L"不变身：动作套到当前外观上":L"不变身（动作套到主角）"));
+            CheckRow(dc,graphics,s.toggle,node.own_look||ChainOwnLook(i),hot_==Hit{Part::NodeToggle,index},OwnLookText(i));
             break;
         case NodeType::Armor: case NodeType::Interrupt: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::IgnoreGuard:
             Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
@@ -3946,6 +4279,10 @@ void Paint(HDC printed=nullptr) {
         Label(dc,HeaderText(),title,HasSkin()?strong:body,HasSkin()?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
         DrawButton(dc,graphics,Button::Toggle,config_.enabled,HasSkin());
         DrawButton(dc,graphics,Button::Toast,NpcCombo::ShowToast(),true);
+        DrawButton(dc,graphics,Button::Hud,NpcCombo::ChainHud()!=NpcCombo::kHudOff,true);
+        DrawButton(dc,graphics,Button::ViewTarget,false,true);
+        DrawButton(dc,graphics,Button::SkillDamage,NpcCombo::ChainSkillDamage()>0||(search_.open&&search_.mode==4),true);
+        DrawButton(dc,graphics,Button::GrabDamage,NpcCombo::ChainGrabDamage().mode!=NpcCombo::kGrabFollow||(search_.open&&search_.mode==5),true);
         DrawButton(dc,graphics,Button::Dummy,dummy_present_,true);
         Rounded(graphics,library_,static_cast<float>(m.S(10)),UiTheme::Base(),255,UiTheme::Border(),255);
         Label(dc,Tr(L"添加到画布"),library_title_,strong,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT);
@@ -3972,6 +4309,13 @@ void Paint(HDC printed=nullptr) {
         wchar_t page_text[64]{};
         _snwprintf_s(page_text,_countof(page_text),_TRUNCATE,Tr(L"第 %d / %d 页").c_str(),library_pages_[LibrarySection()]+1,library_page_count_);
         Label(dc,page_text,library_page_label_,small_font,text,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+        if (library_boss_box_.right>library_boss_box_.left) {  // 招式来源
+            const std::string boss=LibraryBoss();const bool hot=hot_.part==Part::LibraryBoss||(search_.open&&search_.mode==6);
+            const COLORREF hue=boss.empty()?accent:BossColor();
+            Rounded(graphics,library_boss_box_,static_cast<float>(m.S(6)),UiTheme::Mix(paper,hue,hot?24:boss.empty()?6:14),255,boss.empty()?UiTheme::Border():hue,255,boss.empty()?1.f:1.5f);
+            RECT inner=library_boss_box_; InflateRect(&inner,-m.S(10),0);
+            Label(dc,Tr(L"招式来源：")+(boss.empty()?Tr(L"本表外观"):Tr(BossLookName(boss).c_str()))+L"  ▾",inner,small_font,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        }
         for (size_t i=0;i<tabs_.size();++i) {
             const Tab& tab=tabs_[i]; const bool on=tab.kind==category_,hot=hot_==Hit{Part::Tab,static_cast<int>(i)};
             const COLORREF hue=tab.kind<0?accent:KindColor(static_cast<Kind>(tab.kind));
@@ -4235,8 +4579,7 @@ void DragEnd(POINT p) {
         break;
     case Drag::Pill:
         if (PtInRect(&canvas_,p)&&static_cast<size_t>(done.index)<pills_.size()) {
-            Node node; node.ability=pills_[static_cast<size_t>(done.index)].ability;
-            Place(node,ToCanvasX(p.x)-30,ToCanvasY(p.y)-kHeader/2.f);
+            Place(LibraryNode(pills_[static_cast<size_t>(done.index)].ability),ToCanvasX(p.x)-30,ToCanvasY(p.y)-kHeader/2.f);
         }
         break;
     default: break;
@@ -4433,21 +4776,38 @@ namespace {
 // page's look's moves; a BOSS 技能 / 援护 node's 招式 rows are its look's.
 // 投技 previews: a grab stands in the preview's look row as kGrabSkin with "grab:<variant id>" for its move.
 constexpr int32_t kGrabSkin=-100;
+constexpr int32_t kEffectSkin=-101;  // 特效预览: `ability` is a BOSS 特效's effect name
 const char kGrabPrefix[]="grab:";
+// The look a move of this page previews with: the page's own look, else (the hero's page, whose list holds the BOSS
+// moves the hero was granted for 不变身 beside its own) the look whose moves hold that ability. -1: none (the hero's own
+// moves have no preview). Found looks are kept; a miss is looked up again after 2 s (the looks' lists load late).
+int32_t PreviewSkin(const std::string& ability) {
+    if (skin_>=0||ability.empty()) return skin_;
+    struct Found { int32_t row=-1; ULONGLONG at=0; };
+    static std::unordered_map<std::string,Found> found;
+    const ULONGLONG now=GetTickCount64();
+    if (const auto it=found.find(ability);it!=found.end()&&(it->second.row>=0||now<it->second.at+2000)) return it->second.row;
+    Found f; f.at=now;
+    NpcRetarget::SkinMoves m;
+    for (int32_t row=0;row<1024&&NpcRetarget::GetSkinMoves(row,m);++row)
+        if (std::find(m.skills.begin(),m.skills.end(),ability)!=m.skills.end()) { f.row=row; break; }
+    found[ability]=f; return f.row;
+}
 bool SearchMoveRow(int32_t& skin,std::string& ability,RECT& anchor) {
     const int row=search_.hot>=0?search_.hot:(search_.keyed?search_.selected:-1);
     if (row<0||static_cast<size_t>(row)>=search_.rows.size()||search_.rows[static_cast<size_t>(row)].header) return false;
     const size_t index=search_.rows[static_cast<size_t>(row)].item;
     if (index>=search_.items.size()||search_.items[index].ability.empty()) return false;
     const Item& item=search_.items[index];
-    if (item.kind==ItemKind::Move) skin=skin_;
+    if (item.kind==ItemKind::Move) skin=PreviewSkin(item.ability);
     else if (item.kind==ItemKind::BossMove&&At(search_.pick_node)) skin=BossLookRow(config_.chain[static_cast<size_t>(search_.pick_node)].boss);
     else if (item.kind==ItemKind::GrabMove) skin=kGrabSkin;  // a 投技 node's list of grabs
+    else if (item.kind==ItemKind::FxPick) skin=kEffectSkin;  // a BOSS 特效 node's list of effects
     else return false;
     const int row_h=M().S(26),top=search_.list.top+(row-search_.scroll)*row_h;
     if (row<search_.scroll||top+row_h>search_.list.bottom) return false;  // scrolled out of the list
     ability=skin==kGrabSkin?kGrabPrefix+item.ability:item.ability; anchor={search_.list.left,top,search_.list.right,top+row_h};
-    return skin>=0||skin==kGrabSkin;
+    return skin>=0||skin==kGrabSkin||skin==kEffectSkin;
 }
 // The move under the mouse: a pill of the strip (this page's look) or a move card (a BOSS 技能 / 援护 card: its own look),
 // or a move row of the search box (beside).
@@ -4468,7 +4828,7 @@ bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int&
         const int source=hovered&&hovered->type==NodeType::Trim?NpcCombo::TrimmedBy(config_,test_hover_.node):
             hovered&&(hovered->type==NodeType::BoneTransform||hovered->type==NodeType::Speed)?MoveUnderSpeed(test_hover_.node):test_hover_.node;
         const Node* n=At(source); if (!n||n->ability.empty()||(n->type!=NodeType::Skill&&!NpcCombo::PicksBossMove(*n))) return false;
-        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss); ability=n->ability; index=source;
+        skin=n->type==NodeType::Skill?PreviewSkin(n->ability):BossLookRow(n->boss); ability=n->ability; index=source;
         const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(test_hover_.node)).rect; ReleaseDC(window_,dc);
         return skin>=0;
     }
@@ -4480,7 +4840,8 @@ bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int&
     if ((drag_.mode!=Drag::None&&drag_.mode!=Drag::Trim)||edit_.node>=0||record_.node>=0) return false;
     if (search_.open) { beside=true; return SearchMoveRow(skin,ability,anchor); }
     if (hot_.part==Part::Pill&&hot_.index>=0&&static_cast<size_t>(hot_.index)<pills_.size()) {
-        skin=skin_; ability=pills_[static_cast<size_t>(hot_.index)].ability; anchor=pills_[static_cast<size_t>(hot_.index)].rect; return skin>=0&&!ability.empty(); }
+        ability=pills_[static_cast<size_t>(hot_.index)].ability; const std::string boss=LibraryBoss();
+        skin=boss.empty()?PreviewSkin(ability):BossLookRow(boss); anchor=pills_[static_cast<size_t>(hot_.index)].rect; return skin>=0&&!ability.empty(); }
     // A 加速 card (or its open curve window's node) shows the move it speeds up, at its speed.
     const int bone_editor=BoneMotionPage::EditedNode();
     const bool on_speed=hot_.index>=0&&At(hot_.index)&&(At(hot_.index)->type==NodeType::Speed||At(hot_.index)->type==NodeType::BoneTransform)&&
@@ -4488,26 +4849,31 @@ bool HoverMove(int32_t& skin,std::string& ability,RECT& anchor,bool& beside,int&
     const int editor=bone_editor>=0?bone_editor:SpeedCurveWindow::EditedNode();
     if(on_speed||(editor>=0&&hot_.part==Part::None&&At(editor))){
         const int from=on_speed?hot_.index:editor,move=MoveUnderSpeed(from);const Node* n=At(move);if(!n)return false;
-        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss);ability=n->ability;index=move;
+        skin=n->type==NodeType::Skill?PreviewSkin(n->ability):BossLookRow(n->boss);ability=n->ability;index=move;
         const HDC dc=GetDC(window_);anchor=NodeShape(dc,static_cast<size_t>(from)).rect;ReleaseDC(window_,dc);return skin>=0;
     }
     // A 裁剪 card (its steppers too) shows the BOSS 技能 it cuts, only its part, as the chain plays it.
     if (hot_.index>=0&&At(hot_.index)&&config_.chain[static_cast<size_t>(hot_.index)].type==NodeType::Trim&&hot_.part>=Part::Node&&hot_.part<=Part::NodeTrimBar) {
         const int source=NpcCombo::TrimmedBy(config_,hot_.index);
         const Node* n=At(source); if (!n||n->ability.empty()) return false;
-        skin=n->type==NodeType::Skill?skin_:BossLookRow(n->boss); ability=n->ability; index=source;
+        skin=n->type==NodeType::Skill?PreviewSkin(n->ability):BossLookRow(n->boss); ability=n->ability; index=source;
         const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
         return skin>=0;
     }
     if (hot_.part!=Part::Node||!At(hot_.index)) return false;
     const Node& node=config_.chain[static_cast<size_t>(hot_.index)];
     index=hot_.index;
+    if (node.type==NodeType::BossEffect&&!node.ability.empty()) {  // BOSS 特效: its effect on the stage
+        skin=kEffectSkin; ability=node.ability; index=-1;
+        const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
+        return true;
+    }
     if (node.type==NodeType::Grab&&!node.ability.empty()) {  // 投技: its grab
         skin=kGrabSkin; ability=kGrabPrefix+node.ability;
         const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
         return true;
     }
-    if (node.type==NodeType::Skill&&!node.ability.empty()) { skin=skin_; ability=node.ability; }
+    if (node.type==NodeType::Skill&&!node.ability.empty()) { skin=PreviewSkin(node.ability); ability=node.ability; }
     else if (NpcCombo::PicksBossMove(node)&&!node.ability.empty()&&!node.boss.empty()) { skin=BossLookRow(node.boss); ability=node.ability; }
     else return false;
     const HDC dc=GetDC(window_); anchor=NodeShape(dc,static_cast<size_t>(hot_.index)).rect; ReleaseDC(window_,dc);
@@ -4561,6 +4927,9 @@ void UpdatePreview() {
             // 投技: the boss of the look that plays the grab, playing the grab's executor montage (no target to grab).
             const MotianGrab::Variant* v=NodeGrab([&]{ Node n; n.ability=ability.substr(std::strlen(kGrabPrefix)); return n; }());
             if (!v||!NpcRetarget::GrabPreviewMonster(v->boss_id,v->source,monster)||(package=MotianGrab::PreviewMontage(v->index)).empty()) { preview_.none=true; return; }
+        } else if (skin==kEffectSkin) {
+            const NpcBossEffect* e=NpcBossEffects::Find(ability); if (!e) { preview_.none=true; return; }
+            monster=MovePreview::kEffectStage; package=e->path;
         } else if (!NpcRetarget::MovePreviewSubject(skin,ability,monster,package)) { preview_.none=true; return; }  // the hero's moves: none
         MovePreview::Show(monster,package,preview_.speed,preview_.curve,preview_.trim_from,preview_.trim_to,preview_.bones,preview_.trim_holds); preview_.asked=true; preview_.monster=monster; preview_.package=package; preview_frame_={}; Invalidate();
     } else if (preview_.asked&&changed&&!preview_.monster.empty()) {
@@ -4624,6 +4993,10 @@ void DrawPreview(HDC dc,Gdiplus::Graphics& graphics,const RECT& client) {
         Label(dc,pace,right,Font(UiTheme::Font::Small),UiTheme::Accent(),DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
     }
     std::wstring title=MoveText(preview_.ability);
+    if (preview_.skin==kEffectSkin) {
+        const NpcBossEffect* e=NpcBossEffects::Find(preview_.ability);
+        title=Tr(L"特效预览")+L" · "+(e?FxFolderName(e->folder)+L" / "+[&]{ const std::string n=NpcBossEffects::ShortName(*e); return std::wstring(n.begin(),n.end()); }():Tr(L"（无效特效）"));
+    }
     if (preview_.skin==kGrabSkin) {
         Node n; n.ability=preview_.ability.substr(std::strlen(kGrabPrefix));
         const MotianGrab::Variant* v=NodeGrab(n);
@@ -4684,6 +5057,405 @@ void ApplyScratch() {
         Logf("COMBO_SCRATCH zoom %d%%",static_cast<int>(std::lround(Zoom()*100))); Invalidate();
     }
 }
+
+// ---- 派生显示: the chain going on, in the game's top-right corner ---------------------------------------------------
+// A click-through layered window (as SkillToast) over the game client, drawn on the UI worker from what the game
+// thread publishes (NpcCombo::ChainState) and the chain's saved set (NpcCombo::Load). 详细: the chain from its start
+// as a thumbnail of the page's canvas (its nodes where the page has them), the move playing lit, the node the chain
+// waits at outlined, the move a kept press plays next dashed and the moves the next press may play marked. 简略: the
+// move playing, then a row per press that takes the chain on (its keys as the page shows them and the move it
+// plays), the kept press's row lit. Both show how long the chain still waits for a press. It stays up while
+// NpcCombo::ChainHud is on and the game is in front, hidden only while the hub covers the game: with no chain going
+// on it shows the chain it showed last (else the profile's first start) waiting at its start (待命), and while the game
+// thread publishes nothing new (a load, a pause) the last state it had.
+constexpr wchar_t kHudClass[]=L"PBZChainHud_v1";
+constexpr double kHudRight=24,kHudTop=24,kHudShadow=14,kHudPad=12,kHudMapW=360,kHudMapH=230,kHudMapScale=.30,kHudSimpleW=300,kHudSimpleMaxW=460;
+constexpr ULONGLONG kHudStaleMs=1000;
+constexpr size_t kHudRowsMax=12;  // rows of presses the overlay lists at most
+struct HudState {
+    HWND window=nullptr; UiSurface::Surface surface; double scale=1; int width=0,height=0,margin=0,last_alpha=-1; POINT last{-1,-1};
+    NpcCombo::ChainState state; ULONGLONG wait_from=0,drawn_at=0; int mode=0,drawn_mode=-1,last_trigger=-1; bool shown=false,idle=false,drawn_idle=false;
+    std::string profile; uint64_t generation=0; NpcCombo::Config config; NpcCombo::ChainState drawn; uint64_t drawn_generation=0; UINT drawn_dpi=0;
+    std::vector<bool> drawn_picks;
+    UiMotion::Tween fade;
+} hud_;
+int HS(double v) { return static_cast<int>(std::lround(v*hud_.scale)); }
+UINT HudDpi() { return static_cast<UINT>(std::lround(96*hud_.scale)); }
+const Node* HudNode(const NpcCombo::Config& c,int i) { return i>=0&&static_cast<size_t>(i)<c.chain.size()?&c.chain[static_cast<size_t>(i)]:nullptr; }
+// What the overlay calls a node: a move's name (as the page's fields), else the card's title.
+std::wstring HudName(const NpcCombo::Config& c,int i) {
+    const Node* n=HudNode(c,i); if (!n) return {};
+    switch (n->type) {
+    case NodeType::Skill: case NodeType::BossSkill: case NodeType::Assist: return MoveText(n->ability);
+    case NodeType::WeaponMove: return WeaponMoveText(n->weapon,n->ability);
+    case NodeType::Grab: return GrabField(*n);
+    case NodeType::Look: return Tr(L"变身 · ")+BossLookName(n->boss);
+    case NodeType::Group: {
+        wchar_t text[64]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"组合 · %zu 招").c_str(),NpcCombo::GroupSteps(c,i).size()); return text;
+    }
+    default: return NodeTitle(*n);
+    }
+}
+// The chain's start: its button (a key's own keys), or the 武器派生修改.
+std::wstring HudStart(const NpcCombo::Config& c,int t) {
+    const Node* n=HudNode(c,t); if (!n) return {};
+    if (n->type==NodeType::WeaponActions) return Tr(n->air_set?L"空中派生":L"武器派生修改");
+    if (n->trigger==static_cast<int>(Trigger::NpcKey)) return Tr(L"NPC 技能键");
+    if (NpcCombo::OwnKeysTrigger(n->trigger)) return KeysText(*n);
+    return ButtonLabel(n->trigger);
+}
+// A next press's keys from x at height h (draw false: measured only); returns the width.
+int HudKeys(HDC dc,const NpcCombo::Config& c,int trigger,const NpcCombo::NextInput& in,int x,int y,int h,bool draw,COLORREF muted) {
+    std::vector<int> keys; bool chord=false,raw=false;
+    if (in.button==NpcCombo::kThenKeyButton) {
+        const Node* t=HudNode(c,trigger); const int key=t?NpcCombo::ThenRawKey(*t):-1;
+        if (key<0) return 0;
+        const int w=KeyIconWidth(dc,key,true,h); if (draw) DrawKeyIcon(dc,x,y,key,true,h); return w;
+    }
+    if (NpcCombo::OwnKeysTrigger(in.button)) {
+        const Node* b=HudNode(c,in.branch);
+        if (b&&in.row>=0&&static_cast<size_t>(in.row)<b->routes.size()) { const auto& r=b->routes[static_cast<size_t>(in.row)]; keys=r.keys; chord=r.chord; raw=RawRoute(r); }
+        else if (const Node* t=HudNode(c,trigger)) { keys=t->keys; chord=t->chord; raw=RawTrigger(*t); }
+        int width=0;
+        for (size_t k=0;k<keys.size();++k) {
+            if (k) {
+                const int sep=KeySeparator(h);
+                if (draw) { RECT between{x+width,y,x+width+sep,y+h}; SetTextColor(dc,muted); DrawTextW(dc,chord?L"+":L"→",-1,&between,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_NOPREFIX); }
+                width+=sep;
+            }
+            const int w=KeyIconWidth(dc,keys[k],raw,h); if (draw) DrawKeyIcon(dc,x+width,y,keys[k],raw,h); width+=w;
+        }
+        return width;
+    }
+    if (in.button==static_cast<int>(Trigger::NpcKey)) {
+        const UiHotkeys::Chord key=UiHotkeys::Get(UiHotkeys::Action::NpcSkill);
+        if (key.empty()) { const std::wstring t=Tr(L"NPC 技能键"); const int w=UiHotkeys::KeyWidth(dc,h,t.c_str()); if (draw) UiHotkeys::DrawKey(dc,x,y,h,t.c_str()); return w; }
+        const int w=(std::max)(h,UiHotkeys::Width(dc,h,key)-h/5); if (draw) UiHotkeys::Draw(dc,x,y,h,key,x+w+h); return w;
+    }
+    const std::wstring label=ButtonLabel(in.button);
+    const int w=UiHotkeys::KeyWidth(dc,h,label.c_str()); if (draw) UiHotkeys::DrawKey(dc,x,y,h,label.c_str()); return w;
+}
+int HudTextWidth(HDC dc,HFONT font,const std::wstring& text) {
+    const HGDIOBJ old=SelectObject(dc,font); SIZE size{}; GetTextExtentPoint32W(dc,text.c_str(),static_cast<int>(text.size()),&size); SelectObject(dc,old); return size.cx;
+}
+void HudText(HDC dc,HFONT font,const std::wstring& text,RECT rect,COLORREF color,UINT flags) {
+    const HGDIOBJ old=SelectObject(dc,font); SetTextColor(dc,color); SetBkMode(dc,TRANSPARENT);
+    DrawTextW(dc,text.c_str(),-1,&rect,flags|DT_NOPREFIX); SelectObject(dc,old);
+}
+// The canvas box a node takes in the thumbnail (canvas units, about the page's card).
+RECT HudBox(const Node& n) {
+    int w=300,h=kHeader+kRow*2+kPad;
+    switch (n.type) {
+    case NodeType::Group: w=NpcCombo::ClampGroupW(n.w); h=NpcCombo::ClampGroupH(n.h); break;
+    case NodeType::Branch: w=500; h=kHeader+kRow*(static_cast<int>(n.routes.size())+2)+kPad; break;
+    case NodeType::WeaponActions: w=500; h=kHeader+kRow*(static_cast<int>(n.routes.size())+5)+kPad; break;
+    case NodeType::Trigger: h=kHeader+kRow*5+kPad; break;
+    case NodeType::Interval: w=200; break;
+    case NodeType::BossSkill: case NodeType::Hook: case NodeType::WeaponMove: case NodeType::Teleport: case NodeType::Assist: w=340; h=kHeader+kRow*5+kPad; break;
+    default: break;
+    }
+    return {n.x,n.y,n.x+w,n.y+h};
+}
+// The wait bar: how much of the chain's wait for a press is left (0..1; -1: not waiting).
+double HudWaitLeft(ULONGLONG now) {
+    const ULONGLONG until=hud_.state.wait_until;
+    if (!until||now>=until||hud_.wait_from>=until) return -1;
+    return static_cast<double>(until-now)/static_cast<double>(until-hud_.wait_from);
+}
+void HudBar(HDC dc,Gdiplus::Graphics& g,const RECT& track,double left) {
+    if (left<0) return;
+    Rounded(g,track,static_cast<float>(HS(2)),UiTheme::Mix(UiTheme::Panel(),UiTheme::Text(),14),255,0,0);
+    RECT fill=track; fill.right=fill.left+static_cast<int>(std::lround((track.right-track.left)*std::clamp(left,0.0,1.0)));
+    if (fill.right>fill.left+1) Rounded(g,fill,static_cast<float>(HS(2)),left<.25?UiTheme::Mix(UiTheme::Accent(),RGB(230,80,60),60):UiTheme::Accent(),255,0,0);
+    (void)dc;
+}
+bool HudStartNode(const NpcCombo::Config& c,int i);
+// Where the chain has rows that one press chooses between (the same button: a tap or 按住, now or after a 停顿), the
+// row that press takes now, as the game thread decides it (NpcCombo::Follow, then Decide's shortest pause): the rows
+// whose pause is over since the branch's pause start and whose hold the button held now has reached; of those the
+// longest hold, then the longest pause. Too early for all: the row of the shortest pause still to come (the press is
+// kept for it). picks[k] for next[k]; a press with one row only is not picked.
+std::vector<bool> HudPicks(const NpcCombo::ChainState& s,const std::vector<NpcCombo::NextInput>& next,ULONGLONG now) {
+    std::vector<bool> picks(next.size(),false);
+    const long long since=s.branch_at&&now>=s.branch_at?static_cast<long long>(now-s.branch_at):-1;
+    const auto own_keys=[](const NpcCombo::NextInput& in){ return NpcCombo::OwnKeysTrigger(in.button); };
+    const auto same_press=[&](const NpcCombo::NextInput& a,const NpcCombo::NextInput& b){
+        if (own_keys(a)||own_keys(b)) return a.branch==b.branch&&a.row==b.row;
+        return a.button==b.button;
+    };
+    const auto held_for=[&](const NpcCombo::NextInput& in)->long long{
+        if (!s.hold_down||now<s.hold_down) return 0;
+        const NpcCombo::Press& p=s.hold_press;
+        const bool match=own_keys(in)?p.branch==in.branch&&p.row==in.row:NpcCombo::Matches(in.button,p);
+        return match?static_cast<long long>(now-s.hold_down):0;
+    };
+    std::vector<bool> done(next.size(),false);
+    for (size_t a=0;a<next.size();++a) {
+        if (done[a]) continue;
+        std::vector<size_t> group;
+        for (size_t b=a;b<next.size();++b) if (!done[b]&&same_press(next[a],next[b])) { group.push_back(b); done[b]=true; }
+        if (group.size()<2) continue;
+        const long long held=held_for(next[a]);
+        int best=-1,later=-1;
+        for (const size_t k:group) {
+            const NpcCombo::NextInput& in=next[k];
+            if (in.hold_ms>held) continue;
+            if (in.pause_ms>0&&(since<0||since<in.pause_ms)) {
+                if (later<0||in.pause_ms<next[static_cast<size_t>(later)].pause_ms) later=static_cast<int>(k);
+                continue;
+            }
+            if (best<0) { best=static_cast<int>(k); continue; }
+            const NpcCombo::NextInput& was=next[static_cast<size_t>(best)];
+            if (in.hold_ms>was.hold_ms||(in.hold_ms==was.hold_ms&&in.pause_ms>was.pause_ms)) best=static_cast<int>(k);
+        }
+        const int pick=best>=0?best:later;
+        if (pick>=0) picks[static_cast<size_t>(pick)]=true;
+    }
+    return picks;
+}
+// Paints the overlay into hud_.surface (body inside a shadow margin); false: nothing to show.
+bool HudRender(ULONGLONG now) {
+    const NpcCombo::Config& c=hud_.config; const NpcCombo::ChainState& s=hud_.state;
+    const UINT dpi=HudDpi();
+    const HFONT small_font=UiTheme::GetFont(UiTheme::Font::Small,dpi),strong=UiTheme::GetFont(UiTheme::Font::Strong,dpi),body_font=UiTheme::GetFont(UiTheme::Font::Body,dpi);
+    const COLORREF text=UiTheme::Text(),muted=UiTheme::MutedText(),accent=UiTheme::Accent(),panel=UiTheme::Mix(UiTheme::Panel(),UiTheme::Text(),4);
+    const int pad=HS(kHudPad),current=s.playing>=0?s.playing:s.cursor;
+    hud_.margin=HS(kHudShadow);
+    if (!HudNode(c,s.trigger)) {  // a profile with no start: the title and a line saying so
+        const std::wstring title=Tr(L"派生显示"),note=Tr(L"还没有派生链");
+        HDC measure=CreateCompatibleDC(nullptr);
+        hud_.width=(std::max)({HudTextWidth(measure,strong,title),HudTextWidth(measure,small_font,note),HS(200)})+2*pad;
+        DeleteDC(measure);
+        hud_.height=pad+HS(22)+HS(4)+HS(18)+pad;
+        if (!hud_.surface.Ensure(hud_.width+2*hud_.margin,hud_.height+2*hud_.margin)) return false;
+        hud_.surface.Clear(); HDC dc=hud_.surface.dc; SetBkMode(dc,TRANSPARENT);
+        const RECT body{hud_.margin,hud_.margin,hud_.margin+hud_.width,hud_.margin+hud_.height};
+        SetDCBrushColor(dc,panel); FillRect(dc,&body,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        int y=body.top+pad;
+        HudText(dc,strong,title,{body.left+pad,y,body.right-pad,y+HS(22)},text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); y+=HS(22)+HS(4);
+        HudText(dc,small_font,note,{body.left+pad,y,body.right-pad,y+HS(18)},muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+        hud_.surface.Shape(body,HS(10),UiTheme::Mix(UiTheme::Border(),accent,30),hud_.margin,.45);
+        return true;
+    }
+    const std::wstring start=HudStart(c,s.trigger),now_name=hud_.idle?Tr(L"待命"):current==s.trigger?Tr(L"派生开始"):HudName(c,current);
+    const std::vector<NpcCombo::NextInput> next=NpcCombo::NextInputs(c,s.cursor,s.button,kHudRowsMax);
+    const std::vector<bool> picks=hud_.idle?std::vector<bool>(next.size(),false):HudPicks(s,next,now);
+    // Every press that does something now: the chain's next presses (none at 待命), then under 其他起手 the first press
+    // of every other start (it starts that chain over this one); at 待命 every start's. At most kHudRowsMax rows.
+    struct HudRow { int trigger=-1; NpcCombo::NextInput in; bool other=false; };
+    std::vector<HudRow> rows; size_t more=0;
+    const auto push=[&](int t,const NpcCombo::NextInput& in,bool other){ if (rows.size()<kHudRowsMax) rows.push_back({t,in,other}); else ++more; };
+    if (!hud_.idle) for (const auto& in:next) push(s.trigger,in,false);
+    const size_t own=rows.size();
+    for (size_t i=0;i<c.chain.size();++i) {
+        const int t=static_cast<int>(i);
+        if (!HudStartNode(c,t)||(!hud_.idle&&t==s.trigger)) continue;
+        const Node& n=c.chain[i];
+        for (const auto& in:NpcCombo::NextInputs(c,t,n.type==NodeType::Trigger?n.trigger:0,4)) push(t,in,!hud_.idle);
+    }
+    const double wait=HudWaitLeft(now);
+    // A row's tags: its 按住 and its pause.
+    const auto tags_of=[](const NpcCombo::NextInput& in){
+        std::wstring tags;
+        if (in.hold_ms>0) { wchar_t t[32]{}; _snwprintf_s(t,_countof(t),_TRUNCATE,Tr(L"按住 %.1f s").c_str(),in.hold_ms/1000.0); tags=t; }
+        if (in.pause_ms>0) { wchar_t t[32]{}; _snwprintf_s(t,_countof(t),_TRUNCATE,Tr(L"停顿 %.1f s").c_str(),in.pause_ms/1000.0); tags+=(tags.empty()?L"":L" · ")+std::wstring(t); }
+        return tags;
+    };
+    const int sec_h=HS(18);
+    const auto measure_rows=[&](HDC dc,int key_h,HFONT name_font,int& keys_w,int& names_w){
+        keys_w=0; names_w=0;
+        for (const HudRow& r:rows) {
+            keys_w=(std::max)(keys_w,HudKeys(dc,c,r.trigger,r.in,0,0,key_h,false,muted));
+            const std::wstring tags=tags_of(r.in);
+            names_w=(std::max)(names_w,HudTextWidth(dc,name_font,HudName(c,r.in.move))+(tags.empty()?0:HudTextWidth(dc,small_font,tags)+HS(14)));
+        }
+    };
+    const auto rows_height=[&](int row_h){
+        int h=static_cast<int>(rows.size())*row_h;
+        if (!hud_.idle&&own==0) h+=row_h;                        // 派生到此结束
+        if (own<rows.size()&&!hud_.idle) h+=sec_h;               // 其他起手
+        if (more) h+=sec_h;
+        return h;
+    };
+    // The rows from y: a key column keys_w wide, then the move (the kept press's row lit), its tags on the right.
+    const auto draw_rows=[&](HDC dc,Gdiplus::Graphics& g,const RECT& body,int& y,int key_h,int row_h,HFONT name_font,int keys_w){
+        if (!hud_.idle&&own==0) { HudText(dc,small_font,Tr(L"派生到此结束"),{body.left+pad,y,body.right-pad,y+row_h},muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT); y+=row_h; }
+        for (size_t k=0;k<rows.size();++k) {
+            const HudRow& r=rows[k]; const NpcCombo::NextInput& in=r.in;
+            if (r.other&&(k==0||!rows[k-1].other)) { HudText(dc,small_font,Tr(L"其他起手"),{body.left+pad,y,body.right-pad,y+sec_h},muted,DT_SINGLELINE|DT_BOTTOM|DT_LEFT); y+=sec_h; }
+            const RECT row{body.left+pad-HS(6),y+HS(1),body.right-pad+HS(6),y+row_h-HS(1)};
+            const bool kept=!r.other&&in.move==s.queued,pick=!r.other&&k<own&&k<picks.size()&&picks[k];
+            // The kept press's row filled; the row a press now takes (of rows one press chooses between) outlined.
+            if (kept) Rounded(g,row,static_cast<float>(HS(6)),UiTheme::Mix(panel,accent,30),255,accent,200,1.f);
+            else if (pick) Rounded(g,row,static_cast<float>(HS(6)),UiTheme::Mix(panel,accent,10),255,accent,230,1.5f);
+            const int x=body.left+pad;
+            HudKeys(dc,c,r.trigger,in,x,y+(row_h-key_h)/2,key_h,true,muted);
+            const std::wstring tags=tags_of(in);
+            const int tags_w=tags.empty()?0:HudTextWidth(dc,small_font,tags)+HS(8);
+            // The name gets the room the tags leave; past the widest the panel takes, the tags give way first.
+            const int name_left=x+keys_w+HS(12),name_need=HudTextWidth(dc,name_font,HudName(c,in.move));
+            const int tag_room=(std::max)(0,static_cast<int>(body.right-pad-name_left)-(std::min)(name_need,HS(90)));
+            const int tags_shown=(std::min)(tags_w,tag_room);
+            const RECT name{name_left,y,body.right-pad-tags_shown,y+row_h};
+            HudText(dc,name_font,HudName(c,in.move),name,kept||pick?text:UiTheme::Mix(text,muted,r.other?45:25),DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            if (tags_shown>0) HudText(dc,small_font,tags,{body.right-pad-tags_shown,y,body.right-pad,y+row_h},pick?accent:muted,DT_SINGLELINE|DT_VCENTER|DT_RIGHT|DT_END_ELLIPSIS);
+            y+=row_h;
+        }
+        if (more) {
+            wchar_t t[48]{}; _snwprintf_s(t,_countof(t),_TRUNCATE,Tr(L"还有 %zu 个按键").c_str(),more);
+            HudText(dc,small_font,t,{body.left+pad,y,body.right-pad,y+sec_h},muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT); y+=sec_h;
+        }
+    };
+    HDC measure=CreateCompatibleDC(nullptr);
+    if (hud_.mode==NpcCombo::kHudSimple) {
+        // 简略: the start (small), the move playing (strong), a row per press that does something now, the wait bar.
+        const int key_h=HS(20),row_h=HS(28);
+        int keys_w=0,names_w=0; measure_rows(measure,key_h,body_font,keys_w,names_w);
+        const std::wstring head=hud_.idle?Tr(L"全部起手"):start;  // 待命 lists every start
+        const int title_w=(std::max)(HudTextWidth(measure,strong,now_name),HudTextWidth(measure,small_font,head));
+        hud_.width=std::clamp((std::max)(title_w,keys_w+HS(12)+names_w)+2*pad,HS(kHudSimpleW),HS(kHudSimpleMaxW));
+        hud_.height=pad+HS(16)+HS(24)+HS(8)+rows_height(row_h)+(wait>=0?HS(10):0)+pad;
+        DeleteDC(measure);
+        if (!hud_.surface.Ensure(hud_.width+2*hud_.margin,hud_.height+2*hud_.margin)) return false;
+        hud_.surface.Clear(); HDC dc=hud_.surface.dc; SetBkMode(dc,TRANSPARENT);
+        const RECT body{hud_.margin,hud_.margin,hud_.margin+hud_.width,hud_.margin+hud_.height};
+        SetDCBrushColor(dc,panel); FillRect(dc,&body,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        int y=body.top+pad;
+        HudText(dc,small_font,head,{body.left+pad,y,body.right-pad,y+HS(16)},muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); y+=HS(16);
+        const RECT bar{body.left+pad,y+HS(4),body.left+pad+HS(4),y+HS(20)};
+        Rounded(g,bar,static_cast<float>(HS(2)),accent,255,0,0);
+        HudText(dc,strong,now_name,{bar.right+HS(8),y,body.right-pad,y+HS(24)},text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); y+=HS(24)+HS(8);
+        draw_rows(dc,g,body,y,key_h,row_h,body_font,keys_w);
+        if (wait>=0) HudBar(dc,g,{body.left+pad,y+HS(5),body.right-pad,y+HS(8)},wait);
+        hud_.surface.Shape(body,HS(10),UiTheme::Mix(UiTheme::Border(),accent,30),hud_.margin,.45);
+        return true;
+    }
+    // 详细: the nodes the start's wires reach (and those in the 组合 among them), as the page places them.
+    std::vector<char> in(c.chain.size(),0);
+    in[static_cast<size_t>(s.trigger)]=1;
+    for (const size_t i:NpcCombo::Order(c,s.trigger)) in[i]=1;
+    for (bool grew=true;grew;) {
+        grew=false;
+        for (size_t i=0;i<c.chain.size();++i) {
+            const Node& n=c.chain[i];
+            if (in[i]||n.group<0||static_cast<size_t>(n.group)>=c.chain.size()||!in[static_cast<size_t>(n.group)]||NpcCombo::IsModifier(n)||NpcCombo::IsSetting(n)) continue;
+            in[i]=1; grew=true;
+        }
+    }
+    LONG x0=LONG_MAX,y0=LONG_MAX,x1=LONG_MIN,y1=LONG_MIN;
+    for (size_t i=0;i<c.chain.size();++i) if (in[i]) { const RECT b=HudBox(c.chain[i]); x0=(std::min)(x0,b.left); y0=(std::min)(y0,b.top); x1=(std::max)(x1,b.right); y1=(std::max)(y1,b.bottom); }
+    const double bw=(std::max)(1L,x1-x0),bh=(std::max)(1L,y1-y0);
+    const double k=(std::min)({HS(kHudMapW)/bw,HS(kHudMapH)/bh,kHudMapScale*hud_.scale});
+    const int map_w=static_cast<int>(std::lround(bw*k)),map_h=static_cast<int>(std::lround(bh*k));
+    const std::wstring status=hud_.idle?Tr(L"待命 · 按起手键开始"):s.playing>=0?Tr(L"正在：")+now_name:s.queued>=0?Tr(L"接下来：")+HudName(c,s.queued):wait>=0?Tr(L"等待下一键"):now_name;
+    const int head_w=HudTextWidth(measure,strong,start)+HS(16),foot_w=HudTextWidth(measure,small_font,status);
+    // Under the map, the presses that do something now (as 简略's, smaller).
+    const int list_key_h=HS(16),list_row_h=HS(22);
+    int list_keys_w=0,list_names_w=0; measure_rows(measure,list_key_h,small_font,list_keys_w,list_names_w);
+    DeleteDC(measure);
+    hud_.width=(std::max)({map_w,head_w,foot_w,HS(220),(std::min)(list_keys_w+HS(12)+list_names_w,HS(kHudSimpleMaxW))})+2*pad;
+    hud_.height=pad+HS(22)+HS(6)+map_h+HS(8)+HS(18)+(wait>=0?HS(9):0)+HS(6)+rows_height(list_row_h)+pad;
+    if (!hud_.surface.Ensure(hud_.width+2*hud_.margin,hud_.height+2*hud_.margin)) return false;
+    hud_.surface.Clear(); HDC dc=hud_.surface.dc; SetBkMode(dc,TRANSPARENT);
+    const RECT body{hud_.margin,hud_.margin,hud_.margin+hud_.width,hud_.margin+hud_.height};
+    SetDCBrushColor(dc,panel); FillRect(dc,&body,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    Gdiplus::Graphics g(dc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    int y=body.top+pad;
+    HudText(dc,strong,start,{body.left+pad,y,body.right-pad,y+HS(22)},text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); y+=HS(22)+HS(6);
+    const int ox=body.left+pad+((body.right-body.left-2*pad)-map_w)/2,oy=y;
+    const auto at=[&](LONG cx,LONG cy){ return POINT{ox+static_cast<int>(std::lround((cx-x0)*k)),oy+static_cast<int>(std::lround((cy-y0)*k))}; };
+    const auto box=[&](size_t i){ const RECT b=HudBox(c.chain[i]); const POINT a=at(b.left,b.top),z=at(b.right,b.bottom); return RECT{a.x,a.y,(std::max)(a.x+HS(6),z.x),(std::max)(a.y+HS(4),z.y)}; };
+    std::vector<char> lead(c.chain.size(),0);  // the moves the next press may play
+    for (const auto& n:next) if (n.move>=0&&static_cast<size_t>(n.move)<lead.size()) lead[static_cast<size_t>(n.move)]=1;
+    // 组合 frames under everything.
+    for (size_t i=0;i<c.chain.size();++i) if (in[i]&&c.chain[i].type==NodeType::Group) {
+        const bool lit=s.cursor==static_cast<int>(i);
+        Rounded(g,box(i),static_cast<float>(HS(4)),UiTheme::Mix(panel,GroupColor(),14),255,lit?accent:UiTheme::Mix(UiTheme::Border(),GroupColor(),40),255,lit?2.f:1.f);
+    }
+    // Wires: from an output (a row's for a 按键分支 / 武器派生修改) to the target's header.
+    for (size_t i=0;i<c.chain.size();++i) {
+        if (!in[i]) continue;
+        const Node& n=c.chain[i]; const RECT from=box(i);
+        for (size_t o=0;o<NpcCombo::OutCount(n);++o) {
+            const int to=NpcCombo::OutOf(n,o);
+            if (to<0||static_cast<size_t>(to)>=c.chain.size()||!in[static_cast<size_t>(to)]) continue;
+            const int row=n.type==NodeType::Branch?1+static_cast<int>(o):n.type==NodeType::WeaponActions?3+static_cast<int>(o):-1;
+            const POINT a{from.right,row<0?from.top+static_cast<int>(std::lround(kHeader*k/2)):from.top+static_cast<int>(std::lround((kHeader+row*kRow+kRow/2)*k))};
+            const RECT tb=box(static_cast<size_t>(to)); const POINT b{tb.left,tb.top+static_cast<int>(std::lround(kHeader*k/2))};
+            const bool hot=static_cast<int>(i)==s.cursor||(lead[static_cast<size_t>(to)]&&(row>=0||static_cast<int>(i)==s.cursor));
+            Gdiplus::Pen pen(Argb(hot?accent:muted,hot?230:110),hot?2.f:1.f);
+            const float dx=(std::max)(12.f,std::fabs(static_cast<float>(b.x-a.x))*.45f);
+            g.DrawBezier(&pen,Gdiplus::PointF(static_cast<float>(a.x),static_cast<float>(a.y)),Gdiplus::PointF(a.x+dx,static_cast<float>(a.y)),
+                         Gdiplus::PointF(b.x-dx,static_cast<float>(b.y)),Gdiplus::PointF(static_cast<float>(b.x),static_cast<float>(b.y)));
+        }
+    }
+    // Nodes: their colour; the move playing filled with the accent, the node the chain is at outlined, a kept press's
+    // move dashed, the next press's moves marked. A name when the box has room.
+    for (size_t i=0;i<c.chain.size();++i) {
+        if (!in[i]||c.chain[i].type==NodeType::Group) continue;
+        const Node& n=c.chain[i]; const RECT r=box(i); const int idx=static_cast<int>(i);
+        const bool playing=idx==s.playing,at_node=idx==s.cursor&&s.playing<0,kept=idx==s.queued,leads=lead[i]!=0;
+        const COLORREF hue=NodeHue(n);
+        if (playing) { RECT glow=r; InflateRect(&glow,HS(3),HS(3)); Rounded(g,glow,static_cast<float>(HS(6)),accent,70,0,0); }
+        Rounded(g,r,static_cast<float>(HS(3)),playing?UiTheme::Mix(accent,text,10):UiTheme::Mix(panel,hue,leads||kept?55:38),255,
+                playing||at_node?accent:UiTheme::Mix(UiTheme::Border(),hue,50),255,playing||at_node?2.f:1.f);
+        if (kept) {
+            Gdiplus::Pen dash(Argb(accent,255),2.f); dash.SetDashStyle(Gdiplus::DashStyleDash);
+            RECT d=r; InflateRect(&d,HS(2),HS(2));
+            g.DrawRectangle(&dash,static_cast<float>(d.left),static_cast<float>(d.top),static_cast<float>(d.right-d.left),static_cast<float>(d.bottom-d.top));
+        } else if (leads&&!playing) {
+            Gdiplus::Pen mark(Argb(accent,150),1.f);
+            g.DrawRectangle(&mark,static_cast<float>(r.left-HS(1)),static_cast<float>(r.top-HS(1)),static_cast<float>(r.right-r.left+HS(2)),static_cast<float>(r.bottom-r.top+HS(2)));
+        }
+        if (r.right-r.left>=HS(44)&&r.bottom-r.top>=HS(12)) {
+            RECT t=r; InflateRect(&t,-HS(3),0);
+            const std::wstring name=n.type==NodeType::Trigger||n.type==NodeType::WeaponActions?HudStart(c,idx):HudName(c,idx);
+            HudText(dc,small_font,name,t,playing?UiTheme::Mix(panel,text,0):text,DT_SINGLELINE|DT_VCENTER|DT_CENTER|DT_END_ELLIPSIS);
+        }
+    }
+    y=oy+map_h+HS(8);
+    HudText(dc,small_font,status,{body.left+pad,y,body.right-pad,y+HS(18)},s.playing>=0?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); y+=HS(18);
+    if (wait>=0) { HudBar(dc,g,{body.left+pad,y+HS(3),body.right-pad,y+HS(6)},wait); y+=HS(9); }
+    y+=HS(6);
+    draw_rows(dc,g,body,y,list_key_h,list_row_h,small_font,list_keys_w);
+    hud_.surface.Shape(body,HS(10),UiTheme::Mix(UiTheme::Border(),accent,30),hud_.margin,.45);
+    return true;
+}
+bool HudCreate() {
+    if (hud_.window) return true;
+    WNDCLASSW cls{}; cls.lpfnWndProc=DefWindowProcW; cls.hInstance=GetModuleHandleW(nullptr); cls.lpszClassName=kHudClass;
+    if (!RegisterClassW(&cls)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return false;
+    hud_.window=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT,kHudClass,L"",WS_POPUP,0,0,1,1,nullptr,nullptr,cls.hInstance,nullptr);
+    if (!hud_.window) return false;
+    if (!UiHost::Attach(hud_.window)) { DestroyWindow(hud_.window); hud_.window=nullptr; return false; }
+    return true;
+}
+// The state shown and the chain it names (read again when the set changes).
+void HudLoad(const std::string& profile) {
+    const uint64_t generation=NpcCombo::Generation();
+    if (profile!=hud_.profile) hud_.last_trigger=-1;  // the node numbers are another set's
+    if (profile!=hud_.profile||generation!=hud_.generation) { hud_.config=NpcCombo::Load(profile); hud_.profile=profile; hud_.generation=generation; }
+}
+void HudTake(const NpcCombo::ChainState& s,ULONGLONG now) {
+    if (s.wait_until!=hud_.state.wait_until||hud_.idle) hud_.wait_from=s.wait_until?now:0;
+    HudLoad(s.profile);
+    hud_.state=s; hud_.idle=false; hud_.last_trigger=s.trigger;
+}
+// A node a chain may start at: an on 按键 start or 武器派生修改.
+bool HudStartNode(const NpcCombo::Config& c,int i) {
+    const Node* n=HudNode(c,i); return n&&n->on&&(n->type==NodeType::Trigger||n->type==NodeType::WeaponActions);
+}
+// 待命: no chain going on; the chain shown last (else the set's first start), at its start.
+void HudIdle(const std::string& profile,ULONGLONG now) {
+    HudLoad(profile);
+    const NpcCombo::Config& c=hud_.config;
+    int t=HudStartNode(c,hud_.last_trigger)?hud_.last_trigger:-1;
+    for (size_t i=0;t<0&&i<c.chain.size();++i) if (HudStartNode(c,static_cast<int>(i))) t=static_cast<int>(i);
+    NpcCombo::ChainState s; s.profile=profile; s.trigger=t; s.cursor=t; s.at=now;
+    if (const Node* n=HudNode(c,t)) s.button=n->type==NodeType::Trigger?n->trigger:0;
+    hud_.state=s; hud_.wait_from=0; hud_.idle=true;
+}
 }  // namespace
 bool HandleCommand(const char* arguments) {
     char verb[32]{},first[160]{}; int skill=0;
@@ -4710,6 +5482,49 @@ bool HandleCommand(const char* arguments) {
     return true;
 }
 void SetLogger(void (*log)(const char*)) { log_=log; }
+// 派生显示 (UI worker): follows NpcCombo::ChainHud and the published chain state; up the whole time it is on.
+void HudTick() {
+    const ULONGLONG now=GetTickCount64();
+    const int mode=NpcCombo::ChainHud();
+    const bool want=mode!=NpcCombo::kHudOff&&UiHost::InGame()&&!DebugHub::ObscuresGameplay();
+    if (!want&&!hud_.shown) return;
+    if (want) {
+        const NpcCombo::ChainState s=NpcCombo::GetChain();
+        const bool fresh=s.at&&now<s.at+kHudStaleMs;
+        hud_.mode=mode;
+        if (fresh&&s.trigger>=0) HudTake(s,now);
+        else if (fresh&&!s.profile.empty()) HudIdle(s.profile,now);
+        else if (!hud_.idle&&hud_.state.trigger<0) HudIdle(hud_.profile.empty()?std::string(NpcCombo::kHeroProfile):hud_.profile,now);
+        // else: nothing new from the game thread (a load, a pause): the state shown stays
+    }
+    if (!HudCreate()) return;
+    const HWND game_window=UiHost::Game(); const UINT dpi=game_window?GetDpiForWindow(game_window):96;
+    hud_.scale=std::clamp(static_cast<double>(dpi?dpi:96)/96.0,.75,2.5);
+    const bool reduced=UiMotion::ReducedMotion();
+    if (want&&!hud_.shown) { hud_.shown=true; hud_.fade.ease=UiMotion::EaseOutCubic; hud_.fade.Jump(0); hud_.drawn_mode=-1; }
+    hud_.fade.Set(want?1.0:0.0,want?160:260,now,reduced);
+    if (!want&&!hud_.fade.Running(now)) { ShowWindow(hud_.window,SW_HIDE); hud_.shown=false; return; }
+    // Drawn again on a change, and every 50 ms while the wait bar runs.
+    const NpcCombo::ChainState& d=hud_.drawn; const NpcCombo::ChainState& c=hud_.state;
+    // The picked rows move with time (a pause running out, a button held long enough): drawn again when they change.
+    const std::vector<bool> picks=hud_.idle?std::vector<bool>():HudPicks(c,NpcCombo::NextInputs(hud_.config,c.cursor,c.button,kHudRowsMax),now);
+    const bool changed=picks!=hud_.drawn_picks||hud_.drawn_mode!=hud_.mode||hud_.drawn_dpi!=dpi||hud_.drawn_idle!=hud_.idle||hud_.drawn_generation!=hud_.generation||d.profile!=c.profile||d.trigger!=c.trigger||
+        d.cursor!=c.cursor||d.playing!=c.playing||d.queued!=c.queued||d.button!=c.button||d.wait_until!=c.wait_until||
+        (c.wait_until>now&&now>=hud_.drawn_at+50);
+    if (changed) {
+        if (!HudRender(now)) { ShowWindow(hud_.window,SW_HIDE); hud_.shown=false; return; }
+        hud_.drawn=c; hud_.drawn_picks=picks; hud_.drawn_mode=hud_.mode; hud_.drawn_idle=hud_.idle; hud_.drawn_dpi=dpi; hud_.drawn_generation=hud_.generation; hud_.drawn_at=now; hud_.last={-1,-1}; hud_.last_alpha=-1;
+    }
+    const SIZE client=UiHost::ClientSize(); const POINT origin=UiHost::ClientOrigin();
+    const POINT where{origin.x+client.cx-HS(kHudRight)-hud_.width-hud_.margin,origin.y+HS(kHudTop)-hud_.margin};
+    const int alpha=static_cast<int>(std::clamp(std::lround(hud_.fade.At(now)*255),0L,255L));
+    if (where.x!=hud_.last.x||where.y!=hud_.last.y||alpha!=hud_.last_alpha) { hud_.surface.Present(hud_.window,where,static_cast<BYTE>(alpha)); hud_.last=where; hud_.last_alpha=alpha; }
+    if (!IsWindowVisible(hud_.window)) { ShowWindow(hud_.window,SW_SHOWNA); SetWindowPos(hud_.window,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE); }
+}
+void HudShutdown() {
+    if (hud_.window) { UiHost::Detach(hud_.window); DestroyWindow(hud_.window); }
+    hud_.window=nullptr; hud_.surface.Reset(); hud_.shown=false;
+}
 void Tick() {
     if (const LONG curve=InterlockedExchange(&test_curve_,0)) TestCurve(curve==2);
     BoneMotionPage::TickEditor(window_);
@@ -4743,6 +5558,22 @@ void Tick() {
     if (search_.open||edit_.node>=0) Repaint();  // the caret blinks
 }
 namespace Probe {
+// 派生显示 offline: the overlay for the page's chain at that place, as 32-bit premultiplied pixels (no window).
+// since_ms: how long the branch's pause has run (-1: not started).
+bool HudPixels(int mode,int trigger,int cursor,int playing,int queued,unsigned long long wait_left_ms,std::vector<uint32_t>& pixels,int& width,int& height,long long since_ms) {
+    const ULONGLONG now=GetTickCount64();
+    hud_.config=config_; hud_.mode=mode; hud_.scale=1; hud_.idle=cursor<0;  // cursor -1: 待命 at the start
+    if (hud_.idle) { cursor=trigger; playing=-1; queued=-1; wait_left_ms=0; }
+    NpcCombo::ChainState s; s.profile="probe"; s.trigger=trigger; s.cursor=cursor; s.playing=playing; s.queued=queued;
+    const Node* t=HudNode(config_,trigger); s.button=t&&t->type==NodeType::Trigger?NpcCombo::ThenButton(*t):static_cast<int>(Trigger::Light);
+    if (cursor==trigger&&t) s.button=t->trigger;
+    s.wait_until=wait_left_ms?now+wait_left_ms:0; s.at=now; s.branch_at=since_ms>=0?now-static_cast<ULONGLONG>(since_ms):0;
+    hud_.state=s; hud_.wait_from=wait_left_ms?now-wait_left_ms:0;  // half the wait left
+    if (!HudRender(now)) return false;
+    GdiFlush(); width=hud_.surface.width; height=hud_.surface.height;
+    pixels.assign(hud_.surface.pixels,hud_.surface.pixels+static_cast<size_t>(width)*height);
+    return true;
+}
 void RefreshData(){Refresh(false);}
 void PickNodes(const std::vector<int>& nodes){picked_.clear();for(int node:nodes)if(At(node))picked_.push_back(node);selected_=picked_.empty()?-1:picked_.back();}
 bool ClipboardShortcut(int key){return ClipboardKey(key,true);}
@@ -4884,6 +5715,12 @@ int RecordingNode() { return record_.node; }
 int RecordingRoute() { return record_.node>=0?record_.route:-1; }
 void ScrollWeapons(int pixels) { library_tab_=1; Layout(); ScrollStrip(pixels>0?1:-1); }
 void Library(int tab,int category) { library_tab_=std::clamp(tab,0,1); node_category_=std::clamp(category,0,4); Layout(); }
+void LibraryFrom(const std::string& look) { library_boss_=look; category_=-1; library_pages_[4]=0; Layout(); }
+RECT LibraryFromBox() { return library_boss_box_; }
+void LibraryFromList(bool open) { if (open) OpenSourceSearch(); else if (search_.open) CloseSearch(); }
+std::vector<std::string> LibraryMoves() { std::vector<std::string> out; for (const auto& p:pills_) out.push_back(p.ability); return out; }
+int AddLibraryMove(size_t index) { if (index>=pills_.size()) return -1; const size_t before=config_.chain.size(); Append(LibraryNode(pills_[index].ability)); return config_.chain.size()>before?static_cast<int>(config_.chain.size()-1):-1; }
+std::string NodeSummary(int index) { const Node* n=At(index); return n?std::to_string(static_cast<int>(n->type))+"|"+n->boss+"|"+n->ability:std::string(); }
 RECT LibraryBox() { return library_; }
 RECT LibraryTabBox(int tab) { return tab>=0&&tab<2?library_tabs_[tab]:RECT{}; }
 RECT LibraryCategoryBox(int category) { return category>=0&&category<5?node_categories_[category]:RECT{}; }

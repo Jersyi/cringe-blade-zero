@@ -143,6 +143,16 @@ int main() {
     explicit_key.combo=-1;explicit_key.branch=1;
     check(!NativeDetour(explicit_key,true),"explicit graph row is not a native detour");
     check(!NativeDetour(attack,false),"completed chain is not kept indefinitely");
+    {
+        ComboPlayback::KeyPart part;
+        check(!part.Takes(0,true,false),"no key pressed yet: no key part");
+        part.Note(1000,150);
+        check(part.Takes(1000,true,false)&&part.Takes(1149,true,false)&&!part.Takes(1150,true,false),"an action within 150 ms of a watched key going down is part of the keys");
+        check(!part.Takes(1100,false,false),"outside a chain 吞掉 decides: no key part");
+        check(!part.Takes(1100,true,true),"an action the chain takes stays the chain's press");
+        part.Note(2000,150);
+        check(part.Takes(2100,true,false)&&!part.Takes(2150,true,false),"every key press opens its own window");
+    }
     ComboPlayback::LiftOnce hero,foe;
     check(!hero.Take(10,2,true,0),"maintenance does not consume a lift");
     check(hero.Take(10,2,true,80),"first lift accepted");

@@ -38,6 +38,9 @@ struct Display {
     Transform last_grip; bool has_grip = false;
     // As the boss's own weapon actor hangs: its socket on the boss skeleton, the mesh template's relative transform.
     std::string boss_socket; Transform own_relative; Object* asset = nullptr; bool skeletal = false;
+    // direct: on the look's own socket (a look of the Boss's skeleton), nothing set per tick once the blend is done.
+    // smooth / smooth_clock: the grip last placed on the hero's hand (low-passed); last_switch: the hand / pose switch.
+    bool direct = false; Transform smooth; bool has_smooth = false; double smooth_clock = 0; ULONGLONG last_switch = 0;
 };
 #pragma warning(pop)
 // What a grab cut by the move chain still owes its target (HandOff / HandOffEnd).
@@ -495,22 +498,56 @@ bool Rehang(Display& d, Object* mesh, ue::Name socket, Object* holder) {
     Call attach(d.component, "K2_AttachToComponent");
     if (!attach.Set("Parent", mesh).Set("SocketName", socket).Set("LocationRule", uint8_t{1}).Set("RotationRule", uint8_t{1}).Set("ScaleRule", uint8_t{1})
              .Set("bWeldSimulatedBodies", false).Invoke() || !attach.Get<bool>("ReturnValue")) return false;
-    d.from = RelativeTo(now, frame); d.switched = GetTickCount64();
-    d.holder = holder; d.holder_name = holder ? ue::NameOf(holder) : ue::Name{}; d.has_grip = false;
+    d.from = RelativeTo(now, frame); d.switched = GetTickCount64(); d.last_switch = d.switched;
+    d.holder = holder; d.holder_name = holder ? ue::NameOf(holder) : ue::Name{}; d.has_grip = false; d.has_smooth = false; d.direct = false;
     ++session_.hold_switches;
     return true;
 }
+// The skeleton asset a skeletal mesh component draws with (nullptr: none / unreadable).
+Object* SkeletonOf(Object* component) {
+    if (!ue::Alive(component)) return nullptr;
+    Call get(component, "GetSkeletalMeshAsset"); Object* asset = get.Invoke() ? get.Get<Object*>("ReturnValue") : nullptr;
+    Object* skeleton = nullptr; if (ue::Alive(asset)) ReadField(asset, "Skeleton", skeleton);
+    return ue::Alive(skeleton) ? skeleton : nullptr;
+}
+double Seconds() { LARGE_INTEGER hz{}, t{}; QueryPerformanceFrequency(&hz); QueryPerformanceCounter(&t); return static_cast<double>(t.QuadPart) / static_cast<double>(hz.QuadPart); }
+// The grip on the hero's hand is low-passed (kGripTauS) so the proxy's sampling (a frame behind the fist, at a montage
+// time predicted from the last step) does not shake it; a jump past kGripSnapCm (a new grip) is taken at once. A hand /
+// Boss-pose switch waits kSwitchDwellMs after the last one, so the weapon at the hold threshold does not flip each tick.
+constexpr double kGripTauS = .035, kGripSnapCm = 25;
+constexpr ULONGLONG kSwitchDwellMs = 250;
 void FollowSkinHands() {
     double size = 1;
     Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(size)) : nullptr;
     if (!ue::Alive(skin)) skin = nullptr;
     Object* own = nullptr;
     if (!skin && session_.proxy && Same(session_.proxy, session_.proxy_name)) { ReadField(session_.pawn, "Mesh", own); if (!ue::Alive(own)) own = nullptr; }
+    // A look on the Boss's own skeleton plays the move as the Boss does: its weapon socket is where the Boss's weapon
+    // actor hangs, so the stand-in hangs there as authored and the engine carries it in the same frame (11-12: it still
+    // shook when re-placed from the pose proxy every tick).
+    Object* proxy = session_.proxy && Same(session_.proxy, session_.proxy_name) ? session_.proxy : nullptr;
+    Object* skin_skeleton = skin ? SkeletonOf(skin) : nullptr;
+    const bool boss_look = skin_skeleton && (!proxy || SkeletonOf(proxy) == skin_skeleton);
     const ULONGLONG now = GetTickCount64();
     for (Display& d : session_.displays) {
-        if (d.hand.None() || !Same(d.component, d.name) || !Same(d.parent, d.parent_name)) continue;
-        const bool lost = d.holder && !Same(d.holder, d.holder_name);  // the look it hung on is gone: back on the parent below
-        if (lost) d.holder = nullptr;
+        if (!Same(d.component, d.name)) continue;
+        const ue::Name own_socket = boss_look && !d.boss_socket.empty() ? Socket(skin, d.boss_socket.c_str()) : ue::Name{};
+        if (!own_socket.None()) {
+            if (!d.direct || d.holder != skin) {
+                if (!Rehang(d, skin, own_socket, skin)) continue;
+                d.direct = true;
+                char socket_text[96]{}; ue::NameText(own_socket, socket_text, sizeof(socket_text));
+                Logf("GRAB_EXTRAS boss weapon on the look's own socket %s (the Boss's skeleton): as the Boss's weapon actor hangs, nothing set per tick", socket_text);
+            }
+            if (!d.switched) continue;
+            const double t = std::clamp(static_cast<double>(now - d.switched) / kSwitchMs, 0.0, 1.0);
+            Call(d.component, "K2_SetRelativeTransform").Set("NewTransform", t < 1 ? Blend(d.from, d.own_relative, t) : d.own_relative).Set("bSweep", false).Set("bTeleport", true).Invoke();
+            if (t >= 1) d.switched = 0;
+            continue;
+        }
+        if (d.hand.None() || !Same(d.parent, d.parent_name)) continue;
+        const bool lost = d.holder && (!Same(d.holder, d.holder_name) || d.direct);  // the look it hung on is gone: back on the parent below
+        if (lost) { d.holder = nullptr; d.direct = false; }
         Object* visible = skin ? skin : (own && d.parent == session_.proxy ? own : nullptr);
         Transform socket{}, boss_hand{}, hand{};
         const bool poses = SocketWorld(d.parent, d.socket, socket) && SocketWorld(d.parent, d.hand, boss_hand);
@@ -520,12 +557,20 @@ void FollowSkinHands() {
             d.follow_refused = true;
         }
         const double grip_gap = poses ? Gap(socket, boss_hand) : 1e9;
-        const bool held = seen && !d.follow_refused && grip_gap < (d.holder == visible ? kHoldLeaveCm : kHoldEnterCm);
+        bool held = seen && !d.follow_refused && grip_gap < (d.holder == visible ? kHoldLeaveCm : kHoldEnterCm);
+        const bool settled = !d.last_switch || now >= d.last_switch + kSwitchDwellMs;
+        if (!lost && !settled && seen && held != (d.holder == visible)) held = d.holder == visible;  // too soon after the last switch
         if (held && d.holder != visible) { if (!Rehang(d, visible, d.hand, visible)) continue; }
         else if (!held && (d.holder || lost)) { if (!Rehang(d, d.parent, d.socket, nullptr)) continue; }
         Transform target = d.attached;
         if (held) {
             target = GripOn(Compose(d.attached, socket), boss_hand, hand);
+            const double clock = Seconds();
+            if (d.has_smooth && Gap(target, d.smooth) < kGripSnapCm) {
+                const double dt = std::clamp(clock - d.smooth_clock, 0.0, .1);
+                target = Blend(d.smooth, target, 1 - std::exp(-dt / kGripTauS));
+            }
+            d.smooth = target; d.has_smooth = true; d.smooth_clock = clock;
             if (d.has_grip) {
                 const double step = Gap(target, d.last_grip);
                 ++session_.hold_frames; session_.hold_sum += step; session_.hold_max = (std::max)(session_.hold_max, step);
@@ -885,12 +930,25 @@ void SetOptions(const Options& value) {
     SettingsStore::PutBool(kSection, L"IgnoreInvulnerable", o.ignore_invulnerable);
 }
 Options GetOptions() { AcquireSRWLockShared(&lock_); const Options o = options_; ReleaseSRWLockShared(&lock_); return o; }
+namespace {
+struct ChainDamage { bool on = false; Damage mode = Damage::Native; float value = 0; ULONGLONG until = 0; };
+ChainDamage chain_damage_;  // game thread
+}
+void SetChainDamage(Damage mode, float value, unsigned long long until_ms) { chain_damage_ = {true, mode, value, until_ms}; }
+void ClearChainDamage() { chain_damage_ = {}; }
 std::wstring LastResult() { AcquireSRWLockShared(&lock_); std::wstring text = result_; ReleaseSRWLockShared(&lock_); return text; }
 void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move, double hero_over_boss, unsigned char* source_ability, unsigned char* source_timeline) {
     if (session_.active) Finish(false);
     session_ = {};
     if (!ue::Alive(pawn) || !ue::Alive(target)) return;
     session_.active = true; session_.options = GetOptions();
+    if (chain_damage_.on && GetTickCount64() <= chain_damage_.until) {  // the chain's 投技伤害
+        Options o = session_.options; o.damage = chain_damage_.mode;
+        if (o.damage == Damage::Multiplier) o.multiplier = chain_damage_.value; else if (o.damage == Damage::Percent) o.percent = chain_damage_.value;
+        session_.options = Sanitize(o);
+        Logf("GRAB_EXTRAS chain damage: mode=%d value=%.2f (the combo page's, not the grab page's)", static_cast<int>(session_.options.damage), static_cast<double>(chain_damage_.value));
+    }
+    chain_damage_ = {};
     for (const char* c = move; c && *c; ++c) session_.move.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*c)));
     session_.pawn = pawn; session_.pawn_name = ue::NameOf(pawn);
     session_.target = target; session_.target_name = ue::NameOf(target);
@@ -978,6 +1036,10 @@ bool Posing() { return session_.active && !session_.pose_over; }
 void SetSkinDisplay(SkinDisplay provider) { skin_display_ = provider; }
 bool ChangeHealth(unsigned char* character, float delta) {
     return ue::Alive(character) && std::isfinite(delta) && AttributeLayout() && AddHealth(character, delta);
+}
+bool CharacterHealth(unsigned char* character, float& health, float& maximum) {
+    health = maximum = 0;
+    return ue::Alive(character) && ReadHealth(reinterpret_cast<Object*>(character), health, maximum);
 }
 bool ChangeMaxHealth(unsigned char* character, float delta) {
     if (!ue::Alive(character) || !std::isfinite(delta) || !AttributeLayout()) return false;

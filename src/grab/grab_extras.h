@@ -43,6 +43,11 @@ inline float HitExtra(Damage mode, float drop, float multiplier, float percent, 
     }
     return 0;
 }
+// 招式派生's 投技伤害 (the combo page): the chain sets it as it asks for a grab; the next Begin within until_ms takes this
+// damage mode and value in place of the grab page's (its weapon hiding and 无视无敌 stay the grab page's), and so does
+// what a hand-off leaves to the boss body. Cleared by that Begin, by Clear, or once it runs out. Game thread.
+void SetChainDamage(Damage mode, float value, unsigned long long until_ms);
+void ClearChainDamage();
 using Logger = void (*)(const char*);
 void Initialize(Logger logger); // Loads persisted options.
 void SetOptions(const Options& options); // Worker/UI; persisted.
@@ -94,6 +99,8 @@ void HandOffEnd(int32_t damage, bool completed);
 // damage uses (AttributeUtils.ModifyCharacterAttributeValue; negative removes health), so death and
 // hit callbacks stay the game's own. False when the call or the attribute layout is unavailable.
 bool ChangeHealth(unsigned char* character, float delta);
+// Game thread: a character's health and maximum health (the attributes the grab damage reads). False when unreadable.
+bool CharacterHealth(unsigned char* character, float& health, float& maximum);
 // Game thread. delta added to the maximum health attribute (Health_Max, else MaxHealth); the runtime audit's dummy.
 bool ChangeMaxHealth(unsigned char* character, float delta);
 }

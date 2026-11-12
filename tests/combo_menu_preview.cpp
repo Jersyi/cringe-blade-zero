@@ -122,6 +122,7 @@ void SetMinimum(HWND page, int, int height) {
 }
 bool Notify(const wchar_t* text) { std::wprintf(L"notify: %ls\n", text); return true; }
 bool SetPreviewHole(const RECT*) { return false; }
+bool ObscuresGameplay() { return false; }  // 派生显示 (ComboMenu::HudTick)
 void ShowPage(Page) {}
 bool PreviewHoleSupported() { return false; }
 void Hide() {}

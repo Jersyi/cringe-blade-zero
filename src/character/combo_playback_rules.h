@@ -76,6 +76,14 @@ struct NativeInput {
         const unsigned result=bits;*this={};return result;
     }
 };
+// 自定义按键 while a chain goes on: a hero action one of the keys brought (seen within `ms` of a watched key going
+// down) that the chain does not take is part of those keys, not the hero's own action: it neither cuts the move
+// playing nor drops the kept press, and the game's action from it is cancelled. Outside a chain 吞掉 decides.
+struct KeyPart {
+    uint64_t until=0;
+    void Note(uint64_t now,uint64_t ms){until=now+ms;}
+    bool Takes(uint64_t now,bool chain_on,bool leads)const{return chain_on&&!leads&&now<until;}
+};
 // Owned by one tracked actor. Maintenance calls (zero height) never consume a lift.
 // Token zero is reserved for explicit diagnostic commands, which may be repeated.
 struct LiftOnce {
