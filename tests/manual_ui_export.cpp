@@ -6,6 +6,7 @@
 #include "bone_motion_page.h"
 #include "weapon_icons.h"
 #include "npc_boss_effects.h"
+#include "combo_plugins.h"
 #include <filesystem>
 #include <fstream>
 
@@ -44,8 +45,18 @@ int wmain(int argc,wchar_t** argv){
     using namespace NpcCombo;using namespace ComboMenu::Probe;
     NpcRetarget::SkinMoves moves;NpcRetarget::GetSkinMoves(0,moves);
     NpcCombo::RecordClip(moves.skills.front(),4.0f);
-    constexpr const char* names[]={"Skill","Interval","Trigger","AutoDodge","Branch","Speed","Weapon","Armor","Interrupt","Grab","BossSkill","WeaponMove","Damage","Group","Teleport","Invincible","Look","HeroLook","KeepLook","ForceHit","PreInput","WeaponActions","IgnoreGuard","KeepChain","Assist","Hook","Trim","Air","AirDefault","BoneTransform","BossEffect"};
-    static_assert(std::size(names)==static_cast<size_t>(NodeType::BossEffect)+1);
+    constexpr const char* names[]={"Skill","Interval","Trigger","AutoDodge","Branch","Speed","Weapon","Armor","Interrupt","Grab","BossSkill","WeaponMove","Damage","Group","Teleport","Invincible","Look","HeroLook","KeepLook","ForceHit","PreInput","WeaponActions","IgnoreGuard","KeepChain","Assist","Hook","Trim","Air","AirDefault","BoneTransform","BossEffect","Plugin","HeroSize"};
+    static_assert(std::size(names)==static_cast<size_t>(NodeType::HeroSize)+1);
+    // 插件节点: the sample plugin's 目标距离 (a 判断 node with three outputs), registered as the game would load it.
+    ComboPlugins::SetEnabled(true);
+    ComboPlugins::AddForTest([](const PbzApi* api,PbzPlugin* self)->PbzResult{
+        PbzPluginInfo info{};info.size=sizeof(info);info.id="pbz.conditions";info.name="条件判断（示例）";info.version="1.0.0";info.min_api=1;
+        if(api->describe(self,&info)!=PBZ_OK)return PBZ_E_STATE;
+        static const char* const outs[]={"在距离内","更远","没有目标"};
+        PbzActionDesc d{};d.size=sizeof(d);d.id="target_distance";d.name="目标距离";d.group="条件判断";d.description="目标在设定距离内时走第一个出口";
+        d.kind=PBZ_ACTION_DECIDE;d.output_count=3;d.outputs=outs;d.decide=[](void*,const PbzNodeCall*)->int32_t{return 0;};
+        d.has_value=1;d.value_label="距离";d.value_unit="厘米";d.value_min=50;d.value_max=5000;d.value_step=50;d.value_default=400;
+        return api->register_action(self,&d);},L"manual");
     const auto make=[&](NodeType type){
         Node n;n.type=type;n.x=200;n.y=180;n.ability=moves.skills.front();
         if(IsModifier(n))n=ModifierNode(type,200,180);
@@ -62,6 +73,7 @@ int wmain(int argc,wchar_t** argv){
         if(type==NodeType::PreInput)n.ms=300;
         if(type==NodeType::BoneTransform)n.bones=BoneMotion::Feminine();
         if(type==NodeType::Group){n.w=460;n.h=240;}
+        if(type==NodeType::Plugin){n.ability.clear();n.action="pbz.conditions/target_distance";n.action_kind=kActionDecide;n.value=400;n.routes.resize(3);for(auto& r:n.routes){r.button=0;r.next=1;}}
         if(type==NodeType::BossEffect){n.boss="MoYuan";n.ability=kNpcBossEffects[0].name;for(const auto& e:kNpcBossEffects)if(std::string(e.folder)=="MoYuan"){n.ability=e.name;break;}
             n.fx_place=static_cast<int>(EffectPlace::Front);n.fx_damage=15;n.fx_radius=500;n.fx_hits=3;}
         return n;
@@ -94,6 +106,7 @@ int wmain(int argc,wchar_t** argv){
         }
     };
     for(size_t i=0;i<std::size(names);++i)render(make(static_cast<NodeType>(i)),names[i]);
+    ComboPlugins::SetEnabled(false);  // the page's other pictures as a player first sees it (派生插件 off)
     render(AirSetNode(200,180),"AirSet");
     auto keys=TriggerNode(Trigger::Keys,200,180);keys.keys={VK_LBUTTON,VK_RBUTTON};keys.chord=true;render(keys,"Keys");
     auto combo=TriggerNode(Trigger::Combo,200,180);combo.keys={static_cast<int>(Trigger::Stance),static_cast<int>(Trigger::Special)};combo.chord=true;render(combo,"ComboKeys");

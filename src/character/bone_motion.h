@@ -19,4 +19,18 @@ void Supplement(bool enabled,bool save=true);
 bool SupplementEnabled();
 Snapshot Get();
 bool Command(const std::string& text); // worker, diagnostic commands are not persisted
+// The 身材 / 骨骼 editor (NpcBody / NpcBridge) writes the hero's pose through this module's hook, so one component has one
+// hook (two hooks on the pose finalize slot refuse each other). `listener` runs right after the engine finalized
+// `component`'s pose and after this module's own edits (骨骼变换 nodes), on the thread that finalized it.
+// Game thread; nullptr stops at once. The hook itself follows at the next Tick.
+using PoseListener=void(*)(ue::Object* component);
+void Listen(ue::Object* component,PoseListener listener);
+// More listeners beside the editor's (2026-11-13: Listen is one slot of several, so a later listener no longer replaces an earlier
+// one). AddListener returns an id (> 0) or 0 when the slots (3) are taken; RemoveListener(id) stops it at once. Same rules as Listen: game
+// thread to add / remove, the function runs on the finalizing thread right after the engine's pose and the edits above, and must not
+// call engine functions or allocate (an atomic counter is the intended use). A listener keeps the component's hook alive.
+int AddListener(ue::Object* component,PoseListener listener);
+void RemoveListener(int id);
+bool Listening();          // the listened component has its hook now
+const char* ListenNote();  // one line for the editor's status
 }

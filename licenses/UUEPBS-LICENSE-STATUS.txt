@@ -1,18 +1,27 @@
 UUEPBS license review / source attribution
-Reviewed 2026-11-09
+Reviewed 2026-11-09, again 2026-11-13
 Author/maintainer: XTGMods
 Project: https://github.com/XTGMods/UUEPBS
 Revision: 7c54929929086413afbd12070962f0d499e90c7e
 Source: https://github.com/XTGMods/UUEPBS/blob/7c54929929086413afbd12070962f0d499e90c7e/README.md#credits
 
-No license for UUEPBS itself was found in the repository at this revision.
-The README's MIT notice is specifically for Dear ImGui, copyright
-(c) 2014-2025 Omar Cornut. It does not grant a license to UUEPBS itself.
+Found on 2026-11-13: no LICENSE file in the repository; GitHub detects no license.
+The README's MIT text is headed "Dear ImGui" and names Omar Cornut (copyright
+2014-2025); the line before it reads "UUEPBS links third-party code under this
+license".
 
-The PBZ body editor references the published feature design, with original
-PBZ implementation. No UUEPBS code or assets are included in this package.
-This file records license status; it is not a substitute license or a grant
-of rights by XTGMods. No project license text has been invented or relabeled.
+2026-11-13: the maintainer of this mod read that README notice as permission to
+modify and redistribute UUEPBS, and integrated the UUEPBS v1.3 editor
+(src/uuepbs/, built into version.dll) together with a contributor's PBZ port.
+The package ships only UUEPBS's own three example presets, unchanged
+(samples/UUEPBS Presets/Example - Athletic / Curvy / Petite.json, from presets/
+at the revision above); the contributor's own presets and animations are not
+included (decided 2026-11-13).
 
-If the author supplies a license for direct reuse, include that complete
-license and applicable author/third-party notices with the integrated code.
+This file records that decision and the facts above. It is not a license from
+XTGMods and no license text has been invented or relabeled. If the author
+publishes a license, include its complete text and notices with the integrated
+code; if the author objects, remove src/uuepbs/ and the presets.
+
+Dear ImGui (src/third_party/imgui/, used by the editor) is MIT licensed:
+see DearImGui-LICENSE.txt.

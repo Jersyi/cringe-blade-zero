@@ -43,6 +43,11 @@ bool CancelAbilitySpec(ue::Object* asc, int32_t handle);
 constexpr float kSkillDamageDefault = 3.0f, kSkillDamageMin = 1.0f, kSkillDamageMax = 10.0f;
 float SkillDamageMultiplier();
 bool SetSkillDamageMultiplier(float multiplier); // clamped, persisted; false when not finite
+// Any thread, no engine calls. The boss locomotion option (BOSS 自带移动动画, [NpcRetarget] BossLocomotion, default
+// off): while the hero only moves (no montage, on the ground, no boss move), a look plays the boss's own idle / walk / run
+// on the whole body. Bones the hero has none of follow the boss's own animation either way. Takes effect at once.
+bool BossLocomotion();
+void SetBossLocomotion(bool enabled); // persisted
 // Game thread. The NPC display component while a skin is on, else null: a grab's boss weapon follows
 // its hands. size: the skin's height over the hero's (rest pelvis), 1 without a skin; the grab
 // scales the boss weapon by it, the display and the victim keep their own size.

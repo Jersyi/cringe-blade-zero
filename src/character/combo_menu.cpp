@@ -34,6 +34,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include "combo_plugins.h"
 #include <utility>
 #include <vector>
 #pragma comment(lib, "ole32.lib")
@@ -68,21 +69,22 @@ constexpr float kOverviewZoom=.35f;
 constexpr int kHeader=28,kRow=24,kPad=8,kPin=6,kGrid=16,kMajor=128;
 enum class Button : int { Toggle, Interval, AddTrigger, Arrange, Frame, Remove, Clear, Branch, Speed, Weapon, Armor, Interrupt, Grab, BossSkill, File, SaveFile, SaveAs, WeaponMove, Damage,
                           Group, Teleport, Invincible, Look, HeroLook, KeepLook, ForceHit, WeaponActions, Toast, Dummy, AutoDodge, IgnoreGuard, KeepChain, Assist, Hook, Trim, Air, AirSet, BoneTransform,
-                          Copy, Paste, Hud, SkillDamage, GrabDamage, BossEffect, ViewTarget, Count };  // Hud: 派生显示 (关 / 详细 / 简略), beside 派生提示;
+                          Copy, Paste, Hud, SkillDamage, GrabDamage, BossEffect, ViewTarget, PluginNode, Plugins, HeroSize, ViewScale, Display, Camera, Damages, Count };  // Plugins: 派生插件 (on / off, the list)  // Hud: 派生显示 (关 / 详细 / 简略), beside 派生提示;
                                                                                 // ViewTarget: 镜头跟随 (骨盆 / 脖子 / 头部), beside 派生显示;
+                                                                                // ViewScale: 镜头取景 (按身高 / 按体型比例), beside 镜头跟随; HeroSize: + 主角体型
                                                                                 // SkillDamage / GrabDamage: 派生页的技能伤害 / 投技伤害
 // The canvas tools, laid out right to left.
-constexpr Button kTools[]={Button::Copy,Button::Paste,Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::BossEffect,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::BoneTransform,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval};
+constexpr Button kTools[]={Button::Copy,Button::Paste,Button::SaveAs,Button::SaveFile,Button::File,Button::Clear,Button::Remove,Button::Frame,Button::Arrange,Button::Weapon,Button::KeepChain,Button::Interrupt,Button::IgnoreGuard,Button::Invincible,Button::BossEffect,Button::Air,Button::ForceHit,Button::Armor,Button::Damage,Button::BoneTransform,Button::HeroSize,Button::Speed,Button::Trim,Button::AddTrigger,Button::Branch,Button::Grab,Button::AirSet,Button::WeaponActions,Button::WeaponMove,Button::Hook,Button::Teleport,Button::HeroLook,Button::KeepLook,Button::Look,Button::Assist,Button::BossSkill,Button::Group,Button::AutoDodge,Button::Interval,Button::PluginNode};
 // Management stays above the canvas; creation tools belong to the right library.
 constexpr Button kCanvasTools[]={Button::File,Button::SaveFile,Button::SaveAs,Button::Arrange,Button::Frame,Button::Copy,Button::Paste,Button::Remove,Button::Clear};
 constexpr const wchar_t* kNodeCategories[]={L"起端与流程",L"动作与移动",L"战斗修饰",L"外观变身",L"BOSS 招式"};
 constexpr int NodeCategory(Button b) {
     switch (b) {
-    case Button::AddTrigger: case Button::Branch: case Button::AirSet: case Button::WeaponActions: case Button::Interval: case Button::Group: return 0;
+    case Button::AddTrigger: case Button::Branch: case Button::AirSet: case Button::WeaponActions: case Button::Interval: case Button::Group: case Button::PluginNode: return 0;
     case Button::BossSkill: case Button::Assist: case Button::Grab: case Button::WeaponMove: case Button::AutoDodge: case Button::Teleport: case Button::Hook: return 1;
     case Button::Speed: case Button::Trim: case Button::Weapon: case Button::Armor: case Button::Interrupt: case Button::Damage:
     case Button::Invincible: case Button::ForceHit: case Button::IgnoreGuard: case Button::KeepChain: case Button::Air: case Button::BossEffect: return 2;
-    case Button::BoneTransform: case Button::Look: case Button::HeroLook: case Button::KeepLook: return 3;
+    case Button::BoneTransform: case Button::HeroSize: case Button::Look: case Button::HeroLook: case Button::KeepLook: return 3;
     default: return -1;
     }
 }
@@ -135,12 +137,18 @@ enum class ItemKind { Move, Interval, AutoDodge, Trigger, Branch, Speed, Weapon,
                       WeaponMove, Damage, WeaponPick, WeaponSkill, Group, Teleport, TeleportDist, TeleportLift, ComboKey, ComboMode, RawKey, Invincible,
                       Look, HeroLook, KeepLook, ForceHit, HitKind, WeaponActions, ThenKey, Chain, IgnoreGuard, KeepChain, Assist, Hook, HookMode, Trim,
                       HookDist, HookSpeed, Air, AirLift, AirHang, Launch, AirSet, BoneTransform, ChainSkill, ChainGrab,
-                      BossEffect, FxFolder, FxPick, FxPlace, FxDamage, FxRadius, FxHits, MoveSource };
+                      BossEffect, FxFolder, FxPick, FxPlace, FxDamage, FxRadius, FxHits, MoveSource,
+                      PluginNode, PluginAction, PluginToggle, PluginFolder, PluginInfo, HeroSize,
+                      PluginGrant,  // 插件权限: ability = the plugin's id, trigger = the PBZ_CAP_* bit a click switches
+                      PluginUi,     // a control on a plugin's own page: ability = "plugin id TAB page TAB item", trigger = PBZ_UI_*, value = +1 / -1 (a slider's two steps)
+                      HudMode, ToastMode, ViewBone, ViewFrame,  // the top bar's 显示 / 镜头 lists: trigger = the value a click sets
+                      PluginReload };  // 派生插件 list: read PBZPlugins\scripts\*.lua again (ComboPlugins::RequestScriptReload)
 // value: a ChainSkill's multiplier (0: follow the NPC 技能 page), a ChainGrab's (trigger: its mode, kGrabFollow: follow the 投技 page).
-struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; float value=0; };
+// choice: a row of the top bar's 显示 / 镜头 / 伤害 lists, drawn as a radio button; on: the value in use now.
+struct Item { ItemKind kind=ItemKind::Move; std::wstring label,group,keys; std::string ability; int trigger=0; Kind move=Kind::Other; float value=0; bool choice=false,on=false; };
 struct SearchRow { bool header=false; size_t item=0; std::wstring text; };
 struct Search {
-    bool open=false; RECT rect{},edit{},list{}; float x=0,y=0; int from=-1,into=-1,from_out=0,pick_node=-1,pick_route=-1,mod_from=-1,mode=0; // mode 1 files, 2 save-as, 3 派生表, 4 技能伤害, 5 投技伤害
+    bool open=false; RECT rect{},edit{},list{}; float x=0,y=0; int from=-1,into=-1,from_out=0,pick_node=-1,pick_route=-1,mod_from=-1,mode=0; // mode 1 files, 2 save-as, 3 派生表, 4 技能伤害, 5 投技伤害, 7 派生插件, 8 镜头, 9 显示, 10 伤害 (4 + 5)
     int pick_part=0;  // a branch row's field (pick_route >= 0): 0 its button, 1 its keys, 2 how they are pressed
     // mode 6: the BOSS 招式 list's 招式来源 (this table's look or another boss)
     std::wstring query; std::vector<Item> items; std::vector<SearchRow> rows; int selected=-1,scroll=0,hot=-1;
@@ -160,6 +168,7 @@ std::vector<Pill> pills_;
 std::vector<Tab> tabs_;
 RECT buttons_[static_cast<int>(Button::Count)]{};
 RECT header_{},tabs_title_{},strip_{},strip_area_{},strip_left_{},strip_right_{},canvas_{},footer_{};
+int bar_rules_[2]{};  // the top bar's group rules (x): chain switch | 显示 镜头 伤害 | 派生插件 测试木桩
 int category_=-1;
 RECT library_{},library_title_{},library_tabs_[2]{},node_categories_[5]{},library_list_{},library_page_label_{},library_section_{},library_category_title_{};
 int library_tab_=0,node_category_=0,library_pages_[6]{},library_page_count_=1,library_capacity_=1,library_items_=0;
@@ -239,10 +248,46 @@ struct CanvasCache {
     void Clear(){Geometry();order.clear();graph_valid=false;}
 } canvas_cache_;
 void DropCanvasCache(){sizes_.clear();owners_.clear();canvas_cache_.Clear();}
+uint64_t plugin_serial_=0;  // ComboPlugins::Serial when the cards were measured (plugins load on the game thread)
 void Repaint(){if(window_)InvalidateRect(window_,nullptr,FALSE);}
 
 
 std::wstring Tr(const wchar_t* text) { return UiI18n::Translate(text?text:L""); }
+// ---- 派生插件 (ComboPlugins) ------------------------------------------------------------------------------------------
+// A 插件节点's action as the loaded plugins describe it (false: nothing picked, or its plugin is not loaded).
+// 插件权限 (the 派生插件 list): what each PBZ_CAP_* lets a plugin do (sdk/pbz_combo_api.h). The player allows them one plugin at a time.
+struct CapRow { unsigned cap; const wchar_t* name; };
+const CapRow kCapRows[]={{PBZ_CAP_READ,L"读取模块状态、订阅模块事件"},{PBZ_CAP_WRITE,L"修改模块（外观、身材、毛发、Boss 连战等）"},{PBZ_CAP_INI,L"写入设置文件 PBZDebugMenu.ini"},
+                         {PBZ_CAP_COMMAND,L"运行命令"},{PBZ_CAP_UI,L"在这个列表里显示插件自己的页"}};
+bool PluginAction(const NpcCombo::Node& node,ComboPlugins::ActionView& out) { return !node.action.empty()&&ComboPlugins::FindAction(node.action,out); }
+bool PluginHasValue(const NpcCombo::Node& node) { ComboPlugins::ActionView a; return PluginAction(node,a)&&a.has_value; }
+std::wstring PluginIdText(const std::string& id) { return std::wstring(id.begin(),id.end()); }
+std::wstring PluginTitle(const NpcCombo::Node& node) { ComboPlugins::ActionView a; return PluginAction(node,a)?a.name:Tr(L"插件节点"); }
+std::wstring PluginField(const NpcCombo::Node& node) {
+    if (node.action.empty()) return Tr(L"选择插件动作");
+    ComboPlugins::ActionView a;
+    return PluginAction(node,a)?a.plugin+L" · "+a.name:PluginIdText(node.action)+Tr(L"（插件未载入）");
+}
+std::wstring PluginOutput(const NpcCombo::Node& node,size_t k) {
+    ComboPlugins::ActionView a;
+    if (PluginAction(node,a)&&k<a.outputs.size()) return a.outputs[k];
+    wchar_t text[32]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"出口 %zu").c_str(),k+1); return text;
+}
+std::wstring PluginValueText(const NpcCombo::Node& node) { return std::to_wstring(node.value); }
+// The value's label with its unit: "距离（厘米）".
+std::wstring PluginValueLabel(const ComboPlugins::ActionView& a) { return a.value_label+(a.value_unit.empty()?L"":L"（"+a.value_unit+L"）"); }
+// A 插件信号 key: the name its plugin gave it.
+std::wstring SignalLabel(int code) {
+    const std::wstring name=ComboPlugins::SignalName(code);
+    if (!name.empty()) return name;
+    wchar_t text[48]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"插件信号 %04X（未载入）").c_str(),code-NpcCombo::kSignalKey); return text;
+}
+void OpenPluginFolder() {
+    const std::wstring dir=ComboPlugins::Folder(); CreateDirectoryW(dir.c_str(),nullptr);
+    std::wstring command=L"explorer.exe \""+dir+L"\"";
+    STARTUPINFOW si{}; si.cb=sizeof(si); PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&si,&pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+}
 UiLayout::Metrics M() { return UiLayout::For(window_); }
 HFONT Font(UiTheme::Font role) { return UiTheme::GetFont(role,window_); }
 float Zoom() { return kZooms[zoom_index_]; }
@@ -461,6 +506,7 @@ std::wstring KeyboardLabel(int vk) {
     wchar_t text[24]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,L"VK 0x%02X",vk); return text;
 }
 std::wstring RawKeyLabel(int code) {
+    if (NpcCombo::IsSignalKey(code)) return SignalLabel(code);
     return NpcCombo::IsPadKey(code)?PadLabel(code,UiHotkeys::ActivePad()==UiHotkeys::Device::PlayStation):KeyboardLabel(code);
 }
 int Px(int units);
@@ -496,6 +542,7 @@ UiHotkeys::Chord KeyChord(int code) {
 }
 int KeyIconWidth(HDC dc,int code,bool raw,int h) {
     if (!raw) return UiHotkeys::KeyWidth(dc,h,Tr(NpcCombo::ComboKeyLabel(code)).c_str());
+    if (NpcCombo::IsSignalKey(code)) return UiHotkeys::KeyWidth(dc,h,SignalLabel(code).c_str());
     if (NpcCombo::IsStickKey(code)) return UiHotkeys::StickWidth(h,PsPad());
     if (MouseKey(code)) return UiHotkeys::KeyWidth(dc,h,KeyboardLabel(code).c_str());
     return (std::max)(h,UiHotkeys::Width(dc,h,KeyChord(code))-h/5);  // Width counts the gap after the glyph
@@ -503,6 +550,7 @@ int KeyIconWidth(HDC dc,int code,bool raw,int h) {
 int DrawKeyIcon(HDC dc,int x,int y,int code,bool raw,int h) {
     const int width=KeyIconWidth(dc,code,raw,h);
     if (!raw) UiHotkeys::DrawKey(dc,x,y,h,Tr(NpcCombo::ComboKeyLabel(code)).c_str());
+    else if (NpcCombo::IsSignalKey(code)) UiHotkeys::DrawKey(dc,x,y,h,SignalLabel(code).c_str());
     else if (NpcCombo::IsStickKey(code)) UiHotkeys::DrawStick(dc,x,y,h,code-NpcCombo::kStickKey,PsPad());
     else if (MouseKey(code)) UiHotkeys::DrawKey(dc,x,y,h,KeyboardLabel(code).c_str());
     else UiHotkeys::Draw(dc,x,y,h,KeyChord(code),x+width+h);
@@ -730,6 +778,7 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Weapon: return Tr(L"武器属性");
     case NodeType::Armor: return Tr(L"霸体");
     case NodeType::Invincible: return Tr(L"无敌");
+    case NodeType::HeroSize: return Tr(L"主角体型");
     case NodeType::IgnoreGuard: return Tr(L"无视防御");
     case NodeType::KeepChain: return Tr(L"保持派生");
     case NodeType::KeepLook: return Tr(L"保留变身");
@@ -751,10 +800,15 @@ std::wstring NodeTitle(const Node& node) {
     case NodeType::Air: return Tr(L"滞空");
     case NodeType::BossEffect: return Tr(L"BOSS 特效");
     case NodeType::AirDefault: return Tr(L"空中释放");
+    case NodeType::Plugin: return PluginTitle(node);
     default: return MoveText(node.ability);
     }
 }
 std::wstring ButtonLabel(int button) { return Tr(NpcCombo::TriggerLabel(static_cast<Trigger>(button))); }
+// A 武器派生修改 row's action: the one weapon move it names, or its button (every press of it).
+std::wstring RowActionLabel(const Node& node,const NpcCombo::Route& route) {
+    return NpcCombo::NamedRow(node,route)?WeaponMoveText(node.weapon,route.ability):ButtonLabel(route.button);
+}
 // A card's title: a 组合 says how many moves it plays; a node in a 组合 starts with its place in the frame's order.
 std::wstring CardTitle(size_t index) {
     const Node& node=config_.chain[index];
@@ -944,6 +998,10 @@ std::wstring ModifierNote(size_t index) {
         if (from.triggers) return Tr(L"整条链：闪避、移动等任何动作都不打断派生，按这个时间等下一次按键");
         wchar_t text[128]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招后：任何动作都不打断派生").c_str(),from.nodes); return text;
     }
+    if (node.type==NodeType::HeroSize) {
+        if (from.triggers) return Tr(L"整条链：招式中 BOSS 模型和武器缩放到主角大小");
+        wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招缩放到主角大小").c_str(),from.nodes); return text;
+    }
     if (node.type==NodeType::Invincible) {
         if (from.triggers) return Tr(L"整条链无敌：招式中不会被打到");
         wchar_t text[96]{}; _snwprintf_s(text,_countof(text),_TRUNCATE,Tr(L"指向它的 %d 招无敌").c_str(),from.nodes); return text;
@@ -1021,7 +1079,7 @@ std::wstring NodeNote(size_t index) {
     case NodeType::AutoDodge: return moves_.dodges.empty()?Tr(L"这个外观没有闪避"):wired?Tr(L"按摇杆方向选 Boss 闪避"):Tr(L"未连接");
     case NodeType::Trigger: return {};
     case NodeType::Branch: return Tr(L"上一招后按哪个键（点按或按住），接哪一招");
-    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: case NodeType::KeepChain: case NodeType::Trim: case NodeType::Air: case NodeType::BossEffect: return ModifierNote(index);
+    case NodeType::Speed: case NodeType::Weapon: case NodeType::Armor: case NodeType::Interrupt: case NodeType::Damage: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::ForceHit: case NodeType::IgnoreGuard: case NodeType::KeepChain: case NodeType::Trim: case NodeType::Air: case NodeType::BossEffect: case NodeType::HeroSize: return ModifierNote(index);
     case NodeType::WeaponMove: {
         if (!wired) return Tr(L"未连接");
         return Tr(L"拿这把武器放这一招，放完换回");
@@ -1029,6 +1087,15 @@ std::wstring NodeNote(size_t index) {
     case NodeType::Grab: return wired?GrabNote(index):GrabNote(index)+L" · "+Tr(L"未连接");
     case NodeType::BossSkill: return wired?Tr(node.own_look||NpcCombo::OwnLookEverywhere(config_,index)?L"在当前外观上放这一招（不变身）":L"瞬身变身放这一招，放完变回"):Tr(L"未连接");
     case NodeType::Assist: return wired?Tr(L"Boss 瞬移到目标身前放这一招，主角照常行动"):Tr(L"未连接");
+    case NodeType::Plugin: {
+        if (!ComboPlugins::Enabled()) return Tr(L"派生插件已关闭：在顶栏「派生插件」里打开");
+        if (node.action.empty()) return Tr(L"选择一个插件动作");
+        ComboPlugins::ActionView a;
+        if (!PluginAction(node,a)) return Tr(L"这个插件没有载入：按键经过这里不起作用");
+        if (!wired) return Tr(L"未连接");
+        if (!a.description.empty()) return a.description;
+        return Tr(a.kind==PBZ_ACTION_DECIDE?L"按键经过时由插件决定走哪个出口":L"插件执行这个动作；主角照常行动，之后等下一次按键");
+    }
     case NodeType::Look:
         if (node.boss.empty()) return Tr(L"选择要变成的 Boss");
         return wired?Tr(L"瞬身变成这个 Boss，派生链结束后保持"):Tr(L"未连接");
@@ -1096,12 +1163,20 @@ SIZE MeasureNodeBody(HDC dc,size_t index) {
         int wide=(std::max)(Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,(std::max)(Units(dc,UiTheme::Font::Body,ActionsWeaponText(node)+L"  ▾")+60,
                                                                                    Units(dc,UiTheme::Font::Small,NodeNote(index))+34));
         wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,ChainOwnLookText(true))+50);  // 整体不变身
-        int extra=0;for (const NpcCombo::Route& route:node.routes){wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,ButtonLabel(route.button)+L" ▾")+116+StepperUnits(RouteHoldUnits(dc)));
+        int extra=0;for (const NpcCombo::Route& route:node.routes){wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,RowActionLabel(node,route)+L" ▾")+116+StepperUnits(RouteHoldUnits(dc)));
             if(NpcCombo::KeysRoute(route)){++extra;wide=(std::max)(wide,KeyIconsUnits(dc,route.keys,RawRoute(route),false,UiTheme::Font::Small)+Units(dc,UiTheme::Font::Small,RouteModeText(route,true))+100);}}
         return {std::clamp(wide,500,900),kHeader+kRow*(static_cast<int>(node.routes.size())+extra+5)+kPad};  // + 整体不变身
     }
     if (node.type==NodeType::Group) return {NpcCombo::ClampGroupW(node.w),NpcCombo::ClampGroupH(node.h)};
     const int title=Units(dc,UiTheme::Font::Strong,CardTitle(index))+70,note=Units(dc,UiTheme::Font::Small,NodeNote(index))+34;
+    if (node.type==NodeType::Plugin) {  // its action, its value (when it has one), a note, then a row per output (判断)
+        ComboPlugins::ActionView a; const bool value=PluginAction(node,a)&&a.has_value;
+        int wide=(std::max)((std::max)(title,note),Units(dc,UiTheme::Font::Body,PluginField(node)+L"  ▾")+90);
+        if (value) wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,PluginValueLabel(a))+170);
+        const int outs=NpcCombo::PluginDecides(node)?static_cast<int>(node.routes.size()):0;
+        for (int k=0;k<outs;++k) wide=(std::max)(wide,Units(dc,UiTheme::Font::Small,PluginOutput(node,static_cast<size_t>(k)))+70);
+        return {std::clamp(wide,260,500),kHeader+kRow*(2+(value?1:0)+outs)+kPad};
+    }
     if (node.type==NodeType::Hook) {  // its mode, its reach, its speed, a note, its 派生点
         int field=0; for (int mode=0;mode<3;++mode) field=(std::max)(field,Units(dc,UiTheme::Font::Body,HookModeText(mode)+L"  ▾")+60);
         field=(std::max)(field,(std::max)(Units(dc,UiTheme::Font::Body,HookDistText(NpcCombo::kHookDistMax)+L"  ▾"),Units(dc,UiTheme::Font::Body,HookSpeedText(NpcCombo::kHookSpeedMax)+L"  ▾"))+60);
@@ -1128,7 +1203,8 @@ SIZE MeasureNodeBody(HDC dc,size_t index) {
         const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):WeaponMoveText(node.weapon,node.ability))+L"  ▾")+60;
         return {std::clamp((std::max)((std::max)(title,weapon),(std::max)(move,note)),280,440),kHeader+kRow*4+kPad};
     }
-    if (node.type==NodeType::Armor||node.type==NodeType::Interrupt||node.type==NodeType::Invincible||node.type==NodeType::KeepLook||node.type==NodeType::IgnoreGuard) return {std::clamp((std::max)(title,note),200,340),kHeader+kRow+kPad};
+    if (node.type==NodeType::Armor||node.type==NodeType::Interrupt||node.type==NodeType::Invincible||node.type==NodeType::KeepLook||node.type==NodeType::IgnoreGuard||
+        node.type==NodeType::HeroSize) return {std::clamp((std::max)(title,note),200,340),kHeader+kRow+kPad};
     if (node.type==NodeType::BossSkill) {
         const int look=Units(dc,UiTheme::Font::Body,(node.boss.empty()?Tr(L"选择外观"):BossLookName(node.boss))+L"  ▾")+60;
         const int move=Units(dc,UiTheme::Font::Body,(node.ability.empty()?Tr(L"选择招式"):MoveText(node.ability))+L"  ▾")+60;
@@ -1212,7 +1288,7 @@ Shape NodeShape(HDC dc,size_t index) {
     const int mid=(s.rect.top*2+Px(kHeader))/2;
     s.header={s.rect.left,s.rect.top,s.rect.right,s.rect.top+Px(kHeader)};
     const bool modifier=NpcCombo::IsModifier(node),move=node.type==NodeType::Skill||node.type==NodeType::AutoDodge,setting=NpcCombo::IsSetting(node);
-    s.has_in=!NpcCombo::StartsChain(node)&&!modifier&&!setting; s.has_out=!NpcCombo::HasRows(node)&&!modifier&&!setting;
+    s.has_in=!NpcCombo::StartsChain(node)&&!modifier&&!setting; s.has_out=!NpcCombo::RowOutputs(node)&&!modifier&&!setting;
     s.in={s.rect.left+Px(13),mid}; s.out={s.rect.right-Px(13),mid};
     // Round pins: a trigger's arrow pin sits where an exec input would, a move's just under its exec input; a
     // modifier's (where arrows end) where an exec output would.
@@ -1279,6 +1355,14 @@ Shape NodeShape(HDC dc,size_t index) {
         s.resize={s.rect.right-h,s.rect.bottom-h,s.rect.right,s.rect.bottom};
     } else if (node.type==NodeType::BossEffect) {  // toggle / toggle2: its radius and hits fields
         s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26); s.field3=Row(s.rect,2,26); s.field4=Row(s.rect,3,26); s.toggle=Row(s.rect,4,26); s.toggle2=Row(s.rect,5,26);
+    } else if (node.type==NodeType::Plugin) {
+        // Row 0: the action; row 1: its value (a stepper) when it has one; then the note and a row per output (判断).
+        s.field=Row(s.rect,0,26);
+        int at=1;
+        if (PluginHasValue(node)) stepper(at++);
+        ++at;
+        if (NpcCombo::PluginDecides(node))
+            for (size_t k=0;k<node.routes.size();++k) { RouteShape route; const RECT line=Row(s.rect,at++); route.field=line; route.out={s.rect.right-Px(13),(line.top+line.bottom)/2}; s.routes.push_back(route); }
     } else if (node.type==NodeType::Air) {
         s.field=Row(s.rect,0,26); s.field2=Row(s.rect,1,26); s.field3=Row(s.rect,2,26); s.field4=Row(s.rect,3,26);  // then a note
     } else if (node.type==NodeType::AirDefault) {
@@ -1313,7 +1397,10 @@ Shape NodeShape(HDC dc,size_t index) {
             route.hplus={route.remove.left-Px(8)-b,line.top,route.remove.left-Px(8),line.bottom};
             route.hvalue={route.hplus.left-Px(4)-Px(RouteHoldUnits(dc)),line.top,route.hplus.left-Px(4),line.bottom};
             route.hminus={route.hvalue.left-Px(4)-b,line.top,route.hvalue.left-Px(4),line.bottom};
-            route.field={line.left,line.top,route.hminus.left-Px(8),line.bottom};
+            // A row naming one weapon move has no 按住 (the move itself is the press): its field takes the room.
+            const bool named=NpcCombo::NamedRow(node,node.routes[k]);
+            route.field={line.left,line.top,(named?route.remove.left:route.hminus.left)-Px(8),line.bottom};
+            if(named)route.hminus=route.hvalue=route.hplus=RECT{};
             route.out={s.rect.right-Px(13),(line.top+line.bottom)/2};
             if(NpcCombo::KeysRoute(node.routes[k])){const RECT keys=Row(s.rect,at++);const int split=keys.left+Px(16)+(right-keys.left-Px(16))*11/20;
                 route.has_keys=true;route.keys={keys.left+Px(16),keys.top,split-Px(3),keys.bottom};route.mode={split+Px(3),keys.top,right,keys.bottom};}
@@ -1600,6 +1687,10 @@ void Nudge(int index,int dir,int route=-1) {
         node.ms=NpcCombo::ClampCancel(node.ms+dir*NpcCombo::kCancelStep);
     else if (node.type==NodeType::Branch&&route>=0&&static_cast<size_t>(route)<node.routes.size())
         node.routes[static_cast<size_t>(route)].pause_ms=NpcCombo::ClampPause(node.routes[static_cast<size_t>(route)].pause_ms+dir*NpcCombo::kPauseStep);
+    else if (node.type==NodeType::Plugin) {
+        ComboPlugins::ActionView a; if (!PluginAction(node,a)||!a.has_value) return;
+        node.value=static_cast<int>(std::clamp<long long>(static_cast<long long>(node.value)+static_cast<long long>(dir)*a.value_step,a.value_min,a.value_max));
+    }
     else return;
     Save(); Invalidate();
 }
@@ -1634,7 +1725,7 @@ void NudgeHold(int index,int dir,int row) {
 bool Typed(const Node& node) {
     return node.type==NodeType::Speed||node.type==NodeType::Damage||node.type==NodeType::Skill||node.type==NodeType::AutoDodge||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||
            node.type==NodeType::Hook||node.type==NodeType::Teleport||node.type==NodeType::Group||node.type==NodeType::PreInput||node.type==NodeType::KeepChain||
-           node.type==NodeType::Trim;
+           node.type==NodeType::Trim||(node.type==NodeType::Plugin&&PluginHasValue(node));
 }
 void BeginEdit(int index) {
     if (!At(index)||!Typed(config_.chain[static_cast<size_t>(index)])) return;
@@ -1644,6 +1735,7 @@ void BeginEdit(int index) {
     else if (node.type==NodeType::PreInput) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampPreInput(node.ms)/1000.0);
     else if (node.type==NodeType::KeepChain) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampKeepChain(node.ms)/1000.0);
     else if (node.type==NodeType::Trim) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",NpcCombo::ClampTrim(node.trim_from)/1000.0);
+    else if (node.type==NodeType::Plugin) _snwprintf_s(text,_countof(text),_TRUNCATE,L"%d",node.value);
     else _snwprintf_s(text,_countof(text),_TRUNCATE,L"%.2f",node.type==NodeType::Speed?NpcCombo::ClampSpeed(node.speed)/100.0:NpcCombo::ClampCancel(node.ms)/1000.0);
     edit_={index,text,true}; SetFocus(window_); Invalidate();
 }
@@ -1693,6 +1785,14 @@ void CommitEdit() {
             node->ms=NpcCombo::ClampKeepChain(ms);
             if (node->ms!=ms) DebugHub::Notify(Tr(L"保持派生在 0.5 到 30 秒之间，已调整。").c_str());
             Save();
+        } else if (end&&end!=done.text.c_str()&&node->type==NodeType::Plugin) {
+            ComboPlugins::ActionView a;
+            if (PluginAction(*node,a)&&a.has_value) {
+                const int typed=static_cast<int>(std::llround(std::clamp(value,-2e9,2e9)));
+                node->value=std::clamp(typed,a.value_min,a.value_max);
+                if (node->value!=typed) { wchar_t note[128]{}; _snwprintf_s(note,_countof(note),_TRUNCATE,Tr(L"数值在 %d 到 %d 之间，已调整。").c_str(),a.value_min,a.value_max); DebugHub::Notify(note); }
+                Save();
+            }
         } else if (end&&end!=done.text.c_str()&&node->type==NodeType::Trim&&value>=0) {
             const int ms=static_cast<int>(std::lround(value*1000));
             node->trim_from=NpcCombo::ClampTrim(ms);
@@ -1865,7 +1965,7 @@ void Arrange() {
                 for (const int m:mods) if (m>=0&&m<count&&!placed[static_cast<size_t>(m)]&&NpcCombo::IsModifier(config_.chain[static_cast<size_t>(m)])) place(static_cast<size_t>(m),step.indent);
                 place(static_cast<size_t>(i),step.indent);
                 const Node& node=config_.chain[static_cast<size_t>(i)];
-                if (!NpcCombo::HasRows(node)) { i=node.next; continue; }
+                if (!NpcCombo::RowOutputs(node)) { i=node.next; continue; }
                 const int right=node.x+static_cast<int>(NodeSize(dc,static_cast<size_t>(i)).cx)+gap;
                 for (size_t r=node.routes.size();r-->0;)  // last first: the first route comes off the stack first
                     steps.push_back({node.routes[r].next,r>0?(right+300<width?right:step.indent):step.indent,r>0});
@@ -1936,6 +2036,7 @@ void SearchItems() {
             const Node& from=config_.chain[static_cast<size_t>(search_.mod_from)];
             if (NpcCombo::StartsChain(from)||NpcCombo::TakesAir(from)||from.type==NodeType::Group) add({ItemKind::Air,Tr(L"滞空"),flow});
             if (NpcCombo::ModifierFits([&]{ std::vector<Node> two{from,NpcCombo::ModifierNode(NodeType::BossEffect,0,0)}; return two; }(),0,1)) add({ItemKind::BossEffect,Tr(L"BOSS 特效"),flow});
+            if (NpcCombo::ModifierFits([&]{ std::vector<Node> two{from,NpcCombo::ModifierNode(NodeType::HeroSize,0,0)}; return two; }(),0,1)) add({ItemKind::HeroSize,Tr(L"主角体型"),flow});
         }
         return;
     }
@@ -1943,6 +2044,80 @@ void SearchItems() {
         // The .combo files in combos\ (the active one first).
         for (const std::wstring& name:files_.names) if (name==files_.active) add({ItemKind::File,name,Tr(L"当前文件")});
         for (const std::wstring& name:files_.names) if (name!=files_.active) add({ItemKind::File,name,Tr(L"combos 文件夹")});
+        return;
+    }
+    if (search_.mode==7) {
+        // 派生插件: on / off, the folder, then each plugin found there and whether it is in use.
+        const bool on=ComboPlugins::Enabled();
+        const std::wstring top=Tr(L"派生插件");
+        Item toggle{ItemKind::PluginToggle,Tr(on?L"关闭派生插件":L"打开派生插件（载入 PBZPlugins 文件夹里的插件）"),top}; add(toggle);
+        Item folder{ItemKind::PluginFolder,Tr(L"打开插件文件夹 PBZPlugins"),top}; add(folder);
+        if (on&&ComboPlugins::ScriptsEnabled()) { Item reload{ItemKind::PluginReload,Tr(L"重新读取脚本（PBZPlugins\\scripts 里的 Lua 脚本）"),top}; add(reload); }
+        else if (on) { Item off{ItemKind::PluginInfo,Tr(L"Lua 脚本已关闭（PBZDebugMenu.ini 的 [Plugins] Scripts = 0）"),top}; add(off); }
+        const std::vector<ComboPlugins::PluginView> plugins=ComboPlugins::Plugins();
+        if (on&&plugins.empty()) { Item none{ItemKind::PluginInfo,Tr(ComboPlugins::Loaded()?L"PBZPlugins 文件夹里没有插件":L"正在载入插件…"),Tr(L"插件")}; add(none); }
+        for (const ComboPlugins::PluginView& p:plugins) {
+            std::wstring label=(p.script?L"Lua · ":L"")+(p.name.empty()?p.file:p.name)+(p.version.empty()?L"":L" "+p.version);  // a script is marked
+            if (p.loaded&&!p.faulted) { wchar_t counts[96]{}; _snwprintf_s(counts,_countof(counts),_TRUNCATE,Tr(L" · %zu 个信号 · %zu 个节点动作").c_str(),p.signals,p.actions); label+=counts; }
+            else label+=L" · "+p.error;
+            Item item{ItemKind::PluginInfo,label,Tr(p.loaded&&!p.faulted?L"已载入的插件":L"没有载入")}; add(item);
+        }
+        // 插件权限: what each plugin asked for beyond the combo ability (describe_ex), one row each; a click allows or takes it back.
+        for (const ComboPlugins::PluginView& p:plugins) {
+            if (!p.loaded||p.faulted||p.id.empty()||p.requested==PBZ_CAP_COMBO) continue;
+            const std::wstring who=p.name.empty()?p.file:p.name;
+            if (!p.caps_reason.empty()) { Item why{ItemKind::PluginInfo,Tr(L"申请理由：")+p.caps_reason,who+L" · "+Tr(L"权限")}; add(why); }
+            for (const CapRow& c:kCapRows) {
+                if (!(p.requested&c.cap)) continue;
+                const bool allowed=(p.granted&c.cap)!=0;
+                Item row{ItemKind::PluginGrant,Tr(c.name)+Tr(allowed?L" · 已允许（点击收回）":L" · 未允许（点击允许）"),who+L" · "+Tr(L"权限")};
+                row.ability=p.id; row.trigger=static_cast<int>(c.cap); add(row);
+            }
+        }
+        // The pages the plugins declared (ui_page): each control one row, drawn with the list's own rows; a click operates it.
+        for (const PluginUi::Page& page:ComboPlugins::UiPages()) {
+            const std::wstring group=page.owner_name+L" · "+page.title;
+            for (const PluginUi::Item& it:page.items) {
+                const std::string id=page.owner+"\t"+page.id+"\t"+it.id;
+                const std::wstring head=it.label.empty()?std::wstring():it.label+L"：";
+                wchar_t number[48]{};
+                if (it.kind==PBZ_UI_LABEL) { Item row{ItemKind::PluginInfo,head+it.text,group}; add(row); }
+                else if (it.kind==PBZ_UI_TEXT) {
+                    size_t at=0;  // a line a row
+                    while (at<=it.text.size()) {
+                        const size_t nl=it.text.find(L'\n',at); Item row{ItemKind::PluginInfo,it.text.substr(at,nl==std::wstring::npos?std::wstring::npos:nl-at),group}; add(row);
+                        if (nl==std::wstring::npos) break;
+                        at=nl+1;
+                    }
+                }
+                else if (it.kind==PBZ_UI_BUTTON) { Item row{ItemKind::PluginUi,L"▶ "+it.label,group}; row.ability=id; row.trigger=it.kind; row.value=1; add(row); }
+                else if (it.kind==PBZ_UI_TOGGLE) { Item row{ItemKind::PluginUi,head+Tr(it.value!=0?L"开（点击关闭）":L"关（点击打开）"),group}; row.ability=id; row.trigger=it.kind; add(row); }
+                else if (it.kind==PBZ_UI_CHOICE) {
+                    const size_t k=it.choices.empty()?0:(std::min)(static_cast<size_t>(it.value<0?0:it.value),it.choices.size()-1);
+                    Item row{ItemKind::PluginUi,head+(it.choices.empty()?std::wstring():it.choices[k])+Tr(L"（点击换下一个）"),group}; row.ability=id; row.trigger=it.kind; add(row);
+                }
+                else if (it.kind==PBZ_UI_SLIDER) {
+                    _snwprintf_s(number,_countof(number),_TRUNCATE,L"%g",it.value);
+                    const std::wstring shown=head+number+it.text;
+                    Item up{ItemKind::PluginUi,shown+Tr(L"　▲ 加"),group}; up.ability=id; up.trigger=it.kind; up.value=1; add(up);
+                    Item down{ItemKind::PluginUi,shown+Tr(L"　▼ 减"),group}; down.ability=id; down.trigger=it.kind; down.value=-1; add(down);
+                }
+            }
+        }
+        return;
+    }
+    if (search_.pick_node>=0&&search_.pick_route==-1&&At(search_.pick_node)&&config_.chain[static_cast<size_t>(search_.pick_node)].type==NodeType::Plugin) {
+        // A 插件节点's action: every one the loaded plugins registered, by plugin and group.
+        const std::vector<ComboPlugins::ActionView> actions=ComboPlugins::Actions();
+        if (!ComboPlugins::Enabled()) { Item off{ItemKind::PluginToggle,Tr(L"打开派生插件（载入 PBZPlugins 文件夹里的插件）"),Tr(L"派生插件")}; add(off); }
+        else if (actions.empty()) {
+            Item none{ItemKind::PluginInfo,Tr(ComboPlugins::Loaded()?L"没有已载入的插件动作：把插件 DLL 放进 PBZPlugins 文件夹后重启游戏":L"正在载入插件…"),Tr(L"派生插件")}; add(none);
+            Item folder{ItemKind::PluginFolder,Tr(L"打开插件文件夹 PBZPlugins"),Tr(L"派生插件")}; add(folder);
+        }
+        for (const ComboPlugins::ActionView& a:actions) {
+            Item item{ItemKind::PluginAction,a.name+Tr(a.kind==PBZ_ACTION_DECIDE?L"（判断）":L"（动作）"),a.plugin+(a.group.empty()?L"":L" · "+a.group)};
+            item.ability=a.id; add(item);
+        }
         return;
     }
     if (search_.mode==6) {
@@ -1954,20 +2129,48 @@ void SearchItems() {
         }
         return;
     }
-    if (search_.mode==4) {
+    if (search_.mode==4||search_.mode==10) {
         // 派生页的技能伤害: follow the NPC 技能 page, or a multiplier of the boss's own damage.
         const std::wstring group=Tr(L"派生链的 BOSS 技能伤害");
-        Item follow{ItemKind::ChainSkill,Tr(L"跟随 NPC 技能页"),group}; add(follow);
-        for (const float v:{.5f,1.f,1.5f,2.f,3.f,5.f,8.f,10.f}) { Item item{ItemKind::ChainSkill,ChainSkillText(v),group}; item.value=v; add(item); }
-        return;
+        const float skill=NpcCombo::ChainSkillDamage();
+        const auto choice=[&](Item item){ item.choice=true; item.on=std::fabs(item.value-skill)<1e-3f; add(item); };
+        choice({ItemKind::ChainSkill,Tr(L"跟随 NPC 技能页"),group});
+        for (const float v:{.5f,1.f,1.5f,2.f,3.f,5.f,8.f,10.f}) { Item item{ItemKind::ChainSkill,ChainSkillText(v),group}; item.value=v; choice(item); }
+        if (search_.mode==4) return;
     }
-    if (search_.mode==5) {
+    if (search_.mode==5||search_.mode==10) {
         // 派生页的投技伤害: follow the 投技 page, the grab's own damage, a multiplier, or at least a share of max health.
         const std::wstring group=Tr(L"派生链的投技伤害");
-        Item follow{ItemKind::ChainGrab,Tr(L"跟随投技页"),group}; follow.trigger=NpcCombo::kGrabFollow; add(follow);
-        Item native{ItemKind::ChainGrab,Tr(L"原生伤害"),group}; native.trigger=0; add(native);
-        for (const float v:{2.f,4.5f,10.f,15.f,20.f,30.f}) { Item item{ItemKind::ChainGrab,ChainGrabText({1,v}),group}; item.trigger=1; item.value=v; add(item); }
-        for (const float v:{10.f,20.f,30.f,50.f,100.f}) { Item item{ItemKind::ChainGrab,ChainGrabText({2,v}),group}; item.trigger=2; item.value=v; add(item); }
+        const NpcCombo::ChainGrab grab=NpcCombo::ChainGrabDamage();
+        const auto choice=[&](Item item){ item.choice=true; item.on=item.trigger==grab.mode&&(grab.mode<=0||std::fabs(item.value-grab.value)<1e-3f); add(item); };
+        Item follow{ItemKind::ChainGrab,Tr(L"跟随投技页"),group}; follow.trigger=NpcCombo::kGrabFollow; choice(follow);
+        Item native{ItemKind::ChainGrab,Tr(L"原生伤害"),group}; native.trigger=0; choice(native);
+        for (const float v:{2.f,4.5f,10.f,15.f,20.f,30.f}) { Item item{ItemKind::ChainGrab,ChainGrabText({1,v}),group}; item.trigger=1; item.value=v; choice(item); }
+        for (const float v:{10.f,20.f,30.f,50.f,100.f}) { Item item{ItemKind::ChainGrab,ChainGrabText({2,v}),group}; item.trigger=2; item.value=v; choice(item); }
+        return;
+    }
+    if (search_.mode==8||search_.mode==9) {
+        // 镜头: the bone the 视角跟随 camera looks at and how far it stands. 显示: the chain in the game's top-right corner
+        // and the move name in its bottom-right one. Each row sets one value; the one in use is marked.
+        const auto choice=[&](ItemKind kind,const wchar_t* label,const std::wstring& group,int value,bool on){
+            Item item{kind,Tr(label),group}; item.trigger=value; item.choice=true; item.on=on; add(item); };
+        if (search_.mode==8) {
+            const int bone=NpcCombo::ViewTarget(); const bool ratio=NpcCombo::ViewScale()==NpcCombo::kScaleHeroRatio;
+            const std::wstring follow=Tr(L"镜头跟随：招式中镜头盯着的骨骼"),framing=Tr(L"镜头取景：招式中镜头离模型多远");
+            choice(ItemKind::ViewBone,L"骨盆",follow,NpcCombo::kViewPelvis,bone!=NpcCombo::kViewNeck&&bone!=NpcCombo::kViewHead);
+            choice(ItemKind::ViewBone,L"脖子",follow,NpcCombo::kViewNeck,bone==NpcCombo::kViewNeck);
+            choice(ItemKind::ViewBone,L"头部",follow,NpcCombo::kViewHead,bone==NpcCombo::kViewHead);
+            choice(ItemKind::ViewFrame,L"按身高（只有高于 2 米的模型拉远镜头）",framing,NpcCombo::kScaleHeight,!ratio);
+            choice(ItemKind::ViewFrame,L"按体型比例（按 BOSS 显示的大小和主角身高之比）",framing,NpcCombo::kScaleHeroRatio,ratio);
+        } else {
+            const int hud=NpcCombo::ChainHud(); const bool toast=NpcCombo::ShowToast();
+            const std::wstring chain=Tr(L"派生显示：游戏右上角的派生链"),notice=Tr(L"派生提示：放招时右下角的招式名");
+            choice(ItemKind::HudMode,L"关",chain,NpcCombo::kHudOff,hud!=NpcCombo::kHudDetailed&&hud!=NpcCombo::kHudSimple);
+            choice(ItemKind::HudMode,L"详细（整条派生链的缩略图，当前位置高亮）",chain,NpcCombo::kHudDetailed,hud==NpcCombo::kHudDetailed);
+            choice(ItemKind::HudMode,L"简略（接下来可以按的键和对应招式）",chain,NpcCombo::kHudSimple,hud==NpcCombo::kHudSimple);
+            choice(ItemKind::ToastMode,L"开",notice,1,toast);
+            choice(ItemKind::ToastMode,L"关",notice,0,!toast);
+        }
         return;
     }
     if (search_.mode==3) {
@@ -2008,7 +2211,15 @@ void SearchItems() {
             for (const auto& [id,shaqi]:ListedWeapons()) { Item item{ItemKind::WeaponPick,WeaponName(id),Tr(shaqi?L"影之武装":L"武器")}; item.ability=id; add(item); }
             return;
         }
-        const bool air=config_.chain[static_cast<size_t>(search_.pick_node)].air_set;
+        const Node& actions=config_.chain[static_cast<size_t>(search_.pick_node)];
+        const bool air=actions.air_set;
+        // A 武器派生修改 row may name one move of its weapon (an air, dash or skill move no button covers alone): those
+        // first, then the buttons (a row takes every press of one).
+        if (!air) if (const ComboWeapons::Weapon* w=ComboWeapons::Find(actions.weapon))
+            for (int kind=0;kind<4;++kind) for (size_t i=0;i<w->count;++i) if (w->moves[i].kind==kind) {
+                Item item{ItemKind::WeaponSkill,WeaponMoveText(actions.weapon,w->moves[i].ability),Tr(L"只改这一个动作 · ")+WeaponKindLabel(kind)};
+                item.ability=w->moves[i].ability; add(item);
+            }
         const std::wstring group=Tr(air?L"在空中按哪个键":L"改哪个动作");
         if (air) { Item item{ItemKind::Button,ButtonLabel(static_cast<int>(Trigger::NpcKey)),group}; item.trigger=static_cast<int>(Trigger::NpcKey); add(item); }
         for (const Trigger t:NpcCombo::kTriggerOrder) if (!NpcCombo::OwnKeysTrigger(static_cast<int>(t))&&(air?NpcCombo::ValidAirAction(static_cast<int>(t)):NpcCombo::ValidWeaponAction(static_cast<int>(t)))) {
@@ -2128,6 +2339,9 @@ void SearchItems() {
                 Item record{ItemKind::RawKey,Tr(L"录制按键：键盘、鼠标五键、手柄或左摇杆（回车确认）"),Tr(L"录制")}; record.trigger=-4; add(record);
                 wchar_t group[96]{}; _snwprintf_s(group,_countof(group),_TRUNCATE,Tr(L"手柄按键（%zu / %zu）").c_str(),keys.size(),NpcCombo::kComboKeysMax);
                 for (int bit=0;bit<NpcCombo::kPadBits+NpcCombo::kStickWays;++bit) { Item item{ItemKind::RawKey,PadBothLabel(NpcCombo::kPadKey+bit),group}; item.trigger=NpcCombo::kPadKey+bit; add(item); }
+                // 插件信号: the virtual keys of the loaded plugins (a key like the others: alone, in order or together).
+                for (const ComboPlugins::SignalView& sg:ComboPlugins::Signals()) {
+                    Item item{ItemKind::RawKey,sg.name,Tr(L"插件信号")+L" · "+sg.plugin+(sg.group.empty()?L"":L" · "+sg.group)}; item.trigger=sg.code; add(item); }
             }
             if (!keys.empty()) {
                 Item undo{ItemKind::RawKey,Tr(L"删除最后一个按键"),Tr(L"修改")}; undo.trigger=-1; add(undo);
@@ -2242,6 +2456,8 @@ void SearchItems() {
     add({ItemKind::ForceHit,Tr(L"强制受击"),flow});
     add({ItemKind::Air,Tr(L"滞空"),flow});
     add({ItemKind::BossEffect,Tr(L"BOSS 特效"),flow});
+    add({ItemKind::HeroSize,Tr(L"主角体型"),flow});
+    add({ItemKind::PluginNode,Tr(L"插件节点"),flow});
     add({ItemKind::Interrupt,Tr(L"允许中断"),flow});
     add({ItemKind::KeepChain,Tr(L"保持派生"),flow});
     add({ItemKind::Weapon,Tr(L"武器属性"),flow});
@@ -2385,20 +2601,43 @@ void OpenFileSearch(int mode) {
     SearchItems(); SearchFilter(); SearchLayout(); Invalidate();
 }
 void OpenFiles() { OpenFileSearch(1); }
-// 派生页的技能伤害 (mode 4) / 投技伤害 (mode 5): the presets under the button, the value in use selected.
-void OpenDamageSearch(int mode) {
-    const RECT b=buttons_[static_cast<int>(mode==4?Button::SkillDamage:Button::GrabDamage)];
+// The top bar's lists under their buttons (user 11-13: the bar was too crowded): 镜头 (mode 8), 显示 (9), 伤害 (10, the
+// 技能伤害 (4) and 投技伤害 (5) presets together), the values in use marked and the first of them selected. keep_row /
+// keep_scroll: a pick opens the list again where it was, so both values of a list can be set one after the other.
+Button MenuButton(int mode) { return mode==8?Button::Camera:mode==9?Button::Display:Button::Damages; }
+void OpenMenuSearch(int mode,int keep_row=-1,int keep_scroll=0) {
+    const RECT b=buttons_[static_cast<int>(MenuButton(mode))];
     OpenSearch({b.left,canvas_.top+M().S(8)},-1,-1,0);
     if (!search_.open) return;
     search_.mode=mode; SearchItems(); SearchFilter();
-    const float skill=NpcCombo::ChainSkillDamage(); const NpcCombo::ChainGrab grab=NpcCombo::ChainGrabDamage();
-    for (size_t r=0;r<search_.rows.size();++r) {
-        if (search_.rows[r].header) continue;
-        const Item& item=search_.items[search_.rows[r].item];
-        const bool now=mode==4?std::fabs(item.value-skill)<1e-3f:item.trigger==grab.mode&&(grab.mode<=0||std::fabs(item.value-grab.value)<1e-3f);
-        if (now) { search_.selected=static_cast<int>(r); break; }
-    }
+    if (keep_row>=0&&static_cast<size_t>(keep_row)<search_.rows.size()) { search_.selected=keep_row; search_.scroll=keep_scroll; }
+    else for (size_t r=0;r<search_.rows.size();++r)
+        if (!search_.rows[r].header&&search_.items[search_.rows[r].item].on) { search_.selected=static_cast<int>(r); break; }
     SearchLayout(); SearchEnsureVisible(); Invalidate();
+}
+void OpenDamageSearch(int mode) { OpenMenuSearch(mode); }
+// What each 显示 / 镜头 value does, said once it is set.
+void NotifyChainHud(int mode) {
+    DebugHub::Notify(Tr(mode==NpcCombo::kHudDetailed?L"派生显示：详细（右上角显示整条派生链的缩略图，当前位置实时高亮）":
+                        mode==NpcCombo::kHudSimple?L"派生显示：简略（右上角显示接下来可以按的键和对应招式）":L"派生显示已关闭").c_str());
+}
+void NotifyToast(bool on) {
+    DebugHub::Notify(Tr(on?L"派生提示已打开：派生链放招时右下角显示招式名":L"派生提示已关闭：派生链放招时右下角不再显示招式名").c_str());
+}
+void NotifyViewTarget(int target) {
+    DebugHub::Notify(Tr(target==NpcCombo::kViewNeck?L"镜头跟随：脖子（招式中镜头盯着模型的脖子）":
+                        target==NpcCombo::kViewHead?L"镜头跟随：头部（招式中镜头盯着模型的头部）":L"镜头跟随：骨盆（招式中镜头盯着模型的骨盆）").c_str());
+}
+void NotifyViewScale(int mode) {
+    DebugHub::Notify(Tr(mode==NpcCombo::kScaleHeroRatio?L"镜头取景：按体型比例（招式中镜头按 BOSS 当前显示的大小和主角身高之比拉远或拉近；缩放到主角体型时和主角一样）":
+                        L"镜头取景：按身高（招式中只有高于 2 米的模型按身高拉远镜头）").c_str());
+}
+// The 派生插件 list (mode 7) under its button.
+void OpenPluginSearch() {
+    const RECT b=buttons_[static_cast<int>(Button::Plugins)];
+    OpenSearch({b.left,canvas_.top+M().S(8)},-1,-1,0);
+    if (!search_.open) return;
+    search_.mode=7; SearchItems(); SearchFilter(); SearchLayout(); Invalidate();
 }
 // The 招式来源 list (mode 6) beside the dropdown, on the source shown now.
 void OpenSourceSearch() {
@@ -2531,8 +2770,71 @@ void SearchPick(int row) {
     if (row<0||static_cast<size_t>(row)>=search_.rows.size()||search_.rows[static_cast<size_t>(row)].header) return;
     const Item item=search_.items[search_.rows[static_cast<size_t>(row)].item];
     const float x=search_.x,y=search_.y; const int from=search_.from,into=search_.into,from_out=search_.from_out,pick=search_.pick_node,route=search_.pick_route,mod_from=search_.mod_from;
-    const int part=search_.pick_part;
+    const int part=search_.pick_part,menu_mode=search_.mode,menu_scroll=search_.scroll;
+    const int menu_row=search_.query.empty()?row:-1;  // a typed filter: the reopened list is whole, so its rows differ
     CloseSearch();
+    if (item.kind==ItemKind::HudMode||item.kind==ItemKind::ToastMode||item.kind==ItemKind::ViewBone||item.kind==ItemKind::ViewFrame) {
+        switch (item.kind) {
+        case ItemKind::HudMode: NpcCombo::SetChainHud(item.trigger); NotifyChainHud(NpcCombo::ChainHud()); break;
+        case ItemKind::ToastMode: NpcCombo::SetShowToast(item.trigger!=0); NotifyToast(NpcCombo::ShowToast()); break;
+        case ItemKind::ViewBone: NpcCombo::SetViewTarget(item.trigger); NotifyViewTarget(NpcCombo::ViewTarget()); break;
+        default: NpcCombo::SetViewScale(item.trigger); NotifyViewScale(NpcCombo::ViewScale()); break;
+        }
+        Layout(); OpenMenuSearch(menu_mode,menu_row,menu_scroll); return;
+    }
+    if (item.kind==ItemKind::PluginToggle) {
+        const bool on=!ComboPlugins::Enabled(); ComboPlugins::SetEnabled(on);
+        DebugHub::Notify(Tr(on?L"派生插件已打开：载入 PBZPlugins 文件夹里的插件（载入后一直保留到游戏退出）":L"派生插件已关闭：插件信号、插件节点不再起作用").c_str());
+        DropCanvasCache(); Layout(); Invalidate(); return;
+    }
+    if (item.kind==ItemKind::PluginFolder) { OpenPluginFolder(); return; }
+    if (item.kind==ItemKind::PluginReload) {  // the DLLs stay; every script stops and the folder is read again next frame
+        ComboPlugins::RequestScriptReload();
+        DebugHub::Notify(Tr(L"正在重新读取 Lua 脚本：所有脚本先停下，下一帧再读一遍 PBZPlugins\\scripts").c_str());
+        OpenPluginSearch(); return;
+    }
+    if (item.kind==ItemKind::PluginInfo) return;
+    if (item.kind==ItemKind::PluginGrant) {  // allow / take back one ability for one plugin, then show the list again
+        for (const ComboPlugins::PluginView& p:ComboPlugins::Plugins())
+            if (p.id==item.ability) { ComboPlugins::SetGrant(p.id,(p.granted&~static_cast<uint32_t>(PBZ_CAP_COMBO))^static_cast<uint32_t>(item.trigger)); break; }
+        OpenPluginSearch(); return;
+    }
+    if (item.kind==ItemKind::PluginUi) {  // operate one control of a plugin's page, then show the list again
+        const size_t a=item.ability.find('\t'),b=a==std::string::npos?a:item.ability.find('\t',a+1);
+        if (b!=std::string::npos) {
+            const std::string owner=item.ability.substr(0,a),page=item.ability.substr(a+1,b-a-1),id=item.ability.substr(b+1);
+            PluginUi::Item it;
+            if (PluginUi::FindItem(owner,page,id,it)) {
+                double value=1;
+                if (it.kind==PBZ_UI_TOGGLE) value=it.value!=0?0:1;
+                else if (it.kind==PBZ_UI_CHOICE) value=it.choices.empty()?0:std::fmod(it.value+1,static_cast<double>(it.choices.size()));
+                else if (it.kind==PBZ_UI_SLIDER) {
+                    value=it.value+(item.value<0?-it.step:it.step);
+                    if (value>it.max) value=it.max; else if (value<it.min) value=it.min;
+                }
+                ComboPlugins::UiInput(owner,page,id,value);
+            }
+        }
+        OpenPluginSearch(); return;
+    }
+    if (item.kind==ItemKind::PluginAction) {
+        if (!At(pick)||config_.chain[static_cast<size_t>(pick)].type!=NodeType::Plugin) return;
+        ComboPlugins::ActionView a; if (!ComboPlugins::FindAction(item.ability,a)) return;
+        Node& target=config_.chain[static_cast<size_t>(pick)];
+        const bool decide=a.kind==PBZ_ACTION_DECIDE,was=NpcCombo::PluginDecides(target);
+        if (target.action!=a.id) target.value=a.has_value?a.value_default:0;
+        target.action=a.id; target.action_kind=decide?NpcCombo::kActionDecide:NpcCombo::kActionRun;
+        if (decide) {  // a row per output; the wire it had goes on from the first
+            const int first=was?-1:target.next; target.next=-1;
+            target.routes.resize((std::min)(a.outputs.size(),NpcCombo::kMaxRoutes));
+            for (NpcCombo::Route& r:target.routes) r.button=0;
+            if (first>=0&&!target.routes.empty()) target.routes[0].next=first;
+        } else {
+            if (was&&!target.routes.empty()) target.next=target.routes[0].next;
+            target.routes.clear();
+        }
+        Select(pick); Save(); DropCanvasCache(); Layout(); Invalidate(); return;
+    }
     if (item.kind==ItemKind::MoveSource) {
         library_boss_=item.ability; category_=-1; library_pages_[4]=0;
         DebugHub::Notify((library_boss_.empty()?Tr(L"BOSS 招式列表：本表外观的招式"):
@@ -2543,14 +2845,14 @@ void SearchPick(int row) {
         NpcCombo::SetChainSkillDamage(item.value);
         DebugHub::Notify((item.value>0?Tr(L"派生链放的 BOSS 技能伤害：")+ChainSkillText(item.value)+Tr(L"（代替 NPC 技能页的设置）"):
                                        Tr(L"派生链放的 BOSS 技能伤害跟随 NPC 技能页")).c_str());
-        Layout(); Invalidate(); return;
+        Layout(); if (menu_mode==10) OpenMenuSearch(10,menu_row,menu_scroll); return;
     }
     if (item.kind==ItemKind::ChainGrab) {
         NpcCombo::SetChainGrabDamage({item.trigger,item.value});
         const NpcCombo::ChainGrab now=NpcCombo::ChainGrabDamage();
         DebugHub::Notify((now.mode!=NpcCombo::kGrabFollow?Tr(L"派生链放的投技伤害：")+ChainGrabText(now)+Tr(L"（代替投技页的设置）"):
                                                          Tr(L"派生链放的投技伤害跟随投技页")).c_str());
-        Layout(); Invalidate(); return;
+        Layout(); if (menu_mode==10) OpenMenuSearch(10,menu_row,menu_scroll); return;
     }
     if (item.kind==ItemKind::File) {
         if (NpcCombo::SelectFile(item.label)) DebugHub::Notify((Tr(L"已载入派生文件：")+item.label+L".combo").c_str());
@@ -2574,10 +2876,22 @@ void SearchPick(int row) {
         if (target.ability.empty()) OpenPicker(pick,-2);  // then its move
         Invalidate(); return;
     }
+    if (item.kind==ItemKind::WeaponSkill&&At(pick)&&route>=0&&WeaponActionsNode(config_.chain[static_cast<size_t>(pick)])) {
+        // A 武器派生修改 row naming one move of its weapon (the move's kind is the button an older build reads it as).
+        Node& target=config_.chain[static_cast<size_t>(pick)];
+        if (target.air_set||static_cast<size_t>(route)>=target.routes.size()) return;
+        NpcCombo::Route& picked=target.routes[static_cast<size_t>(route)];
+        const ComboWeapons::Move* move=ComboWeapons::MoveOf(target.weapon,item.ability);
+        picked.ability=item.ability; picked.button=NpcCombo::NamedRowButton(move?move->kind:ComboWeapons::kSkill); picked.keys.clear(); picked.hold_ms=0;
+        if (record_.node==pick&&record_.route==route) record_={};
+        Select(pick); Save(); Layout(); Invalidate(); return;
+    }
     if (item.kind==ItemKind::WeaponPick||item.kind==ItemKind::WeaponSkill) {
         if (!At(pick)) return;
         Node& target=config_.chain[static_cast<size_t>(pick)];
-        if ((ExecutionTrigger(target)||WeaponActionsNode(target))&&item.kind==ItemKind::WeaponPick) { target.weapon=item.ability; Select(pick); Save(); Layout(); Invalidate(); return; }
+        if ((ExecutionTrigger(target)||WeaponActionsNode(target))&&item.kind==ItemKind::WeaponPick) {
+            if (target.weapon!=item.ability) for (NpcCombo::Route& r:target.routes) r.ability.clear();  // another weapon's moves: the rows take their buttons
+            target.weapon=item.ability; Select(pick); Save(); Layout(); Invalidate(); return; }
         if (target.type!=NodeType::WeaponMove) return;
         if (item.kind==ItemKind::WeaponSkill) { target.ability=item.ability; Select(pick); Save(); Layout(); Invalidate(); return; }
         if (target.weapon!=item.ability) { target.weapon=item.ability; if (!ComboWeapons::MoveOf(target.weapon,target.ability)) target.ability.clear(); }
@@ -2697,6 +3011,7 @@ void SearchPick(int row) {
         if (route>=0&&static_cast<size_t>(route)<target.routes.size()) {
             NpcCombo::Route& picked=target.routes[static_cast<size_t>(route)];
             if (picked.button!=item.trigger) { picked.keys.clear(); if (record_.node==pick&&record_.route==route) record_={}; }  // the keys were the other kind's
+            picked.ability.clear();  // a button: every press of it, no single weapon move
             picked.button=item.trigger;
         }
         else if (target.type==NodeType::Trigger&&!IsKey(pick)&&item.trigger!=static_cast<int>(Trigger::NpcKey)) {
@@ -2721,6 +3036,7 @@ void SearchPick(int row) {
     case ItemKind::Weapon: node=NpcCombo::ModifierNode(NodeType::Weapon,0,0); break;
     case ItemKind::Armor: node=NpcCombo::ModifierNode(NodeType::Armor,0,0); break;
     case ItemKind::Invincible: node=NpcCombo::ModifierNode(NodeType::Invincible,0,0); break;
+    case ItemKind::HeroSize: node=NpcCombo::ModifierNode(NodeType::HeroSize,0,0); break;
     case ItemKind::IgnoreGuard: node=NpcCombo::ModifierNode(NodeType::IgnoreGuard,0,0); break;
     case ItemKind::KeepChain: node=NpcCombo::ModifierNode(NodeType::KeepChain,0,0); break;
     case ItemKind::KeepLook: node=NpcCombo::ModifierNode(NodeType::KeepLook,0,0); break;
@@ -2731,6 +3047,7 @@ void SearchPick(int row) {
     case ItemKind::Grab: node.type=NodeType::Grab; break;
     case ItemKind::BossSkill: node.type=NodeType::BossSkill; break;
     case ItemKind::Assist: node.type=NodeType::Assist; break;
+    case ItemKind::PluginNode: node.type=NodeType::Plugin; break;
     case ItemKind::Look: node.type=NodeType::Look; break;
     case ItemKind::HeroLook: node.type=NodeType::HeroLook; break;
     case ItemKind::WeaponMove: node.type=NodeType::WeaponMove; break;
@@ -2746,7 +3063,7 @@ void SearchPick(int row) {
     const bool exec=!NpcCombo::StartsChain(node)&&!NpcCombo::IsModifier(node);
     const int index=Place(node,x,y,exec?from:-1,exec?into:-1,from_out);
     if (index>=0&&mod_from>=0&&NpcCombo::LinkModifier(config_,mod_from,index)) { Save(); Invalidate(); }
-    if (index>=0&&(node.type==NodeType::WeaponMove||node.type==NodeType::Grab||node.type==NodeType::Look||node.type==NodeType::Assist||node.type==NodeType::BossEffect||
+    if (index>=0&&(node.type==NodeType::WeaponMove||node.type==NodeType::Grab||node.type==NodeType::Look||node.type==NodeType::Assist||node.type==NodeType::BossEffect||node.type==NodeType::Plugin||
                    (WeaponActionsNode(node)&&!node.air_set))) OpenPicker(index,-1);  // its weapon / grab / look at once
     if (index>=0&&KeysTrigger(node)) OpenPicker(index,-2);  // a 组合键: its keys at once
 }
@@ -2762,24 +3079,24 @@ void PressButton(Button button) {
     case Button::Copy: CopySelection();return;
     case Button::Paste: PasteSelection();return;
     case Button::Toggle: config_.enabled=!config_.enabled; Save(); break;
-    case Button::Toast: {
-        const bool on=!NpcCombo::ShowToast(); NpcCombo::SetShowToast(on);
-        DebugHub::Notify(Tr(on?L"派生提示已打开：派生链放招时右下角显示招式名":L"派生提示已关闭：派生链放招时右下角不再显示招式名").c_str());
-        Layout(); Invalidate(); return;
+    // The old one-value buttons (no longer on the bar; their values are rows of the 显示 / 镜头 / 伤害 lists).
+    case Button::Toast: { const bool on=!NpcCombo::ShowToast(); NpcCombo::SetShowToast(on); NotifyToast(on); Layout(); Invalidate(); return; }
+    case Button::Hud: { const int mode=(NpcCombo::ChainHud()+1)%3; NpcCombo::SetChainHud(mode); NotifyChainHud(mode); Layout(); Invalidate(); return; }
+    case Button::ViewTarget: { const int target=(NpcCombo::ViewTarget()+1)%3; NpcCombo::SetViewTarget(target); NotifyViewTarget(target); Layout(); Invalidate(); return; }
+    case Button::ViewScale: {
+        const int mode=NpcCombo::ViewScale()==NpcCombo::kScaleHeroRatio?NpcCombo::kScaleHeight:NpcCombo::kScaleHeroRatio;
+        NpcCombo::SetViewScale(mode); NotifyViewScale(mode); Layout(); Invalidate(); return;
     }
-    case Button::Hud: {  // 派生显示: 关 -> 详细 -> 简略 -> 关
-        const int mode=(NpcCombo::ChainHud()+1)%3; NpcCombo::SetChainHud(mode);
-        DebugHub::Notify(Tr(mode==NpcCombo::kHudDetailed?L"派生显示：详细（右上角显示整条派生链的缩略图，当前位置实时高亮）":
-                            mode==NpcCombo::kHudSimple?L"派生显示：简略（右上角显示接下来可以按的键和对应招式）":L"派生显示已关闭").c_str());
-        Layout(); Invalidate(); return;
-    }
-    case Button::ViewTarget: {  // 镜头跟随: 骨盆 -> 脖子 -> 头部 -> 骨盆
-        const int target=(NpcCombo::ViewTarget()+1)%3; NpcCombo::SetViewTarget(target);
-        DebugHub::Notify(Tr(target==NpcCombo::kViewNeck?L"镜头跟随：脖子（招式中镜头盯着模型的脖子）":
-                            target==NpcCombo::kViewHead?L"镜头跟随：头部（招式中镜头盯着模型的头部）":L"镜头跟随：骨盆（招式中镜头盯着模型的骨盆）").c_str());
-        Layout(); Invalidate(); return;
-    }
+    case Button::Display: if (search_.open&&search_.mode==9) CloseSearch(); else OpenMenuSearch(9); return;
+    case Button::Camera: if (search_.open&&search_.mode==8) CloseSearch(); else OpenMenuSearch(8); return;
+    case Button::Damages: if (search_.open&&search_.mode==10) CloseSearch(); else OpenMenuSearch(10); return;
     case Button::SkillDamage: if (search_.open&&search_.mode==4) CloseSearch(); else OpenDamageSearch(4); return;
+    case Button::Plugins: if (search_.open&&search_.mode==7) CloseSearch(); else OpenPluginSearch(); return;
+    case Button::PluginNode: {
+        Node node; node.type=NodeType::Plugin; Append(node);
+        if (At(selected_)&&config_.chain[static_cast<size_t>(selected_)].type==NodeType::Plugin) OpenPicker(selected_,-1);
+        return;
+    }
     case Button::GrabDamage: if (search_.open&&search_.mode==5) CloseSearch(); else OpenDamageSearch(5); return;
     case Button::Dummy: {  // 测试木桩: the game thread spawns / removes it; the label follows its snapshot (Tick)
         const bool present=TestDummy::GetSnapshot().present; TestDummy::Request(!present);
@@ -2793,6 +3110,7 @@ void PressButton(Button button) {
     case Button::Weapon: AddModifier(NodeType::Weapon); return;
     case Button::Armor: AddModifier(NodeType::Armor); return;
     case Button::Invincible: AddModifier(NodeType::Invincible); return;
+    case Button::HeroSize: AddModifier(NodeType::HeroSize); return;
     case Button::IgnoreGuard: AddModifier(NodeType::IgnoreGuard); return;
     case Button::KeepChain: AddModifier(NodeType::KeepChain); return;
     case Button::KeepLook: AddModifier(NodeType::KeepLook); return;
@@ -2988,7 +3306,13 @@ std::wstring ButtonText(Button button) {
     case Button::GrabDamage: { const NpcCombo::ChainGrab g=NpcCombo::ChainGrabDamage(); return Tr(L"投技伤害：")+(g.mode!=NpcCombo::kGrabFollow?ChainGrabText(g):Tr(L"跟随"))+L" ▾"; }
     case Button::Hud: { const int mode=NpcCombo::ChainHud(); return Tr(mode==NpcCombo::kHudDetailed?L"派生显示：详细":mode==NpcCombo::kHudSimple?L"派生显示：简略":L"派生显示：关"); }
     case Button::ViewTarget: { const int t=NpcCombo::ViewTarget(); return Tr(t==NpcCombo::kViewNeck?L"镜头跟随：脖子":t==NpcCombo::kViewHead?L"镜头跟随：头部":L"镜头跟随：骨盆"); }
-    case Button::Dummy: return Tr(dummy_present_?L"移除测试木桩":L"召唤测试木桩");
+    case Button::ViewScale: return Tr(NpcCombo::ViewScale()==NpcCombo::kScaleHeroRatio?L"镜头取景：按体型比例":L"镜头取景：按身高");
+    case Button::Dummy: return Tr(dummy_present_?L"移除木桩":L"召唤木桩");
+    case Button::Display: return Tr(L"显示 ▾");
+    case Button::Camera: return Tr(L"镜头 ▾");
+    case Button::Damages: return Tr(L"伤害 ▾");
+    case Button::Plugins: return Tr(ComboPlugins::Enabled()?L"派生插件：开 ▾":L"派生插件：关 ▾");
+    case Button::PluginNode: return Tr(L"+ 插件节点");
     case Button::Interval: return Tr(L"+ 间隔");
     case Button::Branch: return Tr(L"+ 按键分支");
     case Button::BoneTransform: return Tr(L"+ 骨骼变换");
@@ -2996,6 +3320,7 @@ std::wstring ButtonText(Button button) {
     case Button::Weapon: return Tr(L"+ 武器属性");
     case Button::Armor: return Tr(L"+ 霸体");
     case Button::Invincible: return Tr(L"+ 无敌");
+    case Button::HeroSize: return Tr(L"+ 主角体型");
     case Button::IgnoreGuard: return Tr(L"+ 无视防御");
     case Button::KeepChain: return Tr(L"+ 保持派生");
     case Button::KeepLook: return Tr(L"+ 保留变身");
@@ -3051,21 +3376,17 @@ void Layout() {
     const auto button_w=[&](Button b){ return static_cast<int>(Extent(dc,b==Button::Toggle?strong:small_font,ButtonText(b)).cx)+m.S(b==Button::Toggle?28:20); };
     const int toggle_w=button_w(Button::Toggle);
     buttons_[static_cast<int>(Button::Toggle)]={right-toggle_w,y,right,y+row};
-    const int toast_w=button_w(Button::Toast);  // 派生提示: the notice in the game's bottom-right corner
-    buttons_[static_cast<int>(Button::Toast)]={right-toggle_w-gap-toast_w,y,right-toggle_w-gap,y+row};
-    const int hud_w=button_w(Button::Hud);  // 派生显示: the chain in the game's top-right corner
-    buttons_[static_cast<int>(Button::Hud)]={right-toggle_w-toast_w-2*gap-hud_w,y,right-toggle_w-toast_w-2*gap,y+row};
-    const int view_w=button_w(Button::ViewTarget);  // 镜头跟随: the bone the 视角跟随 camera looks at
-    const int view_right=right-toggle_w-toast_w-hud_w-3*gap;
-    buttons_[static_cast<int>(Button::ViewTarget)]={view_right-view_w,y,view_right,y+row};
-    const int dummy_w=button_w(Button::Dummy);  // 测试木桩: a mob that stands still and does not die, to try chains on
-    const int dummy_right=view_right-view_w-gap;
-    buttons_[static_cast<int>(Button::Dummy)]={dummy_right-dummy_w,y,dummy_right,y+row};
-    // 派生页的技能伤害 / 投技伤害: what the chain's BOSS 技能 and 投技 deal, over the other pages'.
-    const int grab_w=button_w(Button::GrabDamage),skill_w=button_w(Button::SkillDamage),grab_right=dummy_right-dummy_w-gap;
-    buttons_[static_cast<int>(Button::GrabDamage)]={grab_right-grab_w,y,grab_right,y+row};
-    buttons_[static_cast<int>(Button::SkillDamage)]={grab_right-grab_w-gap-skill_w,y,grab_right-grab_w-gap,y+row};
-    header_={pad,y,(std::max)(pad+m.S(80),grab_right-grab_w-skill_w-2*gap),y+row};
+    // Right to left after the chain switch, in two groups with a rule between (user 11-13: ten buttons were too crowded):
+    // 显示 (派生显示 + 派生提示), 镜头 (镜头跟随 + 镜头取景), 伤害 (技能伤害 + 投技伤害), each a list with the value in use
+    // marked; then 派生插件 (plugin DLLs in PBZPlugins, off by default) and 测试木桩 (a mob that stands still and does not die).
+    const int group_gap=m.S(20);
+    int bar_right=right-toggle_w;
+    const auto place=[&](Button b,int space){ const int bw=button_w(b); bar_right-=space; buttons_[static_cast<int>(b)]={bar_right-bw,y,bar_right,y+row}; bar_right-=bw; };
+    bar_rules_[0]=bar_right-group_gap/2;
+    place(Button::Display,group_gap); place(Button::Camera,gap); place(Button::Damages,gap);
+    bar_rules_[1]=bar_right-group_gap/2;
+    place(Button::Plugins,group_gap); place(Button::Dummy,gap);
+    header_={pad,y,(std::max)(pad+m.S(80),bar_right-group_gap),y+row};
     header_.right=(std::min)(header_.right,pad+static_cast<LONG>(Extent(dc,HasSkin()?strong:body,HeaderText()).cx)+m.S(20));
     y+=row+m.S(10);
     const int footer_h=m.S(24),min_canvas=m.S(460),panel=m.S(264);
@@ -3240,12 +3561,8 @@ Hit HitTest(POINT p) {
     const auto in=[&](const RECT& r){return PtInRect(&r,p)!=FALSE;};
     if (search_.open&&in(search_.rect)) return {Part::Search,SearchRowAt(p)};
     if (HasSkin()&&in(buttons_[static_cast<int>(Button::Toggle)])) return {Part::Button,static_cast<int>(Button::Toggle)};
-    if (in(buttons_[static_cast<int>(Button::Toast)])) return {Part::Button,static_cast<int>(Button::Toast)};
-    if (in(buttons_[static_cast<int>(Button::Hud)])) return {Part::Button,static_cast<int>(Button::Hud)};
-    if (in(buttons_[static_cast<int>(Button::ViewTarget)])) return {Part::Button,static_cast<int>(Button::ViewTarget)};
-    if (in(buttons_[static_cast<int>(Button::SkillDamage)])) return {Part::Button,static_cast<int>(Button::SkillDamage)};
-    if (in(buttons_[static_cast<int>(Button::GrabDamage)])) return {Part::Button,static_cast<int>(Button::GrabDamage)};
-    if (in(buttons_[static_cast<int>(Button::Dummy)])) return {Part::Button,static_cast<int>(Button::Dummy)};
+    for (const Button b:{Button::Display,Button::Camera,Button::Damages,Button::Plugins,Button::Dummy})
+        if (in(buttons_[static_cast<int>(b)])) return {Part::Button,static_cast<int>(b)};
     if (in(header_)) return {Part::Header,-1};
     for (int i=0;i<2;++i) if (in(library_tabs_[i])) return {Part::LibraryTab,i};
     for (int i=0;i<5;++i) if (in(node_categories_[i])) return {Part::NodeCategory,i};
@@ -3290,7 +3607,7 @@ Hit HitTest(POINT p) {
         for (size_t r=0;r<s.routes.size();++r) if (Near(p,s.routes[r].out,pin)) { route_out=static_cast<int>(r); break; }
         const bool stepper=node.type==NodeType::Interval||node.type==NodeType::Trigger||node.type==NodeType::Speed||node.type==NodeType::Damage||node.type==NodeType::KeepChain||node.type==NodeType::Skill||
                            node.type==NodeType::AutoDodge||node.type==NodeType::BossSkill||node.type==NodeType::WeaponMove||node.type==NodeType::Teleport||node.type==NodeType::PreInput||
-                           node.type==NodeType::WeaponActions||node.type==NodeType::Hook||node.type==NodeType::Trim;
+                           node.type==NodeType::WeaponActions||node.type==NodeType::Hook||node.type==NodeType::Trim||(node.type==NodeType::Plugin&&PluginHasValue(node));
         if (route_out>=0) hit={Part::RouteOut,i,route_out};
         else if (s.has_out&&Near(p,s.out,pin)) hit={Part::NodeOut,i};
         else if (s.has_in&&Near(p,s.in,pin)) hit={Part::NodeIn,i};
@@ -3335,6 +3652,7 @@ Hit HitTest(POINT p) {
         else if (node.type==NodeType::WeaponMove&&in(s.field)) hit={Part::NodeField,i};
         else if (node.type==NodeType::WeaponMove&&in(s.field2)) hit={Part::NodeField2,i};
         else if (node.type==NodeType::Teleport&&in(s.field)) hit={Part::NodeField,i};
+        else if (node.type==NodeType::Plugin&&in(s.field)) hit={Part::NodeField,i};
         else if (node.type==NodeType::Teleport&&in(s.field2)) hit={Part::NodeField2,i};
         else if (ExecutionTrigger(node)&&in(s.field2)) hit={Part::NodeField2,i};
         else if (KeysTrigger(node)&&in(s.field2)) hit={Part::NodeField2,i};
@@ -3424,6 +3742,7 @@ COLORREF ModColor(NodeType type) {
     if (type==NodeType::Weapon) return UiTheme::Mix(RGB(214,160,60),UiTheme::Text(),15);
     if (type==NodeType::Armor) return UiTheme::Mix(RGB(200,96,70),UiTheme::Text(),15);
     if (type==NodeType::Invincible) return UiTheme::Mix(RGB(232,196,84),UiTheme::Text(),12);
+    if (type==NodeType::HeroSize) return UiTheme::Mix(RGB(72,190,150),UiTheme::Text(),15);
     if (type==NodeType::IgnoreGuard) return UiTheme::Mix(RGB(120,150,240),UiTheme::Text(),15);
     if (type==NodeType::KeepChain) return UiTheme::Mix(RGB(64,176,214),UiTheme::Text(),15);
     if (type==NodeType::KeepLook) return UiTheme::Mix(RGB(168,120,232),UiTheme::Text(),15);
@@ -3437,6 +3756,7 @@ COLORREF ModColor(NodeType type) {
 }
 COLORREF GrabColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(190,104,170),UiTheme::Text(),15); }
 COLORREF BranchColor() { return UiTheme::Mix(RGB(150,120,210),UiTheme::Text(),15); }
+COLORREF PluginColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(196,120,224),UiTheme::Text(),15); }
 COLORREF GroupColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(120,170,120),UiTheme::Text(),18); }
 COLORREF TeleportColor() { return UiTheme::HighContrast()?UiTheme::AccentBlue():UiTheme::Mix(RGB(110,140,230),UiTheme::Text(),15); }
 // Where an arrow from `from` meets the card `rect`: on its way to the card's middle, just outside the card's edge (so
@@ -3576,13 +3896,25 @@ void DrawSearch(HDC dc,Gdiplus::Graphics& graphics) {
         const SearchRow& row=search_.rows[static_cast<size_t>(r)];
         const int top=search_.list.top+(r-search_.scroll)*row_h;
         RECT line{search_.list.left,top,search_.list.right,top+row_h};
-        if (row.header) { RECT t=line; t.left+=m.S(8); Label(dc,row.text,t,Font(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); continue; }
+        if (row.header) {
+            if (r>0) {  // a rule between groups
+                Gdiplus::Pen rule(Argb(UiTheme::Border()),1.f);
+                graphics.DrawLine(&rule,static_cast<float>(line.left+m.S(8)),static_cast<float>(top)+.5f,static_cast<float>(line.right-m.S(8)),static_cast<float>(top)+.5f);
+            }
+            RECT t=line; t.left+=m.S(8); Label(dc,row.text,t,Font(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS); continue;
+        }
         const Item& item=search_.items[row.item];
         const bool sel=r==search_.selected,hot=r==search_.hot;
         if (sel||hot) Rounded(graphics,line,static_cast<float>(m.S(6)),UiTheme::Mix(panel,accent,sel?32:14),255,0,0);
-        const COLORREF hue=item.kind==ItemKind::Move?KindColor(item.move):item.kind==ItemKind::Trigger?TriggerColor(item.trigger):UiTheme::AccentBlue();
-        const RECT dot{line.left+m.S(14),top+row_h/2-m.S(4),line.left+m.S(22),top+row_h/2+m.S(4)};
-        Rounded(graphics,dot,static_cast<float>(m.S(4)),hue,255,0,0);
+        if (item.choice) {  // a radio button: a ring, filled while the value is in use
+            const int cx=line.left+m.S(18),cy=top+row_h/2,ring_r=m.S(6),dot_r=m.S(3);
+            Rounded(graphics,{cx-ring_r,cy-ring_r,cx+ring_r+1,cy+ring_r+1},static_cast<float>(ring_r),panel,0,item.on?accent:muted,255,1.5f);
+            if (item.on) Rounded(graphics,{cx-dot_r,cy-dot_r,cx+dot_r+1,cy+dot_r+1},static_cast<float>(dot_r),accent,255,0,0);
+        } else {
+            const COLORREF hue=item.kind==ItemKind::Move?KindColor(item.move):item.kind==ItemKind::Trigger?TriggerColor(item.trigger):UiTheme::AccentBlue();
+            const RECT dot{line.left+m.S(14),top+row_h/2-m.S(4),line.left+m.S(22),top+row_h/2+m.S(4)};
+            Rounded(graphics,dot,static_cast<float>(m.S(4)),hue,255,0,0);
+        }
         RECT t=line; t.left+=m.S(30); t.right-=m.S(8);
         Label(dc,row.text,t,Font(UiTheme::Font::Body),text,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
     }
@@ -3600,6 +3932,7 @@ COLORREF NodeHue(const Node& node) {
     case NodeType::WeaponMove: case NodeType::WeaponActions: case NodeType::Hook: return WeaponColor();
     case NodeType::Teleport: case NodeType::HeroLook: return TeleportColor();
     case NodeType::Assist: return AssistColor();
+    case NodeType::Plugin: return PluginColor();
     case NodeType::BossSkill: case NodeType::Look: return BossColor();
     case NodeType::Grab: return GrabColor();
     case NodeType::Group: return GroupColor();
@@ -3780,7 +4113,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
         const Node& n=config_.chain[i];
         for (size_t o=0;o<NpcCombo::OutCount(n);++o) {
             const int next=NpcCombo::OutOf(n,o); if (next<0||static_cast<size_t>(next)>=count) continue;
-            const POINT from=NpcCombo::HasRows(n)&&o<shapes[i].routes.size()?shapes[i].routes[o].out:shapes[i].out;
+            const POINT from=NpcCombo::RowOutputs(n)&&o<shapes[i].routes.size()?shapes[i].routes[o].out:shapes[i].out;
             const POINT into=shapes[static_cast<size_t>(next)].in;
             if (overview) { if (visible(span(from,into,2))) flat_line(from,into,UiTheme::Mix(base,live[i]&&live[static_cast<size_t>(next)]?text:muted,live[i]?70:40)); continue; }
             // The curve stays inside its control points' box.
@@ -3904,8 +4237,8 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
                 const bool row_hot=hot_==Hit{Part::RouteField,index,row};
                 Rounded(graphics,rs.field,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),row_hue,row_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),row_hue,30),255);
                 RECT row_inner=rs.field; InflateRect(&row_inner,-Px(6),0);
-                Label(dc,ButtonLabel(route.button)+L" ▾",row_inner,Scaled(UiTheme::Font::Small),route.next>=0?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
-                {const bool editing=edit_.node==index&&edit_.hold==row,caret=(GetTickCount64()/530)%2==0;
+                Label(dc,RowActionLabel(node,route)+L" ▾",row_inner,Scaled(UiTheme::Font::Small),route.next>=0?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+                if(!NpcCombo::NamedRow(node,route)){const bool editing=edit_.node==index&&edit_.hold==row,caret=(GetTickCount64()/530)%2==0;
                     StepperAt(dc,graphics,rs.hminus,rs.hvalue,rs.hplus,editing?edit_.text+(caret?L"▏":L" ")+L" s":HoldText(route.hold_ms),Hit{Part::RouteHoldMinus,index,row},Hit{Part::RouteHoldPlus,index,row},Hit{Part::RouteHoldValue,index,row},UiTheme::Font::Small);
                     if(editing)Rounded(graphics,rs.hvalue,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));}
                 const bool remove_hot=hot_==Hit{Part::RouteRemove,index,row};
@@ -4097,6 +4430,32 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
             break;
         }
+        case NodeType::Plugin: {
+            // Its action, its value (a stepper), a note, then its outputs (判断) each with its own exec pin.
+            Card(dc,graphics,s,PluginColor(),CardTitle(i),selected,playing,!live[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
+            {
+                const bool field_hot=hot_==Hit{Part::NodeField,index};
+                Rounded(graphics,s.field,static_cast<float>(Px(5)),UiTheme::Mix(UiTheme::Base(),PluginColor(),field_hot?28:10),255,UiTheme::Mix(UiTheme::Border(),PluginColor(),30),255);
+                RECT inner=s.field; InflateRect(&inner,-Px(7),0);
+                ComboPlugins::ActionView a; const bool known=PluginAction(node,a);
+                Label(dc,PluginField(node)+L"  ▾",inner,Scaled(UiTheme::Font::Body),known?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+                int row=1;
+                if (known&&a.has_value) {
+                    RECT label=Row(s.rect,row++); label.right=s.minus.left-Px(6);
+                    Label(dc,PluginValueLabel(a),label,Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+                    const bool editing=edit_.node==index,caret=(GetTickCount64()/530)%2==0;
+                    Stepper(dc,graphics,s,index,editing?edit_.text+(caret?L"▏":L" "):PluginValueText(node));
+                    if (editing) Rounded(graphics,s.value,static_cast<float>(Px(5)),0,0,accent,255,(std::max)(1.5f,2.f*Zoom()));
+                }
+                Label(dc,NodeNote(i),Row(s.rect,row,10),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
+            }
+            for (size_t r=0;r<node.routes.size()&&r<s.routes.size();++r) {
+                const RouteShape& rs=s.routes[r]; RECT label=rs.field; label.right=rs.out.x-Px(12);
+                Label(dc,L"→ "+PluginOutput(node,r),label,Scaled(UiTheme::Font::Small),text,DT_SINGLELINE|DT_VCENTER|DT_RIGHT|DT_END_ELLIPSIS);
+                ExecPin(graphics,rs.out,node.routes[r].next>=0,hot_==Hit{Part::RouteOut,index,static_cast<int>(r)},live[i]?text:muted);
+            }
+            break;
+        }
         case NodeType::Assist: {
             Card(dc,graphics,s,AssistColor(),CardTitle(i),selected,playing,!live[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
             const auto field=[&](const RECT& r,Part part,const std::wstring& label,bool on){
@@ -4197,7 +4556,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
             Label(dc,NodeNote(i),Row(s.rect,1),Scaled(UiTheme::Font::Small),muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             CheckRow(dc,graphics,s.toggle,node.own_look||ChainOwnLook(i),hot_==Hit{Part::NodeToggle,index},OwnLookText(i));
             break;
-        case NodeType::Armor: case NodeType::Interrupt: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::IgnoreGuard:
+        case NodeType::Armor: case NodeType::Interrupt: case NodeType::Invincible: case NodeType::KeepLook: case NodeType::IgnoreGuard: case NodeType::HeroSize:
             Card(dc,graphics,s,ModColor(node.type),CardTitle(i),selected,false,!pointed[i],selected||hot,hot_==Hit{Part::NodeRemove,index});
             Label(dc,NodeNote(i),Row(s.rect,0),Scaled(UiTheme::Font::Small),pointed[i]?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
             break;
@@ -4264,6 +4623,7 @@ void DrawCanvas(HDC dc,Gdiplus::Graphics& graphics) {
 }
 void DrawPreview(HDC dc,Gdiplus::Graphics& graphics,const RECT& client);
 void Paint(HDC printed=nullptr) {
+    if (const uint64_t serial=ComboPlugins::Serial(); serial!=plugin_serial_) { plugin_serial_=serial; DropCanvasCache(); }  // plugins loaded or changed
     // Laid out and framed on the first paint, when the page has its real size (not the size it was created at).
     if (HasSkin()&&canvas_.right>canvas_.left) {
         if (!config_.placed) { Arrange(); framed_=false; }
@@ -4278,12 +4638,18 @@ void Paint(HDC printed=nullptr) {
         RECT title=header_; title.left+=m.S(8);
         Label(dc,HeaderText(),title,HasSkin()?strong:body,HasSkin()?text:muted,DT_SINGLELINE|DT_VCENTER|DT_LEFT|DT_END_ELLIPSIS);
         DrawButton(dc,graphics,Button::Toggle,config_.enabled,HasSkin());
-        DrawButton(dc,graphics,Button::Toast,NpcCombo::ShowToast(),true);
-        DrawButton(dc,graphics,Button::Hud,NpcCombo::ChainHud()!=NpcCombo::kHudOff,true);
-        DrawButton(dc,graphics,Button::ViewTarget,false,true);
-        DrawButton(dc,graphics,Button::SkillDamage,NpcCombo::ChainSkillDamage()>0||(search_.open&&search_.mode==4),true);
-        DrawButton(dc,graphics,Button::GrabDamage,NpcCombo::ChainGrabDamage().mode!=NpcCombo::kGrabFollow||(search_.open&&search_.mode==5),true);
+        // 显示 lit while the corner chain shows, 镜头 / 伤害 while they differ from the defaults, each while its list is open.
+        DrawButton(dc,graphics,Button::Display,NpcCombo::ChainHud()!=NpcCombo::kHudOff||(search_.open&&search_.mode==9),true);
+        DrawButton(dc,graphics,Button::Camera,NpcCombo::ViewTarget()!=NpcCombo::kViewPelvis||NpcCombo::ViewScale()==NpcCombo::kScaleHeroRatio||(search_.open&&search_.mode==8),true);
+        DrawButton(dc,graphics,Button::Damages,NpcCombo::ChainSkillDamage()>0||NpcCombo::ChainGrabDamage().mode!=NpcCombo::kGrabFollow||(search_.open&&search_.mode==10),true);
         DrawButton(dc,graphics,Button::Dummy,dummy_present_,true);
+        {
+            const RECT bar=buttons_[static_cast<int>(Button::Toggle)];
+            Gdiplus::Pen rule(Argb(UiTheme::Border()),1.f);
+            for (const int x:bar_rules_) if (x>0)
+                graphics.DrawLine(&rule,static_cast<float>(x)+.5f,static_cast<float>(bar.top+m.S(7)),static_cast<float>(x)+.5f,static_cast<float>(bar.bottom-m.S(7)));
+        }
+        DrawButton(dc,graphics,Button::Plugins,ComboPlugins::Enabled()||(search_.open&&search_.mode==7),true);
         Rounded(graphics,library_,static_cast<float>(m.S(10)),UiTheme::Base(),255,UiTheme::Border(),255);
         Label(dc,Tr(L"添加到画布"),library_title_,strong,text,DT_SINGLELINE|DT_VCENTER|DT_LEFT);
         RECT tab_group=library_tabs_[0]; tab_group.right=library_tabs_[1].right; InflateRect(&tab_group,m.S(3),m.S(3));
@@ -4568,7 +4934,7 @@ void DragEnd(POINT p) {
             const Node& s=config_.chain[static_cast<size_t>(source)];
             size_t out=0;
             if (hit.part==Part::RouteOut) out=static_cast<size_t>(hit.sub);
-            else if (NpcCombo::HasRows(s)) for (size_t r=0;r<s.routes.size();++r) if (s.routes[r].next<0) { out=r; break; }
+            else if (NpcCombo::RowOutputs(s)) for (size_t r=0;r<s.routes.size();++r) if (s.routes[r].next<0) { out=r; break; }
             NpcCombo::Link(config_,source,done.index,out);
         }
         else if (source<0&&PtInRect(&canvas_,p)) OpenSearch(p,-1,done.index,0);
@@ -5255,9 +5621,11 @@ bool HudRender(ULONGLONG now) {
     }
     const double wait=HudWaitLeft(now);
     // A row's tags: its 按住 and its pause.
-    const auto tags_of=[](const NpcCombo::NextInput& in){
+    const auto tags_of=[&](const NpcCombo::NextInput& in){
         std::wstring tags;
-        if (in.hold_ms>0) { wchar_t t[32]{}; _snwprintf_s(t,_countof(t),_TRUNCATE,Tr(L"按住 %.1f s").c_str(),in.hold_ms/1000.0); tags=t; }
+        if (!in.ability.empty()&&in.branch>=0&&static_cast<size_t>(in.branch)<c.chain.size())  // a 武器派生修改 row naming one move
+            tags=WeaponMoveText(c.chain[static_cast<size_t>(in.branch)].weapon,in.ability);
+        if (in.hold_ms>0) { wchar_t t[32]{}; _snwprintf_s(t,_countof(t),_TRUNCATE,Tr(L"按住 %.1f s").c_str(),in.hold_ms/1000.0); tags+=(tags.empty()?L"":L" · ")+std::wstring(t); }
         if (in.pause_ms>0) { wchar_t t[32]{}; _snwprintf_s(t,_countof(t),_TRUNCATE,Tr(L"停顿 %.1f s").c_str(),in.pause_ms/1000.0); tags+=(tags.empty()?L"":L" · ")+std::wstring(t); }
         return tags;
     };

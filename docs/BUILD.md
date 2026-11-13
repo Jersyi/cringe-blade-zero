@@ -4,7 +4,7 @@
 
 ## 准备构建环境
 
-玩家手册源文件为 `docs/USER_MANUAL.md`。可在安装 ReportLab 的 Python 环境中运行 `python scripts/build_manual.py`，默认使用 Windows 微软雅黑字体，输出 `output/pdf/豪之刃MOD功能与节点手册.pdf` 和覆盖检查 JSON；生成器会核对全部 30 类节点及调试补充卡片。正式打包前渲染 PDF 检查分页和中文显示。`build.ps1 -Package` 会在该 PDF 存在时将其纳入 ZIP；Markdown 和明确公开的 `samples/sampleCombo.combo` 始终纳入，其他玩家文件不会打包。
+玩家手册源文件为 `docs/USER_MANUAL.md`。可在安装 ReportLab 的 Python 环境中运行 `python scripts/build_manual.py`，默认使用 Windows 微软雅黑字体，输出 `output/pdf/豪之刃MOD功能与节点手册.pdf` 和覆盖检查 JSON；生成器会核对全部节点类型（当前 32 类）及调试补充卡片。正式打包前渲染 PDF 检查分页和中文显示。`build.ps1 -Package` 会在该 PDF 存在时将其纳入 ZIP；Markdown 和明确公开的 `samples/sampleCombo.combo` 始终纳入，其他玩家文件不会打包。
 
 安装器隔离测试运行 `powershell -NoProfile -ExecutionPolicy Bypass -File tests/installer_sample_test.ps1`；发布示例解包检查运行 `build/Release/sample_combo_test.exe samples/sampleCombo.combo`。前者使用独立临时目录及假 DLL，不操作游戏安装。
 
@@ -24,7 +24,7 @@ if ($LASTEXITCODE -ne 0) { throw 'UI export failed' }
 python scripts/build_manual.py
 ```
 
-导出器只在自己的隐藏窗口内渲染实际控件，不启动游戏、不发游戏输入；示例配置写入独立临时目录。输出 34 张节点图片、6 张 UI 图片和 `nodes.json`，生成器验证 30 类节点的图片覆盖。PDF 完成后应检查全部页面缩略图、关键页面原图和嵌入中文字体。
+导出器只在自己的隐藏窗口内渲染实际控件，不启动游戏、不发游戏输入；示例配置写入独立临时目录。输出 36 张节点图片、9 张 UI 图片和 `nodes.json`，生成器验证 32 类节点的图片覆盖。PDF 完成后应检查全部页面缩略图、关键页面原图和嵌入中文字体。
 
 ## 编译完整版
 
@@ -65,13 +65,15 @@ $tests = @(
     'combo_save_stress_test', 'combo_library_test', 'combo_playback_rules_test',
     'air_attack_reset_test', 'npc_skill_support_test', 'npc_skill_colliders_test',
     'npc_pose_transfer_test', 'npc_cutscene_policy_test', 'npc_source_budget_test',
-    'supplement_layout_test'
+    'supplement_layout_test', 'combo_plugins_test', 'mod_registry_test', 'lua_host_test'
 )
 foreach ($test in $tests) {
     & ".\build\Release\$test.exe"
     if ($LASTEXITCODE -ne 0) { throw "$test failed" }
 }
 ```
+
+`combo_plugins_test` 会把三个示例插件复制到 `build\Release\PBZPlugins\` 再按游戏里的方式载入（含权限、模块、命令、UI 页，用内存里的假模块）；`mod_registry_test` 单独测模块注册表和插件 UI 页模型；`lua_host_test` 用真实的插件宿主、假的派生链和假模块测 Lua 脚本（沙箱、指令预算、内存上限、错误隔离、`pbz` 表、热重载；示例脚本来自 `sdk/samples/lua`，会先删掉 exe 旁 `PBZPlugins` 里别的测试留下的 DLL 副本）。Lua 5.4.7 在 `src/third_party/lua/`，按 C++ 编译，只编进 `lua_host_test` 和 `version`。派生插件 SDK 的示例也能脱离本项目单独构建：`cmake -S sdk/samples -B build_sdk -A x64`。
 
 `combo_library_test` 使用隐藏窗口，不注入鼠标键盘输入。`supplement_sequence_test` 也使用隐藏窗口，但会写固定位置的预览 PNG；单独运行前建立 `local/validation/supplement_sequence_20261109/`，检查图片后自行清理。不要把 `input_focus_test` 或 `combo_menu_preview` 加入无人值守测试：它们会操作焦点或输入。
 

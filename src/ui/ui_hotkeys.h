@@ -37,6 +37,7 @@ enum class Action : int {
     GearUp,
     GearDown,
     NpcSkill,
+    BodyEditor,
     Count
 };
 enum class Device : unsigned char { Keyboard, Xbox, PlayStation };

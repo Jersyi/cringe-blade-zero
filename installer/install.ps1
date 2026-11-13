@@ -347,6 +347,24 @@ function Install-SampleCombo([string]$GameFolder) {
     return $target
 }
 
+# 身材 / 骨骼: the bundled UUEPBS presets and animations next to version.dll. A file the player already has is kept.
+function Install-BodyPresets([string]$GameFolder) {
+    $source = Join-Path $Here 'samples\UUEPBS Presets'
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) { return }
+    $target = Join-Path $GameFolder 'UUEPBS Presets'
+    $added = 0
+    foreach ($file in Get-ChildItem -LiteralPath $source -Recurse -File) {
+        $relative = $file.FullName.Substring($source.Length).TrimStart('\')
+        $destination = Join-Path $target $relative
+        if (Test-Path -LiteralPath $destination) { continue }
+        New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $destination
+        Unblock-File -LiteralPath $destination -ErrorAction SilentlyContinue
+        $added++
+    }
+    Write-Host ('   ' + (T '身材预设与动画：' 'Body presets and animations: ') + $target + '  (' + (T '新增 ' 'added ') + $added + ')')
+}
+
 function Install-Dll([string]$Selected, [string]$Target) {
     $source = if ($Selected -eq '1') { $FullDll } else { $TriggersDll }
     $name = if ($Selected -eq '1') { T '完整版' 'the full version' } else { T '精简版' 'triggers-only' }
@@ -364,7 +382,7 @@ function Install-Dll([string]$Selected, [string]$Target) {
         Copy-Item -LiteralPath $source -Destination $Target -Force
         # The copy keeps the ZIP's "downloaded from the internet" mark, which some security software refuses.
         Unblock-File -LiteralPath $Target -ErrorAction SilentlyContinue
-        if ($Selected -eq '1') { [void](Install-SampleCombo ([IO.Path]::GetDirectoryName($Target))) }
+        if ($Selected -eq '1') { [void](Install-SampleCombo ([IO.Path]::GetDirectoryName($Target))); Install-BodyPresets ([IO.Path]::GetDirectoryName($Target)) }
     } catch {
         if (Test-AccessDenied $_) { Restart-Elevated $Selected; return $false }
         Write-Host ("   $Red" + (T '复制失败：' 'Copy failed: ') + $_.Exception.Message + $R); return $false

@@ -271,6 +271,35 @@ int main() {
         Check(!InvincibleFor(br, bk, c) && !InvincibleFor(br, bk, 0) && at(c).mods[kModSpeed] == speed, "removing 无敌 breaks its arrows only");
     }
     {
+        // 主角体型: a modifier wired as 加速 is, its own slot; saved as an unwired 间隔 with a t: mark.
+        const int hs = static_cast<int>(br.chain.size()); br.chain.push_back(ModifierNode(NodeType::HeroSize, 0, 0));
+        Check(IsModifier(br.chain.back()) && SlotOf(NodeType::HeroSize) == kModSize && !HeroSizeFor(br, bk, c), "a 主角体型 nothing points at covers nothing");
+        Check(LinkModifier(br, c, hs) && at(c).mods[kModSize] == hs && at(c).mods[kModSpeed] == speed && HeroSizeFor(br, bk, c) && !HeroSizeFor(br, bk, 0),
+              "C at 主角体型: only C, its 加速 stays");
+        Check(LinkModifier(br, bk, hs) && HeroSizeFor(br, bk, 0) && HeroSizeFor(br, bk, c), "the trigger at 主角体型: every move of its chain");
+        const std::wstring text = Encode(br), mark = L"|t:" + std::to_wstring(hs);
+        const Config round = Decode(text);
+        Check(text.find(mark) != std::wstring::npos && round.chain[static_cast<size_t>(hs)].type == NodeType::HeroSize && HeroSizeFor(round, bk, 0) &&
+              HeroSizeFor(round, bk, c) && Encode(round) == text, "主角体型 saved with its t: mark, its arrows read back");
+        std::wstring old = text; old.erase(old.find(mark), mark.size());
+        const Config older = Decode(old);
+        Check(older.chain.size() == br.chain.size() && older.chain[static_cast<size_t>(hs)].type == NodeType::Interval && older.chain[static_cast<size_t>(hs)].next < 0 &&
+              !HeroSizeFor(older, bk, 0) && older.chain[static_cast<size_t>(c)].mods[kModSpeed] == speed, "an older build: an unwired 间隔 in its place, the other arrows kept");
+        Remove(br, static_cast<size_t>(hs));
+        Check(!HeroSizeFor(br, bk, c) && !HeroSizeFor(br, bk, 0) && at(c).mods[kModSpeed] == speed, "removing 主角体型 breaks its arrows only");
+        // Who may point at it: as at 加速, but not a 援护 (another actor), a 投技 or a look change.
+        const auto fits = [](Node from) { const std::vector<Node> two{from, ModifierNode(NodeType::HeroSize, 0, 0)}; return ModifierFits(two, 0, 1); };
+        Node skill{NodeType::Skill}; skill.ability = "GA_X";
+        Node boss{NodeType::BossSkill}; boss.boss = "PengMeng"; boss.ability = "GA_PengMeng_Skill_02";
+        Node help{NodeType::Assist}; help.boss = "DangHui"; help.ability = "GA_DangHui_Skill_01";
+        Node grab{NodeType::Grab}; grab.ability = "GA_X";
+        Node look{NodeType::Look}; look.boss = "PengMeng";
+        Check(fits(TriggerNode(Trigger::NpcKey, 0, 0)) && fits(skill) && fits(boss) && fits(Node{NodeType::Group}) && fits(Node{NodeType::AutoDodge}),
+              "a trigger, a skill, a BOSS 技能, a 组合 and the stick's dodge may point at it");
+        Check(!fits(help) && !fits(grab) && !fits(look) && !fits(Node{NodeType::HeroLook}) && !fits(ModifierNode(NodeType::Speed, 0, 0)),
+              "not a 援护, a 投技, a look change or another modifier");
+    }
+    {
         // 无视防御: a modifier like 无敌, its own slot; a move or the trigger may point at it; saved as Z.
         const int guard = static_cast<int>(br.chain.size()); br.chain.push_back(ModifierNode(NodeType::IgnoreGuard, 0, 0));
         Check(IsModifier(br.chain.back()) && SlotOf(NodeType::IgnoreGuard) == kModIgnoreGuard && !IgnoreGuardFor(br, bk, c), "a 无视防御 nothing points at covers nothing");

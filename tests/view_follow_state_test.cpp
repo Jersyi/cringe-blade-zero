@@ -73,6 +73,24 @@ int main(){
     check(camera==263,"late component acquisition restores current offset without rebasing the pose");
     for(uint64_t visit=20;visit<1020;++visit)
         check(!SameCast(5,visit,41,1000,5,visit+1,41,1000),"loop visits never carry the old trimmed pose baseline");
+    // 取景: the model's height without the culling widening. User log 11-13 pid 23652: 彭猛 (PengMengSeq, no physics
+    // asset, BoundsScale 2) bounds 981 cm, framed from 2267 cm; 左殇：真龙之躯 (scale 1) 238 cm.
+    check(near(ModelHeight(490.5,2.0),490.5)&&near(ModelHeight(119,1),238),"彭猛's doubled bounds halved; a scale of 1 kept");
+    check(near(ModelHeight(119,0),238)&&near(ModelHeight(119,std::numeric_limits<double>::quiet_NaN()),238)&&near(ModelHeight(119,-2),238),"unread, NaN or negative scale counts as 1");
+    check(ModelHeight(0,1)==180&&ModelHeight(std::numeric_limits<double>::quiet_NaN(),1)==180,"no bounds: 180 cm");
+    check(ModelHeight(40,1)==120&&ModelHeight(5000,1)==2500&&ModelHeight(5000,2)==2500,"clamped to 1.2..25 m");
+    {   // 主角体型 (user log 11-13 pid 33952): 彭猛 shown at x0.409 kept the 490 cm framing, 435 cm x2.45 = 1068 cm.
+        const double shown=175.0/427.3,own=ModelHeight(490.5*shown,2.0,shown);
+        check(near(own,490.5)&&near(ModelHeight(490.5,2.0,1),490.5),"measured while shrunk: still its own height");
+        const double grow=(std::max)(1.0,own*shown/200),before=(std::max)(1.0,own/200);
+        check(std::abs(435*before-1068)<2&&435*grow<440,"framed at the hero's size: about the game camera's 435 cm, not 10.7 m");
+        check(near(ModelHeight(119,1,0),238)&&near(ModelHeight(119,1,std::numeric_limits<double>::quiet_NaN()),238),"an unread shown scale counts as 1");
+    }
+    {   // The camera's push-out (DriveViewFollow: the game camera's relation, 462 cm in that log, x max(1, height / 200 cm)).
+        const double native=462,before=native*(std::max)(1.0,ModelHeight(490.5,1)/200),after=native*(std::max)(1.0,ModelHeight(490.5,2)/200);
+        check(std::abs(before-2266)<1&&std::abs(after-1133)<1,"彭猛 framed from 11.3 m (half its height of view, as the hero), not 22.7 m");
+        check(near(native*(std::max)(1.0,ModelHeight(85,1)/200),native),"a model up to 2 m keeps the game camera's relation");
+    }
     // 取景: axes round trip, distance by size, relation pushed out along itself, never looking up from below.
     for(int yaw=-180;yaw<=180;yaw+=45)for(int pitch=-60;pitch<=60;pitch+=30){
         const auto a=ViewAxes<Vec>(yaw,pitch);const Vec w{123,-45,67};const Vec back=ToWorld(a,ToLocal(a,w));

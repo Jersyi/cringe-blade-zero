@@ -49,6 +49,19 @@ inline double FrameDistance(double size,double hfov,double aspect,double fill){
     const double half_v=std::tan(hfov*k)/aspect;
     return size>0?size/(2*half_v*fill):0;
 }
+// 取景: the shown model's height from its bounds (BoxExtent z, half the height) without the bounds scale. A look display
+// with no physics asset gets BoundsScale 2 (its limbs must not leave the culling volume); that widening is not the
+// model: 彭猛 (no physics asset) read 981 cm for a 490 cm model and was framed from 22.7 m (user 11-13 "视角过远").
+// `shown`: the scale the component is shown at when measured (主角体型 shrinks a look display, SetRelativeScale3D); the
+// height is the model's at its own size, and the camera frames it times the scale it is shown at then (11-13: 彭猛
+// shown at x0.41 was framed for 490 cm from 10.7 m and looked tiny).
+// Clamped 120..2500 cm; no bounds: 180. A scale that is unread, zero or not finite counts as 1.
+inline double ModelHeight(double extent_z,double bounds_scale,double shown=1){
+    if(!(std::isfinite(bounds_scale)&&bounds_scale>0))bounds_scale=1;
+    if(!(std::isfinite(shown)&&shown>0.01))shown=1;
+    if(!(std::isfinite(extent_z)&&extent_z>0))return 180;
+    return std::clamp(extent_z*2/bounds_scale/shown,120.0,2500.0);
+}
 // The eye's place from the body in the view's axes: the game camera's own relation (`native`, measured with no offset
 // on) pushed out along itself to at least `distance`; a relation too short to have a direction is straight behind.
 template<class V> V FrameRelation(const V& native,double distance){

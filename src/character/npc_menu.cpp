@@ -18,14 +18,14 @@ namespace {
 constexpr wchar_t kClass[] = L"PBZ_NpcRetarget_Window_v1";
 constexpr int kSearch = 4601, kList = 4602, kInspect = 4603;
 constexpr int kApply = 4610, kRestore = 4611, kClose = 4612;
-constexpr int kSkillDamage = 4614;
+constexpr int kSkillDamage = 4614, kBossLoco = 4615;
 // NPC skill damage multiplier choices; an ini value that is none of them gets a row of its own.
 constexpr float kDamageChoices[] = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f, 8.0f, 10.0f};
 HWND window_ = nullptr, return_window_ = nullptr;
 HWND title_ = nullptr, introduction_ = nullptr, search_label_ = nullptr, search_ = nullptr, list_ = nullptr;
 HWND detail_ = nullptr, gates_ = nullptr, active_ = nullptr, status_ = nullptr;
 HWND inspect_ = nullptr, apply_ = nullptr, restore_ = nullptr, close_ = nullptr;
-HWND skill_damage_label_ = nullptr, skill_damage_ = nullptr;
+HWND skill_damage_label_ = nullptr, skill_damage_ = nullptr, boss_loco_ = nullptr;
 std::vector<float> damage_values_; // skill_damage_ rows
 HFONT font_ = nullptr;
 Logger logger_ = nullptr;
@@ -137,11 +137,16 @@ void ShowSkillDamage() {
     const LRESULT row = found - damage_values_.begin();
     if (SendMessageW(skill_damage_, CB_GETCURSEL, 0, 0) != row) SendMessageW(skill_damage_, CB_SETCURSEL, static_cast<WPARAM>(row), 0);
 }
+void ShowBossLocomotion() {
+    if (!boss_loco_) return;
+    const WPARAM want = NpcRetarget::BossLocomotion() ? BST_CHECKED : BST_UNCHECKED;
+    if (static_cast<WPARAM>(SendMessageW(boss_loco_, BM_GETCHECK, 0, 0)) != want) SendMessageW(boss_loco_, BM_SETCHECK, want, 0);
+}
 void Update() {
     if (!window_) return;
     updating_ = true;
     snapshot_ = NpcRetarget::GetSnapshot();
-    ShowSkillDamage();
+    ShowSkillDamage(); ShowBossLocomotion();
     if (CatalogChanged(snapshot_.entries)) { entries_ = snapshot_.entries; Filter(); }
     const CharacterSwap::Snapshot outfit = CharacterSwap::GetSnapshot();
     std::wstring state;
@@ -226,6 +231,8 @@ void Layout() {
     const int damage_width = (std::max)(1, (std::min)(S(180), margin + content - damage_left - damage_label - gap / 2));
     MoveWindow(skill_damage_label_, damage_left, search_top + (edit_height - line) / 2, damage_label, line, TRUE);
     MoveWindow(skill_damage_, damage_left + damage_label + gap / 2, search_top, damage_width, edit_height + S(240), TRUE);
+    const int loco_left = damage_left + damage_label + gap / 2 + damage_width + gap;
+    MoveWindow(boss_loco_, loco_left, search_top, (std::max)(1, margin + content - loco_left), edit_height, TRUE);
     MoveWindow(list_, margin, body_top, left, body_height, TRUE);
     SendMessageW(list_, LB_SETHORIZONTALEXTENT, S(310), 0);
     MoveWindow(detail_, right, body_top, right_width, detail_height, TRUE);
@@ -274,6 +281,13 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wparam, LPARAM lpar
             else Notice(L"NPC 技能伤害倍率未被接受。");
             Update();
         }
+        else if (id == kBossLoco && notification == BN_CLICKED) {
+            const bool on = SendMessageW(boss_loco_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            NpcRetarget::SetBossLocomotion(on);
+            Notice(on ? L"BOSS 自带移动动画已开启：套用外观后，只移动时（待机 / 走 / 跑）播放该 BOSS 自己的移动动画；攻击、闪避、技能仍是原来的动作。"
+                      : L"BOSS 自带移动动画已关闭：移动时恢复主角的移动动作（BOSS 独有的骨骼仍跟随 BOSS 自己的动画）。");
+            Update();
+        }
         else if (id == kClose || id == IDCANCEL) Hide();
         return 0;
     }
@@ -300,6 +314,7 @@ bool Create() {
     skill_damage_label_ = Control(L"STATIC", L"NPC 技能伤害", SS_LEFT, 0);
     skill_damage_ = Control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kSkillDamage);
     for (const float value : kDamageChoices) AddDamageChoice(value);
+    boss_loco_ = Control(L"BUTTON", L"BOSS 自带移动动画", BS_AUTOCHECKBOX | WS_TABSTOP, kBossLoco);
     detail_ = Control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 0, WS_EX_CLIENTEDGE);
     gates_ = Control(L"EDIT", L"适配范围：完整身体 / 头部 / 发丝 / 衣料；走跑、攻击、受击与武器位置；恢复与跨图清理。\r\n"
         L"主角保留原生动画、技能与武器骨骼，NPC 外观独立适配。\r\n"

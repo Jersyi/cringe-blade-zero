@@ -84,6 +84,38 @@ struct KeyPart {
     void Note(uint64_t now,uint64_t ms){until=now+ms;}
     bool Takes(uint64_t now,bool chain_on,bool leads)const{return chain_on&&!leads&&now<until;}
 };
+// Echoes. The game replays a press it held back during a chain move once, as that move (or the chain's move after it)
+// ends. While a chain goes on, a hero action matching a press read from the input during its moves is that replay;
+// once the chain is over with no chain after it, only within kEchoGraceMs of its last move's end. 11-12 (twice): a
+// timeout reset 1.2 s after the last move, and the hero's own attack a second later was taken for the echo of a press
+// made 2.4 s before, during that move, and cancelled: the attack did not come out.
+// over_at: when the chain's moves stopped (its last move's end, else the reset); 0: no chain ended yet.
+constexpr uint64_t kEchoGraceMs=400;
+inline bool EchoOpen(bool chain_on,uint64_t now,uint64_t over_at){
+    return chain_on||(over_at&&now<over_at+kEchoGraceMs);
+}
+// A hero action the chain takes: the other hero action abilities running with it that are cancelled with it. One input
+// can start several (a dodge its dash family), and a perfect dodge starts while its dash still runs: cancelling only
+// the one that brought the press left the rest playing beside the chain's move (the hero went on dodging under the
+// boss move). fresh: started with the press (this frame); bits: its action family; pressed: the press's.
+// A jump the hero is in stays unless the press is a jump (its rise and fall are the game's).
+inline bool CancelWithPress(bool fresh,unsigned bits,unsigned pressed,unsigned dodges,unsigned jump){
+    if(!bits)return false;
+    if((bits&jump)&&!(pressed&jump))return false;
+    return fresh||(bits&dodges)!=0;
+}
+// A dodge family action cancelled for the chain's move while no move of the chain is on the hero: its montage is
+// stopped at once (one blending out still moves the hero by its root motion) and on the ground its speed goes.
+inline bool StopDodgeMotion(unsigned cancelled,unsigned dodges,bool chain_move_on){
+    return (cancelled&dodges)!=0&&!chain_move_on;
+}
+// A press the chain left to the game during a move (a native detour) and the borrowed look after that move. As the move
+// ends the look stays only for the hero's own action of that press: one running then, or a move cut for it (允许中断);
+// else it goes back as after any move. Later it stays while a montage plays that is not the move's own (`move_tail`:
+// the one playing when the move ended). 11-13: a heavy attack pressed as a boss move finished kept the boss look on,
+// held by that move's montage playing out, and the hero stood still until it ended ("按重击会罚站").
+inline bool DetourKeepsLook(bool detour,bool cut_for_hero,bool hero_action){ return detour&&(cut_for_hero||hero_action); }
+inline bool DetourHolds(bool montage,bool move_tail){ return montage&&!move_tail; }
 // Owned by one tracked actor. Maintenance calls (zero height) never consume a lift.
 // Token zero is reserved for explicit diagnostic commands, which may be repeated.
 struct LiftOnce {

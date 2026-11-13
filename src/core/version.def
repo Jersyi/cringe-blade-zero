@@ -18,3 +18,4 @@ EXPORTS
     VerQueryValueA=Proxy15 @16
     VerQueryValueW=Proxy16 @17
     PBZDebugMenuStatus @1000
+    PbzAttachPlugin @1001

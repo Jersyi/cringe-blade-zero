@@ -153,6 +153,37 @@ int main() {
         part.Note(2000,150);
         check(part.Takes(2100,true,false)&&!part.Takes(2150,true,false),"every key press opens its own window");
     }
+    {
+        using ComboPlayback::EchoOpen;using ComboPlayback::kEchoGraceMs;
+        check(EchoOpen(true,50000,0)&&EchoOpen(true,50000,1000),"while a chain goes on every press read during its moves can echo");
+        check(!EchoOpen(false,5000,0),"no chain ended yet and none on: no echo");
+        // 18:32: last move ended 41.0 s, timeout reset 42.2 s, the hero's own attack at 43.0 s.
+        check(!EchoOpen(false,43000,41000)&&!EchoOpen(false,42200,41000),"after a timeout reset the hero's attack is its own, not an echo");
+        check(EchoOpen(false,1000+kEchoGraceMs-1,1000)&&!EchoOpen(false,1000+kEchoGraceMs,1000),"a chain cut short: its last move's replay is still an echo for the grace");
+        using ComboPlayback::CancelWithPress;
+        const unsigned dash=1u<<static_cast<int>(Trigger::Dash),perfect=1u<<static_cast<int>(Trigger::PerfectDodge),light_bit=1u<<static_cast<int>(Trigger::Light),
+            jump=1u<<static_cast<int>(Trigger::Jump),stance=1u<<static_cast<int>(Trigger::Stance);
+        unsigned dodges=0;for(int i=static_cast<int>(Trigger::Dash);i<=static_cast<int>(Trigger::AnyDodge);++i)dodges|=1u<<i;
+        check(CancelWithPress(false,dash,perfect,dodges,jump),"a perfect dodge taken: the dash still running from before goes with it");
+        check(CancelWithPress(true,dash,dash,dodges,jump),"a dodge input's sibling dash abilities go with the one taken");
+        check(CancelWithPress(true,light_bit,dash,dodges,jump),"anything started by the same input goes");
+        check(!CancelWithPress(false,stance,light_bit,dodges,jump),"an older stance is not a sibling of the press");
+        check(!CancelWithPress(true,jump,light_bit,dodges,jump)&&!CancelWithPress(false,jump,dash,dodges,jump),"the jump the hero is in stays");
+        check(CancelWithPress(true,jump,jump,dodges,jump),"a jump press taken cancels its jump abilities");
+        check(!CancelWithPress(true,0,dash,dodges,jump),"an ability with no action family is never touched");
+        using ComboPlayback::StopDodgeMotion;
+        check(StopDodgeMotion(perfect,dodges,false)&&StopDodgeMotion(dash|light_bit,dodges,false),"a cancelled dodge stops its motion before the chain's move");
+        check(!StopDodgeMotion(dash,dodges,true),"never while a move of the chain plays (its montage is the chain's)");
+        check(!StopDodgeMotion(light_bit,dodges,false),"an attack's cancel keeps the hero's motion as before");
+    }
+    {   // 11-13 "按重击会罚站": the press left to the game keeps the look only for the hero's action it brought.
+        using ComboPlayback::DetourKeepsLook;using ComboPlayback::DetourHolds;
+        check(!DetourKeepsLook(true,false,false),"no hero action as the move ends: the look goes back as after any move");
+        check(DetourKeepsLook(true,false,true)&&DetourKeepsLook(true,true,false),"the hero's action running, or the move cut for it: the look stays");
+        check(!DetourKeepsLook(false,true,true),"no press left to the game: nothing kept");
+        check(!DetourHolds(true,true)&&!DetourHolds(false,false),"the move's own montage playing out holds nothing");
+        check(DetourHolds(true,false),"another montage (the hero's own action) holds the look");
+    }
     ComboPlayback::LiftOnce hero,foe;
     check(!hero.Take(10,2,true,0),"maintenance does not consume a lift");
     check(hero.Take(10,2,true,80),"first lift accepted");

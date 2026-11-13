@@ -5,7 +5,43 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Every source folder is an include root, so headers are included by bare name.
-include_directories(src/core src/ui src/boss src/grab src/air src/weapons src/character src/hair src/pad src/supplement src/net src/generated)
+include_directories(src/core src/ui src/boss src/grab src/air src/weapons src/character src/hair src/pad src/supplement src/net src/generated src/plugin sdk/include
+    src/uuepbs/core src/uuepbs/ui src/uuepbs/win src/third_party/imgui src/third_party/lua/include)
+
+# Lua 5.4.7 (src/third_party/lua, MIT, see licenses/Lua-LICENSE.txt) for the plugin API's scripts. Compiled as C++ (a Lua error is
+# then a C++ exception, so the host's own frames unwind), as it came, at /W3 /WX- like the other vendor sources. Left out on purpose:
+# lua.c / luac.c (programs), linit.c and the io / os / package (loadlib) / debug libraries: a script cannot have what is not in the
+# binary (lua_host.cpp opens base, coroutine, table, string, math, utf8 and adds its own small os).
+set(PBZ_LUA_SOURCES "")
+foreach(name lapi lauxlib lbaselib lcode lcorolib lctype ldebug ldo ldump lfunc lgc llex lmathlib lmem lobject lopcodes lparser lstate lstring lstrlib ltable
+        ltablib ltm lundump lutf8lib lvm lzio)
+    list(APPEND PBZ_LUA_SOURCES src/third_party/lua/src/${name}.c)
+endforeach()
+set_source_files_properties(${PBZ_LUA_SOURCES} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "/W3;/WX-;/EHsc;/wd4005;/wd4334")
+# The script host (src/plugin/lua_host.cpp) and the interpreter, for the full mod and lua_host_test.
+set(PBZ_LUA_HOST_SOURCES src/plugin/lua_host.cpp ${PBZ_LUA_SOURCES})
+
+# 派生插件 host: the plugin API, the module registry it reads and the UI-page model (every target that links the host needs all three).
+set(PBZ_PLUGIN_HOST_SOURCES src/plugin/combo_plugins.cpp src/plugin/mod_registry.cpp src/plugin/plugin_ui.cpp)
+# Each module's registry table (the plugin API), in its own folder; module_apis.cpp calls them. Only the full mod has them.
+set(PBZ_MODULE_API_SOURCES src/plugin/module_apis.cpp src/character/combo_api.cpp src/character/npc_look_api.cpp src/character/character_api.cpp src/character/npc_body_api.cpp
+    src/boss/boss_rush_api.cpp src/air/air_skills_api.cpp src/grab/motian_grab_api.cpp src/weapons/weapon_presets_api.cpp src/pad/pad_api.cpp src/hair/hair_api.cpp src/ui/hub_api.cpp)
+
+# 身材 / 骨骼: the UUEPBS editor (XTGMods, github.com/XTGMods/UUEPBS) and Dear ImGui 1.92.1 (MIT) as they came, at their
+# own warning level, so /W4 /WX applies to this project's code only. See licenses/ and THIRD_PARTY_NOTICES.md.
+set(PBZ_VENDOR_SOURCES
+    src/third_party/imgui/imgui.cpp src/third_party/imgui/imgui_draw.cpp
+    src/third_party/imgui/imgui_tables.cpp src/third_party/imgui/imgui_widgets.cpp
+    src/third_party/imgui/backends/imgui_impl_dx11.cpp src/third_party/imgui/backends/imgui_impl_win32.cpp
+    src/uuepbs/core/anim.cpp src/uuepbs/core/body_groups.cpp src/uuepbs/core/bridge.cpp
+    src/uuepbs/core/character_memory.cpp src/uuepbs/core/mirror.cpp src/uuepbs/core/morphs.cpp
+    src/uuepbs/core/presets.cpp src/uuepbs/core/registry.cpp src/uuepbs/core/resolver.cpp
+    src/uuepbs/core/rig_names.cpp src/uuepbs/core/sculpt.cpp
+    src/uuepbs/ui/fonts.cpp src/uuepbs/ui/i18n.cpp src/uuepbs/ui/image_decode.cpp
+    src/uuepbs/ui/panel_view.cpp src/uuepbs/ui/skin.cpp src/uuepbs/ui/soft_raster.cpp
+    src/uuepbs/win/slider_window.cpp)
+# C4005: they define WIN32_LEAN_AND_MEAN / NOMINMAX themselves, as pbz_settings does.
+set_source_files_properties(${PBZ_VENDOR_SOURCES} PROPERTIES COMPILE_OPTIONS "/W3;/WX-;/std:c++20;/wd4005")
 
 function(pbz_settings target)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -24,6 +60,12 @@ add_executable(bone_body_editor_test tests/bone_body_editor_test.cpp)
 pbz_settings(bone_body_editor_test)
 add_executable(weapon_action_hold_test tests/weapon_action_hold_test.cpp)
 pbz_settings(weapon_action_hold_test)
+add_executable(weapon_action_named_test tests/weapon_action_named_test.cpp)
+pbz_settings(weapon_action_named_test)
+# 身材 / 骨骼: the bundled presets and animations load with the editor's own readers (vendored, built as PBZ_VENDOR_SOURCES).
+add_executable(body_presets_test tests/body_presets_test.cpp src/uuepbs/core/presets.cpp src/uuepbs/core/anim.cpp src/uuepbs/core/sculpt.cpp src/uuepbs/core/morphs.cpp src/uuepbs/core/rig_names.cpp)
+pbz_settings(body_presets_test)
+set_source_files_properties(tests/body_presets_test.cpp PROPERTIES COMPILE_OPTIONS "/std:c++20")
 
 add_library(version SHARED
     src/core/proxy.cpp
@@ -32,7 +74,9 @@ add_library(version SHARED
     src/hair/hair_controls.cpp
     src/boss/boss_menu.cpp src/boss/boss_rush.cpp src/boss/boss_record_guard.cpp src/boss/boss_ai.cpp src/boss/boss_ai_menu.cpp
     src/boss/entry_safety.cpp src/boss/entry_protection.cpp src/boss/entry_focus.cpp src/boss/test_dummy.cpp src/boss/boss_assist.cpp src/boss/move_preview.cpp
-    src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion.cpp src/character/bone_motion_page.cpp
+    ${PBZ_PLUGIN_HOST_SOURCES} src/character/character_swap.cpp src/character/npc_retarget.cpp src/character/npc_menu.cpp src/character/npc_combo.cpp src/character/combo_file.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion.cpp src/character/bone_motion_page.cpp
+    src/character/npc_body.cpp src/character/npc_body_rig.cpp src/character/npc_body_preset.cpp src/character/npc_anim.cpp
+    src/character/npc_body_menu.cpp src/character/npc_bridge.cpp ${PBZ_VENDOR_SOURCES}
     src/air/air_skills.cpp src/air/air_skills_menu.cpp
     src/grab/motian_grab.cpp src/grab/motian_grab_menu.cpp src/grab/grab_extras.cpp
     src/core/settings_store.cpp src/ui/hub_pause.cpp src/ui/gear_widget.cpp src/ui/skill_toast.cpp src/core/title_control.cpp
@@ -41,9 +85,10 @@ add_library(version SHARED
     src/core/ue_runtime.cpp src/core/game_thread.cpp src/core/game_build.cpp src/hair/groom_force.cpp
     src/supplement/debug_supplement.cpp src/supplement/supplement_menu.cpp src/ui/donate_page.cpp
     src/net/net_steam.cpp src/net/net_puppet.cpp src/net/net_page.cpp
+    ${PBZ_MODULE_API_SOURCES} ${PBZ_LUA_HOST_SOURCES}
     src/core/forwarders.asm src/core/version.def)
 pbz_settings(version)
-target_link_libraries(version PRIVATE bcrypt user32 gdi32 comctl32 cabinet)
+target_link_libraries(version PRIVATE bcrypt user32 gdi32 comctl32 cabinet d3d11 dxgi dwmapi shell32 ole32)
 set_target_properties(version PROPERTIES OUTPUT_NAME version)
 
 # Standalone version.dll: adaptive triggers always off, nothing else (no debug menu / panel / ini), in build/triggers_only.
@@ -121,6 +166,13 @@ pbz_settings(grab_damage_test)
 add_executable(npc_pose_transfer_test tests/npc_pose_transfer_test.cpp)
 pbz_settings(npc_pose_transfer_test)
 
+# A look's own locomotion: loop picked by speed / heading, fallbacks, play rate from root travel, body weight easing.
+add_executable(npc_own_locomotion_test tests/npc_own_locomotion_test.cpp)
+pbz_settings(npc_own_locomotion_test)
+# 主角体型 / 镜头取景 按体型比例: the look's height ratio, the scale it is shown at, its easing, the camera's push-out.
+add_executable(npc_hero_size_test tests/npc_hero_size_test.cpp)
+pbz_settings(npc_hero_size_test)
+
 # Debug supplement page: every catalog item on exactly one card.
 add_executable(supplement_layout_test tests/supplement_layout_test.cpp)
 pbz_settings(supplement_layout_test)
@@ -148,23 +200,23 @@ add_executable(npc_combo_test tests/npc_combo_test.cpp)
 pbz_settings(npc_combo_test)
 
 # 招式派生 page rendered offline from the generated skill / dodge tables (stubbed game state) to a PNG.
-add_executable(combo_menu_preview tests/combo_menu_preview.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(combo_menu_preview tests/combo_menu_preview.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp ${PBZ_PLUGIN_HOST_SOURCES}
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_menu_preview)
 target_link_libraries(combo_menu_preview PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
 
 # Hidden host only: no activation, capture, injected input, game launch or real chain folders.
-add_executable(combo_library_test tests/combo_library_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(combo_library_test tests/combo_library_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp ${PBZ_PLUGIN_HOST_SOURCES}
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_library_test)
 target_link_libraries(combo_library_test PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
 
-add_executable(manual_ui_export tests/manual_ui_export.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(manual_ui_export tests/manual_ui_export.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp ${PBZ_PLUGIN_HOST_SOURCES}
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(manual_ui_export)
 target_link_libraries(manual_ui_export PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
 
-add_executable(combo_canvas_perf_test tests/combo_canvas_perf_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp
+add_executable(combo_canvas_perf_test tests/combo_canvas_perf_test.cpp src/character/combo_menu.cpp src/character/speed_curve_window.cpp src/character/bone_motion_page.cpp src/character/npc_combo.cpp src/character/combo_file.cpp ${PBZ_PLUGIN_HOST_SOURCES}
     src/core/settings_store.cpp src/ui/ui_theme.cpp src/ui/ui_i18n.cpp src/ui/ui_assets.cpp src/ui/ui_host.cpp src/weapons/weapon_icons.cpp)
 pbz_settings(combo_canvas_perf_test)
 target_link_libraries(combo_canvas_perf_test PRIVATE user32 gdi32 gdiplus comctl32 dwmapi uxtheme cabinet shlwapi)
@@ -172,6 +224,26 @@ target_link_libraries(combo_canvas_perf_test PRIVATE user32 gdi32 gdiplus comctl
 add_executable(combo_save_stress_test tests/combo_save_stress_test.cpp src/character/combo_file.cpp src/character/npc_combo.cpp src/core/settings_store.cpp)
 pbz_settings(combo_save_stress_test)
 target_link_libraries(combo_save_stress_test PRIVATE cabinet)
+
+# 派生插件: the SDK's sample plugins (sdk/samples) and the host test, which loads them from PBZPlugins\ next to it.
+add_library(pbz_conditions SHARED sdk/samples/conditions/pbz_conditions.cpp)
+pbz_settings(pbz_conditions)
+add_library(pbz_weapon_actions SHARED sdk/samples/weapon_actions/pbz_weapon_actions.cpp)
+pbz_settings(pbz_weapon_actions)
+add_library(pbz_mod_panel SHARED sdk/samples/mod_panel/pbz_mod_panel.cpp)
+pbz_settings(pbz_mod_panel)
+add_executable(combo_plugins_test tests/combo_plugins_test.cpp ${PBZ_PLUGIN_HOST_SOURCES} src/character/npc_combo.cpp src/character/combo_file.cpp src/core/settings_store.cpp)
+pbz_settings(combo_plugins_test)
+target_link_libraries(combo_plugins_test PRIVATE cabinet)
+add_dependencies(combo_plugins_test pbz_conditions pbz_weapon_actions pbz_mod_panel)
+# The module registry and the plugin UI-page model on their own (no host, no game).
+add_executable(mod_registry_test tests/mod_registry_test.cpp src/plugin/mod_registry.cpp src/plugin/plugin_ui.cpp)
+pbz_settings(mod_registry_test)
+# Lua scripts: the script host with the real plugin host, the registry and a fake chain; the sample scripts come from sdk/samples/lua.
+add_executable(lua_host_test tests/lua_host_test.cpp ${PBZ_PLUGIN_HOST_SOURCES} ${PBZ_LUA_HOST_SOURCES} src/character/npc_combo.cpp src/character/combo_file.cpp src/core/settings_store.cpp)
+pbz_settings(lua_host_test)
+target_link_libraries(lua_host_test PRIVATE cabinet)
+target_compile_definitions(lua_host_test PRIVATE PBZ_LUA_SAMPLES_DIR=L"${CMAKE_CURRENT_SOURCE_DIR}/sdk/samples/lua")
 
 # .combo files: format round trip, bad files, ini migration, save-as / select, live reload.
 add_executable(combo_file_test tests/combo_file_test.cpp src/character/combo_file.cpp src/character/npc_combo.cpp src/core/settings_store.cpp)

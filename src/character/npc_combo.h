@@ -79,6 +79,13 @@ void SetChainHud(int mode);
 enum : int { kViewPelvis = 0, kViewNeck = 1, kViewHead = 2 };
 int ViewTarget();
 void SetViewTarget(int target);
+// 镜头取景 (PBZDebugMenu.ini [NpcCombo] ViewScale): how far the 视角跟随 camera stands from the shown model. kScaleHeight
+// (default): the game camera's relation, pushed out only for a model over 2 m in proportion to its height.
+// kScaleHeroRatio (按体型比例): the relation times the shown model's height over the hero's (the look's own ratio times
+// the size it is shown at now: 1 under 主角体型), so a small look brings the camera in too. Any thread; cached.
+enum : int { kScaleHeight = 0, kScaleHeroRatio = 1 };
+int ViewScale();
+void SetViewScale(int mode);
 // 派生页的技能伤害 / 投技伤害 (PBZDebugMenu.ini [NpcCombo] ChainSkillDamage, ChainGrabDamage, ChainGrabValue): the
 // damage of the BOSS 技能 and 投技 a chain plays, in place of the NPC 技能 page's and the 投技 page's (moves the chain
 // does not play keep those). Skill: 0 follows the NPC 技能 page, else x kChainSkillMin..kChainSkillMax of the boss's own

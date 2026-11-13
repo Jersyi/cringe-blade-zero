@@ -6,6 +6,7 @@
 #include "bone_collision.h"
 #include <windows.h>
 #include <memory>
+#include <atomic>
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
@@ -18,6 +19,13 @@ Logger logger_=nullptr;SRWLOCK lock_=SRWLOCK_INIT;Config global_,preview_;Snapsh
 bool debug_=false;
 bool supplement_=false;
 volatile LONG collision_probe_=0;
+// Pose listeners: slot 0 is the 身材 / 骨骼 editor's (Listen; the editor's note and status follow it), the others are AddListener's
+// (the plugin API's pose event). Each slot has its component and its function; a finalize of a component runs every slot that
+// names it, so one listener never replaces another. `listening_` / `listen_faults_` are slot 0's: whether its hook is in, its faults.
+constexpr int kListeners=4;
+std::atomic<Object*> listen_target_[kListeners]{};std::atomic<PoseListener> listener_[kListeners]{};volatile LONG listening_=0,listen_faults_=0;
+char listen_note_[200]="off";
+bool global_retired_logged_=false;
 constexpr size_t kSlot=380;constexpr uintptr_t kFinalize=0x3dadf30,kFlip=0x3dae6d0;
 void Log(const char* format,...){if(!logger_)return;char text[950]{};va_list args;va_start(args,format);_vsnprintf_s(text,sizeof(text),_TRUNCATE,format,args);va_end(args);logger_(text);}
 bool Readable(const void* p,size_t n){MEMORY_BASIC_INFORMATION m{};if(!p||!VirtualQuery(p,&m,sizeof(m))||m.State!=MEM_COMMIT||(m.Protect&(PAGE_NOACCESS|PAGE_GUARD)))return false;
@@ -75,6 +83,16 @@ void Apply(Hook& h){
     BoneSupplement::SyncCollisions(h.component,a);
 }
 void GuardApply(Hook* h){__try{Apply(*h);}__except(EXCEPTION_EXECUTE_HANDLER){h->fault=true;Log("BONE_MOTION fault: disabled component");}}
+void GuardListen(PoseListener listener,Object* component){__try{listener(component);}__except(EXCEPTION_EXECUTE_HANDLER){InterlockedIncrement(&listen_faults_);}}
+// After the listener wrote, the pose this module compares a cached frame with is the final one (Apply's baseline check).
+// Only while this module edits (Apply wrote this frame): with its edits off the old output must stay as it was.
+void KeepFinal(Hook& h){
+    if(GetCurrentThreadId()!=game_thread_||h.output.empty()||!h.config.on||h.retire||h.fault||!Same(h))return;
+    const int read=ue::At<int32_t>(h.component,0x640);if(read<0||read>1)return;
+    const Array a=ue::At<Array>(h.component,0x5f8+read*16);const size_t bytes=h.output.size()*sizeof(Transform);
+    if(a.num==static_cast<int>(h.output.size())&&Readable(a.data,bytes))std::memcpy(h.output.data(),a.data,bytes);
+}
+void GuardKeepFinal(Hook* h){__try{KeepFinal(*h);}__except(EXCEPTION_EXECUTE_HANDLER){}}
 void __fastcall Finalize(Object* component){
     Hook* found=nullptr;for(auto& h:hooks_)if(h->component==component){found=h.get();break;}
     if(!found){reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+kFinalize)(component);return;}
@@ -82,6 +100,11 @@ void __fastcall Finalize(Object* component){
     const bool fresh=(ue::At<uint8_t>(component,0x7da)&2)!=0;
     original(component);
     if(fresh)for(auto& h:hooks_)if(h.get()==found){GuardApply(h.get());break;}
+    bool listened=false;
+    for(int i=0;i<kListeners;++i)
+        if(component==listen_target_[i].load(std::memory_order_acquire))
+            if(const PoseListener listener=listener_[i].load(std::memory_order_acquire)){GuardListen(listener,component);listened=true;}
+    if(listened&&fresh)GuardKeepFinal(found);
 }
 void Remove(Hook& h){
     if(Readable(h.component,sizeof(void*))&&ue::At<uintptr_t*>(h.component,0)==h.table)
@@ -117,15 +140,30 @@ void TickImpl(bool transitioning){
         else {const auto split=BoneMotion::SplitSupplement(config);result[0]=Ensure(source,split[0]);result[1]=Ensure(display,split[1],true);}
         return result;
     };
-    if(!transitioning){Config node=NpcRetarget::BoneEdits();const auto bound=bind_body(NpcRetarget::BoneBody(),node.on?node:global);primary=bound[0];secondary=bound[1];
-        Object* boss=BossAssist::PreviewBoss();if(ue::Alive(boss))bind_body(Property(boss,"Mesh"),preview.on?preview:global);}
+    // The 骨骼变换 page's own (global) edits are retired: the 身材 / 骨骼 editor took its place (2026-11-13). Only the 骨骼变换
+    // nodes of a chain and their preview still edit here.
+    if(global.on&&!global_retired_logged_){global_retired_logged_=true;Log("BONE_MOTION saved page edits ignored: the 身材 / 骨骼 editor replaced the page");}
+    if(!transitioning){const Config node=NpcRetarget::BoneEdits();const auto bound=bind_body(NpcRetarget::BoneBody(),node);primary=bound[0];secondary=bound[1];
+        Object* boss=BossAssist::PreviewBoss();if(ue::Alive(boss))bind_body(Property(boss,"Mesh"),preview);}
+    // The editor's component keeps a hook while it listens (after the bodies above: their Ensure may have retired it).
+    {Object* listen=nullptr;bool in=false;
+        for(int slot=0;slot<kListeners;++slot){
+            Object* target=listener_[slot].load()?listen_target_[slot].load():nullptr;bool hooked=false;
+            if(!transitioning&&target&&ue::Alive(target)){Hook* h=nullptr;for(auto& x:hooks_)if(x->component==target&&Same(*x)){h=x.get();break;}
+                if(!h)h=Ensure(target,Config{},true);
+                if(h){h->wanted=true;h->retire=false;hooked=true;}}
+            if(slot==0){listen=target;in=hooked;}}
+        if(InterlockedExchange(&listening_,in?1:0)!=(in?1:0)||!in){
+            if(in)_snprintf_s(listen_note_,sizeof(listen_note_),_TRUNCATE,"pose hook on %s (shared with the 骨骼变换 node), faults=%ld",Text(listen).c_str(),listen_faults_);
+            else _snprintf_s(listen_note_,sizeof(listen_note_),_TRUNCATE,"%s",!listen?"off":transitioning?"waiting: scene change":
+                             hooks_.size()>=8?"waiting: every hook slot is taken":!Pins()?"no hook: this game build's pose code differs":"waiting for the hero's body");}}
     BoneSupplement::End(BeforeComponentHook);
     if(InterlockedExchange(&collision_probe_,0))BoneSupplement::ProbeCollisions();
     for(auto it=hooks_.begin();it!=hooks_.end();){Hook& h=**it;
         if(transitioning||!Same(h)||(h.retire&&h.restored)){if(primary==&h)primary=nullptr;if(secondary==&h)secondary=nullptr;Remove(h);it=hooks_.erase(it);}
         else{if(!h.wanted)h.retire=true;++it;}}
     Snapshot s;s.hooks=static_cast<int>(hooks_.size());s.supplement_enabled=supplement;s.supplement_displays=static_cast<int>(BoneSupplement::entries.size());s.supplement_note=BoneSupplement::note;
-    s.note=global.on?"Waiting for a supported body":"Disabled";
+    s.note="Disabled";
     for(Hook* h:{primary,secondary})if(h){s.missing.insert(s.missing.end(),h->missing.begin(),h->missing.end());s.frames=(std::max)(s.frames,h->frames);s.max_delta=(std::max)(s.max_delta,h->max_delta);
         for(const auto& binding:h->bindings)if(binding.bone>=0)++s.matched;
         if(h->fault)s.note="Component disabled after fault";else if(h->config.on&&s.note!="Component disabled after fault")s.note="Active";}
@@ -177,6 +215,22 @@ void BeforeComponentHook(Object* component){
     }
 }
 Snapshot Get(){AcquireSRWLockShared(&lock_);Snapshot s=snapshot_;ReleaseSRWLockShared(&lock_);return s;}
+namespace {
+// Target first when stopping (a finalize running now sees no target), last when starting (its listener is set).
+void SetSlot(int slot,Object* component,PoseListener listener){
+    if(!listener||!component){listen_target_[slot].store(nullptr,std::memory_order_release);listener_[slot].store(nullptr,std::memory_order_release);return;}
+    listener_[slot].store(listener,std::memory_order_release);listen_target_[slot].store(component,std::memory_order_release);
+}
+}
+void Listen(Object* component,PoseListener listener){SetSlot(0,component,listener);}
+int AddListener(Object* component,PoseListener listener){
+    if(!component||!listener)return 0;
+    for(int slot=1;slot<kListeners;++slot)if(!listener_[slot].load(std::memory_order_acquire)){SetSlot(slot,component,listener);return slot;}
+    return 0;
+}
+void RemoveListener(int id){if(id>0&&id<kListeners)SetSlot(id,nullptr,nullptr);}
+bool Listening(){return InterlockedCompareExchange(&listening_,0,0)!=0;}
+const char* ListenNote(){return listen_note_;}
 void Debug(bool enabled){AcquireSRWLockExclusive(&lock_);debug_=enabled;ReleaseSRWLockExclusive(&lock_);}
 void Supplement(bool enabled,bool save){AcquireSRWLockExclusive(&lock_);supplement_=enabled;ReleaseSRWLockExclusive(&lock_);if(save)SettingsStore::Put(L"BoneMotion",L"Supplement",enabled?L"1":L"0");}
 bool SupplementEnabled(){AcquireSRWLockShared(&lock_);const bool enabled=supplement_;ReleaseSRWLockShared(&lock_);return enabled;}

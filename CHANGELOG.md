@@ -1,5 +1,147 @@
 ﻿# 更新日志
 
+## 2026-11-13 · 安装包的 UUEPBS 预设只带 GitHub 上的三个示例
+
+用户要求：“打包里UUEPBS Presets只包含Github上的Preset即可 当前的perset是别人调的”。
+
+- `samples/UUEPBS Presets/` 现在只有 [XTGMods/UUEPBS](https://github.com/XTGMods/UUEPBS) 仓库 `presets/` 下的三个示例：`Example - Athletic.json`、`Example - Curvy.json`、`Example - Petite.json`。取自提交 `7c54929`，用 `git hash-object` 核对过，和仓库里的 blob 逐字节一致。仓库里没有动画，所以安装包也不再带动画。
+- 贡献者调的 14 个预设和 10 个动画挪到了 `local/contrib_uuepbs_presets/UUEPBS Presets/`。这个目录被 git 忽略，不进安装包，只在本机保留。
+- `body_presets_test` 改为期望 3 个预设、0 个动画；3 个预设都能用编辑器自己的读取器载入（38 根骨骼）。
+- 同步了 `THIRD_PARTY_NOTICES.md`、`licenses/UUEPBS-LICENSE-STATUS.txt`、`USER_MANUAL.md`、`更新内容.txt` 和 `build.ps1` 的注释。
+- 游戏目录里已有的 `UUEPBS Presets`（11-13 合并时装的）没有动。
+
+## 2026-11-13 · 派生页顶栏：六个开关收进「显示 / 镜头 / 伤害」三个列表
+
+用户反馈派生页顶栏的选项太挤，要求优化。顶栏原来一排十个按钮（派生链、派生提示、派生显示、镜头跟随、镜头取景、召唤测试木桩、技能伤害、投技伤害、派生插件和左边的派生表标题），100 % 缩放下约 1061 px，最小页宽 720 px 时挤掉了标题。
+
+- **顶栏**（`src/character/combo_menu.cpp` `Layout`）：从右到左是派生链开关 | 「显示 ▾」「镜头 ▾」「伤害 ▾」 | 「派生插件：开/关 ▾」「召唤木桩 / 移除木桩」，两组之间画一条 1 px 竖线（`bar_rules_`）。离屏量字宽（YaHei UI / 华文中宋）约 535 px，最小页宽时标题还有约 133 px。
+- **列表**：新的 `Button::Display / Camera / Damages` 追加在 `Count` 前（Copy 38、Paste 39 不变）。三个列表对应 search mode 9（`HudMode`、`ToastMode`）、8（`ViewBone`、`ViewFrame`）、10（mode 4 + mode 5 的伤害预设）。行是单选：`Item.choice` 画圆圈，`Item.on` 是当前值，实心。点一行就设置、提示，然后在同一行、同一滚动位置重新打开列表（`OpenMenuSearch(mode, row, scroll)`），所以同一列表的两项可以接着改。列表的分组标题上方画分隔线（所有列表都有）。
+- **按钮亮起**：显示 = 右上角派生链开着；镜头 = 跟随不是骨盆或取景按体型比例；伤害 = 技能或投技伤害不跟随其他页；以及列表打开时。
+- **派生插件列表**：Lua 脚本的名字前面标「Lua ·」（`PluginView::script`）；「打开插件文件夹」下面加一行「重新读取脚本」（`ItemKind::PluginReload` → `ComboPlugins::RequestScriptReload()`，提示后重新打开列表），`[Plugins] Scripts = 0` 时换成一行「Lua 脚本已关闭」。
+- **给 Agent 的指南** `docs/AGENT_PLUGIN_GUIDE.md`（安装包 `SDK/AGENT_GUIDE.md`，`build.ps1` 已加）：硬规则、C 插件模板（`describe_ex` + 判断节点 + 授权后画页 + 订阅）、Lua 脚本模板、编译 / 安装 / 授权 / 日志、线程 / 结果码 / 能力 / 模块 / 命令 / UI 速查、配方、测试、改宿主。日志格式、授权名、`pbz.Caps()` 的返回顺序按代码核对过。
+- 旧的 Toast / Hud / ViewTarget / ViewScale / SkillDamage / GrabDamage 按钮留在枚举和 `PressButton` 里（提示文字抽成 `NotifyChainHud` 等），只是不再排进顶栏。新增 17 条英文翻译（`ui_i18n_strings.h`）。
+- 验证：和 Lua（修订 3）一起，51 个目标 Release 构建 0 警告；无窗口测试全过（36 个，加 `sample_combo_test`、`proxy_test` 两种 DLL）。没有在窗口里渲染（`combo_menu_preview`、`manual_ui_export` 会开窗口），`docs/manual_images/ui_combo.png` 还是旧顶栏；没进游戏。
+- **安装**：SHA `01BD5D44…`，Steam 和 WeGame；两处的 `PBZPlugins` 换上新的示例 DLL（加了 `pbz_mod_panel.dll`），并放入 `scripts\` 的三个示例脚本。旧文件在 `local/validation/topbar_lua_20261113/before/`。ZIP：`dist/CringeBladeZero_20261113_4b8e57b-modified.zip`（107 项）。
+
+## 2026-11-13 · 派生插件支持 Lua 脚本（接口修订 3）
+
+用户要求：“要做到能支持lua脚本”。Lua 脚本作为插件接口的一部分：和 DLL 插件在同一个列表、同一套权限，只是不用编 DLL。C 接口**没有新函数**（修订 3 只新增 `has_feature("lua_scripts")`，`host` 模块新增 `scripts_loaded` / `scripts_enabled` / 动作 `reload_scripts`，命令 `plugins.reload_scripts`）。
+
+- **Lua 5.4.7**（`src/third_party/lua/`，MIT，`licenses/Lua-LICENSE.txt`，`THIRD_PARTY_NOTICES.md`；取自 UE4SS 适配版的 `deps/first/LuaRaw`，去掉 `lua.c`、`luac.c`、它的 `luauser.c` 锁垫片）。按 C++ 编译（Lua 出错就是 C++ 异常，宿主自己的栈帧会正常展开），厂商源码 /W3 /WX-。**编译时就没有放进去**：`linit.c`、`liolib.c`、`loslib.c`、`loadlib.c`、`ldblib.c`——脚本没有 `io`、`package`（`require` / `loadlib` / `cpath`）、`debug`，`os` 只有宿主加的 `time` / `clock` / `difftime`。适配版的 `luaconf.h` 把 `lua_lock` 接到 `LuaLock` 等三个函数，`lua_host.cpp` 里把它们定义成空函数（脚本只在游戏线程跑，每个脚本一个 Lua 状态）。
+- **脚本宿主** `src/plugin/lua_host.{h,cpp}`：读 `PBZPlugins\scripts\*.lua`（最多 64 个文件、32 个脚本，每个 ≤ 1 MB），每个脚本是一个插件，id = `lua.<文件名>`（由文件名决定，所以脚本继承不了别的插件的授权；文件名不合法的脚本在列表里显示原因）；用同一套授权（`[PluginGrants]`）；只在「派生插件」打开时读、跑，`[Plugins] Scripts = 0` 单独关掉（缺省 1）。插件宿主里的改动很小：`PbzPlugin` 加 `script` / `retired`、`StartScript` / `RetireScripts` / `SetScriptStatus` / `ScriptFailed`、`SetScriptHost`、`RequestScriptReload`；DLL 的 32 个上限不再算上脚本。
+- **全局表 `pbz`**（同一个表也叫 `PBZ`，名字沿用适配版的 `PBZ` 表，约定也一样：函数不抛错，失败返回 `nil, 结果码, 名字`）：自身（`Init` = `describe_ex`）、信号、节点动作（`decide` 返回出口序号）、回调（`OnEvent` `OnHeroAbility` `OnTick` `OnEnabled` `OnModuleEvent` `OnUi` `OnCaps` `OnStart`）、读派生链、控制、派生表和整套 `Edit*`、选项与设置、模块（`ModuleList` `PropList` `PropGet` `PropSet` `ActionInvoke` `Subscribe` `Command`……按授权）、`UiPage` 等、常量。
+- **安全**：指令预算（`lua_sethook`，每次回调 20 万条指令，载入 500 万条；`pcall` / `xpcall` 换成会把预算错误继续往外抛的版本，协程里的死循环也停得住）；内存上限 16 MB（自己的分配器）；`string.rep` ≤ 1 MB；日志每秒 200 行、提示每秒 4 条；`load` 只读文本；每次进 Lua 都在 SEH 保护里；`pcall` 包住每个回调，出错 = 这个脚本停用 + **一行**日志 + 提示 + 列表里的状态；只在游戏线程调用。预算只数 Lua 指令，不数 C 函数里的时间（字符串模式回溯爆炸仍会卡住游戏线程）。
+- **热重载**：`RequestScriptReload()`（任意线程）→ 下一帧停掉全部脚本（撤掉它们的信号、动作、UI 页、订阅，关 Lua 状态）再读一遍文件夹，DLL 不动；入口：插件列表的「重新读取脚本」（给面板用的函数见手册「给面板用的函数」，我没有改 `combo_menu.cpp`）、命令 `plugins.reload_scripts` / `host.reload_scripts`、命令文件 `plugins reload`（`proxy.cpp` 的 `PollCommand`）。
+- **示例**：`sdk/samples/lua/`（`condition.lua`、`signal.lua`、`panel.lua`），随包放进 `PBZPlugins\scripts\` 和 `SDK\samples\lua\`；`build.ps1` 同时打包许可证。手册新增「Lua 脚本」一章、用户手册「Lua 脚本」一节、`更新内容.txt` 一行。
+- 测试：新增 `lua_host_test`（68 项，真实插件宿主 + 假派生链 + 假模块 + 示例脚本）：关着不读、`Scripts=0`、示例载入与判断 / 信号行为、沙箱（无 io / os.execute / dofile / require / package / debug / string.dump，`load` 拒绝字节码）、预算（顶层死循环、回调死循环、`pcall` 里的、协程里的）、内存上限、一个脚本出错不影响别的、语法错误和非法文件名的状态、日志限流、`pbz` 表对假宿主的调用（派生链读写、编辑会话、选项设置、模块读写、授权前 DENIED、事件、UI 页）、热重载（新文件生效、旧注册撤掉、DLL 不动、列表里不留旧副本、命令与动作）。
+- **未在游戏中验证**：只有宿主逻辑、沙箱和 `pbz` 表用假宿主测过；真实派生链、模块和面板里的 Lua 标记 / 重新读取按钮（面板由另一个会话画）没有试过。没有安装到游戏目录。
+
+## 2026-11-13 · 派生插件接口扩展到整个 MOD（接口修订 2）
+
+用户要求：“把派生插件 API 扩展到能修改整个 MOD”（此前它只覆盖招式派生，身材 / 骨骼、外观、毛发、Boss 连战等都没有接口，`BoneMotionRuntime::Listen` 还是单槽内部钩子）。ABI 仍是 v1（`PBZ_COMBO_API_VERSION` = 1），只在 `PbzApi` 末尾追加少量**通用**函数，不为每个功能写一个函数；详见 `docs/PLUGIN_API.md`。
+
+- **版本与特性探测**：`api_revision`（现在是 2，旧 MOD 的函数表里没有这个字段，`PBZ_API_REVISION_OF` 给 1）和 `has_feature(名字)`，补上 11-13 `PBZ_NODE_HERO_SIZE` 加入时没改版本号的盲点（`has_feature("hero_size_node")`）。`mod_version` 改为 `"20261113"`。
+- **模块注册表**（`src/plugin/mod_registry.*`）：每个模块在自己文件里注册一份描述表——属性（类型 bool / int / float / enum / text、范围、默认、保存在 ini 的哪一项、线程、getter / setter）、动作（文本参数、文本返回）、事件。新函数 `module_list`、`prop_list`、`action_list`、`event_list`、`prop_get`、`prop_set`、`action_invoke`、`module_subscribe`。写入统一**排队到游戏线程**（沿用 `Op` 队列）：`prop_set` 立即检查名字、类型、范围（范围外 `PBZ_E_ARG`，不截断），下一帧调模块自己的设置函数；描述里的线程列写明 `game` / `any` / `worker`，`game` 模块不会被别的线程读。每次进模块的调用有 SEH 保护，模块崩溃只停这个模块。
+- **权限**：`describe_ex`（`min_revision`、申请的能力、给玩家看的理由）、`granted_caps`、回调 `on_caps`、新结果码 `PBZ_E_DENIED = -10`（旧码不变）。能力：`PBZ_CAP_COMBO`（总是授予）、`READ`、`WRITE`、`INI`、`COMMAND`、`UI`，`UE` 预留。玩家在「派生插件」列表里**逐个插件、逐项**点开，保存在 `[PluginGrants]`；默认只给派生。授权随时可收回，已排队的写入执行时再查一次。所有模块写入写日志 `PLUGIN [id] prop_set 模块.属性=值`，拒绝的调用每个插件每种只记一次。**`set_setting` 收紧**：`[NpcCombo]` 和插件自己的 `[Plugin.插件id]` 默认可写，其他段要 `PBZ_CAP_INI`，`[Plugins]` / `[PluginGrants]` 只有玩家能改（11-12 的版本允许写任意段）。
+- **模块事件**：`on_module_event`。没有自己事件钩子的模块用**轮询**（`ModRegistry::AddPoller`，宿主每帧在游戏线程调一次，只在有插件订阅时跑，对比快照后发事件）：`npc_look / look_changed`、`character / swap_changed`、`weapons / weapon_changed`、`boss_rush / rush_changed`、`bones / pose_finalized`。命令和排队动作的答案是只回给发起插件的 `host / command_done`、`host / action_done`。
+- **姿势钩子多监听**：`BoneMotionRuntime` 的监听从单槽（后一次覆盖前一次）改成 4 槽：槽 0 仍是身材 / 骨骼编辑器的 `Listen`，新增 `AddListener` / `RemoveListener`（最多 3 个），一次 finalize 依次调每个命名了这个组件的监听。插件拿到的是 `bones / pose_finalized` 事件（引擎线程上只做原子计数，轮询合并成每帧最多一个事件），**不能**在姿势上写。
+- **命令总线**：`command` / `command_list`，把 `PollCommand` 和各模块 `HandleCommand` 里确认安全的命令登记成白名单（种类 `diagnostic` / `state` / `persist`，`persist` 另需 `PBZ_CAP_INI`；诊断类命令在表里标明不持久）。属于面板线程的命令（毛发开关 `hair.*`、面板显示 / 隐藏 / 切页 `hub.*`、`bones.*`）排队，面板线程每个周期取一次（`proxy.cpp` 的 Worker 循环里 `ComboPlugins::PumpWorker()`）。不在白名单里的（包括 `title quit`）一律拒绝。
+- **插件 UI 页**：`ui_page`（label / toggle / slider / choice / button / text，每个插件 8 页、每页 64 个控件）；控件可以绑定模块属性（`模块.属性`）或动作（`模块:动作`），宿主按插件的权限读写，不用写事件代码；没绑定的走 `on_ui`。页由「派生插件」列表自己的行绘制，不暴露窗口句柄；列表里新增每个插件的权限行（点一下允许 / 收回）。
+- **各模块的描述表**（各自的文件，只用模块的公开头文件）：`host`、`combo`（`character/combo_api.cpp`，含 `view_scale`）、`npc_look`（NPC 外观套用）、`character`（角色替换）、`npc_body`（UUEPBS 的骨骼编辑 / 形变权重 / 预设 / 编辑器窗口）、`bones`（骨骼变换运行时）、`boss_rush`、`boss_ai`、`air_skills`、`grab`、`weapons`、`pad`；命令 `hair.*`、`hub.*`。`npc_retarget.cpp` **没有改**（`npc_look` 只用 `npc_retarget.h`）。`NpcBridge` 追加了 `PresetNames / PresetLoad / PresetSave / PresetRemove`（和编辑器面板同一份预设与 Registry）。多个选项一起改时（Options 结构体）用 `module_options.h` 的缓存避免同一帧里后一次覆盖前一次。
+- **没有实现的第 7 项：引擎反射逃生口**。评估后风险太大：`ue::` 层给不出属性类别和位域掩码，写错类型会往游戏对象里写错字节；对象句柄是裸指针，对象回收后同一槽可能换成别的对象；`ProcessEvent` 能跑任何 UFunction（退出游戏、切图、改存档）；也没有无窗口办法验证。理由和替代做法（在模块里加具体的属性 / 动作）写在手册「引擎反射」；`PBZ_CAP_UE` 只是预留，`has_feature("ue")` 永远是 0。
+- **示例 3 `pbz_mod_panel`**（`sdk/samples/mod_panel/`）：先查修订、`describe_ex` 申请权限、授权后（`on_caps`）画一页（绑定 `host.mod_version`、`combo.show_toast`、`combo.chain_hud`、`npc_look:restore`，另有自己处理的按钮）、订阅模块事件、用命令总线问面板线程；页上只放这个 MOD 里真有的模块。随包的 `PBZPlugins` 里是三个示例 DLL。
+- 测试：新增 `mod_registry_test`（63 项：描述表格式、值解析与范围、线程规则、模块崩溃隔离、事件、轮询、命令总线、面板线程队列、UI 页模型与绑定）；`combo_plugins_test` 增补到 142 项（特性探测、旧函数表读成修订 1、`describe_ex`、逐项权限与收回、写入排队与日志、动作 / 命令 / 事件的答案、UI 页与绑定、示例 3 载入）。全部 50 个目标 Release 编译无警告（/W4 /WX，独立构建目录 `build_plugin_api`）；其余无窗口测试全部通过（`combo_library_test`、`combo_menu_preview`、`manual_ui_export`、`combo_canvas_perf_test`、`input_focus_test` 带窗口，没有运行）。
+- **未在游戏中验证**：只有注册表机制、权限、事件、命令、UI 页模型和宿主逻辑用假模块 / 示例 DLL 测过。各模块的描述表、面板里的权限行和插件页、面板线程命令的实际效果、姿势多监听、`bones / pose_finalized`，都只是编译通过。UE4SS 适配版的 Lua `PBZ` 表没有修订 2 的函数（它在另一个仓库）。没有安装到游戏目录。
+
+## 2026-11-13 · BOSS 招式结束时按派生链没用到的键：外观不再停在 BOSS 收招里
+
+用户反馈：“主角派生内变身boss放完技能，立马按重击会罚站，按轻击不会”。用户的主角派生表里轻攻击是起端（trigger 27 → node 31，BOSS 招式，后面没有招式），重攻击没有接线。
+
+- **原因**：招式播放中按下派生链不接的键，`PressComboImpl` 走原生动作（`KeepPress`），置 `native_detour_`。招式结束时 `native_detour_` 让外观不在 move-ended 变回，之后外观一直保持到 `ActiveMontage` 为空。但这时还在播的常常是这一招自己的蒙太奇收尾（BOSS 技能能力结束后蒙太奇仍在主角网格上播，日志里变回时的 `cancelled=montage state=montage=1`），不是主角的动作。游戏也不会把 BOSS 招式期间的重攻击补放出来。结果 BOSS 外观站着放完收尾才变回，期间主角像罚站。轻攻击是起端，被链接住重新出招，所以没有这个现象。
+- **修复**：招式结束时记下当时在播的蒙太奇 `move_tail_`。`ComboPlayback::DetourKeepsLook`：只有主角动作能力正在运行（`HeroActionRunning`，不含链自己的施放），或这一招是为主角动作打断的（`native_handoff_`，允许中断），外观才保留；否则清掉 `native_detour_`，按普通招式结束变回（变回时停掉收尾蒙太奇；随后补放的主角动作由 `HeroNewAction` 保留）。之后的保持条件 `ComboPlayback::DetourHolds`：在播的蒙太奇不是 `move_tail_` 才算主角动作。日志 `NPC_COMBO node=N ended: the press left to the game brought no hero action (...)`。
+- 测试：`combo_playback_rules_test` 6380 项全过（新增 5 项）。未进游戏验证。
+- **安装**：等“扩展插件 API”会话完成第 2 轮（它报告可以发布，默认关闭）后，在同一工作区全部 50 个目标重新构建（无警告），不开窗口的 35 个测试和 sample_combo / body_presets 全过，SHA `0f93688d…` 装到 Steam 与 WeGame（旧版 `1f681b65…` 备份在 `local/validation/heavy_stall_api_20261113/before/`）。这一版同时带着插件 API 第 2 轮。
+
+## 2026-11-13 · 主角体型缩小后镜头 / 抬高 / 瞬身 / 布料按显示大小
+
+用户反馈：“彭猛这种的缩放还是有问题 变得非常小了 … 模型和视角都有问题”。用户日志 pid 33952（20:17:52、20:18:06 两次 node 31 GA_PengMeng_Skill_06）：主角体型把彭猛（头 427.3 / 主角 175.0 cm）显示为 x0.409，但视角跟随仍按 490 cm 取景（游戏镜头关系 370 / 435 cm x2.45 = 930 / 1068 cm），游戏镜头也仍按 `NPC_CAMERA raised … 252.3` 抬高。缩小后的模型约 2 m 高，却从 10 m 外看，画面里不到平时主角的一半。
+
+- **视角跟随**：`ViewModelSize` 缓存模型在自身大小下的身高（`ViewFollowState::ModelHeight(extent, BoundsScale, shown)`，量的时候除以当前 `RelativeScale3D`），每帧乘以当前显示比例取景；按身高和按体型比例两种模式都用显示大小。日志 `NPC_VIEW model height … / shown x… -> …cm at its own size`，接管行带 `shown x…`。
+- **游戏镜头抬高**：`FitCameraLift`（`DriveHeroSize` 每帧）把 `PBZ_NpcRetargetHeight` 抬高改为 `NpcHeroSize::LiftAt(camera_lift_, look_ratio_, 目标比例)`：显示头高减主角头高，缩到主角大小时为 0；恢复时回到原抬高。`HoldCameraLift` 维持新值，日志 `NPC_CAMERA lift A -> B cm for the look shown x…`。
+- **瞬身**：`BlinkSize` 乘以 `hero_size_shown_`，变回主角时的消失特效按缩小后的大小。
+- **布料 / 头发**：缩放过渡结束时（进度到 0 或 1）对外观部件的 ChaosClothComponent 调 `ForceNextUpdateTeleportAndReset`、GroomComponent 调 `ResetSimulation`（`ResetLookSimulation`，日志 `NPC_SIZE settled at x…`），避免按旧大小摆好的粒子继续模拟。
+- **未改**：缩放目标仍是参考姿势头高之比（彭猛缩小后头高 175 cm、包围盒约 2 m，与主角相当）；角色位置、碰撞胶囊（半径 91.8）和招式位移仍按 BOSS 原大小。
+- 测试：`npc_hero_size_test` 19 项、`view_follow_state_test` 1859 项全过。未进游戏验证。
+
+## 2026-11-13 · 合并 OthersChange：武器派生修改点名动作、身材 / 骨骼（UUEPBS 编辑器）代替骨骼变换页
+
+用户要求合并 `OthersChange` 里的两份外部修改，并用第二份直接替换骨骼变换页。用户认为 UUEPBS 是 MIT 许可、可自由修改；核查结果（仓库无 LICENSE，GitHub 未识别许可证，README 的 MIT 全文标题为 Dear ImGui）与维护者的整合决定记录在 `THIRD_PARTY_NOTICES.md` 和 `licenses/UUEPBS-LICENSE-STATUS.txt`。
+
+- **武器派生修改点名动作**（第一份，原基于 11-07 的 `509b8bd`，补丁已无法直接套用，按现在的代码重写）：`Route::ability`、`Press::ability`；`WeaponActionsRow` 先找点了这个动作名的行（不看按键和按住），再按原来的按键规则；`Follow` 从点名行出发时不再要求按键相符（无标签的动作 bits 为 0）。`NamesAbility` / `NamedAbilityButton` / `HasAbilityRows`；`NextInputs` 带上动作名（派生显示的标签）。存档 `|n:节点,行,GA名`（旧版跳过，退回该行按键）；点名行不存 `w:` 按住。运行时 `DriveHeroTriggers`：链里有点名行时才读主角运行中能力的名字；被点名的动作先于输入回显处理，但输入已被链接住（taken 回显）时仍按回显丢弃；接住时取消动作、清掉同键的未接输入和等待按下、`ability_press_bits_` 记下这一行的按键（无标签动作的输入随后不再算第二次按下），直接 `PressCombo`（不进按住等待）。原补丁里提前到吞键判断之前的 `ability_press_at_` 和无标签动作落到吞键分支的问题都已避开。界面：行的动作列表顶部列出这把武器的全部动作（`只改这一个动作 · 轻攻击` 等分组）；点名行不显示按住步进器；换武器时清掉各行的动作名。新测试 `weapon_action_named_test`（19 项）。
+- **身材 / 骨骼**（第二份，原基于 11-09 的 `2e1b256`）：`src/uuepbs/`（UUEPBS v1.3 编辑器与数据层）、`src/third_party/imgui/`（Dear ImGui 1.92.1）以 `/W3 /WX- /std:c++20 /wd4005` 单独编译；`src/character/npc_body*.cpp`、`npc_bridge.cpp`、`npc_anim.cpp` 为贡献者的桥接代码。合并时的改动：
+  - **钩子**：原来 `NpcBody::Hook` 用 `VirtualProtect` 直接改整个类 vtable 的第 380 项，和 `BoneMotionRuntime`（骨骼变换节点，组件私有 vtable 副本的同一项）互相挡掉——谁先装，另一方自检失败、静默不生效。现在 `BoneMotionRuntime::Listen` 给编辑器开一个监听：同一个组件只有一个钩子，引擎 finalize 和骨骼变换节点写完之后调用 `NpcBridge::OnPoseFinalized`；骨骼变换节点在编辑时，缓存帧比较用的输出换成最终姿势（`KeepFinal`），避免两层叠加。
+  - **去掉重复写入**：`NpcBody::Tick` 原来还按早期自写面板的数据在组件 tick 之后直接写姿势、并自己再播一遍 `UUEPBS Presets\Animations` 的动画（与编辑器重复），现由 `legacy_writes_ = false` 关闭；早期自写面板（`npc_body_menu.cpp` 前半，原已不注册）删除，页面只剩总开关、打开按钮和状态。
+  - **默认关闭**：`[NpcBody] Enabled`（默认 0）；打开编辑器即写 1。启用后编辑器隐藏启动并读回 `_last_session`（原移植没有读回），F11 或页面按钮显示。`[NpcBody] Hook`（默认 1）。原 `[NpcBody] Editor` / `StretchBone` 调试开关去掉。
+  - **其他**：`npc_anim.cpp` / `npc_body_preset.cpp` 引用的 `pbzjson` 不存在，改为 `uuepbs::json` 的别名；数据目录按本 DLL 的地址找（原来按名字找 `version.dll`，游戏也载入了系统的同名 DLL）；`g_started` 改为原子量、`Start` 加锁（游戏线程、面板线程、快捷键线程都会调用）；快捷键 `BodyEditor` 默认 F11（原定 F7 已是「毛发 / Groom」）；未调用的 `PausePartnerHook` / `ResumePartnerHook` 未合入。
+  - **页面**：`DebugHub::Page::BoneMotion` 注册为「身材 / 骨骼」（`NpcBodyMenu::CreateLauncherPage`）；`BoneMotionRuntime` 不再应用原页面的全局配置（`[BoneMotion] Config`，启动时有则记一行日志），骨骼变换节点与其预览不变。`NpcRetarget::Apply` 套外观前停掉监听，`DriveBody` 在外观期间不交骨架，变回主角后恢复。
+  - **预设**：`samples/UUEPBS Presets/` 收录贡献者提供的 14 个预设和 10 个动画（不含 `_last_session` 与 `_locomotion_*` 会话文件）；安装器 `Install-BodyPresets` 装到 DLL 旁的 `UUEPBS Presets\`，已有文件不覆盖；打包加入这些文件与 `licenses/DearImGui-LICENSE.txt`。
+- **未验证**：没有进游戏。编辑器窗口、钩子、预设读写和外观期间的暂停都只编译通过；移植作者记录过一次未定位的崩溃（`version.dll+0x3A0272`，`wcslen(NULL)`，F10 面板线程），早期面板删除后未能复现验证。
+
+## 2026-11-13 · 彭猛视角过远、主角体型节点、镜头取景按体型比例
+
+用户反馈：“澎湃”（游戏里没有这个名字，按日志是彭猛）的视角过远；要求增加按主角和 NPC 模型大小的比例重新计算镜头跟随的模式，并增加一个把 NPC 模型（连同武器）缩放到主角大小的节点，连法和加速一样。
+
+- **原因**（日志确认，pid 23652）：彭猛的显示网格 `PengMengSeq` 没有物理资源，套用外观时 `SetBoundsScale(2.0)` 放大包围盒，防止动作中被裁切。视角跟随用 `GetComponentBounds` 量模型身高，读到放大后的 981 cm（实际约 490 cm），按 `max(1, 身高 / 200)` 拉远到 4.9 倍：`GA_PengMeng_Skill_02` 从 2267 cm 和 1867 cm 外取景。
+- **修复**：`ViewFollowState::ModelHeight` 量高时除以组件的 `BoundsScale`。彭猛按 490 cm 计，从约 9–11 m 取景（游戏镜头相对位置 381–462 cm × 2.45）。新日志 `NPC_VIEW model height of …: bounds … / boundsScale … -> …`。
+- **新增：主角体型节点**（`NodeType::HeroSize = 32`，修饰槽 `kModSize`）。连法同加速：起端指向它管整条链，组合管组合里每一招，招式只管自己；援护、投技、变身、变回主角不能连（`ModifierFits`）。连着它的招式播放时（`NpcCombo::HeroSizeFor`），BOSS 外观的显示组件 `SetRelativeScale3D` 到主角身高，过渡 200 ms（smoothstep）。部件、BOSS 武器和碰撞体挂在显示组件上，一起缩放。主角武器走握持适配器：`MapSourceMountPose` 新增 `target_scale` 参数，把手的位置和武器缩放一起乘上显示比例。角色、胶囊和招式位移不缩放。换外观或还原时立即恢复原大小（`ResetHeroSize`），池化组件以原大小停放。日志 `NPC_SIZE`。
+- **保存格式**：写成不接线的间隔加 `|t:节点` 标记；旧版 DLL 读到的是一个不接线的间隔，其他节点序号和箭头不变。插件接口追加 `PBZ_NODE_HERO_SIZE = 32` 和修饰槽 `hero_size`。
+- **新增：镜头取景**（派生页顶栏，`[NpcCombo] ViewScale`：`0` 按身高，默认；`1` 按体型比例）。按体型比例时，推远倍数为 `NpcHeroSize::Grow`：外观身高比 × 当前显示比例，限制在 0.4–12.5。主角体型生效时倍数为 1，即主角的镜头；比主角矮的外观镜头更近。外观身高比 `NpcHeroSize::LookRatio` 取参考姿势头骨高度之比（没有头骨时用骨盆），随姿势计划缓存。日志 `NPC_SIZE <id> height over the hero's …`、`NPC_VIEW framing by size ratio …`。
+- 测试：新增 `npc_hero_size_test`（15 项）；`npc_combo_test` 新增主角体型的接线、保存、旧版回读和可连节点；`npc_pose_transfer_test` 新增半尺寸显示的握持点和武器缩放；`view_follow_state_test` 新增包围盒缩放用例（1856 项）；其余无窗口测试和示例派生全部通过；全部 46 个目标 Release 编译无警告。手册新节点的配图需要开窗口渲染，按测试规则没有生成。
+- 安装：Steam / WeGame / build 三处 SHA256 `93c037820d6e973f8360995a9e9a49458c3ccabf5b7dbd584b0f8a3dc530e7b5`，旧 DLL 在 `local/validation/hero_size_20261113/before/`。**未在游戏中验证。**
+
+## 2026-11-13 · 玉妖腿刃插进地面、BOSS 自带移动动画
+
+用户反馈：玉妖外观脚下的刀刃插进地面；要求可开启 BOSS 自带的 Locomotion，并在设置里给所有 BOSS 加开关。
+
+- **原因**（骨架数据确认）：玉妖脚下有两条 12 节的 `legWeapon` 骨链（`legWeapon_01_r`…`_12_r`、`legWeapon_01_l_01`…`_12`），主角骨架没有。CopyPose 对这些骨只能给参考姿势，而参考姿势里骨链从脚掌直直向下，刀尖在脚底下 67.4 cm（`Yuu_Skeleton` 参考姿势逐级合成）。BOSS 自己的动画里刀刃是收起的。
+- **修复：主角没有的骨骼跟随 BOSS 自己的动画。** 原来只给坐骑（长鸿二阶段、力士）用的姿势傀儡推广到每个有自带移动动画的外观：一个隐藏的单节点 SkeletalMeshComponent 用显示网格播放该 BOSS 的待机 / 走 / 跑（按主角速度与朝向选，前后左右），BOSS 自己的招式期间播放那个招式。主角没有的原始骨（`ik_*` 除外，那些归 IK 跟随）借用主角网格上空闲的源骨槽位，始终取傀儡的局部姿势（`Plan::puppet_always`）。没有自带动画的 7 个外观不变。坐骑仍在自己招式期间整身取傀儡（`Plan::puppet_own`），普通外观不改招式表现。
+- **新增：BOSS 自带移动动画开关**（NPC 页，`[NpcRetarget] BossLocomotion`，默认关；命令 `npcretarget loco on|off|status`）。开启后，主角只是在移动（主角动画上没有蒙太奇、在地面、没有 BOSS 技能或派生招式、没有外来蒙太奇淡出、不在投技里）时，整身按 `PuppetPose::body` 渐变到傀儡（250 ms 进、100 ms 出）；双手握持接触随之减弱。根骨仍是主角的。即时生效，不用重新套外观。
+- **动画来源**（游戏文件只读）：`BP_Monster_* → ActorC_* → *ABP_Item_*` 导入的 AnimSequence，就是游戏给 BOSS 的移动状态机用的那套；没有时退到怪物目录的 Item AnimBP，再退到角色目录。75 个外观中 68 个有，表在 `src/generated/npc_locomotion.generated.h`，生成脚本 `analysis/pbz_bossrush_20261030/npc_locomotion_20261113/find_locomotion.py`。玉妖：`Yuu_Battle_Idle`、四向 `Walk_*_Loop`、`Run_Fwd_Loop`。
+- **播放**：`NpcOwnLocomotion`（`src/character/npc_own_locomotion.h`）。速度档 30 / 15 / 420 / 360 cm/s；朝向四象限，超出边界 12° 才换；缺方向时按走/跑互补，再退前进；播放速率 = 主角速度 / 该循环根运动速度（运行中测量，0.6–1.6，原地循环为 1）。
+- **CopyPose 组件空间**：火流星两种外观用网格空间 CopyPose，借用槽位改存组件空间变换（`Plan::extra_mesh`）。
+- **槽位上限**（离线统计）：玉妖 116 根主角没有的骨、约 96 个可借槽位；按骨序分配，刀刃骨（骨序 165–209）在前，排最后的约 20 根布料物理骨仍是参考姿势（与以前相同）。雷当二阶段、冷屠同样不够，多出的骨保持原样。
+- 傀儡不进 `added_`（池化的显示组件不拥有它），`RetireMount` 负责销毁并移除 tick 前置。日志标签 `NPC_LOCO`；测试命令 `npcretarget boneprobe <骨名>...` 记录显示骨相对脚底的高度。
+- 测试：姿势传递回归新增 own-locomotion 用例（刀刃常驻傀儡、body 0/0.5/1、自身招式不整身接管、NaN、组件空间槽位、握持随 body 衰减），0 失败；`npc_own_locomotion_test` 30 项通过；Release 构建 /W4 /WX 无警告。
+- 安装：Steam / WeGame / build 三处 SHA256 `bf27b2579052e9be5523399583ec7a0307fad7ecc888f5a208d1e8a595d6a671`，旧 DLL 在 `local/validation/boss_locomotion_20261113/before/`。**未在游戏中验证**：本次 Steam 停在选账户界面，游戏没有启动。
+
+## 2026-11-12 · 替换主角动作：链结束后的按键被当成回声取消、闪避族只取消一个
+
+用户反馈：用 BOSS 招式替换主角的闪避、攻击、完美闪避后，出现“平移”和“技能放不出来”。三个原因，两个由日志或游戏文件确认，一个由代码路径推出：
+
+- **链结束后，主角自己的按键被当成回声取消**（日志确认）。招式播放中从输入读到的按键会记成 `input_presses_`，游戏在招式结束时回放这次按键（回声），回声会被丢弃。这些记录只按 2.5 秒过期，与链是否结束无关。11-12 的日志里，超时重置后约 1 秒，主角自己的普攻被当成 2.4 秒前那次按键的回声取消了：16:20:41（HeiMoShang_A_Draw）、18:32:43（HeiMoShang_A；那次按键先被预输入接收，随后被闪避顶掉）。11-12 起取消调用真正生效（`K2_CancelAbility`），这个误判就从“无害”变成了“按了没反应”。
+  - 修复：`ComboPlayback::EchoOpen`。链进行中照旧；链结束、没有接替的链时，只在最后一招结束后 `kEchoGraceMs`（400 ms）内认回声，之后的记录作废。`ResetCombo` 记录 `echo_over_at_`：链在等下一键时取最后一招的结束时间，否则取重置时间。日志：`press(es) read during the last chain's moves forgotten`。
+- **派生链接收主角动作时只取消第一个新技能**（游戏文件 + 代码路径）。闪避基类 `BP_PlayerDodge_Base` 自带闪避碰撞体、无敌 GE、输入缓冲门和计时器。完美闪避由闪避本体收到 `GameplayEvent.Actor.HitDodge.Target.Perfect` 后启动 `BP_PlayerPerfectDodge_Base`（全局慢放、`GE_DodgeInvulnerable_PerfectDodgeLingering`、反击技能），此时闪避本体还在运行，而且早已记进 `combo_.active`。所以只取消带来按键的那个技能，剩下的闪避族技能会在 BOSS 招式下继续播放：主角接着闪避（平移），残留的动作状态还会挡住后面的施放。代码注释里本来就写着“一次闪避输入会启动好几个”。
+  - 修复：`ComboPlayback::CancelWithPress`。和按键同一帧新启动的、以及所有正在运行的闪避族技能一起取消。主角正在进行的跳跃保留，除非按的就是跳跃。这与按住路径（`EndHold` → `CancelHeroActions`）以及自定义按键路径一致。日志：`-> pressed=1 cancelled=1 with=GA_...`。
+- **闪避取消后的残留位移**（代码路径）。闪避被取消后，它的蒙太奇在淡出期间仍带根运动，地面速度也还在。修复：`ComboPlayback::StopDodgeMotion`。取消了闪避族技能、而且主角身上还没有链的招式时，0.05 秒停掉蒙太奇，地面行走时清零速度（`StopMovementImmediately`）。日志：`dodge motion stopped=montage+speed`。
+- 游戏文件依据：用 `iostore_read.py` / `zen_read.py` 只读解析主角闪避、完美闪避、偏斜和 `PBZDeflectSystem` 的 225 个包，以及 8 个动作基类包的导入表和名称表，没有改动游戏文件。
+- 测试：`combo_playback_rules_test` 6375 项（新增回声窗口、同族取消和位移清除规则）、`npc_combo_test` 通过，Release 编译无警告。DLL 已装到 Steam 与 WeGame，SHA256 `2e397ddacf2686c4668af84d3097167760bb8c32423e05ca126a6092d861fee5`。没有实机验证。
+
+## 2026-11-12 · 派生插件接口：插件节点、插件信号、SDK 与接口手册
+
+- 用户要求分析 `OthersChange`（别人基于上一版源码改的版本），再给 MOD 加一套完整的派生系统 API，方便别人做派生插件，并附 API 手册和用法；之后又要求 API 能改派生系统的任何东西。
+- `OthersChange` 的内容：基于旧提交 509b8bd，给武器派生修改加了「指定具体武器动作」的行（按键带上技能名，行只在主角放的正好是这个技能时匹配），并试图在派生链接住时取消游戏原本的动作。它没有编译过；取消动作的函数是空的，所以原动作照样放出。现在不改源码也能做到同样的事：示例插件 `pbz_weapon_actions` 把具体的武器动作变成插件信号，派生链在等这个信号时取消原动作。`OthersChange/` 只读不发布（`.gitignore`）。
+- 新增派生插件宿主 `src/plugin/combo_plugins.cpp` 和 C 接口 `sdk/include/pbz_combo_api.h`（v1，结构体 size 开头、函数表只在末尾追加、`PBZ_API_HAS` 判断新函数）：
+  - 载入：「招式派生」页顶栏新增「派生插件」开关（`[Plugins] Enabled`，默认关）。打开后在游戏线程上按文件名载入 `PBZPlugins\*.dll`（最多 32 个），调用导出的 `PbzPluginMain`。每次调用插件都有结构化异常保护，出错的插件被停用并提示玩家。
+  - 插件节点 `NodeType::Plugin`（31）：「动作」像援护一样停在节点上，调用一次 `run`；「判断」在按键经过时由 `decide` 选出口（同帧同节点同按键的答案缓存，游戏线程外用上一次的答案）。保存为未接线的 `|I:` 加 `|p:` 标记，旧版本读到的是一个间隔。卡片有动作选择框、可选数值（名字、单位、范围由插件给出）和每个出口一根出线；插件不在时显示「（插件未载入）」，连线和数值保留。
+  - 插件信号：自定义按键的虚拟键 `0x10000 + "插件id/信号id" 的 16 位 FNV-1a 折叠`，可用于自定义按键起端、按键分支和武器派生修改的自定义按键行。`fire_signal` 按一下（排队的多次是分开的几下），`set_signal` 按住，`signal_wanted` 问派生链是否在等它。
+  - 事件（下一帧递送）：派生链开始、按键、播放节点、招式结束、重置、外观换好、派生表变化。`on_hero_ability` 可以取消主角刚开始的技能。
+  - 读写：派生链状态、节点、出口、主角与目标；`press` / `play_node` / `reset_chain` 排队到下一帧；派生表编辑会话（按字段名读写全部节点字段、行字段、接线、修饰、整表导入导出，`edit_commit` 经 Encode/Decode 整理后保存）；MOD 选项和 ini 任意一项（`[Plugins] Enabled` 除外）；注册的节点动作和信号可以更新、注销。
+  - `version.dll` 新增导出 `PbzAttachPlugin`（序号 1001）：别的加载器载入的 DLL（UE4SS 的 C++ mod）用它登记插件，在派生插件打开后的下一帧启动。
+  - UE4SS Lua：`PLUGIN_API.md` 的“UE4SS Lua”一节说明 Lua mod 的全局 `PBZ` 表。它由另行构建的 UE4SS（含本游戏 2026-11-04 版的 GUObjectArray / GNatives 签名和对象数组布局）通过 `PbzAttachPlugin` 接入，不进本仓库和 ZIP；离线联调（Lua → 真实插件宿主）27 项通过，尚未实机运行。
+- 示例插件 `pbz_conditions`（主角血量、目标血量、目标距离、空中、概率五个判断，提示、结束派生链两个动作）和 `pbz_weapon_actions`（规则文件 `pbz_weapon_actions.txt`；主角每放出一种新技能写一行 `ability seen:`）。`sdk/samples/CMakeLists.txt` 可脱离本项目单独构建。
+- 文档：`docs/PLUGIN_API.md`（接口手册：快速开始、生命周期、线程、插件节点、信号、事件、读取、控制、编辑字段表、选项、外部加载、函数参考、示例、排错）；使用手册新增「节点 32：插件节点」和「派生插件：载入与使用」，PDF 重新生成为 60 页。安装包新增 `PBZPlugins\`（两个示例插件）和 `SDK\`（头文件、示例源码、接口手册）。
+- 测试：新增 `combo_plugins_test`（66 项，含载入真实示例 DLL、出错隔离、外部登记）；全部隐藏 / 控制台测试通过。实机效果由用户测试。
+
 ## 2026-11-12 · 没有设置文件时所有功能默认关闭；安装包附玩家版更新内容
 
 - 用户要求没有 PBZDebugMenu.ini 时所有功能默认关闭。其余开关本来就默认关闭，默认开着的只有这四个：关闭自适应扳机（`[Controller] ForceAdaptiveTriggersOff`）、打开面板时暂停游戏（`[Hub] PauseGame`）、派生提示（`[NpcCombo] ShowToast`）、黑伤处决改为魔渊擒拿（`[Grab] TangExecution`）。启动时如果没有设置文件，先新建一个并把这四项写成 0，再读取任何设置；日志记一行 `SETTINGS no PBZDebugMenu.ini: created with every feature off`。已有设置文件时行为不变；只关闭扳机的精简版没有设置文件，仍然一直关闭扳机。

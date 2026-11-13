@@ -337,6 +337,20 @@ void TestWeaponScale() {
     Check(Distance(mapped.translation, want) < 1e-9 && Distance(tip, hero_tip) < 1e-9 && SameRotation(mapped, mount), "scaled body holds the scaled weapon where the hero holds its own");
     Check(mapped.scale[0] == 0 && std::abs(mapped.scale[1] - 1.6) < 1e-12 && std::abs(mapped.scale[2] - 1.6) < 1e-12, "weapon scale multiplies the authored scale, zero kept");
     Transform refused; Check(!NpcGripMath::MapSourceMountPose(grip.data(), held.cache.target_cs.data(), HandR, HandR, PalmR, PalmR, mount, identity.rotation, identity, refused, 0.0), "zero weapon scale is refused");
+    {   // 主角体型: the display shown at half its size on the hero mesh: the grip point and the weapon scale halve with it.
+        Transform half;
+        Check(NpcGripMath::MapSourceMountPose(grip.data(), held.cache.target_cs.data(), HandR, HandR, PalmR, PalmR, mount, identity.rotation, identity, half, contact.weapon_scale * 0.5, 0.5),
+              "weapon maps on a display shown at half size");
+        double half_want[3]; for (size_t i = 0; i < 3; ++i) half_want[i] = mount.translation[i] * 0.8;
+        Check(Distance(half.translation, half_want) < 1e-9 && SameRotation(half, mount) && half.scale[0] == 0 && std::abs(half.scale[2] - 0.8) < 1e-12,
+              "the weapon stays in the shrunk fist: grip and size x0.5, rotation kept");
+        Transform same;
+        Check(NpcGripMath::MapSourceMountPose(grip.data(), held.cache.target_cs.data(), HandR, HandR, PalmR, PalmR, mount, identity.rotation, identity, same, contact.weapon_scale, 1.0) &&
+              Distance(same.translation, mapped.translation) < 1e-12, "a display at its own size maps as before");
+        Check(!NpcGripMath::MapSourceMountPose(grip.data(), held.cache.target_cs.data(), HandR, HandR, PalmR, PalmR, mount, identity.rotation, identity, refused, 1.0, 0.0) &&
+              !NpcGripMath::MapSourceMountPose(grip.data(), held.cache.target_cs.data(), HandR, HandR, PalmR, PalmR, mount, identity.rotation, identity, refused, 1.0, std::nan("")),
+              "a zero or NaN display scale is refused");
+    }
 
     double left[3]; for (size_t i = 0; i < 3; ++i) left[i] = grip[PalmL].translation[i] * 1.6;
     std::printf("  scaled contact: left palm error %.2e cm (unscaled offset would pull it %.2f cm)\n", Distance(held.cache.target_cs[PalmL].translation, left), Distance(wrong.cache.target_cs[PalmL].translation, left));
@@ -643,6 +657,78 @@ void TestMountPuppet() {
     Check(SameRotation(with, without) && !SameRotation(t_puppet.target_cs[UpperL], t_bare.target_cs[UpperL]), "matched arm rides the puppet's pelvis turn");
     std::printf("  mount puppet: borrowed slots %zu of %zu, builds %llu hits %llu\n", assigned, wanted, static_cast<unsigned long long>(cache.builds), static_cast<unsigned long long>(cache.hits));
 }
+// A look's own locomotion (11-13, 玉妖): the display has bones the hero has none of (a blade chain under the foot, at its
+// reference pose pointing 67 cm into the ground). The puppet plays the boss's own idle / walk / run: those bones take its
+// pose always; the rest of the body by PuppetPose::body (the boss locomotion option, while the hero only moves). Not a
+// mount: the hero's montages, own ones included, keep driving the mapped bones.
+void TestOwnLocomotionPuppet() {
+    auto hero = Skeleton(100, 30, 28, 8);
+    hero.push_back({3000, Spine, At(0, 5, 10)}); hero.push_back({3001, Count, At(0, 0, 5)});
+    auto npc = Skeleton(90, 25, 22, 6);
+    const size_t B0 = npc.size(), B1 = B0 + 1;
+    npc.push_back({5000, HandL, At(0, 0, -30)}); npc.push_back({5001, static_cast<int32_t>(B0), At(0, 0, -37)});
+    NpcPoseTransfer::Plan plan; std::string why;
+    Check(NpcPoseTransfer::Build(plan, hero, npc, {}, why), "own-locomotion plan builds");
+    std::vector<uint8_t> always(npc.size(), 0);
+    for (size_t t = 1; t < npc.size(); ++t) always[t] = plan.target_to_source[t] < 0 ? 1 : 0;
+    size_t assigned = 0, wanted = 0;
+    Check(NpcPoseTransfer::SetPuppet(plan, always, assigned, wanted) && assigned == 2 && wanted == 2, "the blade bones borrow slots");
+    plan.puppet_own = false;
+    NpcPoseTransfer::Plan mesh = plan; mesh.extra_mesh = true;
+    std::vector<Transform> pl(npc.size());
+    for (size_t i = 0; i < npc.size(); ++i) pl[i] = npc[i].ref;
+    Yaw(pl[Spine], 20); pl[Spine].translation[2] = 95; Yaw(pl[UpperL], -35); Yaw(pl[LowerR], 15); Axis(pl[B0].rotation, 0, 1, 0, 80); Axis(pl[B1].rotation, 0, 1, 0, 30);
+    const auto puppet_cs = ComposeAll(npc, pl);
+    NpcPoseTransfer::PuppetPose puppet; puppet.cs = puppet_cs.data(); puppet.count = puppet_cs.size(); puppet.serial = 1; puppet.now_ms = 1000;
+    const auto hero_pose = HeroPose(hero, 25, 40);
+    std::vector<Transform> full_pose(hero.size());
+    { std::vector<Transform> local(hero.size()); for (size_t i = 0; i < hero.size(); ++i) local[i] = hero[i].ref;
+      Yaw(local[UpperL], 25); Yaw(local[LowerL], 40); Yaw(local[UpperR], -25); Yaw(local[LowerR], -40); full_pose = ComposeAll(hero, local); }
+    NpcPoseTransfer::Cache cache, bare; NpcPoseTransfer::Prepare(plan, cache); NpcPoseTransfer::Prepare(plan, bare); const char* reason = "";
+    Check(NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), cache, reason, 0, false, &puppet) &&
+          NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), bare, reason), "own-locomotion puppet evaluates");
+    bool body_hero = true;
+    for (size_t t = 0; t < Count; ++t) body_hero = body_hero && SameTransform(cache.target_local[t], bare.target_local[t]);
+    Check(body_hero && SameTransform(cache.target_local[B0], pl[B0]) && SameTransform(cache.target_local[B1], pl[B1]), "body 0: the hero drives the body, the blades are the boss's own");
+    Check(SameTransform(bare.target_local[B0], npc[B0].ref), "without a puppet the blades hold the reference pose");
+    // The hero's own-skeleton montage of the boss (a boss skill): not a mount, so the body stays the retarget.
+    NpcPoseTransfer::Cache own_puppet, own_bare; NpcPoseTransfer::Prepare(plan, own_puppet); NpcPoseTransfer::Prepare(plan, own_bare);
+    Check(NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), own_puppet, reason, 1.0, true, &puppet) &&
+          NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), own_bare, reason, 1.0, true), "own montage evaluates with and without the puppet");
+    bool own_kept = true;
+    for (size_t t = 1; t < Count; ++t) own_kept = own_kept && SameTransform(own_puppet.target_local[t], own_bare.target_local[t]);
+    Check(own_kept && SameTransform(own_puppet.target_local[B0], pl[B0]), "own montage on a non-mount: body retargeted, blades from the puppet");
+    // Body 1: every raw bone but the root is the puppet's; the two-hand contact lets go.
+    puppet.body = 1;
+    Check(NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), cache, reason, 0, false, &puppet), "body 1 evaluates");
+    bool all = true;
+    for (size_t t = 1; t < npc.size(); ++t) all = all && SameTransform(cache.target_local[t], pl[t]);
+    Check(all && SameTransform(cache.target_local[Root], bare.target_local[Root]) && cache.puppet_body == 1, "body 1: the boss's own locomotion, the hero's root");
+    const uint64_t builds = cache.builds;
+    Check(NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), cache, reason, 0, false, &puppet) && cache.hits == 1 && cache.builds == builds, "same poses and body: a cache hit");
+    puppet.body = 0.5;
+    Check(NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), cache, reason, 0, false, &puppet) && cache.builds == builds + 1, "a new body weight rebuilds");
+    Transform half; NpcPoseTransfer::detail::Blend(bare.target_local[LowerR], pl[LowerR], 0.5, half);
+    Check(SameTransform(cache.target_local[LowerR], half) && SameTransform(cache.target_local[B0], pl[B0]), "body 0.5: halfway, blades still the boss's own");
+    puppet.body = std::nan("");
+    Check(NpcPoseTransfer::Evaluate(plan, full_pose.data(), full_pose.size(), cache, reason, 0, false, &puppet) && cache.puppet_body == 0, "a NaN body weight is 0");
+    // A component-space CopyPose (the fire looks) reads a slot as the bone's component-space transform.
+    NpcPoseTransfer::Cache m; NpcPoseTransfer::Prepare(mesh, m); puppet.body = 0;
+    Check(NpcPoseTransfer::Evaluate(mesh, full_pose.data(), full_pose.size(), m, reason, 0, false, &puppet) &&
+          SameTransform(m.synthetic_source[static_cast<size_t>(mesh.extra_source[B1])], m.target_cs[B1]), "extra_mesh: the slot holds the blade's component-space transform");
+    // The two-hand contact (palms close) fades with the body weight.
+    NpcPoseTransfer::Plan held; Check(NpcPoseTransfer::Build(held, hero, npc, {}, why) && NpcPoseTransfer::SetHandContact(held, Request()), "contact plan builds");
+    Check(NpcPoseTransfer::SetPuppet(held, always, assigned, wanted), "contact plan puppet"); held.puppet_own = false;
+    const auto grip = HeroPose(hero, 60, 70);
+    std::vector<Transform> grip_full(hero.size());
+    for (size_t i = 0; i < hero.size(); ++i) grip_full[i] = i < grip.size() ? grip[i] : full_pose[i];
+    NpcPoseTransfer::Cache hc; NpcPoseTransfer::Prepare(held, hc);
+    puppet.body = 0; Check(NpcPoseTransfer::Evaluate(held, grip_full.data(), grip_full.size(), hc, reason, 0, false, &puppet) && hc.contact_weight > 0, "body 0 keeps the contact");
+    const double full = hc.contact_weight;
+    puppet.body = 0.25; Check(NpcPoseTransfer::Evaluate(held, grip_full.data(), grip_full.size(), hc, reason, 0, false, &puppet) && std::abs(hc.contact_weight - full * 0.75) < 1e-12, "body 0.25: contact x0.75");
+    puppet.body = 1; Check(NpcPoseTransfer::Evaluate(held, grip_full.data(), grip_full.size(), hc, reason, 0, false, &puppet) && hc.contact_weight == 0, "body 1: no contact");
+    std::printf("  own locomotion puppet: blades on slots %zu of %zu, contact %.2f\n", assigned, wanted, full);
+}
 // The skin's movement capsule: the combat blueprint's capsule when in range, else stature-scaled; the
 // hero keeps only its radius. Other body shapes scale about the feet; skills cycle in random rounds.
 void TestBodyCollision() {
@@ -741,6 +827,7 @@ int main() {
     TestOwnMontageBuiltOffSkeleton();
     TestOwnMontageNativeArms();
     TestMountPuppet();
+    TestOwnLocomotionPuppet();
     TestWeaponRoutes();
     std::printf("npc_pose_transfer_test failures=%d\n", failures);
     return failures ? 1 : 0;

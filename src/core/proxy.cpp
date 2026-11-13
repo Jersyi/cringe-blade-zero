@@ -38,11 +38,15 @@
 #include "entry_focus.h"
 #include "npc_retarget.h"
 #include "npc_menu.h"
+#include "combo_plugins.h"
+#include "module_apis.h"
 #include "combo_menu.h"
 #include "net_steam.h"
 #include "net_puppet.h"
 #include "bone_motion.h"
 #include "bone_motion_page.h"
+#include "npc_body_menu.h"
+#include "npc_bridge.h"
 #include "net_page.h"
 #include "air_skills.h"
 #include "air_skills_menu.h"
@@ -279,6 +283,7 @@ void PollCommand(HairControls& controls) {
     else if (!std::strcmp(text, "bones") && !std::strcmp(argument,"menu")) DebugHub::ShowPage(DebugHub::Page::BoneMotion);
     else if (!std::strcmp(text, "bones")) ok=BoneMotionRuntime::Command(argument);
     else if (!std::strcmp(text, "net")) ok = NetPage::HandleCommand(argument);        // 联机测试
+    else if (!std::strcmp(text, "plugins")) ok = ComboPlugins::HandleCommand(argument);  // "plugins reload": the Lua scripts again; "plugins status"
     else if (strcmp(text, "status")) ok = false;
     wchar_t status[320]{}, outfit[200]{}; GroomForce::Status(status, 320); GroomForce::OutfitStatus(outfit, 200);
     char line[768]{}; _snprintf_s(line, sizeof(line), _TRUNCATE, "COMMAND %s ok=%d hair=0x%lx force=%ls outfit=%ls", text, ok ? 1 : 0, controls.Status(), status, outfit);
@@ -382,6 +387,7 @@ DWORD WINAPI Worker(void*) {
     CharacterSwap::Initialize(&LogLine, &ReleaseNpcForOutfit);
     NpcRetarget::Initialize(&LogLine, &ReleasePlayerAppearanceForNpc);
     NpcMenu::Initialize(&LogLine);
+    NpcBodyMenu::Initialize(&LogLine);
     AirSkills::Initialize(&LogLine, &EntryFocus::GameplayFocused);
     AirSkillsMenu::Initialize(&LogLine);
     MotianGrab::Initialize(&LogLine, &EntryFocus::GameplayFocused);
@@ -398,6 +404,7 @@ DWORD WINAPI Worker(void*) {
     BossAIMenu::Initialize();
     EntryFocus::Initialize();
     HairControls controls(base, true, &BossMenu::Show);
+    ModuleApis::RegisterAll(&LogLine, &controls);  // the plugin API's module tables (sdk/pbz_combo_api.h: module_list, command_list ...)
     DebugHub::Register(DebugHub::Page::BossRush,L"Boss 连战",&BossMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::BossAI,L"Boss AI",&BossAIMenu::CreatePage);
     DebugHub::Register(DebugHub::Page::Character,L"角色替换",&BossMenu::CreateCharacterPage);
@@ -415,6 +422,7 @@ DWORD WINAPI Worker(void*) {
     UiHotkeys::Bind(UiHotkeys::Action::ShowAir, [] { DebugHub::ShowPage(DebugHub::Page::AirSkills); });
     UiHotkeys::Bind(UiHotkeys::Action::ShowGrab, [] { DebugHub::ShowPage(DebugHub::Page::MotianGrab); });
     UiHotkeys::Bind(UiHotkeys::Action::ShowGroom, [] { DebugHub::ShowPage(DebugHub::Page::Groom); });
+    UiHotkeys::Bind(UiHotkeys::Action::BodyEditor, [] { NpcBridge::Toggle(); });  // its own window, apart from the panel
     UiHotkeys::Bind(UiHotkeys::Action::ShowWeapons, [] { DebugHub::ShowPage(DebugHub::Page::WeaponPresets); });
     UiHotkeys::Bind(UiHotkeys::Action::HairMode, [&controls] { controls.ToggleHair(); });
     UiHotkeys::Bind(UiHotkeys::Action::GpuBounds, [&controls] { controls.ToggleBounds(); });
@@ -441,7 +449,8 @@ DWORD WINAPI Worker(void*) {
     DebugHub::Register(DebugHub::Page::Hotkeys, L"快捷键", &UiHotkeys::CreatePage);
     // The supplement page exists only with the supplement container; the hub lists registered pages only.
     if (DebugSupplement::Present()) DebugHub::Register(DebugHub::Page::Supplement, L"调试补充", &SupplementMenu::CreatePage);
-    DebugHub::Register(DebugHub::Page::BoneMotion, L"骨骼变换", &BoneMotionPage::CreatePage);
+    // 身材 / 骨骼 (2026-11-13): the UUEPBS editor in place of the 骨骼变换 page; the page is its switch and launcher.
+    DebugHub::Register(DebugHub::Page::BoneMotion, L"身材 / 骨骼", &NpcBodyMenu::CreateLauncherPage);
     DebugHub::Register(DebugHub::Page::Online, L"联机测试", &NetPage::CreatePage);
     DebugHub::Register(DebugHub::Page::Donate, L"Donate", &DonatePage::CreatePage);
     Log(DebugSupplement::Present() ? "DEBUG_HUB registered 13 embedded pages (supplement present); hotkeys toggle the host"
@@ -473,8 +482,10 @@ DWORD WINAPI Worker(void*) {
         DonatePage::Tick();
         NetPage::Tick();
         BoneMotionPage::Tick();
+        NpcBodyMenu::Tick();
         EntryFocus::Poll();
         controls.Tick();
+        ComboPlugins::PumpWorker();  // the plugins' command-bus calls that belong to this thread (every cycle: a plugin waits for the answer)
         if (GetTickCount64() < next_settings) { Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25); continue; }
         next_settings = GetTickCount64() + 1000;
         if (!hook_attempted) if (ue::Object* engine = ue::FindEngine()) { InstallGameThread(base, engine); hook_attempted = true; }
@@ -490,6 +501,7 @@ DWORD WINAPI Worker(void*) {
         }
         Sleep(DebugHub::Visible()||DebugHub::Animating()||UiLoadBanner::Active()||GearWidget::Active()||SkillToast::Active()?16:25);
     }
+    NpcBodyMenu::Shutdown();
     BoneMotionPage::Shutdown();
     WeaponPresets::Shutdown(); WeaponPresetsMenu::Shutdown(); SupplementMenu::Shutdown(); DonatePage::Shutdown(); NetPage::Shutdown(); ComboMenu::Shutdown();
     SkillToast::Shutdown(); ComboMenu::HudShutdown(); GearWidget::Shutdown(); DebugHub::Shutdown();
@@ -506,6 +518,9 @@ extern "C" FARPROC ResolveVersionExport(unsigned int index) {
     return answer;
 }
 extern "C" DWORD WINAPI PBZDebugMenuStatus() { return static_cast<DWORD>(InterlockedCompareExchange(&worker_status, 0, 0)); }
+// 派生插件 from a DLL another loader put in the game (a UE4SS C++ mod: tools/pbz-ue4ss-bridge): started like the DLLs
+// in the PBZPlugins folder, on the game thread once 派生插件 is on (sdk/pbz_combo_api.h: PbzAttachPluginFn).
+extern "C" PbzResult PBZ_CALL PbzAttachPlugin(PbzPluginMainFn entry, const wchar_t* name) { return ComboPlugins::Attach(entry, name); }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {

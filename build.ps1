@@ -49,6 +49,18 @@ $readme = @"
   面板里用手柄：十字键 / 左摇杆移动，A（叉）确认，B（圈）返回，LB / RB（L1 / R1）切换页面，LT / RT（L2 / R2）滚动。
   面板打开时游戏收不到手柄按键。
 
+派生插件（可选）
+  别人做的派生插件是 DLL 文件：放进 version.dll 旁的 PBZPlugins 文件夹，在“招式派生”页顶栏把“派生插件”打开，
+  插件随即载入（之后再放进去的插件在下次启动游戏时载入）。不打开“派生插件”时 MOD 不载入任何插件。
+  插件可以提供插件节点（按血量、距离、概率等条件走不同出口，或做一件事）和插件信号（自定义按键里多出的
+  一种“按键”，例如只在空中轻攻击时按下）。
+  随包的 PBZPlugins 文件夹里是三个示例插件（条件判断、武器动作信号、模块面板），需要时整个文件夹复制到 version.dll 旁边。
+  插件要读写 MOD 的其他功能（外观、身材、毛发、Boss 连战……）时，要在插件列表里逐项授权，没授权的调用会被拒绝并写进日志。
+  Lua 脚本：version.dll 旁的 PBZPlugins\scripts 文件夹里的 .lua 文件也是插件（和 DLL 在同一个插件列表里，同样要逐项授权），
+  “派生插件”打开后读取；改完脚本在插件列表里点“重新读取脚本”即可，不用重启游戏。脚本里没有文件和系统命令，跑得太久或出错会被停用，
+  状态显示在插件列表里。随包的 scripts 文件夹里是三个示例脚本。
+  自己制作插件：SDK 文件夹里有接口头文件、示例源码、接口手册 PLUGIN_API.md 和上手指南 AGENT_GUIDE.md（模板、安装、授权、排错速查）。
+
 精简版
   triggers_only\version.dll 只关闭 DualSense 自适应扳机，没有面板和其他功能。
   两个文件同名，只装其中一个。
@@ -84,8 +96,37 @@ $files = [ordered]@{
     "$name/docs/BUILD.md" = Join-Path $projectRoot 'docs\BUILD.md'
     "$name/docs/GAME_UPDATES.md" = Join-Path $projectRoot 'docs\GAME_UPDATES.md'
     "$name/docs/PAK_WORKFLOW.md" = Join-Path $projectRoot 'docs\PAK_WORKFLOW.md'
+    # 派生插件: the three sample plugins ready to copy next to version.dll, and the SDK for plugin authors.
+    "$name/PBZPlugins/pbz_conditions.dll" = Join-Path $buildRoot 'Release\pbz_conditions.dll'
+    "$name/PBZPlugins/pbz_weapon_actions.dll" = Join-Path $buildRoot 'Release\pbz_weapon_actions.dll'
+    "$name/PBZPlugins/pbz_weapon_actions.txt" = Join-Path $projectRoot 'sdk\samples\weapon_actions\pbz_weapon_actions.txt'
+    "$name/PBZPlugins/pbz_mod_panel.dll" = Join-Path $buildRoot 'Release\pbz_mod_panel.dll'
+    # Lua scripts (PBZPlugins\scripts, interface revision 3): the three samples, read once 派生插件 is on; the sources are in the SDK too.
+    "$name/PBZPlugins/scripts/condition.lua" = Join-Path $projectRoot 'sdk\samples\lua\condition.lua'
+    "$name/PBZPlugins/scripts/signal.lua" = Join-Path $projectRoot 'sdk\samples\lua\signal.lua'
+    "$name/PBZPlugins/scripts/panel.lua" = Join-Path $projectRoot 'sdk\samples\lua\panel.lua'
+    "$name/SDK/samples/lua/condition.lua" = Join-Path $projectRoot 'sdk\samples\lua\condition.lua'
+    "$name/SDK/samples/lua/signal.lua" = Join-Path $projectRoot 'sdk\samples\lua\signal.lua'
+    "$name/SDK/samples/lua/panel.lua" = Join-Path $projectRoot 'sdk\samples\lua\panel.lua'
+    "$name/licenses/Lua-LICENSE.txt" = Join-Path $projectRoot 'licenses\Lua-LICENSE.txt'
+    "$name/SDK/PLUGIN_API.md" = Join-Path $projectRoot 'docs\PLUGIN_API.md'
+    "$name/SDK/AGENT_GUIDE.md" = Join-Path $projectRoot 'docs\AGENT_PLUGIN_GUIDE.md'  # how-to for agents (and people) writing plugins / scripts
+    "$name/SDK/include/pbz_combo_api.h" = Join-Path $projectRoot 'sdk\include\pbz_combo_api.h'
+    "$name/SDK/samples/CMakeLists.txt" = Join-Path $projectRoot 'sdk\samples\CMakeLists.txt'
+    "$name/SDK/samples/conditions/pbz_conditions.cpp" = Join-Path $projectRoot 'sdk\samples\conditions\pbz_conditions.cpp'
+    "$name/SDK/samples/weapon_actions/pbz_weapon_actions.cpp" = Join-Path $projectRoot 'sdk\samples\weapon_actions\pbz_weapon_actions.cpp'
+    "$name/SDK/samples/weapon_actions/pbz_weapon_actions.txt" = Join-Path $projectRoot 'sdk\samples\weapon_actions\pbz_weapon_actions.txt'
+    "$name/SDK/samples/mod_panel/pbz_mod_panel.cpp" = Join-Path $projectRoot 'sdk\samples\mod_panel\pbz_mod_panel.cpp'
     "$name/Install.bat"               = Join-Path $projectRoot 'installer\Install.bat'
     "$name/samples/sampleCombo.combo" = Join-Path $projectRoot 'samples\sampleCombo.combo'
+    "$name/licenses/DearImGui-LICENSE.txt" = Join-Path $projectRoot 'licenses\DearImGui-LICENSE.txt'
+}
+# 身材 / 骨骼: the presets the installer puts next to version.dll (UUEPBS Presets\). Only UUEPBS's own three example presets
+# (github.com/XTGMods/UUEPBS presets/, commit 7c54929) are in samples\UUEPBS Presets; the contributor's are kept out of the package.
+$bodyPresets = Join-Path $projectRoot 'samples\UUEPBS Presets'
+foreach ($preset in Get-ChildItem -LiteralPath $bodyPresets -Recurse -File -Filter '*.json') {
+    $relative = $preset.FullName.Substring($bodyPresets.Length).TrimStart('\').Replace('\', '/')
+    $files["$name/samples/UUEPBS Presets/$relative"] = $preset.FullName
 }
 # The manual is added when present; the first release build may precede PDF authoring.
 foreach ($picture in Get-ChildItem -LiteralPath (Join-Path $projectRoot 'docs\manual_images') -Filter '*.png' -File) {

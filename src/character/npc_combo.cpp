@@ -144,6 +144,7 @@ void Changed() { configs_.clear(); InterlockedIncrement64(&generation_); ++store
 constexpr wchar_t kShowToast[] = L"ShowToast";
 constexpr wchar_t kChainHud[] = L"ChainHud";
 constexpr wchar_t kViewTargetKey[] = L"ViewTarget";
+constexpr wchar_t kViewScaleKey[] = L"ViewScale";
 constexpr wchar_t kChainSkill[] = L"ChainSkillDamage";
 constexpr wchar_t kChainGrabMode[] = L"ChainGrabDamage";
 constexpr wchar_t kChainGrabValue[] = L"ChainGrabValue";
@@ -151,7 +152,7 @@ constexpr wchar_t kChainGrabValue[] = L"ChainGrabValue";
 void Migrate() {
     ComboFile::Set set;
     for (const std::wstring& key : SettingsStore::Keys(kSection)) {
-        if (key.find(L'#') != std::wstring::npos || !_wcsicmp(key.c_str(), L"File") || !_wcsicmp(key.c_str(), L"ShowToast") || !_wcsicmp(key.c_str(), L"ChainHud") || !_wcsicmp(key.c_str(), kViewTargetKey) ||
+        if (key.find(L'#') != std::wstring::npos || !_wcsicmp(key.c_str(), L"File") || !_wcsicmp(key.c_str(), L"ShowToast") || !_wcsicmp(key.c_str(), L"ChainHud") || !_wcsicmp(key.c_str(), kViewTargetKey) || !_wcsicmp(key.c_str(), kViewScaleKey) ||
             !_wcsicmp(key.c_str(), kChainSkill) || !_wcsicmp(key.c_str(), kChainGrabMode) || !_wcsicmp(key.c_str(), kChainGrabValue)) continue;
         const std::string profile = Narrow(key);
         const std::wstring text = ReadIniText(key);
@@ -388,6 +389,17 @@ void SetViewTarget(int target) {
     target = std::clamp(target, static_cast<int>(kViewPelvis), static_cast<int>(kViewHead));
     if (target == ViewTarget()) return;
     view_target_.store(target); SettingsStore::PutInt(kSection, kViewTargetKey, target); Log("NPC_COMBO view target=%d", target);
+}
+std::atomic<int> view_scale_{-1};  // -1: not read yet
+int ViewScale() {
+    int mode = view_scale_.load();
+    if (mode < 0) { mode = std::clamp(SettingsStore::GetInt(kSection, kViewScaleKey, kScaleHeight), static_cast<int>(kScaleHeight), static_cast<int>(kScaleHeroRatio)); view_scale_.store(mode); }
+    return mode;
+}
+void SetViewScale(int mode) {
+    mode = std::clamp(mode, static_cast<int>(kScaleHeight), static_cast<int>(kScaleHeroRatio));
+    if (mode == ViewScale()) return;
+    view_scale_.store(mode); SettingsStore::PutInt(kSection, kViewScaleKey, mode); Log("NPC_COMBO view scale=%d", mode);
 }
 // The overrides are read on the game thread every frame (ScaleSkillDamage): kept here once read.
 namespace {

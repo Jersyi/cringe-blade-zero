@@ -69,6 +69,7 @@ const Spec kSpecs[kCount] = {
     {L"GearUp", L"提升挡位", KeyChord(VK_OEM_PLUS), {}, {}},
     {L"GearDown", L"降低挡位", KeyChord(VK_OEM_MINUS), {}, {}},
     {L"NpcSkill", L"施放 NPC 技能", KeyChord('X'), XboxChord(kL3 | kR3), PsChord(kL3 | kR3)},
+    {L"BodyEditor", L"身材 / 骨骼编辑器", KeyChord(VK_F11), {}, {}},  // F7 is 毛发 / Groom's
 };
 // Binding slots in Device order: keyboard, Xbox, PlayStation.
 constexpr int kSlots = 3;

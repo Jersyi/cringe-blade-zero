@@ -1,0 +1,7 @@
+# pbz_weapon_actions 的规则：和 pbz_weapon_actions.dll 一起放进 PBZPlugins\ 文件夹。改完重启游戏生效。
+# 每行一个信号：  信号id | 显示名 | 技能名规则;规则2 | 派生链在等它时取消原动作(1/0)
+# 规则是技能名里包含的一段文字；以 = 开头表示技能名必须完全相同（例如 =GA_Hun_Young_Air_A）。
+# 技能名在 PBZDebugMenu.log 里找：主角每放出一种新技能，插件写一行 "ability seen: 技能名"。
+air_light | 空中轻攻击 | _Air_A | 1
+air_heavy | 空中重攻击 | _Air_B | 1
+dash_attack | 冲刺攻击 | _Sprint;_Dash_Attack | 0

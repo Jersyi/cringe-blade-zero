@@ -12,7 +12,11 @@
 #include "npc_grip_math.h"
 #include "npc_grip_routes.h"
 #include "npc_body_collision.h"
+#include "npc_body.h"
+#include "npc_bridge.h"
 #include "npc_pose_transfer.h"
+#include "npc_own_locomotion.h"
+#include "npc_hero_size.h"
 #include "npc_fx_lookup.h"
 #include "grab_extras.h"
 #include "npc_boss_effects.h"
@@ -29,6 +33,7 @@
 #include "boss_assist.h"
 #include "move_preview.h"
 #include "test_dummy.h"
+#include "combo_plugins.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -93,6 +98,10 @@ static_assert(std::size(kNpcWeaponSetsBySkin)==std::size(kNpcSkillSets),"npc_wea
 // subtree) and the boss's own locomotion loops; ridden: the rider sits on it (a horse).
 struct MountLoops { const char* skeleton;const char* mount_root;int32_t bones;uint8_t ridden;const char* idle;const char* walk;const char* run; };
 #include "npc_mounts.generated.h"
+// Each look's own idle / walk / run (rows follow kProfiles): what its pose puppet plays (NpcOwnLocomotion).
+struct OwnLocomotion { const char* profile;const char* idle;const char* walk[4];const char* run[4]; };
+#include "npc_locomotion.generated.h"
+static_assert(std::size(kOwnLocomotion)==std::size(kProfiles),"npc_locomotion.generated.h rows follow kProfiles");
 constexpr uintptr_t kArrayAddRva = 0x0406ce30, kArrayRemoveRva = 0x0406db20;
 // Set only after exact-PE proof. Array edits alone do not update Shipping SocketMap.
 constexpr uintptr_t kRebuildSocketMapRva = 0x044fc870;
@@ -288,16 +297,25 @@ float audit_speed_=1.0f; // npcretarget audit speed <x> while an audit runs (wor
 std::atomic<float> skill_damage_{kSkillDamageDefault};constexpr wchar_t kSkillSection[]=L"NpcSkill"; // ScaleSkillDamage
 std::atomic<double> foreign_weight_{0.0};std::atomic<bool> foreign_own_{false};double foreign_from_=0,foreign_to_=0;ULONGLONG foreign_start_=0;Object* foreign_montage_=nullptr;
 constexpr ULONGLONG kForeignBlendMs=150;
-// Mounts (kMountLoops): a pose puppet, an invisible single-node SkeletalMeshComponent on the display mesh,
-// plays the boss's own animation: its own montage at the hero's position while one runs, else its idle /
-// walk / run loop by the hero's speed, positions advanced here (rate 0, no notifies). NpcPoseTransfer takes
-// the mount (and on a ridden one the rider's pelvis and legs) from it always, the whole body during own
-// montages. mount_serial_ changes with the animation it plays (read on the animation path).
-struct Mount { const MountLoops* row=nullptr;Identity puppet;Object* loops[3]{};double length[3]{};Object* playing=nullptr;int32_t gait=-1,loop=-1;double position=0;
-    ULONGLONG last_ms=0;uint32_t switches=0;std::vector<Identity> pins; };
-Mount mount_;std::atomic<uint32_t> mount_serial_{0};
-// Speed bands (cm/s) for the loops: walk from 30 (idle again under 15), run from 420 (walk again under 360).
-constexpr double kMountWalkCm=30,kMountIdleCm=15,kMountRunCm=420,kMountWalkBackCm=360;
+// Pose puppet (kOwnLocomotion, kMountLoops): an invisible single-node SkeletalMeshComponent with the display mesh plays
+// the boss's own animation: its own montage at the hero's position while one runs, else its idle / walk / run loop by
+// the hero's speed and heading (NpcOwnLocomotion), positions advanced here (rate 0, no notifies). NpcPoseTransfer takes
+// from it always the bones the hero has none of (玉妖's foot blades: at their reference pose they point 67 cm into the
+// ground) and a mount (on a ridden one the rider's pelvis and legs too); a mount's whole body during own montages; and
+// with the boss locomotion option (BOSS 自带移动动画) the whole body while the hero only moves (loco_body_, eased).
+// mount_serial_ changes with the animation it plays (read on the animation path). The puppet is not in added_ (a pooled
+// display keeps its owned components; the puppet goes with the look): RetireMount destroys it.
+struct Mount { const MountLoops* row=nullptr;const OwnLocomotion* loco=nullptr;Identity puppet,display;
+    Object* loops[NpcOwnLocomotion::kLoops]{};double length[NpcOwnLocomotion::kLoops]{};Object* playing=nullptr;
+    int32_t gait=-1,dir=-1,loop=-1;double position=0,rate=1,body=0,speed=0;bool only_moves=false;
+    ULONGLONG last_ms=0;uint32_t switches=0,body_logs=0;std::vector<Identity> pins;NpcOwnLocomotion::Travel travel; };
+Mount mount_;std::atomic<uint32_t> mount_serial_{0};std::atomic<double> loco_body_{0.0};
+// The look's height over the hero's (NpcHeroSize::LookRatio, 0 unknown) and the scale 主角体型 shows its display at now
+// (read by the grip adapter on any thread).
+double look_ratio_=0;std::atomic<double> hero_size_shown_{1.0};
+// The boss locomotion option ([NpcRetarget] BossLocomotion, default off).
+std::atomic<bool> boss_loco_{false};constexpr wchar_t kRetargetSection[]=L"NpcRetarget";
+volatile LONG loco_probe_=0;SRWLOCK bone_probe_lock_=SRWLOCK_INIT;std::vector<std::string> bone_probe_; // tests: npcretarget loco status / boneprobe
 // Display post-process nodes aimed by the boss's own state (QuietAimNodes): the instance last quieted.
 Object* quiet_instance_=nullptr;
 // A skin dropped because the map or the player changed is put back in the next scene: resume_entry_
@@ -718,6 +736,61 @@ bool ContextNow(Context& context) {
     context.pawn = Property<Object*>(controller, "Pawn"); context.mesh = Property<Object*>(context.pawn, "Mesh");
     return ue::Alive(context.pawn) && ue::Alive(context.mesh) && SkelMesh(context.mesh) && AnimClass(context.mesh);
 }
+// 身材 / 骨骼 (the UUEPBS editor, NpcBridge; 2026-11-13 in place of the 骨骼变换 page): the hero's own body only. Its
+// skeleton is handed to the editor and the sliders are written right after the pose finalize, through BoneMotionRuntime's
+// hook (one hook per component, shared with the 骨骼变换 node: NpcBody::Hook). While a look is on, or its request waits,
+// the hero's body is the game's (its pose drives the look): no listener. [NpcBody] Enabled (default 0) gates all of it;
+// [NpcBody] Hook=0 hands the skeleton over but never writes.
+struct BodyVec3 { double x = 0.0, y = 0.0, z = 0.0; };
+bool body_settings_read_ = false, body_hook_enabled_ = true, body_look_mode_ = false, body_fed_logged_ = false;
+void* body_last_mesh_ = nullptr;
+// The hero's speed (cm/s) for the editor's locomotion layers (idle / walk / run / sprint by 30 / 300 / 700, as UUEPBS's
+// config.lua; its Lua sent CharacterMovement.Velocity every 150 ms).
+double BodySpeed(Object* pawn) {
+    if (!pawn) return 0.0;
+    ue::Call get(pawn, "GetVelocity");
+    if (!get.Invoke()) return 0.0;
+    const BodyVec3 v = get.Get<BodyVec3>("ReturnValue");
+    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+void DriveBodyImpl() {
+    static Context context;
+    if (!NpcBridge::Enabled()) {
+        if (NpcBody::HookedComponent()) { NpcBody::Unhook(); Logf("NPC_BODY off ([NpcBody] Enabled=0): the hero's body is the game's"); }
+        return;
+    }
+    // A look (or its request): the hero's body goes back to the game at once, before ContextNow can refuse this frame.
+    if (source_driver_mode_ || active_ || waiting_action_ >= 0) {
+        if (NpcBody::HookedComponent()) { NpcBody::Unhook(); Logf("NPC_BODY paused: a look is on, the hero's body is the game's until it returns"); }
+        body_look_mode_ = true;
+        return;
+    }
+    if (!ContextNow(context)) return;
+    if (body_look_mode_) { body_look_mode_ = false; Logf("NPC_BODY back on the hero"); }
+    if (!body_settings_read_) {
+        body_settings_read_ = true;
+        body_hook_enabled_ = SettingsStore::GetInt(L"NpcBody", L"Hook", 1) != 0;
+        Logf("NPC_BODY [NpcBody] Hook=%d (0: the skeleton is handed over, the sliders are never written)", body_hook_enabled_ ? 1 : 0);
+    }
+    if (!NpcBody::Tick(context.mesh)) return;
+    NpcBridge::SetLocoSpeed(BodySpeed(context.pawn));
+    const bool fed = NpcBridge::Feed(context.mesh);
+    if (fed && !body_fed_logged_) { body_fed_logged_ = true; Logf("NPC_BODY skeleton handed to the editor: bones=%d", NpcBody::SnapshotCount()); }
+    // Started hidden: it applies the last session's sliders; F11 or the page's button shows it.
+    if (fed && !NpcBridge::Started()) { NpcBridge::Start(false); Logf("NPC_BODY editor %s (hidden until opened)", NpcBridge::Started() ? "started" : "failed to start"); }
+    if (context.mesh != body_last_mesh_) { Logf("NPC_BODY hero mesh %p -> %p", body_last_mesh_, context.mesh); body_last_mesh_ = context.mesh; }
+    if (fed && body_hook_enabled_ && NpcBody::HookedComponent() != context.mesh) {
+        NpcBody::Hook(context.mesh);
+        Logf("NPC_BODY pose listener requested on %p (BoneMotionRuntime's hook, shared with the 骨骼变换 node)", context.mesh);
+    }
+}
+void DriveBody() {
+    __try { DriveBodyImpl(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        static LONG quiet = 0;
+        if (InterlockedIncrement(&quiet) <= 8) Logf("NPC_BODY fault code=0x%08lx", static_cast<unsigned long>(GetExceptionCode()));
+    }
+}
 // What the hero is doing: a montage playing, its speed (cm/s) and its movement mode.
 struct HeroMotion { bool known = false, montage = false; double speed = 0; uint8_t mode = 0; };
 HeroMotion MotionOf(const Context& context) {
@@ -1082,7 +1155,7 @@ bool MatchArmsToHero(NpcPoseTransfer::Plan& plan) {
 // arm match, weapon scale, IK followers, two-hand contact, mount puppet), so a look worn again copies its plan (and
 // the sizes read with it) instead of building it. Rows are checked against the live meshes; the oldest goes first.
 struct PlanCacheRow { Identity source_asset,target_asset;std::string profile;NpcPoseTransfer::Plan plan;std::vector<int32_t> virtual_source;
-    double skin_size=1,stature=0,camera_lift=0;const MountLoops* mount=nullptr;ULONGLONG used=0; };
+    double skin_size=1,stature=0,camera_lift=0,look_ratio=0;const MountLoops* mount=nullptr;const OwnLocomotion* loco=nullptr;ULONGLONG used=0; };
 std::vector<PlanCacheRow> plan_cache_;constexpr size_t kPlanCacheRows=16;
 bool SameAsset(const Identity& cached,const Identity& now){return cached.object&&cached.object==now.object&&cached.index==now.index&&cached.serial==now.serial&&Same(cached);}
 void InstallPoseSession(std::unique_ptr<PoseSession> session){AcquireSRWLockExclusive(&pose_lock_);pose_session_=std::move(session);ReleaseSRWLockExclusive(&pose_lock_);}
@@ -1095,8 +1168,8 @@ bool PreparePoseSession(Object* source,Object* target_asset,const Profile& profi
     plan_cache_.erase(std::remove_if(plan_cache_.begin(),plan_cache_.end(),[](const PlanCacheRow& row){return !Same(row.source_asset)||!Same(row.target_asset);}),plan_cache_.end());
     for(PlanCacheRow& row:plan_cache_){
         if(row.profile!=profile.id||!SameAsset(row.source_asset,session->source_asset)||!SameAsset(row.target_asset,session->target_asset))continue;
-        session->plan=row.plan;session->virtual_source=row.virtual_source;skin_size_=row.skin_size;stature_ratio_=row.stature;camera_lift_=row.camera_lift;
-        mount_.row=row.mount;row.used=GetTickCount64();
+        session->plan=row.plan;session->virtual_source=row.virtual_source;skin_size_=row.skin_size;stature_ratio_=row.stature;camera_lift_=row.camera_lift;look_ratio_=row.look_ratio;
+        mount_.row=row.mount;mount_.loco=row.loco;row.used=GetTickCount64();
         SessionGenerations(*session);NpcPoseTransfer::Prepare(session->plan,session->cache);
         Logf("NPC_BODY prepared from the look cache id=%s mapped=%zu targetRuntime=%zu weaponScale=%.3f skinSize=%.3f contact=%d mount=%s",profile.id,session->plan.mapped,
              session->plan.target.size(),session->plan.weapon_scale,skin_size_,session->plan.contact.enabled?1:0,mount_.row?mount_.row->mount_root:"-");
@@ -1184,30 +1257,44 @@ bool PreparePoseSession(Object* source,Object* target_asset,const Profile& profi
     double turn_degrees[2]{};
     if(contact)for(size_t k=0;k<2;++k){const auto& cs=k?built.target_rest_cs:built.target_ref_cs;double inverse[4],tmp[4],turn[4];NpcGripMath::Inverse(built.source_ref_cs[static_cast<size_t>(request.source_hand_r)].rotation,inverse);
         NpcGripMath::Mul(cs[static_cast<size_t>(request.hand_r)].rotation,request.basis_r,tmp);NpcGripMath::Mul(tmp,inverse,turn);turn_degrees[k]=NpcPoseTransfer::detail::Degrees(turn);}
-    // A mount (kMountLoops) and, on a ridden one, the rider's pelvis and legs (every raw bone outside spine_01)
-    // always follow the pose puppet; unmapped ones borrow source slots no target bone maps for the CopyPose.
-    mount_.row=nullptr;
-    for(const MountLoops& row:kMountLoops){if(std::strcmp(row.skeleton,profile.skeleton))continue;auto& plan=session->plan;
-        const int32_t mount=PlanBone(plan.target,row.mount_root),upper=PlanBone(plan.target,"spine_01");
-        if(mount<0||(row.ridden&&upper<0)){Logf("NPC_MOUNT %s: no %s / spine_01 on the display mesh, no puppet",profile.id,row.mount_root);break;}
-        std::vector<uint8_t> always(plan.target.size(),0);size_t held=0;
-        for(size_t t=1;t<plan.target_raw;++t){bool in_mount=false,in_upper=false;
-            for(int32_t bone=static_cast<int32_t>(t);bone>=0;bone=plan.target[static_cast<size_t>(bone)].parent){in_mount=in_mount||bone==mount;in_upper=in_upper||bone==upper;}
-            always[t]=in_mount||(row.ridden&&!in_upper)?1:0;held+=always[t];}
-        size_t assigned=0,wanted=0;if(!NpcPoseTransfer::SetPuppet(plan,always,assigned,wanted)){Logf("NPC_MOUNT %s: puppet plan refused",profile.id);break;}
-        mount_.row=&row;
-        Logf("NPC_MOUNT %s mount=%s (%d bones) ridden=%d: %zu bones always follow the puppet; borrowed source slots %zu of %zu unmapped",
-            profile.id,row.mount_root,row.bones,row.ridden,held,assigned,wanted);break;}
+    // The pose puppet's always-bones: every raw bone the hero has none of (the boss's own, 玉妖's foot blades; ik_* ones
+    // stay as they were, the IK followers own those), a mount (kMountLoops) and on a ridden one the rider's pelvis and
+    // legs (every raw bone outside spine_01). Unmapped ones borrow source slots no target bone maps for the CopyPose.
+    // Only a look with loops of its own (or a mount) gets a puppet.
+    mount_.row=nullptr;mount_.loco=nullptr;
+    {auto& plan=session->plan;std::vector<uint8_t> always(plan.target.size(),0);size_t own=0,held=0;
+        for(size_t t=1;t<plan.target_raw;++t){if(plan.target_to_source[t]>=0)continue;Name name;std::memcpy(&name,&plan.target[t].name,8);
+            if(Lower(Text(name)).rfind("ik_",0)==0)continue;always[t]=1;++own;}
+        for(const MountLoops& row:kMountLoops){if(std::strcmp(row.skeleton,profile.skeleton))continue;
+            const int32_t mount=PlanBone(plan.target,row.mount_root),upper=PlanBone(plan.target,"spine_01");
+            if(mount<0||(row.ridden&&upper<0)){Logf("NPC_MOUNT %s: no %s / spine_01 on the display mesh, no mount",profile.id,row.mount_root);break;}
+            for(size_t t=1;t<plan.target_raw;++t){bool in_mount=false,in_upper=false;
+                for(int32_t bone=static_cast<int32_t>(t);bone>=0;bone=plan.target[static_cast<size_t>(bone)].parent){in_mount=in_mount||bone==mount;in_upper=in_upper||bone==upper;}
+                if((in_mount||(row.ridden&&!in_upper))&&!always[t]){always[t]=1;++held;}}
+            mount_.row=&row;break;}
+        for(const OwnLocomotion& row:kOwnLocomotion)if(!std::strcmp(row.profile,profile.id)){
+            bool any=row.idle!=nullptr;for(size_t d=0;d<4;++d)any=any||row.walk[d]||row.run[d];if(any)mount_.loco=&row;break;}
+        size_t assigned=0,wanted=0;
+        if(!mount_.row&&!mount_.loco)Logf("NPC_LOCO %s: no locomotion of its own, no puppet (%zu bones the hero has none of keep their reference pose)",profile.id,own);
+        else if(!NpcPoseTransfer::SetPuppet(plan,always,assigned,wanted)){Logf("NPC_LOCO %s: puppet plan refused",profile.id);mount_.row=nullptr;mount_.loco=nullptr;}
+        else{plan.puppet_own=mount_.row!=nullptr;plan.extra_mesh=NpcSkillSupport::MeshSpaceWeaponCopy(profile.id);
+            Logf("NPC_LOCO %s: puppet always-bones %zu (the hero has none of %zu; mount %s adds %zu, ridden=%d); borrowed source slots %zu of %zu unmapped; mount whole body in own montages=%d meshSlots=%d",
+                profile.id,own+held,own,mount_.row?mount_.row->mount_root:"-",held,mount_.row?mount_.row->ridden:0,assigned,wanted,plan.puppet_own?1:0,plan.extra_mesh?1:0);}}
     NpcPoseTransfer::Prepare(session->plan,session->cache);
     const auto& k=session->plan.contact;
     Logf("NPC_BODY two-hand contact %s weaponFrame=1 refTurnDeg native=%.1f matched=%.1f fullCm=%.0f noneCm=%.0f gripGate=%d(weapon_r axis %.0f..%.0f cm, %.0f..%.0f deg)",contact?"enabled":"unavailable",turn_degrees[0],turn_degrees[1],
         k.full_cm,k.none_cm,gate,k.grip_full_cm,k.grip_none_cm,k.axis_full_deg,k.axis_none_deg);
     const int32_t source_head=PlanBone(built.source,"head"),target_head=PlanBone(built.target,"head");
     camera_lift_=source_head>=0&&target_head>=0?built.target_ref_cs[static_cast<size_t>(target_head)].translation[2]-built.source_ref_cs[static_cast<size_t>(source_head)].translation[2]:0;
+    {const int32_t source_pelvis=PlanBone(built.source,"pelvis"),target_pelvis=PlanBone(built.target,"pelvis");
+        const auto z=[](const auto& cs,int32_t bone){return bone>=0&&static_cast<size_t>(bone)<cs.size()?cs[static_cast<size_t>(bone)].translation[2]:0.0;};
+        look_ratio_=NpcHeroSize::LookRatio(z(built.source_ref_cs,source_head),z(built.target_ref_cs,target_head),z(built.source_ref_cs,source_pelvis),z(built.target_ref_cs,target_pelvis));
+        Logf("NPC_SIZE %s height over the hero's %.3f (head %.1f / %.1f cm, pelvis %.1f / %.1f cm); 主角体型 shows it x%.3f",profile.id,look_ratio_,
+            z(built.target_ref_cs,target_head),z(built.source_ref_cs,source_head),z(built.target_ref_cs,target_pelvis),z(built.source_ref_cs,source_pelvis),NpcHeroSize::Target(look_ratio_));}
     Logf("NPC_BODY prepared sourceRaw=%zu sourceRuntime=%zu targetRaw=%zu targetRuntime=%zu mapped=%zu parentMismatchKept=%zu sourceGeneration=%s target=%s sharedAssetWrites=0",
         source_raw,session->plan.source.size(),target_raw,session->plan.target.size(),session->plan.mapped,session->plan.parent_mismatch,Text(session->source_asset.object).c_str(),Text(target_asset).c_str());
     {PlanCacheRow row;row.source_asset=session->source_asset;row.target_asset=session->target_asset;row.profile=profile.id;row.plan=session->plan;row.virtual_source=session->virtual_source;
-        row.skin_size=skin_size_;row.stature=stature_ratio_;row.camera_lift=camera_lift_;row.mount=mount_.row;row.used=GetTickCount64();
+        row.skin_size=skin_size_;row.stature=stature_ratio_;row.camera_lift=camera_lift_;row.look_ratio=look_ratio_;row.mount=mount_.row;row.loco=mount_.loco;row.used=GetTickCount64();
         if(plan_cache_.size()>=kPlanCacheRows)plan_cache_.erase(std::min_element(plan_cache_.begin(),plan_cache_.end(),[](const PlanCacheRow& a,const PlanCacheRow& b){return a.used<b.used;}));
         plan_cache_.push_back(std::move(row));}
     InstallPoseSession(std::move(session));return true;
@@ -1223,7 +1310,7 @@ bool UpdatePoseCache(const Transform* source,size_t count) {
     // The mount puppet's finished pose (the display ticks after it), while it is the display mesh.
     NpcPoseTransfer::PuppetPose puppet;const NpcPoseTransfer::PuppetPose* posed=nullptr;const Identity& id=pose_session_->puppet;
     if(id.object&&Same(id)&&SkelMesh(id.object)==pose_session_->target_asset.object&&SourceCurrentCS(id.object,puppet.cs,puppet.count)){
-        puppet.serial=mount_serial_.load(std::memory_order_relaxed);puppet.now_ms=GetTickCount64();posed=&puppet;}
+        puppet.serial=mount_serial_.load(std::memory_order_relaxed);puppet.now_ms=GetTickCount64();puppet.body=loco_body_.load(std::memory_order_relaxed);posed=&puppet;}
     if(!NpcPoseTransfer::Evaluate(pose_session_->plan,source,count,pose_session_->cache,why,foreign_weight_.load(std::memory_order_relaxed),foreign_own_.load(std::memory_order_relaxed),posed)){pose_session_->why=why;InterlockedExchange(&pose_session_->failed,1);return false;}
     pose_session_->why="ok";return true;
 }
@@ -1585,8 +1672,9 @@ bool AdjustGripSocket(GripHook& hook,Object* self,Name name,uint32_t space,Trans
     bool ok=false;AcquireSRWLockExclusive(&pose_lock_);
     __try {if(UpdatePoseCache(source,count)){
         Transform result;
+        const double shown=hero_size_shown_.load(std::memory_order_relaxed);  // 主角体型: the display is shown that much smaller
         ok=NpcGripMath::MapSourceMountPose(source,pose_session_->cache.target_cs.data(),static_cast<size_t>(anchor),static_cast<size_t>(row.target),row.palm,row.target_palm,native_mount,row.basis,component_space,result,
-            pose_session_->plan.weapon_scale);
+            pose_session_->plan.weapon_scale*shown,shown);
         if(ok){out=result;InterlockedIncrement(&hook.queries);}} }
     __finally {ReleaseSRWLockExclusive(&pose_lock_);}return ok;
 }
@@ -4801,58 +4889,110 @@ Object* LoadAssetPath(const char* path) {
     Call load(Kismet(),"LoadAsset_Blocking");if(!load.Set("Asset",soft).Invoke())return nullptr;
     Object* object=load.Get<Object*>("ReturnValue");return ue::Alive(object)?object:nullptr;
 }
-// The puppet: the display mesh on an invisible component that keeps evaluating, without post-process,
-// cloth or collision; the display ticks after it so its finished pose is this frame's. Not fatal: without
-// it the mount bones keep their rest pose, as before.
-void CreateMountPuppet(const Context& context,Object* display,Object* mesh) {
-    Mount& m=mount_;if(!m.row||!pose_session_)return;const MountLoops& row=*m.row;const char* paths[3]={row.idle,row.walk,row.run};size_t loaded=0;
-    for(size_t i=0;i<3;++i){Object* anim=paths[i]?LoadAssetPath(paths[i]):nullptr;if(!anim||!PinAsset(anim,m.pins))continue;m.loops[i]=anim;
-        Call length(anim,"GetPlayLength");m.length[i]=length.Invoke()?length.Get<float>("ReturnValue"):0;if(!(m.length[i]>0))m.length[i]=Property<float>(anim,"SequenceLength");++loaded;}
-    Object* puppet=Add(context.pawn,Class("/Script/Engine.SkeletalMeshComponent"));if(puppet)added_.push_back(Id(puppet));
+// The puppet: the display mesh on an invisible component that keeps evaluating, without post-process, cloth or
+// collision; the display ticks after it so its finished pose is this frame's. Not fatal: without it the bones it would
+// hold keep their reference pose, as before.
+void CreatePosePuppet(const Context& context,Object* display,Object* mesh) {
+    using namespace NpcOwnLocomotion;
+    Mount& m=mount_;if((!m.row&&!m.loco)||!pose_session_)return;
+    static constexpr const char* kSlot[kLoops]={"idle","walkF","walkB","walkL","walkR","runF","runB","runL","runR"};
+    const char* paths[kLoops]{};
+    if(m.loco){paths[kIdle]=m.loco->idle;for(int32_t d=0;d<4;++d){paths[kWalk+d]=m.loco->walk[d];paths[kRun+d]=m.loco->run[d];}}
+    else{paths[kIdle]=m.row->idle;paths[kWalk]=m.row->walk;paths[kRun]=m.row->run;}
+    size_t loaded=0;std::string list;
+    for(int32_t i=0;i<kLoops;++i){Object* anim=paths[i]?LoadAssetPath(paths[i]):nullptr;if(!anim||!PinAsset(anim,m.pins))continue;m.loops[i]=anim;
+        Call length(anim,"GetPlayLength");m.length[i]=length.Invoke()?length.Get<float>("ReturnValue"):0;if(!(m.length[i]>0))m.length[i]=Property<float>(anim,"SequenceLength");++loaded;
+        if(list.size()<700){char item[192];std::snprintf(item,sizeof(item),"%s%s=%s(%.2fs)",list.empty()?"":" ",kSlot[i],Text(anim).c_str(),m.length[i]);list+=item;}}
+    if(!loaded){Logf("NPC_LOCO puppet not made on %s: none of the look's loops loaded",Text(mesh).c_str());return;}
+    Object* puppet=Add(context.pawn,Class("/Script/Engine.SkeletalMeshComponent"));
     const bool made=puppet&&SetVisible(puppet,false,true)&&SetMesh(puppet,mesh)&&Put(puppet,"VisibilityBasedAnimTickOption",uint8_t{0})&&
         PutBool(puppet,"bEnableUpdateRateOptimizations",false)&&PutBool(puppet,"bDisablePostProcessBlueprint",true)&&
         Call(puppet,"SetCollisionEnabled").Set("NewType",uint8_t{0}).Invoke()&&Call(puppet,"SetGenerateOverlapEvents").Set("bInGenerateOverlapEvents",false).Invoke()&&
         AttachFinish(context.pawn,puppet,context.mesh,Name{},Transform{})&&Call(puppet,"SetAnimationMode").Set("InAnimationMode",uint8_t{1}).Invoke()&& // AnimationSingleNode
         Call(display,"AddTickPrerequisiteComponent").Set("PrerequisiteComponent",puppet).Invoke();
-    if(made){PutBool(puppet,"bDisableClothSimulation",true);Call(puppet,"SetForcedLOD").Set("InNewForcedLOD",int32_t{1}).Invoke();m.puppet=Id(puppet);
+    if(made){PutBool(puppet,"bDisableClothSimulation",true);Call(puppet,"SetForcedLOD").Set("InNewForcedLOD",int32_t{1}).Invoke();m.puppet=Id(puppet);m.display=Id(display);
         AcquireSRWLockExclusive(&pose_lock_);pose_session_->puppet=m.puppet;ReleaseSRWLockExclusive(&pose_lock_);}
-    Logf("NPC_MOUNT puppet %s on %s: loops idle=%s (%.2f s) walk=%s (%.2f s) run=%s (%.2f s), %zu loaded and held",made?"created":"refused",Text(mesh).c_str(),
-        Text(m.loops[0]).c_str(),m.length[0],Text(m.loops[1]).c_str(),m.length[1],Text(m.loops[2]).c_str(),m.length[2],loaded);
+    else if(puppet&&!Destroy(puppet))added_.push_back(Id(puppet));  // the restore retries it
+    Logf("NPC_LOCO puppet %s on %s (%s): %zu loops loaded and held: %s",made?"created":"refused",Text(mesh).c_str(),m.loco?"own locomotion":"mount loops",loaded,list.c_str());
 }
-// Every frame: the boss's own montage at the hero's position while one runs, else the loop for the hero's
-// speed (a missing walk is the run, else idle; a missing run the walk), advanced here at rate 1.
-void DriveMount() {
-    Mount& m=mount_;if(!m.row||!m.puppet.object||!Same(m.puppet)||!Same(primary_)||!Same(pawn_))return;
+bool PlayingGrab();
+// The hero only moves: on the ground, nothing on its own animation's montage slots, no boss skill or chain move cast on
+// it, no foreign montage fading, no grab. The boss locomotion option gives the whole body to the puppet meanwhile.
+bool HeroOnlyMoves(Object* pawn,Object* mesh) {
+    if(cutscene_host_||skill_.handle>0||pending_.handle>0||foreign_weight_.load(std::memory_order_relaxed)>0||PlayingGrab())return false;
+    Object* instance=AnimInstance(mesh);if(!instance)return false;
+    Call montage(instance,"IsAnyMontagePlaying");if(!montage.Slot("ReturnValue",sizeof(bool))||!montage.Invoke()||montage.Get<bool>("ReturnValue"))return false;
+    const uint8_t mode=Property<uint8_t>(Property<Object*>(pawn,"CharacterMovement"),"MovementMode");
+    return mode==1||mode==2;  // MOVE_Walking, MOVE_NavWalking
+}
+// Every frame: the boss's own montage at the hero's position while one runs, else its loop for the hero's speed and
+// heading (NpcOwnLocomotion::Pick), advanced here at the rate that matches the loop's own root travel to the hero's
+// speed; the body weight eases toward the boss locomotion option's verdict (HeroOnlyMoves).
+void DrivePuppet() {
+    using namespace NpcOwnLocomotion;
+    Mount& m=mount_;
+    if((!m.row&&!m.loco)||!m.puppet.object||!Same(m.puppet)||!Same(primary_)||!Same(pawn_)){if(m.body>0){m.body=0;loco_body_.store(0.0,std::memory_order_relaxed);}return;}
     const ULONGLONG now=GetTickCount64();const double dt=m.last_ms?(std::min)(0.25,static_cast<double>(now-m.last_ms)/1000.0):0;m.last_ms=now;
+    // The pose evaluated at the position set last frame: its root measures the loop's own travel.
+    {const Transform* cs=nullptr;size_t count=0;
+        if(m.loop>=0&&m.playing&&m.playing==m.loops[m.loop]&&SourceCurrentCS(m.puppet.object,cs,count)&&count)m.travel.Sample(m.loop,m.position,cs[0].translation[0],cs[0].translation[1]);}
     Object* want=nullptr;float position=0;bool looping=false;int32_t loop=-1;
     if(foreign_montage_&&foreign_to_>0&&foreign_own_.load(std::memory_order_relaxed)&&ue::Alive(foreign_montage_))
         if(Object* anim=AnimInstance(primary_.object)){Call at(anim,"Montage_GetPosition");if(at.Set("Montage",foreign_montage_).Invoke()){want=foreign_montage_;position=at.Get<float>("ReturnValue");}}
+    Vector v;{Call velocity(pawn_.object,"GetVelocity");if(velocity.Invoke())v=velocity.Get<Vector>("ReturnValue");}
+    const double speed=std::isfinite(v.x+v.y)?std::sqrt(v.x*v.x+v.y*v.y):0;m.speed=speed;
     if(!want){
-        Vector v;Call velocity(pawn_.object,"GetVelocity");if(velocity.Invoke())v=velocity.Get<Vector>("ReturnValue");
-        const double speed=std::sqrt(v.x*v.x+v.y*v.y);int32_t gait=m.gait<0?0:m.gait;
-        if(gait==0&&speed>kMountWalkCm)gait=1;if(gait==1&&speed>kMountRunCm)gait=2;if(gait==2&&speed<kMountWalkBackCm)gait=1;if(gait==1&&speed<kMountIdleCm)gait=0;m.gait=gait;
-        static constexpr int32_t kOrder[3][3]={{0,1,2},{1,2,0},{2,1,0}};
-        for(const int32_t k:kOrder[gait])if(m.loops[k]){loop=k;want=m.loops[k];looping=true;break;}}
-    if(!want)return;
-    if(want!=m.playing){
-        if(!Call(m.puppet.object,"PlayAnimation").Set("NewAnimToPlay",want).Set("bLooping",looping).Invoke())return;
-        Call(m.puppet.object,"SetPlayRate").Set("Rate",0.f).Invoke();
-        // Walk <-> run keeps the stride phase; anything else starts the loop over.
-        m.position=looping&&m.loop>=0&&m.length[m.loop]>0&&m.playing==m.loops[m.loop]?std::fmod(m.position/m.length[m.loop],1.0)*m.length[loop]:0;
-        m.playing=want;mount_serial_.fetch_add(1,std::memory_order_relaxed);
-        if(++m.switches<=24)Logf("NPC_MOUNT puppet plays %s%s",Text(want).c_str(),looping?" (loop by speed)":" (the boss's own montage at the hero's position)");}
-    m.loop=loop;
-    if(looping){const double length=m.length[loop];m.position=length>0?std::fmod(m.position+dt,length):0;position=static_cast<float>(m.position);}
-    Call(m.puppet.object,"SetPosition").Set("InPos",position).Set("bFireNotifies",false).Invoke();
+        m.gait=Gait(m.gait,speed);
+        if(speed>kIdleCm){Call turn(pawn_.object,"K2_GetActorRotation");const double yaw=turn.Invoke()?turn.Get<RotatorD>("ReturnValue").yaw:0;
+            m.dir=Direction(std::atan2(v.y,v.x)*57.29577951308232-yaw,m.dir);}
+        unsigned present=0;for(int32_t i=0;i<kLoops;++i)if(m.loops[i])present|=1u<<i;
+        loop=Pick(present,m.gait,m.dir<0?kForward:m.dir);if(loop>=0){want=m.loops[loop];looping=true;}}
+    if(want&&want!=m.playing){
+        if(!Call(m.puppet.object,"PlayAnimation").Set("NewAnimToPlay",want).Set("bLooping",looping).Invoke())want=nullptr;
+        else{Call(m.puppet.object,"SetPlayRate").Set("Rate",0.f).Invoke();
+            // Walk <-> run (any direction) keeps the stride phase; anything else starts the loop over.
+            m.position=looping&&loop>=kWalk&&m.loop>=kWalk&&m.length[m.loop]>0&&m.playing==m.loops[m.loop]?std::fmod(m.position/m.length[m.loop],1.0)*m.length[loop]:0;
+            m.playing=want;mount_serial_.fetch_add(1,std::memory_order_relaxed);
+            if(++m.switches<=24)Logf("NPC_LOCO puppet plays %s%s",Text(want).c_str(),looping?" (loop by speed and heading)":" (the boss's own montage at the hero's position)");}}
+    if(want){
+        m.loop=loop;
+        if(looping){const double length=m.length[loop];m.rate=Rate(loop,speed,m.travel.Speed(loop));m.position=length>0?std::fmod(m.position+dt*m.rate,length):0;position=static_cast<float>(m.position);}
+        Call(m.puppet.object,"SetPosition").Set("InPos",position).Set("bFireNotifies",false).Invoke();}
+    const bool on=want&&looping&&boss_loco_.load(std::memory_order_relaxed)&&HeroOnlyMoves(pawn_.object,primary_.object);
+    m.body=Ease(m.body,on,dt*1000);loco_body_.store(m.body,std::memory_order_relaxed);
+    if(on!=m.only_moves){m.only_moves=on;
+        if(++m.body_logs<=40)Logf("NPC_LOCO whole body -> %s (speed %.0f cm/s, puppet %s)",on?"the boss's own locomotion":"the hero's animation",speed,Text(m.playing).c_str());}
 }
-// The puppet component itself goes with added_.
+// tests: npcretarget loco status
+void LogLocoStatus() {
+    const Mount& m=mount_;
+    Logf("NPC_LOCO status option=%d look=%s puppet=%d playing=%s loop=%d gait=%d dir=%d speed=%.0f rate=%.2f body=%.2f onlyMoves=%d travel(walkF %.0f runF %.0f) switches=%u",
+        boss_loco_.load(std::memory_order_relaxed)?1:0,m.loco?m.loco->profile:m.row?m.row->mount_root:"-",m.puppet.object&&Same(m.puppet)?1:0,Text(m.playing).c_str(),m.loop,m.gait,m.dir,m.speed,m.rate,m.body,
+        m.only_moves?1:0,m.travel.Speed(NpcOwnLocomotion::kWalk),m.travel.Speed(NpcOwnLocomotion::kRun),m.switches);
+}
+// tests: npcretarget boneprobe <bone>...: each display bone's height over the display's origin (the feet).
+void LogBoneProbe() {
+    std::vector<std::string> names;AcquireSRWLockExclusive(&bone_probe_lock_);names.swap(bone_probe_);ReleaseSRWLockExclusive(&bone_probe_lock_);
+    if(!active_||!Same(display_)){Logf("NPC_LOCO boneprobe: no look on");return;}
+    Vector origin;{Call at(display_.object,"K2_GetComponentLocation");if(at.Invoke())origin=at.Get<Vector>("ReturnValue");}
+    for(const std::string& bone:names){const std::wstring wide(bone.begin(),bone.end());Call at(display_.object,"GetSocketLocation");
+        if(!at.Set("InSocketName",ue::MakeName(wide.c_str())).Invoke()){Logf("NPC_LOCO boneprobe %s: no reading",bone.c_str());continue;}
+        const Vector w=at.Get<Vector>("ReturnValue");
+        Logf("NPC_LOCO boneprobe %s height %.1f cm over the display origin (offset %.1f %.1f) body=%.2f playing=%s",bone.c_str(),w.z-origin.z,w.x-origin.x,w.y-origin.y,mount_.body,Text(mount_.playing).c_str());}
+}
+// The puppet is destroyed here (it is not in added_; one that will not go is left to the restore's retries).
 void RetireMount(const char* why) {
-    if(!mount_.row&&!mount_.puppet.object&&mount_.pins.empty()){quiet_instance_=nullptr;return;}
+    loco_body_.store(0.0,std::memory_order_relaxed);
+    if(!mount_.row&&!mount_.loco&&!mount_.puppet.object&&mount_.pins.empty()){quiet_instance_=nullptr;return;}
     AcquireSRWLockExclusive(&pose_lock_);if(pose_session_)pose_session_->puppet={};ReleaseSRWLockExclusive(&pose_lock_);
+    bool destroyed=!mount_.puppet.object;
+    if(mount_.puppet.object&&Same(mount_.puppet)){
+        if(Same(mount_.display))Call(mount_.display.object,"RemoveTickPrerequisiteComponent").Set("PrerequisiteComponent",mount_.puppet.object).Invoke();
+        destroyed=Destroy(mount_.puppet.object);if(!destroyed)added_.push_back(mount_.puppet);}
     size_t released=0;
-    if(!ClassRefsReady())Logf("NPC_MOUNT loop references kept: native helper bytes changed");
+    if(!ClassRefsReady())Logf("NPC_LOCO loop references kept: native helper bytes changed");
     else for(const Identity& pin:mount_.pins)if(RawIdentity(pin,pin.index,pin.serial)){reinterpret_cast<void(__fastcall*)(Object*)>(ue::Base()+0x158fa30)(pin.object);++released;}
-    Logf("NPC_MOUNT retired (%s): puppet switches=%u, loop references released=%zu of %zu",why,mount_.switches,released,mount_.pins.size());
+    Logf("NPC_LOCO puppet retired (%s): switches=%u destroyed=%d, loop references released=%zu of %zu",why,mount_.switches,destroyed?1:0,released,mount_.pins.size());
     mount_={};quiet_instance_=nullptr;
 }
 // Class default objects by class: one scan of the object array the first time, the same live object after.
@@ -5048,9 +5188,11 @@ double QpcMs(LONGLONG from);
 #include "npc_display_pool_runtime.h"
 
 bool RestoreSourceSettings();
+void ResetHeroSize(const char* why);
 bool Restore(bool preserve_external = true) {
     stage_ = "restore";
     ResetCameraLift();
+    ResetHeroSize("restore");  // the display is parked or handed on at its own size
     ClearSkill("restore");EndBossCalls("restore");RestoreBodyCollision();RestoreHurtVoice();ReleasePins();ReleaseBarePins();RetireMount("restore");
     cleanup_pending_ = HasResources();
     if (Same(skeleton_edit_.skeleton) && !QuiesceSkeleton(skeleton_edit_.skeleton.object)) {
@@ -5339,6 +5481,9 @@ bool Apply(const Context& context,int32_t entry) {
     const bool post_enabled=options.disabled&&!options.override_class&&body_post;
     if(post_enabled)options.disabled=false;
     Logf("NPC_RETARGET body post-process class=%s donorDisabled=%d enabledForPlay=%d",Text(body_post).c_str(),options.disabled||post_enabled?1:0,post_enabled?1:0);
+    // 身材 / 骨骼: the hero's pose drives the look from here on; the editor's listener stops at once (it is back once the
+    // look is gone, DriveBody). Here and not in DriveBody alone: a waiting look request can skip DriveBody's frame.
+    if(NpcBody::HookedComponent()){NpcBody::Unhook();Logf("NPC_BODY paused (apply): the look takes the hero's body");}
     // The only gameplay Mesh/ABP remains the original Hun. All following
     // changes are private components, node caches and reversible own flags.
     source_driver_mode_=true;primary_=Id(context.mesh);source_asset_=Id(SkelMesh(context.mesh));pawn_=Id(context.pawn);original_class_=Id(AnimClass(context.mesh));target_mesh_=Id(target);
@@ -5367,7 +5512,7 @@ bool Apply(const Context& context,int32_t entry) {
     // Restore dormant native state before authored hair/cloth setup, so that
     // setup wins over the inactive defaults captured during pre-registration.
     if(reused&&!PoolWake(*active_bundle_)){Restore();return Fail(L"缓存外观未能恢复更新状态，已清理并保留原装配路径");}
-    QuietAimNodes(display);if(mount_.row&&!cutscene_host_)CreateMountPuppet(context,display,target);
+    QuietAimNodes(display);if((mount_.row||mount_.loco)&&!cutscene_host_)CreatePosePuppet(context,display,target);
     clock.Mark("display");stage_="assemble NPC parts";Context display_context=context;display_context.mesh=display;face_wait_started_=face_wait_seen_=GetTickCount64();
     const bool assembled=Assemble(display_context,donor,profile,parts);clock.Mark("parts-create");
     const bool gripped=assembled&&InstallGripHook(context.mesh,profile);clock.Mark("grip");
@@ -5520,6 +5665,17 @@ struct ComboRun {
     ULONGLONG press_before=0; // combo_.last_press before the kept press came (back when 预输入 clears that press)
 };
 ComboRun combo_;
+// 派生插件 (ComboPlugins): an event of the chain for the plugins (queued there, delivered at the next frame), and the
+// last press into the chain (a 插件节点's run is told which press brought it).
+unsigned plugin_press_bits_=0;bool plugin_press_key_=false;
+void PluginEvent(int type,int node,const char* text,int taken=0,unsigned bits=0,bool npc_key=false,int button=-1){
+    if(!ComboPlugins::Listening())return;
+    const NpcCombo::Node* n=node>=0&&static_cast<size_t>(node)<combo_.config.chain.size()?&combo_.config.chain[static_cast<size_t>(node)]:nullptr;
+    PbzEvent e{};e.size=sizeof(e);e.type=type;e.now_ms=GetTickCount64();e.trigger=combo_.trigger;e.node=node;e.node_type=n?static_cast<int32_t>(n->type):-1;
+    e.button=button>=0?button:combo_.button;e.taken=taken;e.press_bits=bits;e.npc_key=npc_key?1:0;
+    e.text=text?text:"";e.ability=n?n->ability.c_str():"";e.boss=n?n->boss.c_str():"";
+    ComboPlugins::Emit(e);
+}
 NpcCombo::Press charge_queued_input_,charge_active_input_;
 ComboPlayback::NativeInput native_input_;
 bool native_detour_=false,native_handoff_=false;
@@ -6359,10 +6515,15 @@ void StartTeleport(const Context& context,int index,int button,ULONGLONG now);
 bool TeleportRefused(ULONGLONG now);
 void EndSpeed(const char* why);
 void EndTrim(const char* why);
+// When the last chain's moves stopped (ComboPlayback::EchoOpen): its last move's end when it waited for a press, else
+// the reset. 0: no chain ended yet.
+ULONGLONG echo_over_at_=0;
 void ResetCombo(const char* why,const std::wstring& note) {
+    if(combo_.trigger>=0)echo_over_at_=combo_.phase==ComboRun::Phase::Idle&&combo_.ended_at?combo_.ended_at:GetTickCount64();
     EndTrim(why);
     if(!ChainGrabActive())GrabExtras::ClearChainDamage();  // a grab asked but not begun takes no 派生页 damage later
     native_input_={};native_detour_=false;native_handoff_=false;
+    if(combo_.trigger>=0)PluginEvent(PBZ_EVENT_CHAIN_RESET,combo_.cursor,why);
     EndSpeed(why);
     SetComboArmor(false);
     SetComboInvincible(false);
@@ -6440,7 +6601,9 @@ void PlayNode(int index,int button,ULONGLONG now);
 // A press's hop: the keys row it took is kept for a straight wire after it (the same keys again); a hop of another
 // button forgets it.
 float WeaponStrength(Object* pawn,ULONGLONG now);
-bool AssistNode(int index){const NpcCombo::Node* n=ComboNode(index);return n&&n->type==NpcCombo::NodeType::Assist;}
+// A node after which the hero is free: a BOSS 援护 (another actor plays it) or a 插件节点 (动作: the plugin does what it
+// does; nothing plays on the hero). The press that leads there leaves the hero's own action alone.
+bool AssistNode(int index){const NpcCombo::Node* n=ComboNode(index);return n&&(n->type==NpcCombo::NodeType::Assist||NpcCombo::PluginRuns(*n));}
 bool PlayingAssist(){return AssistNode(combo_.playing);}
 // BOSS 援护: node `index`'s boss is called in (BossAssist: an actor of its own) with the node's modifiers; the hero and
 // the move it plays are left alone.
@@ -6485,6 +6648,7 @@ void PlayNode(int index,int button,ULONGLONG now) {
         (group_cut>0&&now>=group_.started+static_cast<ULONGLONG>(group_cut)));
     if(!group_open)combo_.path_clock.Reset(); // a step-local interrupt never grants the next step permission
     const int keep=combo_.cursor;
+    PluginEvent(PBZ_EVENT_NODE_PLAY,index,"",0,0,false,button);
     PlayNodeImpl(index,button,now);
     if(step)StepCursor(keep);
 }
@@ -6514,6 +6678,16 @@ void PlayNodeImpl(int index,int button,ULONGLONG now) {
         combo_.cursor=index;combo_.playing=index;combo_.button=button;combo_.phase=ComboRun::Phase::Running;combo_.at=now;combo_.started=now;combo_.cut_at=now;
         combo_.rated=nullptr;combo_.first_rated=false;combo_.rate_check=0;
         PublishCombo(L"派生链：BOSS 援护");return;
+    }
+    if(NpcCombo::PluginRuns(*node)){
+        // 插件节点 (动作): nothing plays on the hero or a boss; the plugin's run is called once and the chain waits here
+        // as after a 援护 (the hero is left alone; a move of the chain's still playing ends first: DriveCombo).
+        combo_.cursor=index;combo_.playing=index;combo_.button=button;combo_.phase=ComboRun::Phase::Running;combo_.at=now;combo_.started=now;combo_.cut_at=now;
+        combo_.rated=nullptr;combo_.first_rated=false;combo_.rate_check=0;
+        Logf("NPC_COMBO plugin node=%d action=%s value=%d button=%d plugins=%s",index,node->action.c_str(),node->value,button,ComboPlugins::Enabled()?"on":"off");
+        PublishCombo(L"派生链：插件节点");
+        ComboPlugins::Run(combo_.config,index,button,plugin_press_bits_,plugin_press_key_,ComboProfile());
+        return;
     }
     if(node->type==NpcCombo::NodeType::Teleport){
         // 瞬移: the hero's own 瞬身 dodge landing in front of the target (any look; a weapon held stays).
@@ -6784,7 +6958,7 @@ NpcCombo::Press WithWeapon(const NpcCombo::Press& press) {
     NpcCombo::Press out=press;
     if(!out.airborne&&Same(ChainPawn()))out.airborne=Airborne(ChainPawn().object);
     const bool action_row=press.branch>=0&&static_cast<size_t>(press.branch)<combo_.config.chain.size()&&combo_.config.chain[static_cast<size_t>(press.branch)].type==NpcCombo::NodeType::WeaponActions;
-    if(press.key||press.combo>=0||(press.branch>=0&&!action_row)||!press.bits||!press.weapon.empty()||!NpcCombo::HasWeaponActions(combo_.config))return out;
+    if(press.key||press.combo>=0||(press.branch>=0&&!action_row)||(!press.bits&&press.ability.empty())||!press.weapon.empty()||!NpcCombo::HasWeaponActions(combo_.config))return out;
     std::string id;if(WeaponPresets::CurrentMainWeaponId(id))out.weapon=id;
     return out;
 }
@@ -6917,7 +7091,7 @@ void CutForHero(const char* source,unsigned bits,int node){
     InterruptMove(source,bits,node);
 }
 // One press; false when it leads nowhere and starts no chain (the caller does what the press did before).
-bool PressCombo(const NpcCombo::Press& press,const char* source) {
+bool PressComboImpl(const NpcCombo::Press& press,const char* source) {
     if(combo_.native)return false;
     const ULONGLONG now=GetTickCount64();
     if(const int32_t kept=KeptLookEnding();kept!=-2){
@@ -6965,7 +7139,15 @@ bool PressCombo(const NpcCombo::Press& press,const char* source) {
         if(NpcCombo::HasThen(node)){const int key=NpcCombo::ThenRawKey(node);const char* t2=key<0?NpcCombo::TriggerTag(static_cast<NpcCombo::Trigger>(node.then)):nullptr;
             then=std::string(" then=")+(key>=0?NpcCombo::RawKeyToken(key):t2?t2:"npc-key");}
         Logf("NPC_COMBO trigger=%d (%s) source=%s resetMs=%d%s%s",where.trigger,tag?tag:"npc-key",source,combo_.reset_ms,then.c_str(),again?" again":"");}
+    PluginEvent(PBZ_EVENT_CHAIN_START,where.trigger,source,1,press.bits,press.key);
     Queue(where,now,source,again);return true;
+}
+// Every press into the chain: the plugins hear it (PBZ_EVENT_PRESS) with whether the chain took it.
+bool PressCombo(const NpcCombo::Press& press,const char* source){
+    plugin_press_bits_=press.bits;plugin_press_key_=press.key;
+    const bool taken=PressComboImpl(press,source);
+    PluginEvent(PBZ_EVENT_PRESS,combo_.cursor,source,taken?1:0,press.bits,press.key);
+    return taken;
 }
 // 加速 runs on the hero's own time. PBZ moves play on the Lego ability timeline, which sets the montage position
 // itself (a montage rate is ignored), and every tick the game's slomo system sets a character's CustomTimeDilation
@@ -7246,7 +7428,7 @@ void RateComboMove(const Context& context,ULONGLONG now) {
     const NpcCombo::Node* node=ComboNode(combo_.playing);if(!node)return;
     if(speed_.node>=0&&speed_.node!=combo_.playing)EndSpeed("next-move");
     if(trim_.node>=0&&trim_.node!=combo_.playing)EndTrim("another node");
-    if(node->type==NpcCombo::NodeType::Assist)return;  // its 加速 is its boss's time
+    if(node->type==NpcCombo::NodeType::Assist||node->type==NpcCombo::NodeType::Plugin)return;  // a 援护's 加速 is its boss's time; a 插件节点 plays nothing
     const NpcCombo::TrimRange trim=NpcCombo::TrimFor(combo_.config,combo_.playing);
     if(trim_.node==combo_.playing&&!trim_.cut)++trim_.calls;
     Object* anim=AnimInstance(context.mesh);if(!anim)return;
@@ -7387,6 +7569,14 @@ void AdvanceGroup(ULONGLONG now){
     PlayNode(group_.steps[group_.step],group_.button,now);
 }
 // Every frame.
+// A press the chain left to the game during a move (KeepPress: native_detour_) keeps the borrowed look after that move
+// only for the hero's own action it brought. 11-13 user: "变身boss放完技能，立马按重击会罚站，按轻击不会" - a heavy
+// attack the chain does not take, pressed as the boss move finished, kept the boss look on after the move, held by the
+// move's own montage still playing out on the hero's mesh (ActiveMontage), with no hero action of it: the boss stood
+// there until that montage ended. The light attack started the chain again, so it never showed. move_tail_: the montage
+// playing when the chain's move ended (the move's own), never counted as the hero's action.
+Identity move_tail_;
+bool HeroActionRunning();
 void DriveCombo() {
     if(!ComboReady()||combo_.trigger<0){
         if(armor_.on)SetComboArmor(false);
@@ -7475,6 +7665,7 @@ void DriveCombo() {
         // until that pause, counted from arriving at the branch (the 派生点 plus the intervals before it), plus the larger
         // of reset_ms and kPauseGraceMs (ComboPlayback::NodeClock::Deadline).
         const int ended=combo_.playing;
+        PluginEvent(PBZ_EVENT_MOVE_END,ended,"");
         EndSpeed("move-ended");EndTrim("the move ended");
         combo_.phase=P::Idle;combo_.playing=-1;
         if(group_.index>=0){combo_.started=group_.started;Logf("NPC_COMBO group=%d done steps=%zu",group_.index,group_.steps.size());group_={};}
@@ -7482,6 +7673,11 @@ void DriveCombo() {
         // nothing after this move: while it goes on the look stays, so the next move changes straight from it to the
         // look it needs (连续变身); the chain stopping or timing out brings the owner's look back (ResetCombo). The hero
         // look a 武器派生 borrowed follows its weapon.
+        {Context context;move_tail_=ContextNow(context)&&context.pawn==ChainPawn().object?Id(ActiveMontage(context)):Identity{};}
+        if(native_detour_&&!ComboPlayback::DetourKeepsLook(native_detour_,native_handoff_,HeroActionRunning())){
+            native_detour_=false;
+            Logf("NPC_COMBO node=%d ended: the press left to the game brought no hero action (%s): the look goes as after any move",
+                 ended,Same(move_tail_)?("the move's montage "+Text(move_tail_.object)+" still plays out").c_str():"no montage plays");}
         const bool weapon_held=weapon_.stage==WeaponHold::Stage::Holding;
         if(weapon_held&&!native_detour_)BeginWeaponReturn("move-ended");
         if(!native_detour_&&borrow_.stage==Borrow::Stage::Wearing&&!(borrow_.row<0&&weapon_.stage!=WeaponHold::Stage::Off)&&!NpcCombo::Continues(combo_.config,combo_.cursor))
@@ -7499,8 +7695,8 @@ void DriveCombo() {
         return;
     }
     if(native_detour_&&combo_.phase==P::Idle){
-        Context context;
-        if(ContextNow(context)&&context.pawn==ChainPawn().object&&ActiveMontage(context))
+        Context context;Object* montage=ContextNow(context)&&context.pawn==ChainPawn().object?ActiveMontage(context):nullptr;
+        if(ComboPlayback::DetourHolds(montage!=nullptr,Same(move_tail_)&&montage==move_tail_.object))
             combo_.reset_at=(std::max)(combo_.reset_at,now+static_cast<ULONGLONG>(ChainWaitMs()));
         else{
             native_detour_=false;
@@ -7620,6 +7816,12 @@ bool HeroActionSpecs(Object* asc,std::vector<HeroSpec>& out){
         out.push_back({ue::At<int32_t>(row,handle_at),ability,bits});}
     return true;
 }
+// One of the hero's action abilities runs now, none of the chain's casts (its move, 武器派生 or 瞬移 dash).
+bool HeroActionRunning(){
+    Object* asc=Same(ChainPawn())?PawnAsc(ChainPawn().object):nullptr;std::vector<HeroSpec> specs;
+    if(!ue::Alive(asc)||!HeroActionSpecs(asc,specs))return false;
+    return std::any_of(specs.begin(),specs.end(),[](const HeroSpec& s){return !(skill_.handle>0&&s.handle==skill_.handle)&&!(pending_.handle>0&&s.handle==pending_.handle);});
+}
 // 吞掉: the hero's action abilities seen first inside the swallow window are cancelled (never the chain's own casts).
 void SwallowHeroActions(ULONGLONG now,bool swallow_any){
     if(!swallow_any){raw_.seen.clear();return;}
@@ -7714,6 +7916,7 @@ bool HeroButtonDown(unsigned bits,bool& known){
 }
 bool RawKeyDown(int code){
     const UiHotkeys::PadLevel pad=UiHotkeys::CurrentPad();if(!pad.in_game)return false;
+    if(NpcCombo::IsSignalKey(code))return ComboPlugins::SignalDown(code);  // a plugin's 插件信号
     if(NpcCombo::IsPadKey(code))return ((NpcCombo::PadCodeBits(pad.buttons,pad.stick)>>(code-NpcCombo::kPadKey))&1u)!=0;
     return (GetAsyncKeyState(code)&0x8000)!=0;
 }
@@ -7960,6 +8163,19 @@ void DriveHeroInput() {
     }
     hero_input_.baselined=true;
 }
+bool StopHeroMovement(Object* pawn);
+// ComboPlayback::StopDodgeMotion: the hero's montages stopped at once (0.05 s blend) and, walking, its speed gone.
+std::string StopHeroDodgeMotion(const Context& context){
+    std::string out;
+    if(Object* instance=AnimInstance(context.mesh)){
+        Call playing(instance,"IsAnyMontagePlaying");
+        if(playing.Slot("ReturnValue",sizeof(bool))&&playing.Invoke()&&playing.Get<bool>("ReturnValue")&&
+           Call(instance,"Montage_Stop").Set("InBlendOutTime",0.05f).Set("Montage",static_cast<Object*>(nullptr)).Invoke())out="montage";}
+    const HeroMotion motion=MotionOf(context);
+    if(motion.known&&(motion.mode==1||motion.mode==2)&&motion.speed>1&&StopHeroMovement(context.pawn))
+        out+=out.empty()?"speed":"+speed";
+    return out.empty()?"none":out;
+}
 void DriveHeroTriggers() {
     if(!ComboReady()){combo_.active.clear();return;}
     if(!HeroButtonsUsed()&&combo_.trigger<0)return;  // NPC-key-only chains still observe native detours
@@ -7973,22 +8189,57 @@ void DriveHeroTriggers() {
     if(specs<0||items<0||size<=0||handle_at<0||ability_at<0||count_at<0)return;
     const Array array=ue::At<Array>(asc,specs+items);
     if(array.num<0||array.num>4096||array.max<array.num||(array.num&&!FaceReadable(array.data,static_cast<size_t>(array.num)*static_cast<size_t>(size))))return;
-    std::vector<int32_t> running;unsigned hit_bits=0;int32_t hit_handle=0;Object* hit_ability=nullptr;
+    std::vector<int32_t> running;unsigned hit_bits=0;int32_t hit_handle=0;Object* hit_ability=nullptr;std::string hit_name;
     // The chain's own casts are no presses of the hero: its hero move, 武器派生 or 瞬移 dash (skill_ / pending_), and
     // while it plays a 投技 the grab's abilities (the grab module activates them). They join the running list, so they
     // are never taken for a press later either.
     const bool own_grab=(PlayingGrab()&&combo_.phase!=ComboRun::Phase::Idle)||GrabCutCleaning();
+    // A 武器派生修改 row names one weapon action: the running abilities' names are read too (only then).
+    const bool named=NpcCombo::HasAbilityRows(combo_.config);
+    // The hero's other action abilities running now (none of the chain's casts): a press the chain takes cancels those
+    // that came with it (ComboPlayback::CancelWithPress). fresh: not running at the last look.
+    struct HeroRun { int32_t handle=0;Object* ability=nullptr;unsigned bits=0;bool fresh=false; };std::vector<HeroRun> others;
     for(int32_t i=0;i<array.num;++i){Object* row=static_cast<Object*>(array.data)+static_cast<size_t>(i)*static_cast<size_t>(size);
         if(!ue::At<uint8_t>(row,count_at))continue;
-        Object* ability=ue::At<Object*>(row,ability_at);const unsigned bits=AbilityActionBits(ability);if(!bits)continue;
+        Object* ability=ue::At<Object*>(row,ability_at);const unsigned bits=AbilityActionBits(ability);
+        // A hero action, or a weapon action a 武器派生修改 row names (an air, dash or skill move may carry no hero action tag).
+        std::string name;if(named)name=AbilityName(ability);
+        if(!bits&&!(named&&NpcCombo::NamesAbility(combo_.config,name)))continue;
         const int32_t handle=ue::At<int32_t>(row,handle_at);running.push_back(handle);
-        if(hit_bits||std::find(combo_.active.begin(),combo_.active.end(),handle)!=combo_.active.end())continue;
-        if((skill_.handle>0&&handle==skill_.handle)||(pending_.handle>0&&handle==pending_.handle)||own_grab){
+        const bool fresh=std::find(combo_.active.begin(),combo_.active.end(),handle)==combo_.active.end();
+        const bool own=(skill_.handle>0&&handle==skill_.handle)||(pending_.handle>0&&handle==pending_.handle)||own_grab;
+        if(hit_ability||!fresh){if(!own)others.push_back({handle,ability,bits,fresh});continue;}
+        if(own){
             Logf("NPC_COMBO hero %s bits=0x%x is the chain's own cast: not a press",Text(ability).c_str(),bits);continue;}
-        hit_bits=bits;hit_handle=handle;hit_ability=ability;}
+        hit_bits=bits;hit_handle=handle;hit_ability=ability;hit_name=std::move(name);}
     combo_.active=std::move(running);
-    if(!hit_bits)return;
+    if(!hit_ability)return;
     const ULONGLONG now=GetTickCount64();
+    // A 武器派生修改 row naming this very action takes it ahead of the input echoes below: the input press cannot tell
+    // which action it turned into (an air, dash or skill move sits on the button of a plain attack). Not when an input
+    // press the chain already took brought it (its echo: dropped below as before).
+    if(const int named_button=NpcCombo::NamedAbilityButton(combo_.config,hit_name);named_button>=0&&!combo_.native){
+        NpcCombo::Press by_name{hit_bits,false,{}};by_name.ability=hit_name;
+        const unsigned input_bits=hit_bits?hit_bits:1u<<named_button;  // a tagless action: the input of the row's button brought it
+        const bool echo=std::any_of(input_presses_.begin(),input_presses_.end(),[&](const InputPress& p){return p.taken&&(p.bits&input_bits)&&now<=p.at+kEchoMs;});
+        if(!echo&&ComboTakes(by_name)){
+            const bool cancelled=CancelSpec(asc,hit_handle);
+            // The input press that brought it is this action, not one still to come.
+            input_presses_.erase(std::remove_if(input_presses_.begin(),input_presses_.end(),[&](const InputPress& p){return !p.part&&(p.bits&input_bits)&&now<=p.at+kEchoMs;}),input_presses_.end());
+            if(const auto w=std::find_if(waiting_presses_.begin(),waiting_presses_.end(),[&](const InputPress& p){return (p.bits&input_bits)!=0;});w!=waiting_presses_.end())waiting_presses_.erase(w);
+            ability_press_at_=now;ability_press_bits_=input_bits;
+            const bool pressed=PressCombo(by_name,"weapon-action");
+            Logf("NPC_COMBO hero %s bits=0x%x named by a 武器派生修改 row -> pressed=%d cancelled=%d",hit_name.c_str(),hit_bits,pressed?1:0,cancelled?1:0);
+            return;
+        }
+    }
+    if(!hit_bits)return;  // a tagless weapon action no row takes now stays the hero's
+    // Presses read from the input during the chain's moves are echoes only while it goes on and for a moment after its
+    // last move (ComboPlayback::EchoOpen): later the hero's action is its own press.
+    if(!input_presses_.empty()&&!ComboPlayback::EchoOpen(combo_.trigger>=0,now,echo_over_at_)){
+        Logf("NPC_COMBO hero %s bits=0x%x: %zu press(es) read during the last chain's moves forgotten (it ended %llums ago): not an echo",
+             Text(hit_ability).c_str(),hit_bits,input_presses_.size(),echo_over_at_?now-echo_over_at_:0ull);
+        input_presses_.clear();}
     // 处决: near a mob that can be executed the game plays its execution for the hero's attack press, so the ability is
     // an execution where the input was a light or heavy attack: the same press (its echo).
     constexpr unsigned kExecution=1u<<static_cast<int>(NpcCombo::Trigger::Execution);
@@ -8039,12 +8290,25 @@ void DriveHeroTriggers() {
              Text(hit_ability).c_str(),hit_bits,raw_.part_keys.c_str(),cancelled?1:0);
         return;}
     const bool was=combo_.cursor>=0,take=ComboTakes(press),cut=HeroCuts();const int node=combo_.playing;
-    // Cancelled first, so the boss move is not blocked by the hero's own action still running.
+    // Cancelled first, so the boss move is not blocked by the hero's own action still running. With it go the hero's
+    // actions that came with the press (ComboPlayback::CancelWithPress: the dodge family one input starts, the dash a
+    // perfect dodge starts in); until 11-12 they played on beside the chain's move. A dodge then leaves no motion
+    // (ComboPlayback::StopDodgeMotion: its montage blending out moved the hero on, and so did its speed).
     const bool cancelled=take&&CancelSpec(asc,hit_handle);
+    std::string with,motion;
+    if(take){
+        const unsigned jump=1u<<static_cast<int>(NpcCombo::Trigger::Jump);unsigned gone=cancelled?hit_bits:0u;
+        for(const HeroRun& r:others)if(ComboPlayback::CancelWithPress(r.fresh,r.bits,hit_bits,dodges,jump)&&CancelSpec(asc,r.handle)){
+            gone|=r.bits;with+=(with.empty()?"":",")+AbilityName(r.ability);}
+        Context context;
+        if(ComboPlayback::StopDodgeMotion(gone,dodges,skill_.handle>0||pending_.handle>0)&&ContextNow(context)&&context.pawn==ChainPawn().object)
+            motion=StopHeroDodgeMotion(context);
+    }
     const HoldStart held=PressOrHold(press,"hero-action",HoldKind::Hero,hit_bits);
     const bool pressed=held.waiting?take:held.taken;
     if(!pressed&&cut&&skill_.handle>0)CutForHero("hero-action",hit_bits,node);
-    if(take||was)Logf("NPC_COMBO hero %s bits=0x%x -> pressed=%d cancelled=%d",Text(hit_ability).c_str(),hit_bits,pressed?1:0,cancelled?1:0);
+    if(take||was)Logf("NPC_COMBO hero %s bits=0x%x -> pressed=%d cancelled=%d%s%s%s%s",Text(hit_ability).c_str(),hit_bits,pressed?1:0,cancelled?1:0,
+                      with.empty()?"":" with=",with.c_str(),motion.empty()?"":" dodge motion stopped=",motion.c_str());
 }
 // The NPC skill key: the chain's next move, or false (the key casts as before).
 bool PressNpcKey() {
@@ -8821,8 +9085,11 @@ struct BlinkHidden { Identity actor; };
 struct Blink { bool on=false; bool fx=true; Identity pawn; std::vector<BlinkHidden> hidden; ULONGLONG show_at=0,until=0; };
 Blink blink_;
 constexpr double kBlinkSizeMin=0.5,kBlinkSizeMax=4.0;
-// The size of the look on `pawn` now: the NPC look's (skin_size_) while it is on that pawn, else the hero's own (1).
-double BlinkSize(Object* pawn){return active_&&pawn==pawn_.object&&std::isfinite(skin_size_)?std::clamp(skin_size_,kBlinkSizeMin,kBlinkSizeMax):1.0;}
+// The size of the look on `pawn` now: the NPC look's (skin_size_, times the scale 主角体型 shows it at) while it is on
+// that pawn, else the hero's own (1).
+double BlinkSize(Object* pawn){
+    const double shown=hero_size_shown_.load(std::memory_order_relaxed),size=skin_size_*(std::isfinite(shown)&&shown>0?shown:1.0);
+    return active_&&pawn==pawn_.object&&std::isfinite(size)?std::clamp(size,kBlinkSizeMin,kBlinkSizeMax):1.0;}
 void BlinkFx(Object* pawn,const char* fx,const char* sound,const char* what,double size=-1){
     Call where(pawn,"K2_GetActorLocation");if(!where.Invoke())return;Vector at=where.Get<Vector>("ReturnValue");
     if(!(size>0))size=BlinkSize(pawn);
@@ -9317,16 +9584,75 @@ bool ViewBodyPoint(Object* mesh,Vector& out){
         out=b.Get<Vector>("Origin");if(view_body_.target!=NpcCombo::kViewPelvis)out.z+=b.Get<Vector>("BoxExtent").z*0.6;}
     return std::isfinite(out.x+out.y+out.z);
 }
-// 取景: the shown model's height (its bounds when first shown, standing: clamped to 1.2..25 m), kept per mesh.
-struct ViewModel { Identity mesh;double size=0; };
+// 取景: the shown model's height (its bounds when first shown, standing, without the BoundsScale a display with no
+// physics asset gets: ViewFollowState::ModelHeight), kept per mesh at its own size and framed times the scale it is
+// shown at now: 主角体型 shrinks the look display (SetRelativeScale3D), and 彭猛 at the hero's size was framed for 490 cm.
+struct ViewModel { Identity mesh;double own=0; };
 ViewModel view_model_;
+double ShownScale(Object* mesh){const Vector s=Property<Vector>(mesh,"RelativeScale3D");return std::isfinite(s.z)&&s.z>0.01?s.z:1.0;}
 double ViewModelSize(Object* mesh){
-    if(Same(view_model_.mesh)&&view_model_.mesh.object==mesh)return view_model_.size;
+    const double shown=ShownScale(mesh);
+    if(Same(view_model_.mesh)&&view_model_.mesh.object==mesh)return view_model_.own*shown;
     view_model_={};view_model_.mesh=Id(mesh);
     Call b(KismetSystem(),"GetComponentBounds");
-    if(b.Set("Component",mesh).Invoke()){const Vector e=b.Get<Vector>("BoxExtent");if(std::isfinite(e.z)&&e.z>0)view_model_.size=std::clamp(e.z*2,120.0,2500.0);}
-    if(view_model_.size<=0)view_model_.size=180;
-    return view_model_.size;
+    const double extent=b.Set("Component",mesh).Invoke()?b.Get<Vector>("BoxExtent").z:0;
+    const double scale=Property<float>(mesh,"BoundsScale");
+    view_model_.own=ViewFollowState::ModelHeight(extent,scale,shown);
+    Logf("NPC_VIEW model height of %s: bounds %.0fcm / boundsScale %.2f / shown x%.3f -> %.0fcm at its own size",Text(mesh).c_str(),extent*2,scale,shown,view_model_.own);
+    return view_model_.own*shown;
+}
+// 主角体型: while a move wired to it plays (NpcCombo::HeroSizeFor), the boss look's shown model is scaled to the hero's
+// height (NpcHeroSize::Target of the look's ratio), eased over NpcHeroSize::kEaseMs. The display hangs on the hero mesh
+// at the feet, so it shrinks onto the ground; its parts, the boss weapons and the colliders on it scale with it, and the
+// grip adapter takes hero_size_shown_ for the hero weapons in its hands. The game camera's lift (FitCameraLift), the
+// 视角跟随 framing (ViewModelSize) and the blink bursts (BlinkSize) follow the size shown. The actor, its capsule and the
+// move's travel stay the boss's. A look change or a restore sets the display back to its own size at once.
+struct HeroSizeHold { Identity display;double progress=0,applied=1,clock=0;bool want=false;uint32_t logs=0; };
+HeroSizeHold hero_size_;
+bool SetDisplayScale(Object* display,double s){return Call(display,"SetRelativeScale3D").Set("NewScale3D",Vector{s,s,s}).Invoke();}
+void ResetHeroSize(const char* why){
+    if(Same(hero_size_.display)&&std::abs(hero_size_.applied-1)>1e-6){
+        const bool ok=SetDisplayScale(hero_size_.display.object,1);
+        Logf("NPC_SIZE %s: %s back to its own size (was x%.3f) ok=%d",why,Text(hero_size_.display.object).c_str(),hero_size_.applied,ok?1:0);}
+    hero_size_.display={};hero_size_.applied=1;hero_size_shown_.store(1.0,std::memory_order_relaxed);
+}
+// The game camera's lift (ApplyCameraLift: raised by the look's head over the hero's) for the size 主角体型 takes the
+// look to: the shown head over the hero's, none at the hero's size (彭猛 kept 252 cm over a hero-sized model). The
+// camera blends there (SetCameraLift, 0.4 s); HoldCameraLift keeps it; the look's return resets it as before.
+void FitCameraLift(double shown){
+    if(!camera_owned_||!Same(camera_))return;
+    const double lift=std::clamp(NpcHeroSize::LiftAt(camera_lift_,look_ratio_,shown),kCameraLiftLow,kCameraLiftHigh);
+    if(!std::isfinite(lift)||std::abs(lift-camera_applied_)<1||!SetCameraLift(camera_.object,lift))return;
+    if(hero_size_.logs<400){++hero_size_.logs;Logf("NPC_CAMERA lift %.1f -> %.1fcm for the look shown x%.3f (主角体型)",camera_applied_,lift,shown);}
+    camera_applied_=lift;
+}
+// The look's cloth and hair once the size has settled (the end of an ease): started again from the pose at the new size
+// rather than simulated on from particles laid out at the old one.
+void ResetLookSimulation(double s){
+    Object* cloth=Class("/Script/ChaosClothAssetEngine.ChaosClothComponent"),*groom=Class("/Script/HairStrandsCore.GroomComponent");
+    int cloths=0,grooms=0;
+    for(const Identity& part:added_){if(!Same(part)||part.object==display_.object)continue;
+        if(cloth&&ue::IsA(part.object,cloth)&&Call(part.object,"ForceNextUpdateTeleportAndReset").Invoke())++cloths;
+        else if(groom&&ue::IsA(part.object,groom)&&Call(part.object,"ResetSimulation").Invoke())++grooms;}
+    if((cloths||grooms)&&hero_size_.logs<400){++hero_size_.logs;Logf("NPC_SIZE settled at x%.3f: cloth %d and hair %d started again at that size",s,cloths,grooms);}
+}
+void DriveHeroSize(){
+    const double clock=ClockSeconds(),dt_ms=hero_size_.clock>0?(std::min)(0.1,clock-hero_size_.clock)*1000:0;hero_size_.clock=clock;
+    using P=ComboRun::Phase;
+    const bool shown=active_&&Same(display_)&&!cutscene_host_;
+    // DriveCombo ran ComboReady this frame (a chain that is off or has no owner is reset there).
+    const bool move=combo_.config.enabled&&combo_.trigger>=0&&combo_.phase!=P::Idle&&combo_.playing>=0&&!PlayingAssist()&&!native_handoff_;
+    const bool want=shown&&move&&NpcCombo::HeroSizeFor(combo_.config,combo_.trigger,combo_.playing);
+    if(want!=hero_size_.want){hero_size_.want=want;
+        if(hero_size_.logs<400){++hero_size_.logs;Logf("NPC_SIZE %s node=%d: look height ratio %.3f, shown x%.3f",want?"on":"off",combo_.playing,look_ratio_,want?NpcHeroSize::Target(look_ratio_):1.0);}}
+    if(!shown){ResetHeroSize("no look shown");hero_size_.progress=0;return;}
+    if(!Same(hero_size_.display)||hero_size_.display.object!=display_.object){ResetHeroSize("another display");hero_size_.display=display_;}
+    hero_size_.progress=NpcHeroSize::Step(hero_size_.progress,want,dt_ms);
+    FitCameraLift(want?NpcHeroSize::Target(look_ratio_):1.0);
+    const double s=NpcHeroSize::Shown(hero_size_.progress,NpcHeroSize::Target(look_ratio_));
+    if(std::abs(s-hero_size_.applied)<1e-4)return;
+    if(SetDisplayScale(display_.object,s)){hero_size_.applied=s;hero_size_shown_.store(s,std::memory_order_relaxed);
+        if(hero_size_.progress<=0||hero_size_.progress>=1)ResetLookSimulation(s);}
 }
 // Any montage a boss look plays (the look's own attacks, a move cast some other way than the chain or the NPC key) is a
 // cast too: keyed by the montage (0: none).
@@ -9338,7 +9664,7 @@ uint64_t LookMontage(Object* mesh){
 }
 void DriveViewFollow(){
     const NpcCombo::Node* n=combo_.playing>=0&&static_cast<size_t>(combo_.playing)<combo_.config.chain.size()?&combo_.config.chain[static_cast<size_t>(combo_.playing)]:nullptr;
-    const bool chain_move=n&&NpcCombo::IsMove(*n)&&n->type!=NpcCombo::NodeType::Assist;  // a 援护 is another actor
+    const bool chain_move=n&&NpcCombo::IsMove(*n)&&n->type!=NpcCombo::NodeType::Assist&&n->type!=NpcCombo::NodeType::Plugin;  // a 援护 is another actor; a 插件节点 plays nothing
     const int64_t handle=skill_.handle>0?static_cast<int64_t>(skill_.handle):0;
     Context context;const bool have=ContextNow(context)&&ue::Alive(context.pawn);
     const uint64_t look_montage=!chain_move&&handle<=0&&have?LookMontage(context.mesh):0;
@@ -9418,10 +9744,12 @@ void DriveViewFollow(){
     if(view_.on){view_.max_flat=(std::max)(view_.max_flat,std::sqrt(dx*dx+dy*dy));view_.max_rise=(std::max)(view_.max_rise,std::abs(dz));}
     RotatorD control{};{Call get(pc,"GetControlRotation");if(!get.Invoke())return;control=get.Get<RotatorD>("ReturnValue");}
     const auto axes=ViewFollowState::ViewAxes<Vector>(control.yaw,control.pitch);
-    // The relation: the game camera's (else the hero's default), pushed out for a model taller than the hero.
+    // The relation: the game camera's (else the hero's default), pushed out for a model taller than the hero (镜头取景
+    // 按身高), or by the shown model's height over the hero's (按体型比例: 1 under 主角体型, under 1 for a small look).
     const double size=ViewModelSize(mesh);
     const Vector native=view_native_.known?view_native_.rel:CamDefault(bone);
-    const double grow=(std::max)(1.0,size/kHeroCm);
+    const bool by_ratio=NpcCombo::ViewScale()==NpcCombo::kScaleHeroRatio,look_shown=Same(display_)&&mesh==display_.object;
+    const double grow=by_ratio?(look_shown?NpcHeroSize::Grow(look_ratio_,hero_size_.applied,size/kHeroCm):1.0):(std::max)(1.0,size/kHeroCm);
     const Vector rel{native.x*grow,native.y*grow,native.z*grow};
     // The target: the body through the dead zone, eased; at once when the camera comes in or after a pose jump.
     const double clock=ClockSeconds(),dt=view_cam_.clock>0?(std::min)(0.1,clock-view_cam_.clock):0;view_cam_.clock=clock;
@@ -9463,8 +9791,9 @@ void DriveViewFollow(){
         if(Same(view_cam_.component))Call(view_cam_.component.object,"SetFieldOfView").Set("InFieldOfView",fov).Invoke();
         if(!BlendViewTo(pc,actor_cam,kCamInS)){Logf("NPC_VIEW camera: SetViewTargetWithBlend refused");return;}
         view_cam_.on=true;view_cam_.placed=true;view_cam_.pawn=Id(context.pawn);view_cam_.blend_until=now+static_cast<ULONGLONG>(kCamInS*1000)+150;
-        Logf("NPC_VIEW camera took over for %s: model %.0fcm tall, from (%.0f,%.0f,%.0f) x%.2f = %.0fcm (the game camera's%s), fov %.0f, control pitch/yaw %.0f/%.0f, game view %.0f/%.0f",
-             view_.move.c_str(),size,native.x,native.y,native.z,grow,dist,view_native_.known?"":": not measured, the hero's default",fov,control.pitch,control.yaw,seen.pitch,seen.yaw);
+        Logf("NPC_VIEW camera took over for %s: model %.0fcm tall (shown x%.3f), from (%.0f,%.0f,%.0f) x%.2f = %.0fcm (the game camera's%s), fov %.0f, control pitch/yaw %.0f/%.0f, game view %.0f/%.0f",
+             view_.move.c_str(),size,ShownScale(mesh),native.x,native.y,native.z,grow,dist,view_native_.known?"":": not measured, the hero's default",fov,control.pitch,control.yaw,seen.pitch,seen.yaw);
+        if(by_ratio)Logf("NPC_VIEW framing by size ratio: look %.3f x shown %.3f -> x%.2f",look_shown?look_ratio_:1.0,look_shown?hero_size_.applied:1.0,grow);
         return;
     }
     Call(view_cam_.actor.object,"K2_SetActorLocationAndRotation").Set("NewLocation",eye).Set("NewRotation",rot).Set("bSweep",false).Set("bTeleport",true).Invoke();
@@ -11364,6 +11693,150 @@ void DriveCutsceneLook(const Context& context) {
          failure_text_.empty()?"-":Utf8(failure_text_.c_str()).c_str());
 }
 
+// ---- 派生插件 (ComboPlugins) ----------------------------------------------------------------------------------------
+namespace {
+// The hero's (or an enemy's) health and its maximum (AttributeSetBase Health / MaxHealth; false: unreadable).
+bool PluginHealth(Object* pawn,float& value,float& most){
+    value=0;most=0;
+    Object* set=ue::Alive(pawn)?Property<Object*>(pawn,"AttributeSetBase"):nullptr,*data=Class("/Script/GameplayAbilities.GameplayAttributeData");
+    if(!ue::Alive(set)||!data||ue::StructSize(data)!=16||ue::Offset(data,"CurrentValue")!=12)return false;
+    const int32_t health=Offset(set,"Health"),max_at=Offset(set,"MaxHealth");
+    if(health<0||!FaceReadable(set+health+12,sizeof(float)))return false;
+    value=ue::At<float>(set,health+12);
+    if(max_at>=0&&FaceReadable(set+max_at+12,sizeof(float)))most=ue::At<float>(set,max_at+12);
+    if(!std::isfinite(value)||value<0||value>1e9f){value=0;return false;}
+    if(!std::isfinite(most)||most<0||most>1e9f)most=0;
+    return true;
+}
+std::string PluginLook(){return active_?LookName(selected_):"hero";}
+const NpcCombo::Config* PluginConfig(){return combo_.owner!=-2?&combo_.config:nullptr;}
+int PluginTrigger(){return combo_.trigger;}
+bool PluginState(PbzChainState& s){
+    s.ready=combo_.owner!=-2&&combo_.config.enabled?1:0;
+    s.trigger=combo_.trigger;s.cursor=combo_.cursor;s.playing=combo_.playing;s.queued=combo_.queued.move;s.button=combo_.button;
+    s.phase=combo_.phase==ComboRun::Phase::Running?PBZ_PHASE_RUNNING:combo_.phase==ComboRun::Phase::Starting?PBZ_PHASE_STARTING:PBZ_PHASE_IDLE;
+    s.look_changing=borrow_.stage==Borrow::Stage::Going||borrow_.stage==Borrow::Stage::Returning?1:0;
+    s.visit=combo_.visit;s.generation=combo_.generation;
+    s.move_started_ms=combo_.playing>=0?combo_.started:0;s.reset_at_ms=combo_.phase==ComboRun::Phase::Idle?combo_.reset_at:0;
+    strncpy_s(s.table,ComboProfile(),_TRUNCATE);strncpy_s(s.look,PluginLook().c_str(),_TRUNCATE);
+    return true;
+}
+// get_hero: read at most once a frame (the nearest enemy is a search).
+uint64_t plugin_hero_frame_=0,plugin_frame_=0;PbzHeroFacts plugin_hero_{};
+bool PluginHero(PbzHeroFacts& f){
+    if(plugin_hero_frame_==plugin_frame_&&plugin_hero_.size){const uint32_t size=f.size;f=plugin_hero_;f.size=size;return f.valid!=0;}
+    PbzHeroFacts out{};out.size=sizeof(out);
+    Context context;
+    if(ContextNow(context)&&ue::Alive(context.pawn)){
+        out.valid=1;PluginHealth(context.pawn,out.health,out.health_max);out.airborne=Airborne(context.pawn)?1:0;
+        Vector self{};{Call where(context.pawn,"K2_GetActorLocation");if(where.Invoke()){self=where.Get<Vector>("ReturnValue");out.x=self.x;out.y=self.y;out.z=self.z;}}
+        unsigned char lock[16]{};Object* enemy=nullptr;const bool locked=HeroLockTarget(lock,enemy);
+        if(ue::Alive(enemy)){
+            Call where(enemy,"K2_GetActorLocation");
+            if(where.Invoke()){const Vector p=where.Get<Vector>("ReturnValue");out.has_target=1;out.target_locked=locked?1:0;
+                out.target_distance=static_cast<float>(std::sqrt((p.x-self.x)*(p.x-self.x)+(p.y-self.y)*(p.y-self.y)+(p.z-self.z)*(p.z-self.z)));
+                PluginHealth(enemy,out.target_health,out.target_health_max);}
+        }
+        std::string weapon;if(WeaponPresets::CurrentMainWeaponId(weapon))strncpy_s(out.weapon,weapon.c_str(),_TRUNCATE);
+        strncpy_s(out.look,PluginLook().c_str(),_TRUNCATE);
+    }
+    plugin_hero_=out;plugin_hero_frame_=plugin_frame_;
+    const uint32_t size=f.size;f=out;f.size=size;return out.valid!=0;
+}
+bool PluginPress(int button,const char* source){
+    if(!ComboReady()||!Same(ChainPawn())){Logf("NPC_COMBO plugin press %s button=%d: no chain now",source,button);return false;}
+    NpcCombo::Press press;
+    if(button==static_cast<int>(NpcCombo::Trigger::NpcKey))press.key=true;else press.bits=1u<<button;
+    if(button==static_cast<int>(NpcCombo::Trigger::Execution)){std::string id;if(WeaponPresets::CurrentMainWeaponId(id))press.weapon=id;}
+    const bool taken=PressCombo(press,source);
+    Logf("NPC_COMBO plugin press %s button=%d -> %s",source,button,taken?"taken":"not taken");
+    return taken;
+}
+// play_node: move node `node` now (the move playing is cut, no 派生点 waited for); with no chain going on, one starts
+// at the start whose wires reach it.
+bool PluginPlay(int node,int button){
+    if(!ComboReady()||!Same(ChainPawn()))return false;
+    const NpcCombo::Node* n=ComboNode(node);if(!n||!NpcCombo::IsMove(*n))return false;
+    const ULONGLONG now=GetTickCount64();
+    if(combo_.trigger<0){
+        const int start=NpcCombo::TriggerOf(combo_.config,static_cast<size_t>(node));const NpcCombo::Node* t=ComboNode(start);if(!t)return false;
+        ResetCombo("plugin-play",L"");
+        combo_.trigger=start;combo_.cursor=start;combo_.button=button>=0?button:t->trigger;combo_.reset_ms=NpcCombo::ClampReset(t->ms);
+        ++combo_.visit;combo_.path_clock.Reset();combo_.ended_at=0;combo_.row_branch=-1;combo_.row_row=-1;
+        PluginEvent(PBZ_EVENT_CHAIN_START,start,"plugin-play");
+    }
+    NpcCombo::Hop hop;hop.move=node;hop.button=button>=0?button:combo_.button;
+    Logf("NPC_COMBO plugin play node=%d button=%d trigger=%d",node,hop.button,combo_.trigger);
+    PlayHop(hop,now);return true;
+}
+void PluginReset(const char* reason){
+    if(combo_.trigger<0)return;
+    Logf("NPC_COMBO plugin reset %s",reason);
+    ResetCombo(reason,L"派生链停止：插件结束了派生链");
+}
+bool PluginCancel(int32_t handle){
+    Context context;if(!ContextNow(context)||!ue::Alive(context.pawn))return false;
+    const bool cancelled=CancelSpec(PawnAsc(context.pawn),handle);
+    Logf("NPC_COMBO plugin cancel ability handle=%d -> %d",handle,cancelled?1:0);
+    return cancelled;
+}
+bool PluginWatched(int code){return std::find(raw_.watched.begin(),raw_.watched.end(),code)!=raw_.watched.end();}
+void PluginLog(const char* text){Logf("%s",text);}
+void PluginNotice(const wchar_t* title,const wchar_t* detail){SkillToast::Show(title?title:L"",detail?detail:L"");}
+// "Default__GA_Hun_Young_Air_A_C" / "GA_Hun_Young_Air_A_C_3" -> "GA_Hun_Young_Air_A".
+std::string PluginAbilityName(Object* ability){
+    std::string name=Text(ability);const size_t dot=name.find_last_of("./");if(dot!=std::string::npos)name=name.substr(dot+1);
+    if(name.rfind("Default__",0)==0)name=name.substr(9);
+    const size_t c=name.rfind("_C");
+    if(c!=std::string::npos&&c+2<=name.size()&&(c+2==name.size()||(name[c+2]=='_'&&name.find_first_not_of("0123456789",c+3)==std::string::npos)))name.resize(c);
+    return name;
+}
+// on_hero_ability: each hero ability as it starts (one not active the frame before); a plugin's PBZ_CONSUME cancels it.
+std::vector<int32_t> plugin_seen_;bool plugin_seen_set_=false;
+void DrivePluginAbilities(){
+    if(!ComboPlugins::WantsAbilities()){plugin_seen_.clear();plugin_seen_set_=false;return;}
+    Context context;if(!ContextNow(context)||!ue::Alive(context.pawn)){plugin_seen_.clear();plugin_seen_set_=false;return;}
+    Object* asc=PawnAsc(context.pawn);if(!ue::Alive(asc))return;
+    Object* type=Class("/Script/GameplayAbilities.GameplayAbilitySpec"),*container=Class("/Script/GameplayAbilities.GameplayAbilitySpecContainer");
+    const int32_t specs=Offset(asc,"ActivatableAbilities"),items=container?ue::Offset(container,"Items"):-1,size=type?ue::StructSize(type):0,
+        handle_at=type?ue::Offset(type,"Handle"):-1,ability_at=type?ue::Offset(type,"Ability"):-1,count_at=type?ue::Offset(type,"ActiveCount"):-1;
+    if(specs<0||items<0||size<=0||handle_at<0||ability_at<0||count_at<0)return;
+    const Array array=ue::At<Array>(asc,specs+items);
+    if(array.num<0||array.num>4096||array.max<array.num||(array.num&&!FaceReadable(array.data,static_cast<size_t>(array.num)*static_cast<size_t>(size))))return;
+    std::vector<int32_t> running;std::vector<std::pair<int32_t,Object*>> started;
+    for(int32_t i=0;i<array.num;++i){Object* row=static_cast<Object*>(array.data)+static_cast<size_t>(i)*static_cast<size_t>(size);
+        if(!ue::At<uint8_t>(row,count_at))continue;
+        const int32_t handle=ue::At<int32_t>(row,handle_at);running.push_back(handle);
+        if(plugin_seen_set_&&std::find(plugin_seen_.begin(),plugin_seen_.end(),handle)==plugin_seen_.end())started.push_back({handle,ue::At<Object*>(row,ability_at)});}
+    const bool first=!plugin_seen_set_;plugin_seen_=std::move(running);plugin_seen_set_=true;
+    if(first)return;  // what was active before the plugins listened is no start
+    for(const auto& [handle,ability]:started){  // read first: a cancel may change the spec array
+        const std::string name=PluginAbilityName(ability);
+        PbzAbilityEvent e{};e.size=sizeof(e);e.name=name.c_str();e.bits=AbilityActionBits(ability);e.handle=handle;
+        e.chain_own=(skill_.handle>0&&handle==skill_.handle)||(pending_.handle>0&&handle==pending_.handle)?1:0;e.now_ms=GetTickCount64();
+        if(ComboPlugins::HeroAbility(e)!=PBZ_CONSUME)continue;
+        const bool cancelled=CancelSpec(asc,handle);
+        Logf("NPC_COMBO plugin consumed hero %s bits=0x%x handle=%d cancelled=%d",name.c_str(),e.bits,handle,cancelled?1:0);
+    }
+}
+// Once a frame before the chain: the look and the chain's tables as events, then the plugins' frame and their hero
+// ability hook.
+std::string plugin_look_;uint64_t plugin_generation_=0;int32_t plugin_owner_=-3;
+void DrivePlugins(){
+    ++plugin_frame_;
+    const ULONGLONG now=GetTickCount64();
+    if(ComboPlugins::Listening()){
+        const std::string look=PluginLook();
+        if(look!=plugin_look_){if(!plugin_look_.empty())PluginEvent(PBZ_EVENT_LOOK,-1,look.c_str());plugin_look_=look;}
+        if(combo_.generation!=plugin_generation_||combo_.owner!=plugin_owner_){
+            if(plugin_owner_!=-3)PluginEvent(PBZ_EVENT_TABLES,-1,ComboProfile());
+            plugin_generation_=combo_.generation;plugin_owner_=combo_.owner;}
+    }
+    ComboPlugins::Frame(now);
+    DrivePluginAbilities();
+}
+}  // namespace
+
 void Tick() {
     if (!initialized_) return;
     ChainFrame chain_frame;
@@ -11407,18 +11880,20 @@ void Tick() {
         if (ready) held = PressOrHold(press, "test", HoldKind::Hero, press.bits);
         Logf("NPC_TEST press bits=0x%lx hold=%ldms ready=%d waiting=%d taken=%d owner=%d", bits, hold, ready ? 1 : 0, held.waiting ? 1 : 0, held.taken ? 1 : 0, combo_.owner);
     }
+    if (InterlockedExchange(&loco_probe_, 0)) LogLocoStatus();
+    {bool probe=false;AcquireSRWLockShared(&bone_probe_lock_);probe=!bone_probe_.empty();ReleaseSRWLockShared(&bone_probe_lock_);if(probe)LogBoneProbe();}
     if (InterlockedExchange(&resource_probe_, 0))
         Logf("NPC_TEST resources has=%d active=%d skill=%d(bare %d owned %d) pending=%d(bare %d) skillPins=%zu barePins=%zu weapons=%zu hidden=%zu bareWeapons=%d colliders=%zu standIns=%zu voice=%zu comboOwner=%d",
              HasResources() ? 1 : 0, active_ ? 1 : 0, skill_.handle, skill_.bare ? 1 : 0, skill_.owned ? 1 : 0, pending_.handle, pending_.bare ? 1 : 0, skill_pins_.size(), bare_pins_.size(),
              skill_weapons_.size(), hidden_weapons_.size(), bare_weapons_ ? 1 : 0, skill_colliders_.size(), stand_ins_.size(), voice_slots_.size(), combo_.owner);
     Timed(kPartSkill, [&] {
-        if (active_) { RetryPendingSkill(); HoldSkillLock(); HoldForeignMontage(); DriveMount(); } // every frame
+        if (active_) { RetryPendingSkill(); HoldSkillLock(); HoldForeignMontage(); DrivePuppet(); } // every frame
         else if (pending_.owned || pending_.bare) RetryPendingSkill();  // the hero's own chain move, or a bare boss move (不变身)
         if (!active_ || own_retarget_.skeleton.object) HoldOwnRetarget();  // 不变身: another skeleton's montage on the hero's own body
         if (!active_ && (skill_.owned || skill_.bare)) WatchSkill();  // and its end, also after the chain stopped (no look watches it then)
         if (!active_ && bare_weapons_) { if (skill_.handle > 0 || pending_.handle > 0) HoldBareWeapons(ChainPawn().object); else RemoveSkillWeapons("bare-move-gone"); }
     });
-    Timed(kPartLooks, [&] { DriveBlink(); DriveGrabBodies(); DriveBorrow(); DriveWeapon(); DriveTeleport(); DriveHookProbe(); DriveHookClose(); DriveHookAnchor(); DriveAir(); DriveViewFollow(); DriveViewProbe(); DriveTagDump(); DriveAbilityProbe(); DriveTimelineWatch(); PublishChain(); });
+    Timed(kPartLooks, [&] { DriveBody(); DriveBlink(); DriveGrabBodies(); DriveBorrow(); DriveWeapon(); DriveTeleport(); DriveHookProbe(); DriveHookClose(); DriveHookAnchor(); DriveAir(); DriveViewFollow(); DriveViewProbe(); DriveTagDump(); DriveAbilityProbe(); DriveTimelineWatch(); PublishChain(); });
     if (const LONG asked = InterlockedExchange(&cam_offset_test_, 0)) {  // tests: npcretarget camoffset x y z | off
         Context c; Object* camera = ContextNow(c) ? HeroCamera(c.pawn) : nullptr;
         const Vector offset = asked == 2 ? Vector{} : cam_offset_value_;
@@ -11427,7 +11902,8 @@ void Tick() {
     }
     if (InterlockedExchange(&lock_struct_probe_, 0)) { Context c; if (ContextNow(c)) ProbeLockStruct(c.pawn); }
     // every frame; all stop once the skin is off
-    Timed(kPartCombo, [&] { DriveCombo(); }); Timed(kPartKeys, [&] { DriveRawKeys(); DriveHold(); }); Timed(kPartInput, [&] { DriveHeroInput(); });
+    DrivePlugins();  // 派生插件: before the chain, so their presses and signals are read this frame
+    Timed(kPartCombo, [&] { DriveCombo(); DriveHeroSize(); }); Timed(kPartKeys, [&] { DriveRawKeys(); DriveHold(); }); Timed(kPartInput, [&] { DriveHeroInput(); });
     Timed(kPartTriggers, [&] { DriveHeroTriggers(); DriveOwnAir(); }); Timed(kPartComboKeys, [&] { DriveComboKeys(); PublishChainPosition(); });
     Timed(kPartDamage, [&] { ScaleSkillDamage(); DriveAssistEffects(); DriveBossCalls(); HoldNoExecution(); DriveSlomo(); DriveChainFx(); }); // every frame; all close what they hold once the skin is off
     }
@@ -11578,12 +12054,19 @@ void Initialize(Logger logger, ReleaseAppearance release_appearance) {
     logger_ = logger; release_appearance_ = release_appearance;
     InterlockedExchange(&perf_enabled_,0);Snapshot state;
     NpcCombo::SetLogger(logger); NpcCombo::StartWatcher();  // .combo files: migration, live reload
+    {  // 派生插件 (off until the page's 派生插件 is on: nothing loads before)
+        ComboPlugins::Bridge bridge;
+        bridge.config=&PluginConfig;bridge.state=&PluginState;bridge.hero=&PluginHero;bridge.press=&PluginPress;bridge.reset=&PluginReset;
+        bridge.cancel=&PluginCancel;bridge.watched=&PluginWatched;bridge.trigger=&PluginTrigger;bridge.play=&PluginPlay;
+        ComboPlugins::Initialize(bridge,&PluginLog,&PluginNotice);
+    }
     state.appearance_gate = release_appearance_ != nullptr;
     for (size_t i = 0; i < std::size(kProfiles); ++i) state.entries.push_back({static_cast<int32_t>(i), kProfiles[i].id, kProfiles[i].name, kProfiles[i].detail});
     AcquireSRWLockExclusive(&snapshot_lock); snapshot_ = std::move(state); ReleaseSRWLockExclusive(&snapshot_lock);
     const float damage = SettingsStore::GetFloat(kSkillSection, L"DamageMultiplier", kSkillDamageDefault);
     skill_damage_.store(std::isfinite(damage) ? std::clamp(damage, kSkillDamageMin, kSkillDamageMax) : kSkillDamageDefault, std::memory_order_relaxed);
-    initialized_ = true; Logf("NPC_RETARGET initialized profiles=%zu native AnimationRelative skillDamage=x%.2f", std::size(kProfiles), skill_damage_.load(std::memory_order_relaxed));
+    boss_loco_.store(SettingsStore::GetBool(kRetargetSection, L"BossLocomotion", false), std::memory_order_relaxed);
+    initialized_ = true; Logf("NPC_RETARGET initialized profiles=%zu native AnimationRelative skillDamage=x%.2f bossLocomotion=%d", std::size(kProfiles), skill_damage_.load(std::memory_order_relaxed), boss_loco_.load(std::memory_order_relaxed) ? 1 : 0);
 }
 bool Request(Action action, int32_t entry) {
     if (action == Action::Apply && !InterlockedCompareExchange(&experimental_, 0, 0)) return false;
@@ -11605,6 +12088,11 @@ bool SetSkillDamageMultiplier(float multiplier) {
     const float value = std::clamp(multiplier, kSkillDamageMin, kSkillDamageMax);
     if (value == skill_damage_.exchange(value, std::memory_order_relaxed)) return true;
     SettingsStore::PutFloat(kSkillSection, L"DamageMultiplier", value); Logf("NPC_SKILL damage multiplier x%.2f", value); return true;
+}
+bool BossLocomotion() { return boss_loco_.load(std::memory_order_relaxed); }
+void SetBossLocomotion(bool enabled) {
+    if (enabled == boss_loco_.exchange(enabled, std::memory_order_relaxed)) return;
+    SettingsStore::PutBool(kRetargetSection, L"BossLocomotion", enabled); Logf("NPC_LOCO boss locomotion option %s", enabled ? "on" : "off");
 }
 // The NPC skill key, with or without a look: a look's chain / random round, or the hero's own chain (its 按键 node).
 bool CancelAbilitySpec(ue::Object* asc, int32_t handle) { return CancelSpec(asc, handle); }
@@ -11977,6 +12465,16 @@ bool HandleCommand(const char* verb, const char* arguments) {
         const NpcSkillSet& set = kNpcSkillSets[static_cast<size_t>(skin)];
         if (!set.monster || !*set.monster || skill < 1 || static_cast<size_t>(skill) > set.skill_count) return false;
         BossAssist::Request(set.monster, set.skills[static_cast<size_t>(skill - 1)], BossAssist::Mods{}, mode == "near"); return true;
+    }
+    if (action == "loco") {  // npcretarget loco on|off|status: the boss locomotion option (BOSS 自带移动动画); status logs the puppet
+        if (id == "on" || id == "off") { SetBossLocomotion(id == "on"); return true; }
+        if (id == "status") { InterlockedExchange(&loco_probe_, 1); return true; }
+        return false;
+    }
+    if (action == "boneprobe") {  // tests: npcretarget boneprobe <bone> [bone...]: display bone heights over the feet
+        std::vector<std::string> names; for (std::string name = id; !name.empty() && names.size() < 16; name.clear(), input >> name) names.push_back(name);
+        if (names.empty()) return false;
+        AcquireSRWLockExclusive(&bone_probe_lock_); bone_probe_ = std::move(names); ReleaseSRWLockExclusive(&bone_probe_lock_); return true;
     }
     if (action == "damage") { char* end = nullptr; const float value = std::strtof(id.c_str(), &end); return !id.empty() && end && !*end && SetSkillDamageMultiplier(value); }
     if (action == "status") { const Snapshot state = GetSnapshot(); Logf("NPC_RETARGET_STATUS %s", Utf8(state.status.c_str()).c_str()); return true; }

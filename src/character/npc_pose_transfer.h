@@ -63,16 +63,19 @@ struct Plan {
     // Empty, or a bone without them: kScaled, as long as the display rest (built like the display mesh).
     std::vector<uint8_t> own_mode; std::vector<double> own_length;
     // Pose puppet (SetPuppet): the target mesh playing the target's own animation. puppet_always: raw
-    // target bones that always take its pose (a mount, the rider's pelvis and legs); every other raw
-    // bone but the root takes it by the own-montage weight. extra_source: per target bone, a source slot
-    // no target bone maps, carrying that bone's pose through the source-shaped pose (synthetic_source),
-    // else -1; extra_order lists those bones by slot. All empty = no puppet.
-    std::vector<uint8_t> puppet_always; std::vector<int32_t> extra_source,extra_order;
+    // target bones that always take its pose (a mount, the rider's pelvis and legs, bones the source has
+    // none of); every other raw bone but the root takes it by PuppetPose::body and, when puppet_own, by
+    // the own-montage weight. extra_source: per target bone, a source slot no target bone maps, carrying
+    // that bone's pose through the source-shaped pose (synthetic_source), else -1; extra_order lists those
+    // bones by slot. All empty = no puppet. extra_mesh: the CopyPose copies component space (a slot then
+    // holds the bone's component-space transform, not its local on the slot's source parent).
+    std::vector<uint8_t> puppet_always; std::vector<int32_t> extra_source,extra_order; bool puppet_own=true,extra_mesh=false;
 };
 enum : uint8_t { kScaled = 0, kAnimation = 1, kSkeleton = 2 };
 // The puppet's current component-space pose (target bone order). serial changes with the animation it
 // plays; the target crossfades from its last puppet pose over kPuppetBlendMs (now_ms is that clock).
-struct PuppetPose { const Transform* cs=nullptr;size_t count=0;uint32_t serial=0;uint64_t now_ms=0; };
+// body: how much of every raw bone but the root takes the puppet's pose (0..1; the target's own locomotion).
+struct PuppetPose { const Transform* cs=nullptr;size_t count=0;uint32_t serial=0;uint64_t now_ms=0;double body=0; };
 constexpr uint64_t kPuppetBlendMs=200;
 struct Cache {
     std::vector<Transform> snapshot,target_cs,synthetic_source,source_local,target_local;std::vector<uint8_t> moved;
@@ -81,6 +84,7 @@ struct Cache {
     // bone the turn the puppet added above the source-driven pose (rotates the retarget-pose turns).
     std::vector<Transform> puppet_last,puppet_from,puppet_snapshot;std::vector<std::array<double,4>> shift;
     uint32_t puppet_serial=0;uint64_t puppet_switch_ms=0,puppet_builds=0;bool puppet_seen=false,puppet_used=false,puppet_faded=false;
+    double puppet_body=0; // PuppetPose::body of the pose last built (0 without a puppet)
 };
 inline bool ReferenceCS(const std::vector<Bone>& bones,std::vector<Transform>& out,std::string& why) {
     if(bones.empty()||bones.size()>2048){why="reference-count";return false;}out.resize(bones.size());
@@ -111,7 +115,7 @@ inline bool Build(Plan& plan,std::vector<Bone> source,std::vector<Bone> target,c
 inline int32_t BoneNamed(const std::vector<Bone>& bones,uint64_t name){for(size_t i=0;i<bones.size();++i)if(bones[i].name==name)return static_cast<int32_t>(i);return -1;}
 inline void Prepare(const Plan& plan,Cache& cache){cache.snapshot.resize(plan.source.size());cache.synthetic_source.resize(plan.source.size());cache.source_local.resize(plan.source.size());cache.target_cs.resize(plan.target.size());cache.target_local.resize(plan.target.size());cache.moved.assign(plan.target.size(),0);cache.ready=false;cache.builds=cache.hits=cache.contacts=cache.grip_rejected=0;cache.contact_weight=cache.contact_error_max=cache.foreign=0;cache.own=false;
     const size_t puppet=plan.puppet_always.size()==plan.target.size()?plan.target.size():0;cache.puppet_last.assign(puppet,Transform{});cache.puppet_from.assign(puppet,Transform{});cache.puppet_snapshot.assign(puppet,Transform{});
-    cache.shift.assign(puppet,{0,0,0,1});cache.puppet_serial=0;cache.puppet_switch_ms=cache.puppet_builds=0;cache.puppet_seen=cache.puppet_used=cache.puppet_faded=false;}
+    cache.shift.assign(puppet,{0,0,0,1});cache.puppet_serial=0;cache.puppet_switch_ms=cache.puppet_builds=0;cache.puppet_seen=cache.puppet_used=cache.puppet_faded=false;cache.puppet_body=0;}
 // Pose puppet. always: per target bone, 1 = always takes the puppet's pose (raw non-root bones only).
 // Unmapped raw bones get the source's unmapped slots (never the root's), always-bones first, in bone
 // order, while slots last; assigned / wanted report how many. Call after Build, before Prepare.
@@ -215,8 +219,8 @@ inline bool SolveHandContact(const Plan& plan,const Transform* source,Cache& cac
     const double offset[3]={sl[0]-sr[0],sl[1]-sr[1],sl[2]-sr[2]},distance=std::sqrt(Dot(offset,offset));
     if(!std::isfinite(distance)||distance>=k.none_cm)return true;
     double weight=Fade(distance,k.full_cm,k.none_cm);
-    // The target's own montage keeps its own hands: its key already holds the weapon.
-    if(cache.own)weight*=1-cache.foreign;if(!(weight>0))return true;
+    // The target's own montage keeps its own hands: its key already holds the weapon; so does its own locomotion.
+    if(cache.own)weight*=1-cache.foreign;weight*=1-cache.puppet_body;if(!(weight>0))return true;
     if(k.source_weapon_r>=0){Transform grip;if(!NpcGripMath::ComposeMount(k.grip_l,source[static_cast<size_t>(k.source_hand_l)],grip))return true;
         const Transform& weapon=source[static_cast<size_t>(k.source_weapon_r)];const double up[3]={0,0,1};double axis_r[3],axis_l[3],off[3];
         NpcGripMath::Rotate(weapon.rotation,up,axis_r);NpcGripMath::Rotate(grip.rotation,up,axis_l);
@@ -344,9 +348,10 @@ inline void Blend(const Transform& a,const Transform& b,double w,Transform& out)
 }
 }
 // puppet (Plan::puppet_always set): always-bones take the puppet's local pose (its root-relative pose,
-// crossfaded over kPuppetBlendMs when its animation changes), other raw bones but the root by the
-// own-montage weight. Bones above which the puppet turned the body keep the retarget-pose turns relative
-// to it (Cache::shift). Unmapped bones on a spare slot (Plan::extra_source) reach the CopyPose through it.
+// crossfaded over kPuppetBlendMs when its animation changes), other raw bones but the root by
+// PuppetPose::body or, on a puppet_own plan, the own-montage weight, whichever is more. Bones above which
+// the puppet turned the body keep the retarget-pose turns relative to it (Cache::shift). Unmapped bones
+// on a spare slot (Plan::extra_source) reach the CopyPose through it.
 inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache& cache,const char*& why,double foreign=0,bool own=false,const PuppetPose* puppet=nullptr) {
     if(!source||count!=plan.source.size()||cache.snapshot.size()!=count||cache.target_cs.size()!=plan.target.size()){why="pose-count/epoch";return false;}
     foreign=std::isfinite(foreign)?std::clamp(foreign,0.0,1.0):0.0;own=own&&foreign>0;const size_t n=plan.target.size();
@@ -359,10 +364,11 @@ inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache
         if(cache.puppet_switch_ms){const uint64_t age=puppet->now_ms>cache.puppet_switch_ms?puppet->now_ms-cache.puppet_switch_ms:0;
             if(age>=kPuppetBlendMs)cache.puppet_switch_ms=0;else fade=static_cast<double>(age)/static_cast<double>(kPuppetBlendMs);}}
     else cache.puppet_seen=false;
+    const double body=puppeted&&std::isfinite(puppet->body)?std::clamp(puppet->body,0.0,1.0):0.0;
     const bool puppet_same=!puppeted||(fade>=1&&cache.puppet_used&&!cache.puppet_faded&&!std::memcmp(puppet->cs,cache.puppet_snapshot.data(),n*sizeof(Transform)));
-    if(cache.ready&&cache.foreign==foreign&&cache.own==own&&cache.puppet_used==puppeted&&puppet_same&&!std::memcmp(source,cache.snapshot.data(),count*sizeof(Transform))){++cache.hits;return true;}
-    cache.ready=false;cache.foreign=foreign;cache.own=own;cache.puppet_used=false;const bool keeps=plan.foreign_keep.size()==n;
-    const auto puppet_weight=[&](size_t t){return puppeted&&t>0&&t<plan.target_raw?(plan.puppet_always[t]?1.0:own?foreign:0.0):0.0;};
+    if(cache.ready&&cache.foreign==foreign&&cache.own==own&&cache.puppet_used==puppeted&&cache.puppet_body==body&&puppet_same&&!std::memcmp(source,cache.snapshot.data(),count*sizeof(Transform))){++cache.hits;return true;}
+    cache.ready=false;cache.foreign=foreign;cache.own=own;cache.puppet_used=false;cache.puppet_body=body;const bool keeps=plan.foreign_keep.size()==n;
+    const auto puppet_weight=[&](size_t t){return puppeted&&t>0&&t<plan.target_raw?(plan.puppet_always[t]?1.0:(std::max)(plan.puppet_own&&own?foreign:0.0,body)):0.0;};
     // All storage is prepared before the session. This path allocates nothing
     // and never edits source or an engine pose array.
     for(size_t s=0;s<count;++s){if(plan.source_to_target[s]<0)continue;const int32_t p=plan.source[s].parent;if(!NpcGripMath::FiniteMount(source[s])){why="source-pose-invalid";return false;}for(size_t axis=0;axis<3;++axis)if(source[s].scale[axis]<0){why="shared-negative-scale-native-matrix-required";return false;}
@@ -411,9 +417,12 @@ inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache
         else if(p>=0&&cache.moved[static_cast<size_t>(p)]){if(!NpcGripMath::ComposeMount(cache.target_local[t],cache.target_cs[static_cast<size_t>(p)],cache.target_cs[t])){why="ik-follow-child-invalid";return false;}cache.moved[t]=1;}}
     std::memcpy(cache.synthetic_source.data(),source,count*sizeof(Transform));
     for(size_t s=0;s<count;++s)if(plan.source_to_target[s]>=0)cache.synthetic_source[s]=cache.target_cs[static_cast<size_t>(plan.source_to_target[s])];
-    // A spare slot's CopyPose local is the slot relative to its source parent's slot (parents first).
+    // A spare slot's CopyPose local is the slot relative to its source parent's slot (parents first); a
+    // component-space CopyPose (Plan::extra_mesh) copies the slot as the bone's component-space transform.
     if(plan.extra_source.size()==n)for(const int32_t t:plan.extra_order){const size_t s=static_cast<size_t>(plan.extra_source[static_cast<size_t>(t)]);const int32_t ps=plan.source[s].parent;
-        if(s>=count||ps<0||!NpcGripMath::ComposeMount(cache.target_local[static_cast<size_t>(t)],cache.synthetic_source[static_cast<size_t>(ps)],cache.synthetic_source[s])){why="extra-slot-compose-invalid";return false;}}
+        if(s>=count||ps<0){why="extra-slot-compose-invalid";return false;}
+        if(plan.extra_mesh){cache.synthetic_source[s]=cache.target_cs[static_cast<size_t>(t)];continue;}
+        if(!NpcGripMath::ComposeMount(cache.target_local[static_cast<size_t>(t)],cache.synthetic_source[static_cast<size_t>(ps)],cache.synthetic_source[s])){why="extra-slot-compose-invalid";return false;}}
     if(puppeted){std::memcpy(cache.puppet_snapshot.data(),puppet->cs,n*sizeof(Transform));cache.puppet_used=true;cache.puppet_faded=fade<1;++cache.puppet_builds;}
     std::memcpy(cache.snapshot.data(),source,count*sizeof(Transform));cache.ready=true;++cache.builds;why="ok";return true;
 }

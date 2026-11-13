@@ -30,6 +30,8 @@ build/
 build_*/
 dist/
 local/
+# Third-party source drops (OthersChange: an older build someone else edited) are read, never published.
+OthersChange/
 
 # Player files stay private. The maintainer explicitly publishes this named example only.
 combos/
@@ -45,4 +47,20 @@ combos/
 !docs/WEAPON_DERIVATIONS.md
 !THIRD_PARTY_NOTICES.md
 !licenses/UUEPBS-LICENSE-STATUS.txt
+# 身材 / 骨骼: the UUEPBS editor and Dear ImGui sources, their notices, and UUEPBS's own three example presets (no animations).
+!src/uuepbs/**/*.hpp
+!src/uuepbs/**/*.inc
+!src/uuepbs/README.md
+!licenses/DearImGui-LICENSE.txt
+!samples/UUEPBS Presets/*.json
 !docs/SOFT_BONES.md
+!docs/PLUGIN_API.md
+!docs/AGENT_PLUGIN_GUIDE.md
+!sdk/samples/CMakeLists.txt
+!sdk/samples/weapon_actions/pbz_weapon_actions.txt
+# 派生插件 Lua scripts (interface revision 3): Lua 5.4.7's C sources, lua.hpp, its licence, and the sample scripts.
+!src/third_party/lua/src/*.c
+!src/third_party/lua/include/*.hpp
+!src/third_party/lua/LICENSE
+!licenses/Lua-LICENSE.txt
+!sdk/samples/lua/*.lua
