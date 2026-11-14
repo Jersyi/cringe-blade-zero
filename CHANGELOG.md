@@ -1,5 +1,17 @@
 ﻿# 更新日志
 
+## 2026-11-14 · 项目架构文档和 MIT 许可
+
+用户要求：“更新项目架构 方便其他Agent理解 然后更新license为MIT”。
+
+- 新增 `docs/ARCHITECTURE.md`：构建产物和源文件分组、目录地图、工作线程与游戏线程（`DispatchGameThread` 的模块顺序）、反射访问、命令文件与日志、设置文件、F10 面板与双语、招式派生的四层与存档兼容规则、插件宿主与 Lua 的分层、身材 / 骨骼的文件分工、生成数据、编码约定、哪些测试能无人值守跑、打包与发布、文档索引。内容来自本地交接文档，去掉了本机路径和个人规则，并按当前代码核对过（例如属性读写是 `ue::Offset` + `ue::At<T>`，项目是 C++17）。
+- 新增根目录 `AGENTS.md`（给 AI 助手和新开发者的入口：按任务该读哪份文档、11 条硬规则、编译和测试命令、改完以后要同步什么）和 `CLAUDE.md`（只有一行 `@AGENTS.md`）。
+- 新增 `LICENSE`：MIT，Copyright (c) 2026 Jersyi。MIT 只管本项目自己的代码和文档；`THIRD_PARTY_NOTICES.md` 新开头一节写明不在范围内的部分：Dear ImGui、Lua、stb_image 保留各自的许可；UUEPBS（`src/uuepbs/`、示例预设，以及贡献者桥接代码里照搬 UUEPBS 的部分）许可状态仍未明确，不因此改成 MIT；`src/generated/` 里取自游戏的图标、字体子集和数据表归原权利人所有。
+- `README.md`：加 MIT 徽章；“项目结构”补上 `uuepbs/`、`third_party/`、`net/`、Lua 宿主、`samples/`、`licenses/`，并链接架构文档和 `AGENTS.md`；“开发文档”加这两份和插件上手指南；新增“许可”一节。
+- `build.ps1`：安装包带上 `LICENSE`，`README.txt` 的说明里加一行许可。现有发行版 v20261113-48f2ba5 的安装包没有重新打，下一版起带 `LICENSE`。
+- `.gitignore` 放行 `LICENSE`、`AGENTS.md`、`CLAUDE.md`、`docs/ARCHITECTURE.md`。
+- 只改文档和打包清单，没有改代码，没有重新编译，也没有动游戏目录。
+
 ## 2026-11-13 · 安装包的 UUEPBS 预设只带 GitHub 上的三个示例
 
 用户要求：“打包里UUEPBS Presets只包含Github上的Preset即可 当前的perset是别人调的”。

@@ -64,3 +64,8 @@ combos/
 !src/third_party/lua/LICENSE
 !licenses/Lua-LICENSE.txt
 !sdk/samples/lua/*.lua
+# Project licence (MIT) and the entry points for agents (AGENTS.md, CLAUDE.md imports it) and the architecture doc.
+!LICENSE
+!AGENTS.md
+!CLAUDE.md
+!docs/ARCHITECTURE.md

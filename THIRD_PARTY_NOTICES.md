@@ -1,5 +1,14 @@
 # References and third-party notices
 
+## This project
+
+Since 2026-11-14 this project's own code and documentation are released under the MIT License: see `LICENSE` (Copyright (c) 2026 Jersyi). The MIT License of this project does not cover, and does not relicense:
+
+- `src/third_party/` (Dear ImGui, Lua) and `src/uuepbs/third_party/` (stb_image): each keeps its own license, listed below;
+- UUEPBS: `src/uuepbs/` and `samples/UUEPBS Presets/`, whose license status is unresolved (below). The parts of the contributor's bridge (`src/character/npc_body*`, `npc_bridge.*`, `npc_anim.*`) that reproduce UUEPBS code, data formats or tables carry the same status as UUEPBS;
+- `src/generated/`: the icons, font subsets and data tables taken from the game's files, and the images built from them, belong to their rights holders;
+- the game itself, its executables and its assets, which this repository does not contain.
+
 ## UUEPBS — XTGMods
 
 Project: https://github.com/XTGMods/UUEPBS

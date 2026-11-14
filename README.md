@@ -12,6 +12,7 @@
 ![Language](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square)
 ![Engine](https://img.shields.io/badge/Unreal%20Engine-5-0e1128?style=flat-square)
 ![Build](https://img.shields.io/badge/build-CMake%20%2B%20MSVC-d8c292?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-3c7a3c?style=flat-square)
 
 **[⬇ 下载最新版（CringeBladeZero.zip）](https://github.com/Jersyi/cringe-blade-zero/releases/latest/download/CringeBladeZero.zip)** · [全部版本](https://github.com/Jersyi/cringe-blade-zero/releases) · [❤ Donate](#donate--支持作者)
 
@@ -218,35 +219,42 @@ cmake --build build --config Release --target version
 
 ```text
 src/
-├─ core/          DLL 入口与转发（proxy.cpp、forwarders.asm、version.def）、游戏线程钩子、UObject 反射、设置文件
+├─ core/          DLL 入口与转发（proxy.cpp、forwarders.asm、version.def）、工作线程与命令文件、游戏线程钩子、UObject 反射、exe 识别、设置文件
 ├─ ui/            面板、主题、动画、输入焦点与鼠标捕获、双语、快捷键、横幅、挡位胶囊、面板暂停、技能提示、Donate 页
-├─ boss/          Boss 连战、Boss AI、入场保护与存档保护
+├─ character/     外观重定向（姿势传递、武器适配、碰撞体、技能、坐骑代理）、招式派生、角色替换、身材 / 骨骼、骨骼变换
+├─ plugin/        派生插件宿主、Lua 脚本宿主（lua_host）、模块注册表（mod_registry）、插件 UI 页模型、各模块描述表的入口（module_apis）
+├─ boss/          Boss 连战、Boss AI、BOSS 援护、测试木桩、招式预览、入场与存档保护
 ├─ grab/          投技：原生成对激活、状态租约、Boss 武器与姿态代理、伤害
 ├─ air/           空中技能、空中闪避、JC 与奖励
 ├─ weapons/       武器预设与游戏内武器图标
-├─ character/     角色替换、NPC 外观重定向（姿势传递、武器适配、碰撞体、技能、坐骑代理）
-├─ hair/          毛发显示与 Groom
-├─ plugin/        派生插件：载入 PBZPlugins 里的 DLL、插件接口的实现、模块注册表（mod_registry）、插件 UI 页模型、各模块描述表的入口（module_apis）
-├─ supplement/    可选补充包：运行时挂载、调用原版调试蓝图、调试补充页
+├─ net/           联机测试：Steam 房间与消息、替身
 ├─ pad/           DualSense 自适应扳机；面板打开时对游戏屏蔽手柄
+├─ hair/          毛发显示与 Groom
+├─ supplement/    可选补充包：运行时挂载、调用原版调试蓝图、调试补充页
+├─ uuepbs/        UUEPBS 身材编辑器（第三方）
+├─ third_party/   Dear ImGui、Lua 5.4.7
 ├─ generated/     从游戏数据生成的表（投技目录、武器、骨骼、NPC 档案 / 技能 / 坐骑、UI 资源、导出表）
 ├─ env_check/     环境检查与修复 EnvCheck.exe
 └─ triggers_only/ 精简版 version.dll
-sdk/              派生插件 SDK：接口头文件 include/pbz_combo_api.h 与示例插件源码
-tests/            proxy / 毛发 / 游戏线程 / 扳机 / 输入焦点 / NPC 姿势 / 补充页目录测试
+sdk/              派生插件 SDK：接口头文件 include/pbz_combo_api.h、示例插件源码、示例 Lua 脚本
+tests/            单元测试与离线绘制测试（招式派生模型、存档、插件宿主、Lua、姿势传递、手柄、环境检查等）
 installer/        一键安装（Install.bat 启动 install.ps1；打包时填入 Steam 版与 WeGame 版 PBZ.exe 的大小与 SHA-256）
-docs/             编译、更新适配、独立 pak 指南，以及 README 图片
-scripts/          公开的 EXE 适配工具、空 pak 挂载入口制作工具
+samples/          示例派生文件 sampleCombo.combo、UUEPBS 自带的三个示例身材预设
+licenses/         第三方许可全文
+docs/             架构、编译、更新适配、独立 pak、插件接口、使用手册，以及 README 图片
+scripts/          公开的 EXE 适配工具、空 pak 挂载入口制作工具、手册 PDF 生成
 ```
 
-每个 `src/` 子目录都是头文件搜索路径，源码里直接写 `#include "ue_runtime.h"`。
+每个 `src/` 子目录都是头文件搜索路径，源码里直接写 `#include "ue_runtime.h"`。线程模型、各模块的分工和改动清单见 [项目架构](docs/ARCHITECTURE.md)；给 AI 助手的入口是根目录的 [AGENTS.md](AGENTS.md)。
 
 ## 开发文档
 
+- [AGENTS.md](AGENTS.md)：给 AI 助手和新开发者的入口：硬规则、命令、按任务该读哪份文档。
+- [项目架构](docs/ARCHITECTURE.md)：构建产物、目录、工作线程与游戏线程、反射访问、命令文件与日志、面板、招式派生的四层与存档兼容、插件宿主与 Lua、身材 / 骨骼、生成数据、编码约定、测试与发布。
 - [编译、测试与打包](docs/BUILD.md)：构建依赖、测试、Steam / WeGame 通用包和安装回滚。
 - [游戏更新适配](docs/GAME_UPDATES.md)：地址定位、字节核对、两端差异、资源表和验证流程。
 - [独立 pak 制作与使用](docs/PAK_WORKFLOW.md)：三件套挂载、自制资源 Cook、补充容器重组和 DLL 接入。
-- [派生插件接口手册](docs/PLUGIN_API.md)：C 接口、插件节点与信号、事件、派生表编辑、选项与设置、接口修订与特性探测、权限、模块（读写整个 MOD）、命令总线、插件 UI 页、示例插件。各模块的描述表在各自的 `*_api.cpp`（`src/character/`、`boss/`、`air/`、`grab/`、`weapons/`、`pad/`、`hair/`、`ui/`）。
+- [派生插件接口手册](docs/PLUGIN_API.md)：C 接口、插件节点与信号、事件、派生表编辑、选项与设置、接口修订与特性探测、权限、模块（读写整个 MOD）、命令总线、插件 UI 页、Lua 脚本、示例插件。写插件或脚本的上手指南见 [AGENT_PLUGIN_GUIDE.md](docs/AGENT_PLUGIN_GUIDE.md)。各模块的描述表在各自的 `*_api.cpp`（`src/character/`、`boss/`、`air/`、`grab/`、`weapons/`、`pad/`、`hair/`、`ui/`）。
 
 公开辅助工具在 `scripts/`；[资源解包密钥](docs/PAK_WORKFLOW.md#解包密钥)已记录在独立 pak 指南中。游戏 EXE、资源包及本地分析缓存不随文档上传。
 
@@ -254,10 +262,17 @@ scripts/          公开的 EXE 适配工具、空 pak 挂载入口制作工具
 
 玩家看的更新内容见 [更新内容.txt](更新内容.txt)（随安装包发布）；开发记录见 [CHANGELOG.md](CHANGELOG.md)（不进安装包）。
 
+## 许可
+
+本项目自己的代码和文档以 [MIT 许可](LICENSE) 发布，Copyright (c) 2026 Jersyi。以下内容不在 MIT 许可范围内，保留各自的条款：
+
+- `src/third_party/` 里的 Dear ImGui、Lua 和 `src/uuepbs/third_party/` 里的 stb_image：各自的许可见 `licenses/` 与 [第三方说明](THIRD_PARTY_NOTICES.md)。
+- UUEPBS（`src/uuepbs/` 与 `samples/UUEPBS Presets/`）：许可状态尚未明确，见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+- `src/generated/` 内的图标、字体子集与数据表取自游戏文件，版权归原权利人所有。
+
 ## 说明
 
 - 仅用于单机游戏，与游戏开发商无关。
-- `src/generated/` 内的图标、字体子集与数据表取自游戏文件，版权归原权利人所有。
 
 
 替身头发默认 Groom，可在联机页「替身头发」改为发片；缺少匹配 Groom 时自动回退，不影响主角的头发设置。骨骼页提供自绘搜索列表（排除表情骨骼）和实时全身骨架调试。具体说明见 [骨骼与动画预设](docs/ANIMATION_PRESETS.md)。

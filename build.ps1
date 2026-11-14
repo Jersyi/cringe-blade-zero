@@ -78,6 +78,7 @@ Donate（自愿）
   设置保存在 DLL 旁的 PBZDebugMenu.ini，日志写在 PBZDebugMenu.log。第一次启动（还没有 PBZDebugMenu.ini）时
   所有功能默认关闭，需要哪个就在面板里打开。
   这一版更新了什么、修复了什么，见同目录的 更新内容.txt。
+  MOD 本身的代码以 MIT 许可发布（见 LICENSE）；第三方代码和取自游戏的资源保留各自的条款，见 THIRD_PARTY_NOTICES.md。
   仅用于单机游戏，与游戏开发商无关。
 
 构建 $name
@@ -87,6 +88,7 @@ $files = [ordered]@{
     "$name/triggers_only/version.dll" = Join-Path $buildRoot 'triggers_only\version.dll'
     "$name/EnvCheck.exe"              = Join-Path $buildRoot 'Release\EnvCheck.exe'
     "$name/更新内容.txt"              = Join-Path $projectRoot '更新内容.txt'  # for players; CHANGELOG.md stays in the repo
+    "$name/LICENSE"                   = Join-Path $projectRoot 'LICENSE'  # MIT, this project's own code; third-party terms in THIRD_PARTY_NOTICES.md
     "$name/THIRD_PARTY_NOTICES.md"    = Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md'
     "$name/licenses/UUEPBS-LICENSE-STATUS.txt" = Join-Path $projectRoot 'licenses\UUEPBS-LICENSE-STATUS.txt'
     "$name/docs/WEAPON_DERIVATIONS.md" = Join-Path $projectRoot 'docs\WEAPON_DERIVATIONS.md'
