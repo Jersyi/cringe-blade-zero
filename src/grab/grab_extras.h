@@ -70,7 +70,10 @@ constexpr size_t kMaxWeapons = 4; // both hands, two pieces each (e.g. forearm g
 // hero_over_boss: the hero's height over the executing boss's (kGrabScales). The boss weapon is
 // scaled to the current model, skin size * hero_over_boss, and follows its hand; the models and the
 // victim keep their own size and the place the paired timeline gives them.
-void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons = nullptr, size_t weapon_count = 0, const char* move = nullptr, double hero_over_boss = 1, unsigned char* source_ability = nullptr, unsigned char* source_timeline = nullptr);
+// boss_weapon_configs: the source Boss's Main weapon configs (0: not known); a native switch with Armed=false to a config
+// the Boss lacks changes nothing, so its window does not hide the weapon.
+void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons = nullptr, size_t weapon_count = 0, const char* move = nullptr, double hero_over_boss = 1, unsigned char* source_ability = nullptr, unsigned char* source_timeline = nullptr,
+           size_t boss_weapon_configs = 0);
 void Tick();
 void Finish(bool completed);
 bool Active();
@@ -82,6 +85,22 @@ bool Posing();
 // every tick by that mesh's hand minus the hand it hangs on.
 using SkinDisplay = unsigned char* (*)(double& size);
 void SetSkinDisplay(SkinDisplay provider);
+// Game thread: with a look on the Boss's own skeleton, its weapon bones follow the grab's pose proxy (NpcRetarget::
+// DriveGrabWeapons): proxy, the look bone names the Boss's weapons hang on; returns how many bones it drives (0: not
+// applied); a null proxy stops it.
+using SkinWeapons = size_t (*)(unsigned char* proxy, const char* const* bones, size_t count);
+void SetSkinWeapons(SkinWeapons provider);
+// Any thread, diagnostics (grab looksocket auto|on|off|proxy; not saved). With a look on the Boss's own skeleton: 0 (default)
+// lets the look's weapon bones follow the Boss pose and hangs the weapon on the look's own socket (on the Boss pose's socket
+// when the look cannot); 1 hangs it on the look's own socket with its own weapon bone, 2 on the look's hand while held, 3 on
+// the Boss pose's socket all grab.
+void SetLookSocketMode(int mode);
+// Any thread, diagnostics (grab proxysync rate|predict; not saved): 1 (default) runs the pose proxy at the player's montage
+// time and play rate, 0 sets it one step ahead at rate 0 (11-08..11-15).
+void SetProxySync(int mode);
+// Any thread, diagnostics (grab weaponhide parts|actor; not saved): 1 (default) hides the hero's own weapons part by part
+// for the grab and leaves the weapon actors' own hidden flag (the game's draw / sheathe) alone; 0 hides the actors.
+void SetWeaponHideMode(int mode);
 // The executor's own grab ended: hits stop being scaled (hits landed while the
 // target is still getting up never are) and the outcome is reported.
 void SourceEnded();

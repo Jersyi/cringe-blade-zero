@@ -4,6 +4,7 @@
 #include "ue_runtime.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -21,7 +22,10 @@ Options options_;
 std::wstring result_ = L"投技附加：尚未施放";
 Logger logger_ = nullptr;
 
-struct HiddenActor { Object* actor = nullptr; ue::Name name; bool was_hidden = false; };
+// The hero's own weapons while the grab shows the Boss's (HideWeapons): each weapon actor, its own hidden flag when the
+// grab first saw it (was_hidden) and as last read (last_hidden), and its parts the grab hides.
+struct HiddenPart { Object* component = nullptr; ue::Name name; GrabWeaponVisibility::HeldPart held; bool logged = false; };
+struct HiddenActor { Object* actor = nullptr; ue::Name name; bool was_hidden = false, last_hidden = false; std::vector<HiddenPart> parts; };
 struct alignas(16) Transform { double rotation[4]{0, 0, 0, 1}, translation[4]{}, scale[4]{1, 1, 1, 0}; };
 struct Vector { double x = 0, y = 0, z = 0; };
 struct Rotator { double pitch = 0, yaw = 0, roll = 0; };
@@ -38,9 +42,13 @@ struct Display {
     Transform last_grip; bool has_grip = false;
     // As the boss's own weapon actor hangs: its socket on the boss skeleton, the mesh template's relative transform.
     std::string boss_socket; Transform own_relative; Object* asset = nullptr; bool skeletal = false;
-    // direct: on the look's own socket (a look of the Boss's skeleton), nothing set per tick once the blend is done.
-    // smooth / smooth_clock: the grip last placed on the hero's hand (low-passed); last_switch: the hand / pose switch.
+    // direct: on the look's own socket (a Boss look whose weapon bones follow the Boss pose, grab looksocket on, or a Boss
+    // look without a pose proxy), nothing set per tick once the blend is done. smooth / smooth_clock: the grip last placed on the hero's hand (low-passed); last_switch: the
+    // hand / pose switch.
     bool direct = false; Transform smooth; bool has_smooth = false; double smooth_clock = 0; ULONGLONG last_switch = 0;
+    // A Boss look driving its own weapon bones (TrackLookWeapon): the weapon's place in the look's fist, and the Boss pose's
+    // weapon in the Boss pose's fist, the tick before.
+    Transform look_grip, boss_grip; bool look_has_grip = false;
 };
 #pragma warning(pop)
 // What a grab cut by the move chain still owes its target (HandOff / HandOffEnd).
@@ -83,17 +91,57 @@ struct Session {
     // The player's main slot drawn when the grab began (sheathed: the grab still shows the boss weapon in hand), and the
     // stand-ins' last shown state with its reasons (logged when it changes).
     bool armed_known = false, armed_at_begin = true; int shown_logged = -1;
+    // Ticks since Begin: the stand-ins show from the second one on (the proxy's first pose is not the move's yet, and the
+    // first placement put the weapon about 90 cm off for a frame).
+    int ticks = 0;
+    // A Boss look with the weapon on the Boss pose (logged at the end): the look's hand against the Boss pose's hand that
+    // holds it, each tick from the one the stand-ins show on (pose_first: that tick's).
+    uint32_t pose_ticks = 0; double pose_hand_sum = 0, pose_hand_max = 0, pose_first = -1;
+    // Native sheathe (NativeSheathe): the success timeline's Main-slot switches with Armed=false, the ability and timeline
+    // whose task clock times them, that clock's last value, and the latch.
     Object* source_ability = nullptr; ue::Name source_name;
     Object* source_timeline = nullptr; ue::Name timeline_name;
     std::vector<GrabWeaponVisibility::Window> sheathe_windows;
     float visibility_time = 0;
     GrabWeaponVisibility::NativeState native_visibility;
-    // Ticks since Begin: the stand-ins show from the second one on (the proxy's first pose is not the move's yet, and the
-    // first placement put the weapon about 90 cm off for a frame).
-    int ticks = 0;
+    // A Boss look whose own weapon bones follow the Boss pose (DriveLookWeapons): the bones asked for and how many it drives;
+    // the stand-ins then hang on the look's own sockets. Logged at the end (TrackLookWeapon): while the Boss holds the
+    // weapon, how far it moved in the look's fist a tick, and how far the Boss pose's own weapon moved in its fist (what the
+    // move itself does); always, how far it is from the Boss pose's place.
+    std::vector<std::string> look_names; size_t look_bones = 0;
+    uint32_t look_ticks = 0, look_held = 0; double look_step_sum = 0, look_step_max = 0, look_boss_sum = 0, look_boss_max = 0;
+    double boss_step_sum = 0, boss_step_max = 0;
+    // Proxy sync (logged at the end): each tick before the proxy is set again, its montage time off the player's, i.e. how
+    // far the two drifted apart over the frame just drawn (ms); proxy_rate: the play rate the proxy runs at.
+    uint32_t sync_ticks = 0; double sync_sum = 0, sync_max = 0; float proxy_rate = 0;
+    // The pair in step (TrackPairDrift, one line per segment): a segment runs while the hero and the target play the same two
+    // montages. Each tick the target's montage step against the hero's goes to "steady" (both advancing, at different rates
+    // or dilations) or, when one side moved 50 ms or more further in that tick, to "jumps" (a timeline jump, a section
+    // change, a restart). Rates: the montage's play rate x the mesh's GlobalAnimRateScale; dilation: the actor's own.
+    struct PairSegment {
+        Object* hero = nullptr; Object* target = nullptr;
+        float hero_start = 0, target_start = 0, hero_at = 0, target_at = 0;
+        float hero_rate[2]{}, target_rate[2]{}, hero_dilation[2]{}, target_dilation[2]{};
+        uint32_t ticks = 0, jumps = 0; double steady = 0, jumped = 0, min = 0, max = 0;
+    };
+    PairSegment pair; bool pair_on = false; uint32_t pair_segments = 0;
 };
 Session session_;
+// Diagnostics (grab looksocket auto|on|off|proxy, not saved), for a look on the Boss's own skeleton: 0 lets the look's own
+// weapon bones follow the Boss pose and hangs the weapon on the look's socket (default; on the Boss pose's socket when the
+// look cannot), 1 hangs it on the look's own socket with the look's own weapon bone (as 11-12 to 11-14), 2 re-hangs it on
+// the look's hand while the Boss holds it (as on the hero's own body).
+// 3 keeps it on the Boss pose's socket even when the look could drive its own weapon bones (the first 11-15 fix).
+std::atomic<int> look_mode_{0};
+// Diagnostics (grab proxysync rate|predict, not saved): 1 runs the proxy at the player's montage time and play rate
+// (default), 0 sets it one step ahead at rate 0 (11-08..11-15).
+std::atomic<int> proxy_sync_{1};
+// Diagnostics (grab weaponhide parts|actor, not saved): 1 (default) hides the hero's weapons part by part (each primitive
+// component's bHiddenInGame) and leaves the weapon actor's own hidden flag to the game; 0 hides the weapon actors as
+// before 11-15 (SetActorHiddenInGame, the flag the game draws and sheathes with).
+std::atomic<int> weapon_hide_{1};
 SkinDisplay skin_display_ = nullptr;
+SkinWeapons skin_weapons_ = nullptr;
 constexpr ULONGLONG kMontageSettleMs = 300, kMontageWaitMs = 1000;
 // A skin hand further than this from the hand the weapon hangs on is a wrong bone, not a pose.
 constexpr double kFollowMaxCm = 150;
@@ -166,26 +214,107 @@ std::vector<Object*> WeaponActors(Object* pawn) {
     ue::Free(list.data);
     return result;
 }
+// The primitive components of a weapon actor (meshes, effects; not collision shapes, hidden in game anyway).
+std::vector<Object*> WeaponParts(Object* actor) {
+    std::vector<Object*> result;
+    Object* primitive = ue::FindObject("/Script/Engine.PrimitiveComponent"), *shape = ue::FindObject("/Script/Engine.ShapeComponent");
+    if (!primitive) return result;
+    Call get(actor, "K2_GetComponentsByClass");
+    if (!get.Set("ComponentClass", primitive).Invoke()) return result;
+    const ue::Array list = get.Get<ue::Array>("ReturnValue");
+    if (list.data && list.num > 0 && list.num <= 256)
+        for (int32_t i = 0; i < list.num; ++i) {
+            Object* part = static_cast<Object**>(list.data)[i];
+            if (ue::Alive(part) && !(shape && ue::IsA(part, shape))) result.push_back(part);
+        }
+    ue::Free(list.data);
+    return result;
+}
+std::string NameString(Object* object) { char text[160]{}; if (object) ue::NameText(ue::NameOf(object), text, sizeof(text)); return text; }
+std::string WeaponSocket(Object* actor) {
+    Call root(actor, "K2_GetRootComponent"); ue::Name socket;
+    if (!root.Invoke() || !ReadField(root.Get<Object*>("ReturnValue"), "AttachSocketName", socket)) return "?";
+    char text[96]{}; ue::NameText(socket, text, sizeof(text)); return text;
+}
+bool WeaponShouldShow(Object* weapons, bool& armed_now);
+bool MainDrawn() { bool armed = true; WeaponShouldShow(session_.weapons_component, armed); return armed; }
+// The hero's own weapons are hidden part by part (each primitive component's bHiddenInGame) for the whole grab, each
+// part's own flag kept, and shown again at the end as it was (GrabWeaponVisibility::HeldPart). The weapon actor's own
+// hidden flag stays the game's: it shows a drawn weapon and hides a sheathed one with it, and the look change's blink
+// hides and shows the hero's actors with it. Until 11-15 the grab hid the actors themselves, read that flag at Begin,
+// hid every show during the grab again and showed at the end only those shown at Begin: a weapon the game drew during
+// the grab, or one the blink had hidden right then, stayed hidden while the hero held it (user, 11-15: "武器会莫名消失").
+// A new weapon actor or part (the game attaches one) is hidden on the next scan.
 void HideWeapons() {
+    const bool parts = weapon_hide_.load(std::memory_order_relaxed) != 0;
     for (Object* actor : WeaponActors(session_.pawn)) {
         auto known = std::find_if(session_.hidden.begin(), session_.hidden.end(), [&](const HiddenActor& item) { return item.actor == actor; });
         bool hidden = false;
         if (!Bool(actor, "bHidden", hidden)) continue;
-        if (known == session_.hidden.end()) {
-            HiddenActor item; item.actor = actor; item.name = ue::NameOf(actor); item.was_hidden = hidden;
-            session_.hidden.push_back(item);
+        const bool fresh = known == session_.hidden.end();
+        if (fresh) {
+            HiddenActor item; item.actor = actor; item.name = ue::NameOf(actor); item.was_hidden = item.last_hidden = hidden;
+            session_.hidden.push_back(item); known = std::prev(session_.hidden.end());
         }
-        // The grab's own ForceWeaponVisibility actions can show the weapon again; keep it hidden.
-        if (!hidden) Call(actor, "SetActorHiddenInGame").Set("bNewHidden", true).Invoke();
+        if (!parts) {  // as before 11-15 (grab weaponhide actor): the grab's own ForceWeaponVisibility can show it again; keep it hidden
+            if (!hidden && Call(actor, "SetActorHiddenInGame").Set("bNewHidden", true).Invoke()) known->last_hidden = true;
+            if (fresh) Logf("GRAB_EXTRAS hero weapon %s on %s: actor hidden=%d (hidden as a whole)", NameString(actor).c_str(), WeaponSocket(actor).c_str(), hidden ? 1 : 0);
+            continue;
+        }
+        size_t added = 0, shown = 0;
+        for (Object* part : WeaponParts(actor)) {
+            if (std::any_of(known->parts.begin(), known->parts.end(), [&](const HiddenPart& p) { return p.component == part; })) continue;
+            bool part_hidden = false; if (!Bool(part, "bHiddenInGame", part_hidden)) continue;
+            HiddenPart p; p.component = part; p.name = ue::NameOf(part); p.held.restore_hidden = part_hidden;
+            known->parts.push_back(p); ++added;
+            if (!part_hidden && Call(part, "SetHiddenInGame").Set("NewHidden", true).Set("bPropagateToChildren", false).Invoke()) ++shown;
+        }
+        if (fresh || added)
+            Logf("GRAB_EXTRAS hero weapon %s on %s: actor hidden=%d; %zu parts %s (%zu were shown)", NameString(actor).c_str(), WeaponSocket(actor).c_str(), hidden ? 1 : 0, added,
+                 fresh ? "hidden" : "added and hidden", shown);
+    }
+}
+// Every tick while the grab holds them: a part something else showed is hidden again (and shown at the end); with the
+// actors hidden as a whole (weaponhide actor), a shown actor is hidden again. A change of the actor's own flag (the game
+// drawing or sheathing, a blink) is logged.
+void HoldWeapons() {
+    const bool parts = weapon_hide_.load(std::memory_order_relaxed) != 0;
+    const ULONGLONG t = GetTickCount64() - session_.began;
+    for (HiddenActor& item : session_.hidden) {
+        bool hidden = true;
+        if (!Same(item.actor, item.name) || !Bool(item.actor, "bHidden", hidden)) continue;
+        if (!parts) { if (!hidden) Call(item.actor, "SetActorHiddenInGame").Set("bNewHidden", true).Invoke(); continue; }
+        if (hidden != item.last_hidden) {
+            item.last_hidden = hidden;
+            Logf("GRAB_EXTRAS hero weapon %s %s at %llu ms, not by the grab (main slot drawn %d)", NameString(item.actor).c_str(), hidden ? "hidden" : "shown", t, MainDrawn() ? 1 : 0);
+        }
+        for (HiddenPart& p : item.parts) {
+            bool part_hidden = true;
+            if (!Same(p.component, p.name) || !Bool(p.component, "bHiddenInGame", part_hidden) || !p.held.Seen(part_hidden)) continue;
+            Call(p.component, "SetHiddenInGame").Set("NewHidden", true).Set("bPropagateToChildren", false).Invoke();
+            if (!p.logged) {
+                p.logged = true;
+                Logf("GRAB_EXTRAS hero weapon %s part %s shown at %llu ms, not by the grab: hidden again, shown at the end", NameString(item.actor).c_str(), NameString(p.component).c_str(), t);
+            }
+        }
     }
 }
 void RestoreWeapons() {
-    uint32_t restored = 0;
+    const bool parts = weapon_hide_.load(std::memory_order_relaxed) != 0;
+    uint32_t restored = 0; size_t shown = 0;
     for (const HiddenActor& item : session_.hidden) {
-        if (item.was_hidden || !Same(item.actor, item.name)) continue;
-        if (Call(item.actor, "SetActorHiddenInGame").Set("bNewHidden", false).Invoke()) ++restored;
+        if (!Same(item.actor, item.name)) continue;
+        if (!parts) { if (!item.was_hidden && Call(item.actor, "SetActorHiddenInGame").Set("bNewHidden", false).Invoke()) ++restored; }
+        else for (const HiddenPart& p : item.parts)
+            if (!p.held.restore_hidden && Same(p.component, p.name) && Call(p.component, "SetHiddenInGame").Set("NewHidden", false).Set("bPropagateToChildren", false).Invoke()) ++restored;
+        bool hidden = true; Bool(item.actor, "bHidden", hidden); if (!hidden) ++shown;
+        if (hidden != item.was_hidden)
+            Logf("GRAB_EXTRAS hero weapon %s after the grab: %s (%s at the start) on %s", NameString(item.actor).c_str(), hidden ? "hidden" : "shown", item.was_hidden ? "hidden" : "shown",
+                 WeaponSocket(item.actor).c_str());
     }
-    if (!session_.hidden.empty()) Logf("GRAB_EXTRAS weapons restored=%u tracked=%zu", restored, session_.hidden.size());
+    if (!session_.hidden.empty())
+        Logf("GRAB_EXTRAS weapons restored=%u %s tracked=%zu: %zu weapon actors shown after the grab (main slot drawn %d)", restored, parts ? "parts" : "actors", session_.hidden.size(), shown,
+             MainDrawn() ? 1 : 0);
     session_.hidden.clear();
 }
 // ---- Source Boss weapon stand-in -------------------------------------------
@@ -362,7 +491,7 @@ void SyncProxy() {
     if (!ue::Alive(montage)) return; // keep the last pose between montages
     if (montage != session_.proxy_montage) {
         if (!Call(session_.proxy, "PlayAnimation").Set("NewAnimToPlay", montage).Set("bLooping", false).Invoke()) return;
-        Call(session_.proxy, "SetPlayRate").Set("Rate", 0.f).Invoke();
+        Call(session_.proxy, "SetPlayRate").Set("Rate", 0.f).Invoke(); session_.proxy_rate = 0;
         session_.proxy_montage = montage; session_.proxy_seen = false; session_.proxy_last = -1;
         Call length(montage, "GetPlayLength"); session_.proxy_length = length.Invoke() ? length.Get<float>("ReturnValue") : 0.f;
         char name[160]{}; ue::NameText(ue::NameOf(montage), name, sizeof(name));
@@ -372,18 +501,38 @@ void SyncProxy() {
     if (!position.Set("Montage", montage).Invoke()) return;
     const float now = position.Get<float>("ReturnValue");
     if (!std::isfinite(now)) return;
-    // One step ahead: the step since the tick before, when it is a plain forward step (not a jump to another
-    // section, a stop or a restart), kept inside the montage.
-    float at = now;
-    if (session_.proxy_seen) {
+    // How far the proxy drifted from the player over the frame just drawn: its montage time now against the player's.
+    Call where(session_.proxy, "GetPosition");
+    if (session_.proxy_seen && where.Invoke()) {
+        const double drift = std::fabs(static_cast<double>(where.Get<float>("ReturnValue")) - now) * 1000;
+        if (std::isfinite(drift) && drift < 250) { ++session_.sync_ticks; session_.sync_sum += drift; session_.sync_max = (std::max)(session_.sync_max, drift); }
+    }
+    float at = now, rate = 0;
+    if (proxy_sync_.load(std::memory_order_relaxed)) {
+        // Same time, same rate (11-15): the proxy is a component of the player's actor, so the coming frame advances both by
+        // the same scaled delta (time dilation included) and the proxy is drawn at the player's montage time of that frame.
+        // Predicting one step ahead missed whenever the frame time or a slow-motion changed (the next step is not the last).
+        Call play(anim, "Montage_GetPlayRate"), playing(anim, "Montage_IsPlaying");
+        rate = play.Set("Montage", montage).Invoke() ? play.Get<float>("ReturnValue") : 1.f;
+        if (!std::isfinite(rate) || rate < 0 || rate > 10) rate = 1;
+        if (playing.Set("Montage", montage).Invoke() && !playing.Get<bool>("ReturnValue")) rate = 0;  // paused
+    } else if (session_.proxy_seen) {
+        // One step ahead (11-08..11-15): the step since the tick before, when it is a plain forward step (not a jump to
+        // another section, a stop or a restart), kept inside the montage.
         const float step = now - session_.proxy_last;
         if (step > 0 && step < .25f) at = now + step;
         if (session_.proxy_length > 0 && at > session_.proxy_length) at = session_.proxy_length;
     }
     session_.proxy_last = now; session_.proxy_seen = true;
+    if (rate != session_.proxy_rate) { Call(session_.proxy, "SetPlayRate").Set("Rate", rate).Invoke(); session_.proxy_rate = rate; }
     Call(session_.proxy, "SetPosition").Set("InPos", at).Set("bFireNotifies", false).Invoke();
 }
+void StopLookWeapons() {
+    if (session_.look_bones && skin_weapons_) skin_weapons_(nullptr, nullptr, 0);
+    session_.look_bones = 0;
+}
 void RemoveProxy() {
+    StopLookWeapons();  // the look stops reading the proxy before it goes
     if (session_.proxy && Same(session_.proxy, session_.proxy_name)) Call(session_.proxy, "K2_DestroyComponent").Set("Object", session_.proxy).Invoke();
     session_.proxy = nullptr; session_.proxy_montage = nullptr;
 }
@@ -395,6 +544,61 @@ Object* CurrentMontage(Object* pawn) {
     Call active(anim, "GetCurrentActiveMontage"); if (!active.Invoke()) return nullptr;
     Object* montage = active.Get<Object*>("ReturnValue");
     return ue::Alive(montage) ? montage : nullptr;
+}
+// A montage on an actor's mesh (its current active montage): its position, its play rate times the mesh's
+// GlobalAnimRateScale, and the actor's own time dilation. False when none / unreadable.
+bool MontageAt(Object* actor, Object*& montage, float& at, float& rate, float& dilation) {
+    Object* mesh = nullptr; ReadField(actor, "Mesh", mesh);
+    if (!ue::Alive(mesh)) return false;
+    Call instance(mesh, "GetAnimInstance"); if (!instance.Invoke()) return false;
+    Object* anim = instance.Get<Object*>("ReturnValue"); if (!ue::Alive(anim)) return false;
+    Call active(anim, "GetCurrentActiveMontage"); if (!active.Invoke()) return false;
+    montage = active.Get<Object*>("ReturnValue"); if (!ue::Alive(montage)) return false;
+    Call position(anim, "Montage_GetPosition"); if (!position.Set("Montage", montage).Invoke()) return false;
+    at = position.Get<float>("ReturnValue");
+    Call play(anim, "Montage_GetPlayRate"); rate = play.Set("Montage", montage).Invoke() ? play.Get<float>("ReturnValue") : 1.f;
+    float scale = 1; if (ReadField(mesh, "GlobalAnimRateScale", scale) && std::isfinite(scale)) rate *= scale;
+    dilation = 1; ReadField(actor, "CustomTimeDilation", dilation);
+    return std::isfinite(at) && std::isfinite(rate) && std::isfinite(dilation);
+}
+void LogPairSegment(const char* why) {
+    const Session::PairSegment& s = session_.pair;
+    if (!s.ticks) return;
+    char hero_name[128]{}, target_name[128]{};
+    if (ue::Alive(s.hero)) ue::NameText(ue::NameOf(s.hero), hero_name, sizeof(hero_name));
+    if (ue::Alive(s.target)) ue::NameText(ue::NameOf(s.target), target_name, sizeof(target_name));
+    Logf("GRAB_EXTRAS pair in step #%u (%s): target %s %.2f->%.2f s (rate %.2f..%.2f, dilation %.2f..%.2f), hero %s %.2f->%.2f s "
+         "(rate %.2f..%.2f, dilation %.2f..%.2f) over %u ticks: the target %+.0f ms off the hero (steady %+.0f, %u jumps %+.0f; "
+         "range %+.0f..%+.0f ms; - = behind)", session_.pair_segments + 1, why,
+         target_name, s.target_start, s.target_at, s.target_rate[0], s.target_rate[1], s.target_dilation[0], s.target_dilation[1],
+         hero_name, s.hero_start, s.hero_at, s.hero_rate[0], s.hero_rate[1], s.hero_dilation[0], s.hero_dilation[1],
+         s.ticks, s.steady + s.jumped, s.steady, s.jumps, s.jumped, s.min, s.max);
+}
+void TrackPairDrift() {
+    if (session_.pair_segments >= 8 || !Same(session_.target, session_.target_name)) return;
+    Object* hero = nullptr, *target = nullptr;
+    float hero_at = 0, target_at = 0, hero_rate = 1, target_rate = 1, hero_dilation = 1, target_dilation = 1;
+    const bool seen = MontageAt(session_.pawn, hero, hero_at, hero_rate, hero_dilation) &&
+        MontageAt(session_.target, target, target_at, target_rate, target_dilation);
+    Session::PairSegment& s = session_.pair;
+    if (session_.pair_on && (!seen || hero != s.hero || target != s.target)) {
+        LogPairSegment(seen ? "a montage changed" : "a montage stopped"); ++session_.pair_segments; session_.pair_on = false;
+    }
+    if (!seen) return;
+    const auto widen = [](float (&range)[2], float value) { range[0] = (std::min)(range[0], value); range[1] = (std::max)(range[1], value); };
+    if (!session_.pair_on) {
+        s = Session::PairSegment{}; s.hero = hero; s.target = target;
+        s.hero_start = s.hero_at = hero_at; s.target_start = s.target_at = target_at;
+        s.hero_rate[0] = s.hero_rate[1] = hero_rate; s.target_rate[0] = s.target_rate[1] = target_rate;
+        s.hero_dilation[0] = s.hero_dilation[1] = hero_dilation; s.target_dilation[0] = s.target_dilation[1] = target_dilation;
+        session_.pair_on = true; return;
+    }
+    const double step = (static_cast<double>(target_at) - s.target_at) - (static_cast<double>(hero_at) - s.hero_at);
+    s.hero_at = hero_at; s.target_at = target_at;
+    widen(s.hero_rate, hero_rate); widen(s.target_rate, target_rate); widen(s.hero_dilation, hero_dilation); widen(s.target_dilation, target_dilation);
+    if (!std::isfinite(step)) return;
+    if (std::fabs(step) >= .05) { ++s.jumps; s.jumped += step * 1000; } else s.steady += step * 1000;
+    ++s.ticks; s.min = (std::min)(s.min, s.steady + s.jumped); s.max = (std::max)(s.max, s.steady + s.jumped);
 }
 void UpdatePosing() {
     if (session_.pose_over) return;
@@ -516,22 +720,115 @@ double Seconds() { LARGE_INTEGER hz{}, t{}; QueryPerformanceFrequency(&hz); Quer
 // Boss-pose switch waits kSwitchDwellMs after the last one, so the weapon at the hold threshold does not flip each tick.
 constexpr double kGripTauS = .035, kGripSnapCm = 25;
 constexpr ULONGLONG kSwitchDwellMs = 250;
+// The look bones a Boss look's own weapon sockets hang on (weapon_* only: a scabbard rides the body as the look poses it).
+std::vector<std::string> LookWeaponBones(Object* skin) {
+    std::vector<std::string> names;
+    for (const Display& d : session_.displays) {
+        if (d.boss_socket.empty() || !Same(d.component, d.name)) continue;
+        const ue::Name socket = Socket(skin, d.boss_socket.c_str()); if (socket.None()) continue;
+        ue::Name bone = socket; Call socket_bone(skin, "GetSocketBoneName");
+        if (socket_bone.Set("InSocketName", socket).Invoke() && !socket_bone.Get<ue::Name>("ReturnValue").None()) bone = socket_bone.Get<ue::Name>("ReturnValue");
+        char text[96]{}; ue::NameText(bone, text, sizeof(text));
+        if (_strnicmp(text, "weapon", 6) || std::find(names.begin(), names.end(), std::string(text)) != names.end()) continue;
+        names.emplace_back(text);
+    }
+    return names;
+}
+// A Boss look drives its own weapon bones from the pose proxy (NpcRetarget::DriveGrabWeapons): while the Boss holds the
+// weapon, the look's weapon bone keeps the Boss's grip on the look's own hand, in the look's own pose of the same frame;
+// free, it goes where the proxy has it. Called each tick: the first call starts it, the next ones refresh the proxy ->
+// look frame. 0: not applied (the stand-ins stay on the Boss pose's socket).
+size_t DriveLookWeapons(Object* skin) {
+    if (!skin_weapons_ || !skin || !session_.proxy || !Same(session_.proxy, session_.proxy_name)) return 0;
+    if (session_.look_names.empty()) session_.look_names = LookWeaponBones(skin);
+    if (session_.look_names.empty()) return 0;
+    std::vector<const char*> list; for (const std::string& name : session_.look_names) list.push_back(name.c_str());
+    return skin_weapons_(session_.proxy, list.data(), list.size());
+}
+// Per tick, a stand-in on a look-driven Boss look: how far it is from where the Boss pose has it (the proxy's socket with
+// the same relative), and while the Boss holds it (that socket within kLookHeldCm of the proxy's hand) how far it moved in
+// the look's fist since the tick before (0 = rigid in the hand, nothing to see shake).
+constexpr double kLookHeldCm = 20;
+void TrackLookWeapon(Display& d, Object* skin, Object* proxy) {
+    Call world(d.component, "K2_GetComponentToWorld"); Transform boss_socket{}, boss_hand{}, look_hand{};
+    if (!world.Invoke() || !SocketWorld(proxy, d.socket, boss_socket)) return;
+    const Transform weapon = world.Get<Transform>("ReturnValue"), boss_weapon = Compose(d.attached, boss_socket);
+    const double off = Gap(weapon, boss_weapon);
+    ++session_.look_ticks; session_.look_boss_sum += off; session_.look_boss_max = (std::max)(session_.look_boss_max, off);
+    const bool held = !d.hand.None() && SocketWorld(proxy, d.hand, boss_hand) && Gap(boss_socket, boss_hand) < kLookHeldCm && SocketWorld(skin, d.hand, look_hand);
+    if (!held) { d.look_has_grip = false; return; }
+    const Transform grip = RelativeTo(weapon, look_hand), boss_grip = RelativeTo(boss_weapon, boss_hand);
+    if (d.look_has_grip) {
+        const double step = Gap(grip, d.look_grip), boss_step = Gap(boss_grip, d.boss_grip);
+        ++session_.look_held; session_.look_step_sum += step; session_.look_step_max = (std::max)(session_.look_step_max, step);
+        session_.boss_step_sum += boss_step; session_.boss_step_max = (std::max)(session_.boss_step_max, boss_step);
+    }
+    d.look_grip = grip; d.boss_grip = boss_grip; d.look_has_grip = true;
+}
 void FollowSkinHands() {
     double size = 1;
     Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(size)) : nullptr;
     if (!ue::Alive(skin)) skin = nullptr;
     Object* own = nullptr;
     if (!skin && session_.proxy && Same(session_.proxy, session_.proxy_name)) { ReadField(session_.pawn, "Mesh", own); if (!ue::Alive(own)) own = nullptr; }
-    // A look on the Boss's own skeleton plays the move as the Boss does: its weapon socket is where the Boss's weapon
-    // actor hangs, so the stand-in hangs there as authored and the engine carries it in the same frame (11-12: it still
-    // shook when re-placed from the pose proxy every tick).
+    // A look on the Boss's own skeleton (11-15): the stand-in stays all grab where ShowWeapon hung it, on the pose proxy's
+    // socket. The proxy is the Boss's own mesh playing the move in sync, so that socket is where the Boss's weapon actor
+    // hangs, and the engine carries the weapon with it in the same frame; nothing is set per tick. The look's hand follows
+    // that pose within a few cm (MoTian 02: 0.5-3.8 cm). Its own weapon bone does not: it is the hero's weapon_r retargeted
+    // under a turned hand, 38-111 cm from the hand where the Boss's is 87-237 cm (the planted weapon of the throw), so the
+    // weapon on it floated beside the hips (11-12..11-14). Moving the weapon between the look's hand, its socket and the
+    // proxy each tick was a frame late and every switch a jump: the user saw it shake (11-15).
     Object* proxy = session_.proxy && Same(session_.proxy, session_.proxy_name) ? session_.proxy : nullptr;
     Object* skin_skeleton = skin ? SkeletonOf(skin) : nullptr;
     const bool boss_look = skin_skeleton && (!proxy || SkeletonOf(proxy) == skin_skeleton);
+    const int mode = look_mode_.load(std::memory_order_relaxed);
     const ULONGLONG now = GetTickCount64();
     for (Display& d : session_.displays) {
         if (!Same(d.component, d.name)) continue;
-        const ue::Name own_socket = boss_look && !d.boss_socket.empty() ? Socket(skin, d.boss_socket.c_str()) : ue::Name{};
+        const bool on_proxy = proxy && d.parent == proxy && Same(d.parent, d.parent_name);
+        // The look's own weapon bones follow the Boss pose (11-15, second fix): every stand-in hangs on the look's own socket
+        // as the Boss's weapon actor hangs on the Boss, and nothing is set per tick once there. The weapon bone keeps the
+        // Boss's grip on the look's own fist in the look's own pose of that frame, so it cannot lag or shake against it; on
+        // the proxy's socket it was the proxy's fist, a few cm off the drawn one and sampled at a predicted time.
+        if (boss_look && on_proxy && mode == 0 && session_.look_bones && !d.boss_socket.empty()) {
+            const ue::Name own_socket = Socket(skin, d.boss_socket.c_str());
+            if (!own_socket.None()) {
+                if (!d.direct || d.holder != skin) {
+                    if (!Rehang(d, skin, own_socket, skin)) continue;
+                    d.direct = true;
+                    if (session_.ticks < 2) { Call(d.component, "K2_SetRelativeTransform").Set("NewTransform", d.own_relative).Set("bSweep", false).Set("bTeleport", true).Invoke(); d.switched = 0; }
+                    char socket_text[96]{}; ue::NameText(own_socket, socket_text, sizeof(socket_text));
+                    Logf("GRAB_EXTRAS boss weapon on the look's own socket %s; the look's weapon bones follow the Boss pose (%zu)", socket_text, session_.look_bones);
+                }
+                if (d.switched) {
+                    const double t = std::clamp(static_cast<double>(now - d.switched) / kSwitchMs, 0.0, 1.0);
+                    Call(d.component, "K2_SetRelativeTransform").Set("NewTransform", t < 1 ? Blend(d.from, d.own_relative, t) : d.own_relative).Set("bSweep", false).Set("bTeleport", true).Invoke();
+                    if (t >= 1) d.switched = 0;
+                }
+                if (session_.ticks >= 2) TrackLookWeapon(d, skin, proxy);
+                continue;
+            }
+        }
+        if (boss_look && on_proxy && (mode == 0 || mode == 3)) {
+            if (d.holder || d.direct) { if (!Rehang(d, d.parent, d.socket, nullptr)) continue; }  // moved off by another mode: back
+            if (d.switched) {
+                const double t = std::clamp(static_cast<double>(now - d.switched) / kSwitchMs, 0.0, 1.0);
+                Call(d.component, "K2_SetRelativeTransform").Set("NewTransform", t < 1 ? Blend(d.from, d.attached, t) : d.attached).Set("bSweep", false).Set("bTeleport", true).Invoke();
+                if (t >= 1) d.switched = 0;
+            }
+            Transform look_hand{}, boss_hand{};
+            if (session_.ticks >= 2 && !d.hand.None() && SocketWorld(skin, d.hand, look_hand) && SocketWorld(proxy, d.hand, boss_hand)) {
+                const double gap = Gap(look_hand, boss_hand);
+                if (!session_.pose_ticks) {
+                    session_.pose_first = gap;
+                    Logf("GRAB_EXTRAS Boss look: the weapon stays on the Boss pose's socket all grab (as the Boss's weapon actor); tick %d look hand %.1f cm off the Boss pose's", session_.ticks, gap);
+                }
+                ++session_.pose_ticks; session_.pose_hand_sum += gap; session_.pose_hand_max = (std::max)(session_.pose_hand_max, gap);
+            }
+            if (session_.ticks >= 2) TrackLookWeapon(d, skin, proxy);  // the same fist measure as the look-driven way (A/B)
+            continue;
+        }
+        const ue::Name own_socket = boss_look && (mode == 1 || !on_proxy) && !d.boss_socket.empty() ? Socket(skin, d.boss_socket.c_str()) : ue::Name{};
         if (!own_socket.None()) {
             if (!d.direct || d.holder != skin) {
                 if (!Rehang(d, skin, own_socket, skin)) continue;
@@ -679,9 +976,17 @@ bool WeaponShouldShow(Object* weapons, bool& armed_now) {
     }
     return true;
 }
-// Read the actual success timeline, not a boss-name list. The main-slot switch
-// with Armed=false is an explicit sheathe; Armed=true (e.g. DuYan) is not.
-void CaptureNativeVisibility(Object* ability, Object* timeline) {
+// The success timeline's Main-slot switches (GAA_SwitchWeapon), read from the move itself, not a boss-name list. One with
+// Armed=false selects a weapon config without drawing it (a config says whether its pieces show undrawn:
+// CharacterWeaponConfig::IsUnarmShown) and puts the Boss's weapon away for its window, when the Boss has that config
+// (boss_configs: its Main configs; GrabWeaponVisibility::PutsAway). On the player the switch itself is refused, so the
+// window and the Boss's configs, not the player's slot, say it. 沐小葵 01 switches to config 2 that way for 0.0001-4.5478 s,
+// but the cloaked first phase it belongs to has two configs: natively nothing changes and she holds her sword all grab
+// (user, 11-15: "沐小葵应该有一招投技是带武器的 查看一下带斗篷那个"); her montage moves weapon_r with hand_l to 1.33 s and
+// hand_r after (offline ACL decode of MuXiaoKui_GEx_01). The weapon the user saw in 沐小葵's grabs (11-15: "沐小葵的投技还是
+// 有武器") was the second phase's: that look fights barehanded (grab_weapons.generated.h lists no weapon for its grabs).
+// Armed=true (独眼 01's bow) draws: shown.
+void CaptureNativeVisibility(Object* ability, Object* timeline, size_t boss_configs) {
     if (!ue::Alive(ability) || !ue::Alive(timeline)) return;
     Object* event = ue::FindObject("/Script/LegoAbility.LGAActionEvent");
     Object* switch_class = ue::FindObject("/PBZCombatAsset/Prototypes/Actions/GAA_SwitchWeapon.GAA_SwitchWeapon_C");
@@ -697,13 +1002,19 @@ void CaptureNativeVisibility(Object* ability, Object* timeline) {
     const ue::Name main_slot = ue::MakeName(L"Weapon.Slot.Main");
     for (int32_t i = 0; i < actions.num; ++i) {
         Object* row = static_cast<Object*>(actions.data) + static_cast<size_t>(i) * stride;
-        Object* action = ue::At<Object*>(row, action_at); bool armed = true; ue::Name slot;
+        Object* action = ue::At<Object*>(row, action_at); bool armed = true, reset = false; ue::Name slot; int32_t start_weapon = -1, end_weapon = -1;
         if (!ue::Alive(action) || !ue::IsA(action, switch_class) || !Bool(action, "Armed", armed) ||
             !ReadField(action, "SlotTag", slot) || !(slot == main_slot)) continue;
+        Bool(action, "ResetOnEnd", reset); ReadField(action, "StartWeapon", start_weapon); ReadField(action, "EndWeapon", end_weapon);
         const float at = ue::At<float>(row, start), length = ue::At<float>(row, duration);
         GrabWeaponVisibility::Window window{at + ue::At<float>(row, trigger), at + length + ue::At<float>(row, end_trigger)};
-        Logf("GRAB_EXTRAS native switch armed=%d start=%.4f end=%.4f", armed ? 1 : 0, window.begin, window.end);
-        if (!armed && window.Contains(window.begin)) session_.sheathe_windows.push_back(window);
+        const bool away = GrabWeaponVisibility::PutsAway(armed, start_weapon, boss_configs) && window.Contains(window.begin);
+        char note[128] = "";
+        if (away) std::snprintf(note, sizeof(note), " (puts the weapon away: the stand-ins hide)");
+        else if (!armed) std::snprintf(note, sizeof(note), " (the Boss has %zu configs: natively nothing changes, the weapon stays)", boss_configs);
+        Logf("GRAB_EXTRAS native Main switch to %d armed=%d resetOnEnd=%d end=%d from %.4f to %.4f s%s", start_weapon, armed ? 1 : 0, reset ? 1 : 0, end_weapon,
+             window.begin, window.end, note);
+        if (away) session_.sheathe_windows.push_back(window);
     }
     session_.source_ability = ability; session_.source_name = ue::NameOf(ability);
     session_.source_timeline = timeline; session_.timeline_name = ue::NameOf(timeline);
@@ -743,7 +1054,8 @@ void UpdateDisplays() {
     const bool show = GrabWeaponVisibility::Show(unhidden, armed, session_.armed_at_begin, native_sheathe, session_.ticks);
     if (session_.shown_logged != (show ? 1 : 0)) {
         session_.shown_logged = show ? 1 : 0;
-        Logf("GRAB_EXTRAS stand-ins %s (main slot drawn %d, drawn at the start %d, force-hidden %d, native-sheathe %d time %.4f)", show ? "shown" : "hidden", armed ? 1 : 0, session_.armed_at_begin ? 1 : 0, unhidden ? 0 : 1, native_sheathe ? 1 : 0, session_.visibility_time);
+        Logf("GRAB_EXTRAS stand-ins %s (main slot drawn %d, drawn at the start %d, force-hidden %d, native-sheathe %d time %.4f, tick %d)", show ? "shown" : "hidden", armed ? 1 : 0,
+             session_.armed_at_begin ? 1 : 0, unhidden ? 0 : 1, native_sheathe ? 1 : 0, session_.visibility_time, session_.ticks);
     }
     for (Display& display : session_.displays) {
         if (display.visible == show || !Same(display.component, display.name)) continue;
@@ -937,7 +1249,8 @@ ChainDamage chain_damage_;  // game thread
 void SetChainDamage(Damage mode, float value, unsigned long long until_ms) { chain_damage_ = {true, mode, value, until_ms}; }
 void ClearChainDamage() { chain_damage_ = {}; }
 std::wstring LastResult() { AcquireSRWLockShared(&lock_); std::wstring text = result_; ReleaseSRWLockShared(&lock_); return text; }
-void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move, double hero_over_boss, unsigned char* source_ability, unsigned char* source_timeline) {
+void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, size_t weapon_count, const char* move, double hero_over_boss, unsigned char* source_ability, unsigned char* source_timeline,
+           size_t boss_weapon_configs) {
     if (session_.active) Finish(false);
     session_ = {};
     if (!ue::Alive(pawn) || !ue::Alive(target)) return;
@@ -953,7 +1266,7 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
     session_.pawn = pawn; session_.pawn_name = ue::NameOf(pawn);
     session_.target = target; session_.target_name = ue::NameOf(target);
     session_.began = GetTickCount64(); session_.grab_montage = CurrentMontage(pawn);
-    CaptureNativeVisibility(source_ability, source_timeline);
+    CaptureNativeVisibility(source_ability, source_timeline, boss_weapon_configs);
     double size = 1; if (skin_display_ && !ue::Alive(reinterpret_cast<Object*>(skin_display_(size)))) size = 1;
     if (!std::isfinite(size) || size < .1 || size > 10) size = 1;
     if (!std::isfinite(hero_over_boss) || hero_over_boss < .1 || hero_over_boss > 10) hero_over_boss = 1;
@@ -963,14 +1276,20 @@ void Begin(unsigned char* pawn, unsigned char* target, const Weapon* weapons, si
     if (ReadHealth(target, hp, maximum)) { session_.hp_begin = hp; session_.hp_max = maximum; }
     if (!BindHealth(target) || !HealthNow(session_.last_hp)) { session_.health_offset = -1; Logf("GRAB_EXTRAS per-hit health unavailable; damage events are not scaled"); }
     if (session_.options.hide_weapon) {
-        HideWeapons();
         Call holder(pawn, "GetCharacterWeaponsComponent", "/Script/SGameCombatSystem.CharacterWeaponsHolder");
         if (holder.Invoke()) session_.weapons_component = holder.Get<Object*>("ReturnValue");
+        HideWeapons();
         for (size_t i = 0; weapons && i < weapon_count && i < kMaxWeapons; ++i) if (weapons[i].proxy_mesh) {
             Object* mesh = nullptr; ReadField(pawn, "Mesh", mesh);
             if (CreateProxy(pawn, mesh, weapons[i].proxy_mesh, (weapons[i].proxy_scale > .05 ? weapons[i].proxy_scale : 1.0) * session_.model)) { SyncProxy(); break; }
         }
         for (size_t i = 0; weapons && i < weapon_count && i < kMaxWeapons; ++i) ShowWeapon(pawn, weapons[i]);
+        double look_size = 1; Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(look_size)) : nullptr;
+        if (ue::Alive(skin) && session_.proxy && look_mode_.load(std::memory_order_relaxed) == 0 && SkeletonOf(skin) && SkeletonOf(skin) == SkeletonOf(session_.proxy)) {
+            session_.look_bones = DriveLookWeapons(skin);
+            Logf("GRAB_EXTRAS Boss look: %zu weapon bones of the look follow the Boss pose (%s)", session_.look_bones,
+                 session_.look_bones ? "the stand-ins hang on the look's own sockets" : "not applied: the stand-ins stay on the Boss pose's socket");
+        }
         UpdateDisplays(); FollowSkinHands();
     }
     session_.next_scan = GetTickCount64() + 100;
@@ -985,20 +1304,37 @@ void ProbeDisplays() {
     Object* own = nullptr; ReadField(session_.pawn, "Mesh", own);
     Call actor(session_.pawn, "K2_GetActorLocation"); const Vector pawn = actor.Invoke() ? actor.Get<Vector>("ReturnValue") : Vector{};
     const ULONGLONG t = GetTickCount64() - session_.began;
+    double size = 1;
+    Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(size)) : nullptr;
+    if (!ue::Alive(skin)) skin = nullptr;
     for (const Display& d : session_.displays) {
         if (!Same(d.component, d.name)) { Logf("GRAB_EXTRAS probe t=%llu stand-in gone", t); continue; }
-        Call at(d.component, "K2_GetComponentLocation"), size(d.component, "K2_GetComponentScale"), shown(d.component, "IsVisible");
-        const Vector w = at.Invoke() ? at.Get<Vector>("ReturnValue") : Vector{}, sc = size.Invoke() ? size.Get<Vector>("ReturnValue") : Vector{};
+        Call at(d.component, "K2_GetComponentLocation"), scale(d.component, "K2_GetComponentScale"), shown(d.component, "IsVisible");
+        const Vector w = at.Invoke() ? at.Get<Vector>("ReturnValue") : Vector{}, sc = scale.Invoke() ? scale.Get<Vector>("ReturnValue") : Vector{};
         const bool visible = shown.Invoke() && shown.Get<bool>("ReturnValue");
         bool hidden = false; Bool(d.component, "bHiddenInGame", hidden);
-        Vector hand{}, proxy_hand{};
+        Vector hand{}, proxy_hand{}, boss_socket{}, look_socket{};
         const bool has_hand = ue::Alive(own) && !d.hand.None() && SocketLocation(own, d.hand, hand);
         const bool has_proxy = Same(d.parent, d.parent_name) && !d.hand.None() && SocketLocation(d.parent, d.hand, proxy_hand);
+        // Where the Boss pose puts the weapon (the proxy's socket), and the look's own socket against it.
+        const bool has_socket = Same(d.parent, d.parent_name) && !d.socket.None() && SocketLocation(d.parent, d.socket, boss_socket);
+        const ue::Name own_socket = skin && !d.boss_socket.empty() ? Socket(skin, d.boss_socket.c_str()) : ue::Name{};
+        const bool has_look = !own_socket.None() && SocketLocation(skin, own_socket, look_socket);
         Object* attached = nullptr; ReadField(d.component, "AttachParent", attached);
         char hand_name[64]{}; ue::NameText(d.hand, hand_name, sizeof(hand_name));
-        Logf("GRAB_EXTRAS probe t=%llu visible=%d hiddenInGame=%d on=%s weapon=(%.0f,%.0f,%.0f) scale=%.2f %s: to the player's hand %.1f cm, to the proxy's %.1f cm, proxy hand to the player's %.1f cm; pawn=(%.0f,%.0f,%.0f)",
-             t, visible ? 1 : 0, hidden ? 1 : 0, attached == d.parent ? "boss pose" : d.holder && attached == d.holder ? "hand" : "other", w.x, w.y, w.z, sc.x, hand_name,
-             has_hand ? Distance(w, hand) : -1.0, has_proxy ? Distance(w, proxy_hand) : -1.0, has_hand && has_proxy ? Distance(hand, proxy_hand) : -1.0, pawn.x, pawn.y, pawn.z);
+        const char* on = d.direct ? "look socket" : attached == d.parent ? "boss pose" : d.holder && attached == d.holder ? "hand" : "other";
+        Logf("GRAB_EXTRAS probe t=%llu visible=%d hiddenInGame=%d on=%s weapon=(%.0f,%.0f,%.0f) scale=%.2f %s: to the player's hand %.1f cm, to the proxy's %.1f cm, "
+             "proxy hand to the player's %.1f cm; to the Boss pose's socket %.1f cm, look socket off it %.1f cm; pawn=(%.0f,%.0f,%.0f)",
+             t, visible ? 1 : 0, hidden ? 1 : 0, on, w.x, w.y, w.z, sc.x, hand_name, has_hand ? Distance(w, hand) : -1.0, has_proxy ? Distance(w, proxy_hand) : -1.0,
+             has_hand && has_proxy ? Distance(hand, proxy_hand) : -1.0, has_socket ? Distance(w, boss_socket) : -1.0,
+             has_socket && has_look ? Distance(look_socket, boss_socket) : -1.0, pawn.x, pawn.y, pawn.z);
+        // Each pose's socket against its own hand: the Boss pose holds the weapon where its montage puts it; a look whose
+        // socket stays far from its own hand while the proxy's is close does not move that bone.
+        Vector look_hand{};
+        const bool has_look_hand = skin && !d.hand.None() && SocketLocation(skin, d.hand, look_hand);
+        Logf("GRAB_EXTRAS probe t=%llu socket to its own hand: Boss pose %.1f cm, look %.1f cm; look hand to the proxy's %.1f cm, to the player's %.1f cm", t,
+             has_socket && has_proxy ? Distance(boss_socket, proxy_hand) : -1.0, has_look && has_look_hand ? Distance(look_socket, look_hand) : -1.0,
+             has_look_hand && has_proxy ? Distance(look_hand, proxy_hand) : -1.0, has_look_hand && has_hand ? Distance(look_hand, hand) : -1.0);
     }
 }
 void Tick() {
@@ -1006,17 +1342,17 @@ void Tick() {
     if (session_.ticks < 1000) ++session_.ticks;
     if (GetTickCount64() >= session_.probe_at) { session_.probe_at = GetTickCount64() + 500; ProbeDisplays(); }
     if (!session_.damage_done && Same(session_.target, session_.target_name)) ScaleHits();
+    TrackPairDrift();
     UpdatePosing();
     if (!session_.options.hide_weapon) return;
-    // Cheap re-check of known actors every tick; full re-scan for newly
-    // attached weapons a few times per second.
-    for (const HiddenActor& item : session_.hidden) {
-        bool hidden = true;
-        if (Same(item.actor, item.name) && Bool(item.actor, "bHidden", hidden) && !hidden)
-            Call(item.actor, "SetActorHiddenInGame").Set("bNewHidden", true).Invoke();
-    }
+    // Cheap re-check of known weapons every tick; full re-scan for newly attached weapons a few times per second.
+    HoldWeapons();
     if (GetTickCount64() >= session_.next_scan) { session_.next_scan = GetTickCount64() + 250; HideWeapons(); }
     SyncProxy();
+    if (session_.look_bones) {  // refresh the proxy -> look frame; a look that went away (or changed) stops it
+        double look_size = 1; Object* skin = skin_display_ ? reinterpret_cast<Object*>(skin_display_(look_size)) : nullptr;
+        if (!ue::Alive(skin) || !DriveLookWeapons(skin)) { StopLookWeapons(); Logf("GRAB_EXTRAS Boss look: the look's weapon bones stopped following the Boss pose (look gone)"); }
+    }
     UpdateDisplays();
     FollowSkinHands();
 }
@@ -1026,6 +1362,21 @@ void Finish(bool completed) {
     if (session_.hold_frames || session_.hold_switches)
         Logf("GRAB_EXTRAS fist hold frames=%u: the grip moved mean=%.2f max=%.2f cm a tick in the hand; switches hand/boss pose=%u", session_.hold_frames,
              session_.hold_frames ? session_.hold_sum / session_.hold_frames : 0.0, session_.hold_max, session_.hold_switches);
+    if (session_.pose_ticks)
+        Logf("GRAB_EXTRAS Boss look: the weapon stayed on the Boss pose's socket; the look's hand off the Boss pose's hand mean=%.1f max=%.1f cm over %u ticks (first %.1f cm)",
+             session_.pose_hand_sum / session_.pose_ticks, session_.pose_hand_max, session_.pose_ticks, session_.pose_first);
+    if (session_.look_ticks)
+        Logf("GRAB_EXTRAS Boss look weapon (%s): in the look's fist the weapon moved mean=%.3f max=%.3f cm a tick (the Boss pose's own in its fist "
+             "mean=%.3f max=%.3f) over %u held ticks; off the Boss pose's place mean=%.1f max=%.1f cm over %u ticks",
+             session_.look_bones ? "the look's weapon bones follow the Boss pose" : "on the Boss pose's socket",
+             session_.look_held ? session_.look_step_sum / session_.look_held : 0.0, session_.look_step_max,
+             session_.look_held ? session_.boss_step_sum / session_.look_held : 0.0, session_.boss_step_max,
+             session_.look_held, session_.look_boss_sum / session_.look_ticks, session_.look_boss_max, session_.look_ticks);
+    if (session_.pair_on) { LogPairSegment("at the end"); session_.pair_on = false; }
+    if (session_.sync_ticks)
+        Logf("GRAB_EXTRAS proxy sync (%s): the proxy's montage time off the player's mean=%.2f max=%.2f ms over %u ticks", proxy_sync_.load(std::memory_order_relaxed) ? "same time and rate" : "one step ahead",
+             session_.sync_sum / session_.sync_ticks, session_.sync_max, session_.sync_ticks);
+    StopLookWeapons();
     if (Same(session_.pawn, session_.pawn_name)) { RemoveDisplays(); RemoveProxy(); RestoreWeapons(); }
     else { session_.displays.clear(); session_.hidden.clear(); }
     if (completed && !session_.damage_done) ApplyDamage();
@@ -1034,6 +1385,20 @@ void Finish(bool completed) {
 bool Active() { return session_.active; }
 bool Posing() { return session_.active && !session_.pose_over; }
 void SetSkinDisplay(SkinDisplay provider) { skin_display_ = provider; }
+void SetSkinWeapons(SkinWeapons provider) { skin_weapons_ = provider; }
+void SetLookSocketMode(int mode) {
+    look_mode_.store(mode >= 1 && mode <= 3 ? mode : 0, std::memory_order_relaxed);
+    Logf("GRAB_EXTRAS look socket mode %s", mode == 1 ? "on (the look's own socket with its own weapon bone, as 11-12)" : mode == 2 ? "off (the look's hand while held, as on the hero's body)"
+         : mode == 3 ? "proxy (the Boss pose's socket all grab, the first 11-15 fix)" : "auto (the look's weapon bones follow the Boss pose; on its own socket)");
+}
+void SetWeaponHideMode(int mode) {
+    weapon_hide_.store(mode ? 1 : 0, std::memory_order_relaxed);
+    Logf("GRAB_EXTRAS weapon hide %s", mode ? "parts (each part's own hidden flag; the actor's stays the game's; default)" : "actors (SetActorHiddenInGame, before 11-15)");
+}
+void SetProxySync(int mode) {
+    proxy_sync_.store(mode ? 1 : 0, std::memory_order_relaxed);
+    Logf("GRAB_EXTRAS proxy sync %s", mode ? "same time and rate (default)" : "one step ahead at rate 0 (11-08..11-15)");
+}
 bool ChangeHealth(unsigned char* character, float delta) {
     return ue::Alive(character) && std::isfinite(delta) && AttributeLayout() && AddHealth(character, delta);
 }

@@ -65,7 +65,8 @@ $tests = @(
     'combo_save_stress_test', 'combo_library_test', 'combo_playback_rules_test',
     'air_attack_reset_test', 'npc_skill_support_test', 'npc_skill_colliders_test',
     'npc_pose_transfer_test', 'npc_cutscene_policy_test', 'npc_source_budget_test',
-    'supplement_layout_test', 'combo_plugins_test', 'mod_registry_test', 'lua_host_test'
+    'supplement_layout_test', 'combo_plugins_test', 'mod_registry_test', 'lua_host_test',
+    'grab_weapon_visibility_test', 'grab_state_leases_test'
 )
 foreach ($test in $tests) {
     & ".\build\Release\$test.exe"

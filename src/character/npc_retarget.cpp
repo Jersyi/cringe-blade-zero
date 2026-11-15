@@ -234,13 +234,23 @@ struct SourceSettings { bool visible=true,hidden=false,uro=false,cast_shadow=tru
 SourceSettings source_settings_;
 NpcSourceBudget::Lease source_budget_lease_;
 void* source_budget_allocator_=nullptr;
+#pragma warning(push)
+#pragma warning(disable:4324) // WeaponDrive::to_target is 16-byte aligned: the structs pad to it
 struct PoseSession {
     Identity source,display,source_asset,target_asset;std::array<int32_t,6> generations{};NpcPoseTransfer::Plan plan;NpcPoseTransfer::Cache cache;
     // Per target bone: the source slot a virtual bone copies in the CopyPose map (its target bone's), else -1 (reference pose).
     std::vector<int32_t> virtual_source;
     Identity puppet; // the mount pose puppet (kMountLoops) once created, else empty
+    // A grab's pose proxy driving the look's weapon bones (DriveGrabWeapons): the proxy and its bone count, the bone names
+    // asked for, per driven bone the target / proxy index, both hands (r, l), proxy component -> display component, how
+    // many poses used it / found its pose unreadable, and the cache's held / free counts when it began.
+    struct WeaponDrive {
+        Identity proxy;size_t proxy_count=0;std::vector<std::string> requested;std::vector<int32_t> bones,proxy_bones;
+        int32_t hand[2]{-1,-1},proxy_hand[2]{-1,-1};NpcPoseTransfer::Transform to_target;uint64_t used=0,missed=0,held_at=0,free_at=0;
+    } weapon;
     volatile LONG failed=0;const char* why="not-evaluated";
 };
+#pragma warning(pop)
 std::unique_ptr<PoseSession> pose_session_;
 SRWLOCK pose_lock_=SRWLOCK_INIT;
 std::vector<Identity> added_;
@@ -1311,7 +1321,15 @@ bool UpdatePoseCache(const Transform* source,size_t count) {
     NpcPoseTransfer::PuppetPose puppet;const NpcPoseTransfer::PuppetPose* posed=nullptr;const Identity& id=pose_session_->puppet;
     if(id.object&&Same(id)&&SkelMesh(id.object)==pose_session_->target_asset.object&&SourceCurrentCS(id.object,puppet.cs,puppet.count)){
         puppet.serial=mount_serial_.load(std::memory_order_relaxed);puppet.now_ms=GetTickCount64();puppet.body=loco_body_.load(std::memory_order_relaxed);posed=&puppet;}
-    if(!NpcPoseTransfer::Evaluate(pose_session_->plan,source,count,pose_session_->cache,why,foreign_weight_.load(std::memory_order_relaxed),foreign_own_.load(std::memory_order_relaxed),posed)){pose_session_->why=why;InterlockedExchange(&pose_session_->failed,1);return false;}
+    // A grab's pose proxy (DriveGrabWeapons): its pose of this frame (the display ticks after it) places the weapon bones.
+    NpcPoseTransfer::WeaponPose weapon;const NpcPoseTransfer::WeaponPose* weapons=nullptr;auto& drive=pose_session_->weapon;
+    if(drive.proxy.object&&!drive.bones.empty()){
+        if(Same(drive.proxy)&&SourceCurrentCS(drive.proxy.object,weapon.cs,weapon.count)&&weapon.count==drive.proxy_count){
+            weapon.bones=drive.bones.data();weapon.proxy_bones=drive.proxy_bones.data();weapon.bone_count=drive.bones.size();
+            for(size_t i=0;i<2;++i){weapon.hand[i]=drive.hand[i];weapon.proxy_hand[i]=drive.proxy_hand[i];}
+            weapon.to_target=drive.to_target;weapons=&weapon;++drive.used;}
+        else ++drive.missed;}
+    if(!NpcPoseTransfer::Evaluate(pose_session_->plan,source,count,pose_session_->cache,why,foreign_weight_.load(std::memory_order_relaxed),foreign_own_.load(std::memory_order_relaxed),posed,weapons)){pose_session_->why=why;InterlockedExchange(&pose_session_->failed,1);return false;}
     pose_session_->why="ok";return true;
 }
 bool RawIdentity(Identity identity, int32_t index, int32_t serial) {
@@ -4978,7 +4996,16 @@ void LogBoneProbe() {
     for(const std::string& bone:names){const std::wstring wide(bone.begin(),bone.end());Call at(display_.object,"GetSocketLocation");
         if(!at.Set("InSocketName",ue::MakeName(wide.c_str())).Invoke()){Logf("NPC_LOCO boneprobe %s: no reading",bone.c_str());continue;}
         const Vector w=at.Get<Vector>("ReturnValue");
-        Logf("NPC_LOCO boneprobe %s height %.1f cm over the display origin (offset %.1f %.1f) body=%.2f playing=%s",bone.c_str(),w.z-origin.z,w.x-origin.x,w.y-origin.y,mount_.body,Text(mount_.playing).c_str());}
+        Logf("NPC_LOCO boneprobe %s height %.1f cm over the display origin (offset %.1f %.1f) body=%.2f playing=%s",bone.c_str(),w.z-origin.z,w.x-origin.x,w.y-origin.y,mount_.body,Text(mount_.playing).c_str());
+        // The same bone on the look, on the hero mesh that drives it and on the pose puppet: component space and its
+        // own local in the parent bone, so a bone the look leaves behind shows next to the ones that move.
+        const std::pair<const char*,const Identity*> meshes[]{{"look",&display_},{"hero",&primary_},{"puppet",&mount_.puppet}};
+        for(const auto& [label,mesh]:meshes){if(!mesh->object||!Same(*mesh))continue;Transform space[2];bool read=true;
+            for(uint8_t k=0;k<2&&read;++k){Call get(mesh->object,"GetSocketTransform");
+                read=get.Set("InSocketName",ue::MakeName(wide.c_str())).Set("TransformSpace",uint8_t(k?3:2)).Invoke();if(read)space[k]=get.Get<Transform>("ReturnValue");}
+            if(!read){Logf("NPC_LOCO boneprobe %s on the %s: no reading",bone.c_str(),label);continue;}
+            const double* c=space[0].translation,*l=space[1].translation;
+            Logf("NPC_LOCO boneprobe %s on the %s: component (%.1f %.1f %.1f), in its parent (%.1f %.1f %.1f) %.1f cm",bone.c_str(),label,c[0],c[1],c[2],l[0],l[1],l[2],std::sqrt(l[0]*l[0]+l[1]*l[1]+l[2]*l[2]));}}
 }
 // The puppet is destroyed here (it is not in added_; one that will not go is left to the restore's retries).
 void RetireMount(const char* why) {
@@ -11436,10 +11463,20 @@ bool SlomoEntries(Object* action,std::vector<SlomoEntry>& out,const char** why){
 }
 std::string ClassPackage(Object* object){Object* cls=ue::Alive(object)?ue::ClassOf(object):nullptr;Object* package=cls?ue::OuterOf(cls):nullptr;return package?Text(package):"";}
 bool NpcMoveClass(Object* ability){return ClassPackage(ability).find("/ActorData/Mobs/")!=std::string::npos;}
-// The receiving part of a paired move (a grab's victim side): GEd / BEd / BDEd in the ability's class name.
+// The receiving part of a paired move (a grab's victim side): a GEd / BEd / BDEd token of the ability's class name (between
+// underscores, any case, digits may follow). 沐小葵 (01, 二阶段 01-03), 独眼 01, 狂医 01 and 大刀男 01 name theirs "_Ged":
+// matched as "GEd" only, their victim was not the hero's grab partner and took the grab's own slow alone while the hero
+// ran on (二阶段 03's GlobalSlomo, 0.2 s), so its part fell behind the hero's (user, 11-15: "沐小葵投技被投者动画慢半拍").
+bool ReceivingToken(const std::string& token){
+    for(const char* tag:{"ged","bed","bded"}){const size_t n=std::strlen(tag);
+        if(token.compare(0,n,tag)==0&&std::all_of(token.begin()+static_cast<std::ptrdiff_t>(n),token.end(),[](char c){return c>='0'&&c<='9';}))return true;}
+    return false;
+}
 bool ReceivingMove(Object* ability){
-    if(!ue::Alive(ability))return false;const std::string name=Text(ue::ClassOf(ability));
-    return name.find("GEd")!=std::string::npos||name.find("BEd")!=std::string::npos||name.find("BDEd")!=std::string::npos;
+    if(!ue::Alive(ability))return false;const std::string name=Lower(Text(ue::ClassOf(ability)));
+    for(size_t at=0;at<=name.size();){const size_t end=(std::min)(name.find('_',at),name.size());
+        if(end>at&&ReceivingToken(name.substr(at,end-at)))return true;at=end+1;}
+    return false;
 }
 // Whether one of the abilities the pawn's ASC runs now (ActivatableAbilities rows with an ActiveCount) passes the test.
 template<class Test> bool RunsMove(Object* pawn,Test test){
@@ -11533,7 +11570,10 @@ void ConsiderSlomo(Object* action,Object* hero){
     if(!mine||SlomoSeenBefore(action,newest))return;
     auto moved=std::find_if(slomo_moved_.begin(),slomo_moved_.end(),[&](const SlomoMoved& m){return m.action.object==action&&Same(m.action);});
     const bool npc_hero=RunsMove(hero,[](Object* a){return NpcMoveClass(a);});
-    const auto pair=[&](Object* pawn){return pawn!=hero&&npc_hero&&RunsMove(pawn,[](Object* a){return ReceivingMove(a);});};
+    // The grab's partner: the target the hero's grab holds, or a character playing a receiving part while the hero plays
+    // an NPC move.
+    Object* grab_target=MotianGrab::HeldTarget();
+    const auto pair=[&](Object* pawn){return pawn!=hero&&((grab_target&&pawn==grab_target)||(npc_hero&&RunsMove(pawn,[](Object* a){return ReceivingMove(a);})));};
     // The other keys holding handles: the hero's grab pair is ours, any other character or actor is not (and not ones
     // DriveSlomo gave this action's slow before).
     std::string others;
@@ -12105,6 +12145,46 @@ unsigned char* GrabDisplay(double& size) {
     const bool on = active_ && source_driver_mode_ && Same(display_);
     size = on ? skin_size_ : 1.0; return on ? display_.object : nullptr;
 }
+size_t DriveGrabWeapons(unsigned char* raw,const char* const* bones,size_t count) {
+    Object* proxy=reinterpret_cast<Object*>(raw);
+    if(!proxy||!bones||!count){
+        Identity old;uint64_t used=0,missed=0,held=0,free=0;
+        AcquireSRWLockExclusive(&pose_lock_);
+        if(pose_session_){auto& w=pose_session_->weapon;old=w.proxy;used=w.used;missed=w.missed;held=pose_session_->cache.weapon_held-w.held_at;free=pose_session_->cache.weapon_free-w.free_at;w=PoseSession::WeaponDrive{};}
+        ReleaseSRWLockExclusive(&pose_lock_);
+        if(!old.object)return 0;
+        if(Same(display_)&&Same(old))Call(display_.object,"RemoveTickPrerequisiteComponent").Set("PrerequisiteComponent",old.object).Invoke();
+        Logf("NPC_BODY grab weapon pose off: %llu poses took it, %llu found the proxy unreadable; bones placed held %llu, free %llu",used,missed,held,free);
+        return 0;}
+    if(!active_||!source_driver_mode_||!pose_session_||!Same(display_)||!ue::Alive(proxy))return 0;
+    // The proxy and the look hang on the same mesh, so this frame map is fixed while neither is resized; refreshed per call.
+    Call proxy_world(proxy,"K2_GetComponentToWorld"),display_world(display_.object,"K2_GetComponentToWorld");
+    if(!proxy_world.Invoke()||!display_world.Invoke())return 0;
+    Transform to;if(!NpcGripMath::RelativeNativeSafe(proxy_world.Get<Transform>("ReturnValue"),display_world.Get<Transform>("ReturnValue"),to))return 0;
+    {auto& current=pose_session_->weapon;bool same=current.proxy.object==proxy&&Same(current.proxy)&&current.requested.size()==count;
+        for(size_t i=0;same&&i<count;++i)same=current.requested[i]==(bones[i]?bones[i]:"");
+        if(same){AcquireSRWLockExclusive(&pose_lock_);current.to_target=to;const size_t driven=current.bones.size();ReleaseSRWLockExclusive(&pose_lock_);return driven;}}
+    Object* asset=SkelMesh(proxy);std::vector<NpcPoseTransfer::Bone> refs;size_t raw_count=0;
+    if(!ue::Alive(asset)||!ReadMeshReferences(asset,refs,raw_count)){Logf("NPC_BODY grab weapon pose: the proxy's bones are unreadable");return 0;}
+    const auto& plan=pose_session_->plan;const size_t n=plan.target.size();PoseSession::WeaponDrive next;next.proxy=Id(proxy);next.proxy_count=refs.size();next.to_target=to;
+    std::string skipped;
+    for(size_t i=0;i<count;++i){const char* name=bones[i]?bones[i]:"";next.requested.push_back(name);if(!*name)continue;
+        const int32_t t=PlanBone(plan.target,name),p=PlanBone(refs,name);
+        // The CopyPose must carry the bone: a mapped source slot, or a spare slot of its own (Plan::extra_source).
+        const bool carried=t>0&&(plan.target_to_source[static_cast<size_t>(t)]>=0||(plan.extra_source.size()==n&&plan.extra_source[static_cast<size_t>(t)]>=0));
+        if(!carried||p<=0||next.bones.size()>=NpcPoseTransfer::kWeaponPoseBones){skipped+=skipped.empty()?name:std::string(",")+name;continue;}
+        if(std::find(next.bones.begin(),next.bones.end(),t)==next.bones.end()){next.bones.push_back(t);next.proxy_bones.push_back(p);}}
+    static constexpr const char* kHands[2]={"hand_r","hand_l"};
+    for(size_t i=0;i<2;++i){next.hand[i]=PlanBone(plan.target,kHands[i]);next.proxy_hand[i]=PlanBone(refs,kHands[i]);}
+    if(next.bones.empty()){Logf("NPC_BODY grab weapon pose: no look bone to drive (skipped %s)",skipped.c_str());return 0;}
+    // The look evaluates after the proxy, so it reads the proxy's pose of the same frame.
+    const bool after=Call(display_.object,"AddTickPrerequisiteComponent").Set("PrerequisiteComponent",proxy).Invoke();
+    const size_t driven=next.bones.size();
+    Logf("NPC_BODY grab weapon pose: %zu look bones follow the Boss pose (proxy %zu bones; hands r %d->%d, l %d->%d; look after the proxy %d; proxy->look scale %.3f; skipped %s)",
+        driven,next.proxy_count,next.proxy_hand[0],next.hand[0],next.proxy_hand[1],next.hand[1],after?1:0,to.scale[0],skipped.empty()?"none":skipped.c_str());
+    AcquireSRWLockExclusive(&pose_lock_);if(pose_session_){next.held_at=pose_session_->cache.weapon_held;next.free_at=pose_session_->cache.weapon_free;pose_session_->weapon=std::move(next);}ReleaseSRWLockExclusive(&pose_lock_);
+    return driven;
+}
 Snapshot GetSnapshot() { AcquireSRWLockShared(&snapshot_lock); Snapshot copy = snapshot_; ReleaseSRWLockShared(&snapshot_lock); return copy; }
 bool GetSkinMoves(int32_t skin, SkinMoves& moves) {
     moves = {};
@@ -12165,6 +12245,10 @@ int32_t SkinForGrab(const std::wstring& boss_id, const std::wstring& source) {
         if (best < 0 || folder > best_folder || (folder == best_folder && named && !best_named)) { best = static_cast<int32_t>(row); best_folder = folder; best_named = named; }
     }
     return best;
+}
+size_t GrabBossWeaponConfigs(const std::wstring& boss_id, const std::wstring& source) {
+    const int32_t row = SkinForGrab(boss_id, source);
+    return row >= 0 && static_cast<size_t>(row) < std::size(kNpcWeaponSetsBySkin) ? kNpcWeaponSetsBySkin[static_cast<size_t>(row)].entry_count : 0;
 }
 ue::Object* BoneBody(){if(active_&&Same(display_))return display_.object;Context context;return ContextNow(context)?context.mesh:nullptr;}
 BoneMotion::Config BoneEdits(){

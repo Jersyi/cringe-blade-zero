@@ -53,6 +53,9 @@ endfunction()
 
 add_executable(grab_weapon_visibility_test tests/grab_weapon_visibility_test.cpp)
 pbz_settings(grab_weapon_visibility_test)
+# Grab state leases (Main weapon index / armed / capsule restore) on a scripted weapons component.
+add_executable(grab_state_leases_test tests/grab_state_leases_test.cpp)
+pbz_settings(grab_state_leases_test)
 add_executable(sample_combo_test tests/sample_combo_test.cpp src/character/combo_file.cpp)
 target_link_libraries(sample_combo_test PRIVATE Cabinet)
 pbz_settings(sample_combo_test)

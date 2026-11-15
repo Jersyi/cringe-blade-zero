@@ -77,6 +77,26 @@ enum : uint8_t { kScaled = 0, kAnimation = 1, kSkeleton = 2 };
 // body: how much of every raw bone but the root takes the puppet's pose (0..1; the target's own locomotion).
 struct PuppetPose { const Transform* cs=nullptr;size_t count=0;uint32_t serial=0;uint64_t now_ms=0;double body=0; };
 constexpr uint64_t kPuppetBlendMs=200;
+// The Boss's own weapon pose (a grab played on the Boss's look: the grab's pose proxy is the Boss mesh replaying the move,
+// on the target's Skeleton). Each listed target bone takes the place the Boss's pose gives it. While a hand holds it (its
+// bone within full_cm of that hand's bone in the proxy pose; none_cm lets go, smoothstep between, both hands weighed) it
+// keeps the Boss's grip (the bone relative to that hand) on the target's own hand of this pose: the weapon sits in the fist
+// that is drawn, so a proxy sampled a frame off or a hand a few cm off the Boss's never moves it in the hand (11-15: the
+// weapon hung on the proxy's socket shook against the look's fist). Free (MoTian plants his weapon for the throw) it takes
+// the proxy's place mapped into the target's component space by to_target (proxy component -> target component). The bone
+// keeps the target's own scale; its descendants follow. bones / hand[]: target bones; proxy_bones / proxy_hand[]: the
+// proxy's bones of the same names, hand[0] / [1] the right / left hand (-1 leaves one out). Bad input leaves the pose as it is.
+struct WeaponPose {
+    const Transform* cs=nullptr;size_t count=0;
+    const int32_t* bones=nullptr;const int32_t* proxy_bones=nullptr;size_t bone_count=0;
+    int32_t hand[2]{-1,-1},proxy_hand[2]{-1,-1};
+    Transform to_target;
+    double full_cm=20,none_cm=40;
+};
+constexpr size_t kWeaponPoseBones=8;
+// The WeaponPose inputs a pose depends on beyond the source pose (detail::WeaponKey): bone / proxy counts, the fade, the
+// frame map, then per listed bone and per hand its indices and the proxy transform read.
+constexpr size_t kWeaponKeySize=4+10+kWeaponPoseBones*12+2*12;
 struct Cache {
     std::vector<Transform> snapshot,target_cs,synthetic_source,source_local,target_local;std::vector<uint8_t> moved;
     uint64_t builds=0,hits=0,contacts=0,grip_rejected=0;bool ready=false;double contact_weight=0,contact_error_max=0,foreign=0;bool own=false;
@@ -85,6 +105,10 @@ struct Cache {
     std::vector<Transform> puppet_last,puppet_from,puppet_snapshot;std::vector<std::array<double,4>> shift;
     uint32_t puppet_serial=0;uint64_t puppet_switch_ms=0,puppet_builds=0;bool puppet_seen=false,puppet_used=false,puppet_faded=false;
     double puppet_body=0; // PuppetPose::body of the pose last built (0 without a puppet)
+    // WeaponPose: poses built with it, and listed bones placed while a hand held them / free; the key of the WeaponPose the
+    // pose last built took (weapon_key_size 0: built without one).
+    uint64_t weapon_builds=0,weapon_held=0,weapon_free=0;
+    std::array<double,kWeaponKeySize> weapon_key{};size_t weapon_key_size=0;
 };
 inline bool ReferenceCS(const std::vector<Bone>& bones,std::vector<Transform>& out,std::string& why) {
     if(bones.empty()||bones.size()>2048){why="reference-count";return false;}out.resize(bones.size());
@@ -113,7 +137,7 @@ inline bool Build(Plan& plan,std::vector<Bone> source,std::vector<Bone> target,c
 }
 // Index of the bone whose raw FName is `name`, else -1 (FNames compare case-insensitively by index).
 inline int32_t BoneNamed(const std::vector<Bone>& bones,uint64_t name){for(size_t i=0;i<bones.size();++i)if(bones[i].name==name)return static_cast<int32_t>(i);return -1;}
-inline void Prepare(const Plan& plan,Cache& cache){cache.snapshot.resize(plan.source.size());cache.synthetic_source.resize(plan.source.size());cache.source_local.resize(plan.source.size());cache.target_cs.resize(plan.target.size());cache.target_local.resize(plan.target.size());cache.moved.assign(plan.target.size(),0);cache.ready=false;cache.builds=cache.hits=cache.contacts=cache.grip_rejected=0;cache.contact_weight=cache.contact_error_max=cache.foreign=0;cache.own=false;
+inline void Prepare(const Plan& plan,Cache& cache){cache.snapshot.resize(plan.source.size());cache.synthetic_source.resize(plan.source.size());cache.source_local.resize(plan.source.size());cache.target_cs.resize(plan.target.size());cache.target_local.resize(plan.target.size());cache.moved.assign(plan.target.size(),0);cache.ready=false;cache.builds=cache.hits=cache.contacts=cache.grip_rejected=0;cache.weapon_builds=cache.weapon_held=cache.weapon_free=0;cache.weapon_key_size=0;cache.contact_weight=cache.contact_error_max=cache.foreign=0;cache.own=false;
     const size_t puppet=plan.puppet_always.size()==plan.target.size()?plan.target.size():0;cache.puppet_last.assign(puppet,Transform{});cache.puppet_from.assign(puppet,Transform{});cache.puppet_snapshot.assign(puppet,Transform{});
     cache.shift.assign(puppet,{0,0,0,1});cache.puppet_serial=0;cache.puppet_switch_ms=cache.puppet_builds=0;cache.puppet_seen=cache.puppet_used=cache.puppet_faded=false;cache.puppet_body=0;}
 // Pose puppet. always: per target bone, 1 = always takes the puppet's pose (raw non-root bones only).
@@ -347,12 +371,64 @@ inline void Blend(const Transform& a,const Transform& b,double w,Transform& out)
     Transform r;Slerp(a.rotation,b.rotation,w,r.rotation);for(size_t i=0;i<3;++i){r.translation[i]=a.translation[i]+(b.translation[i]-a.translation[i])*w;r.scale[i]=a.scale[i]+(b.scale[i]-a.scale[i])*w;}out=r;
 }
 }
+namespace detail {
+// Writes what a pose built with `w` depends on beyond the source pose into key; returns its length (0 without w). The
+// same key over an unchanged source pose gives the same pose (Evaluate's cache hit).
+inline size_t WeaponKey(const WeaponPose* w,std::array<double,kWeaponKeySize>& key) {
+    if(!w)return 0;size_t at=0;
+    const auto put=[&](double v){key[at++]=v;};
+    const auto put_transform=[&](const Transform& t){for(size_t k=0;k<4;++k)put(t.rotation[k]);for(size_t k=0;k<3;++k)put(t.translation[k]);for(size_t k=0;k<3;++k)put(t.scale[k]);};
+    const auto put_bone=[&](int32_t index){put(static_cast<double>(index));
+        if(w->cs&&index>=0&&static_cast<size_t>(index)<w->count)put_transform(w->cs[static_cast<size_t>(index)]);else for(int i=0;i<10;++i)put(0);};
+    const size_t bones=w->bones&&w->proxy_bones?(std::min)(w->bone_count,kWeaponPoseBones):0;
+    put(static_cast<double>(w->bone_count));put(static_cast<double>(w->count));put(w->full_cm);put(w->none_cm);put_transform(w->to_target);
+    for(size_t i=0;i<bones;++i){put(static_cast<double>(w->bones[i]));put_bone(w->proxy_bones[i]);}
+    for(size_t side=0;side<2;++side){put(static_cast<double>(w->hand[side]));put_bone(w->proxy_hand[side]);}
+    return at;
+}
+// One WeaponPose bone's component-space place (scale not yet the target's); held: the larger hand weight (0: free).
+inline bool WeaponPlace(const WeaponPose& w,const Cache& cache,size_t i,Transform& out,double& held) {
+    held=0;const Transform& weapon=w.cs[static_cast<size_t>(w.proxy_bones[i])];Transform free;
+    if(!NpcGripMath::ComposeMount(weapon,w.to_target,free))return false;
+    Transform grip[2];double weight[2]{0,0};
+    for(size_t side=0;side<2;++side){const int32_t h=w.hand[side],ph=w.proxy_hand[side];
+        if(h<0||ph<0||static_cast<size_t>(h)>=cache.target_cs.size()||static_cast<size_t>(ph)>=w.count)continue;
+        const Transform& hand=w.cs[static_cast<size_t>(ph)];if(!NpcGripMath::FiniteMount(hand))continue;
+        const double d[3]={weapon.translation[0]-hand.translation[0],weapon.translation[1]-hand.translation[1],weapon.translation[2]-hand.translation[2]};
+        const double weight_now=Fade(std::sqrt(Dot(d,d)),w.full_cm,w.none_cm);if(!(weight_now>0))continue;
+        Transform rel;if(!NpcGripMath::RelativeNativeSafe(weapon,hand,rel)||!NpcGripMath::ComposeMount(rel,cache.target_cs[static_cast<size_t>(h)],grip[side]))continue;
+        weight[side]=weight_now;}
+    out=free;const double total=weight[0]+weight[1];if(!(total>0))return true;
+    Transform hold=weight[1]>0?grip[1]:grip[0];if(weight[0]>0&&weight[1]>0)Blend(grip[0],grip[1],weight[1]/total,hold);
+    held=(std::max)(weight[0],weight[1]);Blend(free,hold,held,out);return true;
+}
+}
+// Moves WeaponPose's bones in cache.target_cs / target_local (parents first, descendants follow). Uses cache.moved.
+inline void ApplyWeaponPose(const Plan& plan,const WeaponPose& w,Cache& cache) {
+    const size_t n=plan.target.size();
+    if(!w.cs||!w.bones||!w.proxy_bones||!w.bone_count||w.bone_count>kWeaponPoseBones||cache.target_cs.size()!=n||cache.target_local.size()!=n||cache.moved.size()!=n)return;
+    if(!(w.full_cm>0)||!(w.none_cm>w.full_cm)||!std::isfinite(w.none_cm)||!NpcGripMath::FiniteMount(w.to_target))return;
+    for(size_t i=0;i<w.bone_count;++i){const int32_t b=w.bones[i],pb=w.proxy_bones[i];
+        if(b<=0||static_cast<size_t>(b)>=n||pb<0||static_cast<size_t>(pb)>=w.count||!NpcGripMath::FiniteMount(w.cs[static_cast<size_t>(pb)]))return;}
+    std::fill(cache.moved.begin(),cache.moved.end(),uint8_t{0});bool any=false;
+    for(size_t t=1;t<n;++t){const int32_t p=plan.target[t].parent;if(p<0)continue;size_t listed=w.bone_count;
+        for(size_t i=0;i<w.bone_count;++i)if(static_cast<size_t>(w.bones[i])==t){listed=i;break;}
+        if(listed<w.bone_count){Transform place,local;double held=0;if(!detail::WeaponPlace(w,cache,listed,place,held))continue;
+            std::memcpy(place.scale,cache.target_cs[t].scale,sizeof(place.scale));
+            if(!NpcGripMath::RelativeNativeSafe(place,cache.target_cs[static_cast<size_t>(p)],local))continue;
+            cache.target_cs[t]=place;cache.target_local[t]=local;cache.moved[t]=1;any=true;if(held>0)++cache.weapon_held;else ++cache.weapon_free;continue;}
+        if(cache.moved[static_cast<size_t>(p)]){Transform cs;if(!NpcGripMath::ComposeMount(cache.target_local[t],cache.target_cs[static_cast<size_t>(p)],cs))continue;cache.target_cs[t]=cs;cache.moved[t]=1;}}
+    if(any)++cache.weapon_builds;
+}
 // puppet (Plan::puppet_always set): always-bones take the puppet's local pose (its root-relative pose,
 // crossfaded over kPuppetBlendMs when its animation changes), other raw bones but the root by
 // PuppetPose::body or, on a puppet_own plan, the own-montage weight, whichever is more. Bones above which
 // the puppet turned the body keep the retarget-pose turns relative to it (Cache::shift). Unmapped bones
 // on a spare slot (Plan::extra_source) reach the CopyPose through it.
-inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache& cache,const char*& why,double foreign=0,bool own=false,const PuppetPose* puppet=nullptr) {
+// weapon (WeaponPose): the Boss's weapon pose for listed bones, applied after the hand contact (the hands are final) and
+// before the IK followers (an IK copy of a weapon bone follows it); the cache hit also needs the same WeaponPose inputs
+// (detail::WeaponKey: the proxy transforms it reads, its indices, fade and frame map), and none when built without one.
+inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache& cache,const char*& why,double foreign=0,bool own=false,const PuppetPose* puppet=nullptr,const WeaponPose* weapon=nullptr) {
     if(!source||count!=plan.source.size()||cache.snapshot.size()!=count||cache.target_cs.size()!=plan.target.size()){why="pose-count/epoch";return false;}
     foreign=std::isfinite(foreign)?std::clamp(foreign,0.0,1.0):0.0;own=own&&foreign>0;const size_t n=plan.target.size();
     bool puppeted=puppet&&puppet->cs&&puppet->count==n&&plan.puppet_always.size()==n&&cache.puppet_last.size()==n&&cache.shift.size()==n;double fade=1;
@@ -366,7 +442,9 @@ inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache
     else cache.puppet_seen=false;
     const double body=puppeted&&std::isfinite(puppet->body)?std::clamp(puppet->body,0.0,1.0):0.0;
     const bool puppet_same=!puppeted||(fade>=1&&cache.puppet_used&&!cache.puppet_faded&&!std::memcmp(puppet->cs,cache.puppet_snapshot.data(),n*sizeof(Transform)));
-    if(cache.ready&&cache.foreign==foreign&&cache.own==own&&cache.puppet_used==puppeted&&cache.puppet_body==body&&puppet_same&&!std::memcmp(source,cache.snapshot.data(),count*sizeof(Transform))){++cache.hits;return true;}
+    std::array<double,kWeaponKeySize> weapon_key;const size_t weapon_key_size=detail::WeaponKey(weapon,weapon_key);
+    const bool weapon_same=weapon_key_size==cache.weapon_key_size&&!std::memcmp(weapon_key.data(),cache.weapon_key.data(),weapon_key_size*sizeof(double));
+    if(cache.ready&&weapon_same&&cache.foreign==foreign&&cache.own==own&&cache.puppet_used==puppeted&&cache.puppet_body==body&&puppet_same&&!std::memcmp(source,cache.snapshot.data(),count*sizeof(Transform))){++cache.hits;return true;}
     cache.ready=false;cache.foreign=foreign;cache.own=own;cache.puppet_used=false;cache.puppet_body=body;const bool keeps=plan.foreign_keep.size()==n;
     const auto puppet_weight=[&](size_t t){return puppeted&&t>0&&t<plan.target_raw?(plan.puppet_always[t]?1.0:(std::max)(plan.puppet_own&&own?foreign:0.0,body)):0.0;};
     // All storage is prepared before the session. This path allocates nothing
@@ -405,6 +483,7 @@ inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache
             double inverse[4];NpcGripMath::Inverse(cache.target_cs[static_cast<size_t>(p)].rotation,inverse);NpcGripMath::Mul(inverse,want,local.rotation);}
         if(p>=0&&!NpcGripMath::ComposeMount(local,cache.target_cs[static_cast<size_t>(p)],cache.target_cs[t])){why="rest-turn-compose-invalid";return false;}}
     if(!detail::SolveHandContact(plan,source,cache)){why="hand-contact-compose-invalid";return false;}
+    if(weapon)ApplyWeaponPose(plan,*weapon,cache);
     // IK copies take their FK bone's final transform (after rest turns and the hand contact).
     if(plan.follow.size()==plan.target.size()&&cache.moved.size()==plan.target.size())for(size_t t=0;t<plan.target.size();++t){
         const int32_t p=plan.target[t].parent,f=plan.follow[t];cache.moved[t]=0;
@@ -424,7 +503,8 @@ inline bool Evaluate(const Plan& plan,const Transform* source,size_t count,Cache
         if(plan.extra_mesh){cache.synthetic_source[s]=cache.target_cs[static_cast<size_t>(t)];continue;}
         if(!NpcGripMath::ComposeMount(cache.target_local[static_cast<size_t>(t)],cache.synthetic_source[static_cast<size_t>(ps)],cache.synthetic_source[s])){why="extra-slot-compose-invalid";return false;}}
     if(puppeted){std::memcpy(cache.puppet_snapshot.data(),puppet->cs,n*sizeof(Transform));cache.puppet_used=true;cache.puppet_faded=fade<1;++cache.puppet_builds;}
-    std::memcpy(cache.snapshot.data(),source,count*sizeof(Transform));cache.ready=true;++cache.builds;why="ok";return true;
+    std::memcpy(cache.snapshot.data(),source,count*sizeof(Transform));std::memcpy(cache.weapon_key.data(),weapon_key.data(),weapon_key_size*sizeof(double));cache.weapon_key_size=weapon_key_size;
+    cache.ready=true;++cache.builds;why="ok";return true;
 }
 #ifdef _MSC_VER
 #pragma warning(pop)

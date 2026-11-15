@@ -813,6 +813,115 @@ void TestWeaponRoutes() {
     Check(NpcGripRoutes::StaleRoutes(routes, {light}).size() == 2, "a light cannot keep an old weapon route alive");
 }
 
+// A grab on a Boss look: the Boss's weapon bone takes the Boss's grip on the look's own hand while a hand holds it (the
+// proxy pose's weapon within full_cm of that hand), the proxy's place mapped into the look's component space when free,
+// a smoothstep between; its child follows; a proxy pose sampled at another time with the same grip changes nothing.
+void TestBossWeaponPose() {
+    enum : int32_t { WRoot, WSpine, WHandR, WHandL, WWeapon, WTip, WCount };
+    const int32_t parents[WCount] = {-1, WRoot, WSpine, WSpine, WHandR, WWeapon};
+    const Transform locals[WCount] = {At(0, 0, 0), At(0, 0, 100), At(-30, 20, 0), At(30, 20, 0), At(-8, 3, 4), At(0, 0, 90)};
+    std::vector<Bone> bones(WCount);
+    for (int32_t i = 0; i < WCount; ++i) bones[static_cast<size_t>(i)] = {static_cast<uint64_t>(3000 + i), parents[i], locals[i]};
+    NpcPoseTransfer::Plan plan; std::string why;
+    Check(NpcPoseTransfer::Build(plan, bones, bones, {}, why), "weapon pose plan builds");
+    // The look's (source-driven) pose: the right hand moved and turned away from the rest pose.
+    std::vector<Transform> local(WCount), pose(WCount);
+    for (size_t i = 0; i < WCount; ++i) local[i] = bones[i].ref;
+    local[WHandR].translation[1] = 45; Yaw(local[WHandR], 35);
+    for (size_t i = 0; i < WCount; ++i)
+        if (parents[i] < 0) pose[i] = local[i]; else NpcGripMath::Compose(local[i], pose[static_cast<size_t>(parents[i])], pose[i]);
+    // Proxy pose (component space): the Boss's hands elsewhere, the weapon 9 cm from the right hand, turned in it.
+    auto proxy_pose = [&](double hand_yaw, double hand_x, double weapon_off) {
+        std::vector<Transform> l(WCount), cs(WCount);
+        for (size_t i = 0; i < WCount; ++i) l[i] = bones[i].ref;
+        l[WHandR].translation[0] = hand_x; Yaw(l[WHandR], hand_yaw);
+        l[WWeapon].translation[0] = -weapon_off; Axis(l[WWeapon].rotation, 1, 0, 0, 25);
+        for (size_t i = 0; i < WCount; ++i)
+            if (parents[i] < 0) cs[i] = l[i]; else NpcGripMath::Compose(l[i], cs[static_cast<size_t>(parents[i])], cs[i]);
+        return cs;
+    };
+    const int32_t listed[1] = {WWeapon}, proxy_listed[1] = {WWeapon};
+    auto weapon_pose = [&](const std::vector<Transform>& cs) {
+        NpcPoseTransfer::WeaponPose w; w.cs = cs.data(); w.count = cs.size(); w.bones = listed; w.proxy_bones = proxy_listed; w.bone_count = 1;
+        w.hand[0] = WHandR; w.hand[1] = WHandL; w.proxy_hand[0] = WHandR; w.proxy_hand[1] = WHandL;
+        w.to_target = At(5, -7, 2); Yaw(w.to_target, 20); for (int i = 0; i < 3; ++i) w.to_target.scale[i] = 1.1;
+        return w;
+    };
+    auto run = [&](const NpcPoseTransfer::WeaponPose* w, NpcPoseTransfer::Cache& cache) {
+        NpcPoseTransfer::Prepare(plan, cache); const char* reason = "";
+        return NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), cache, reason, 0, false, nullptr, w);
+    };
+    NpcPoseTransfer::Cache plain_cache; Check(run(nullptr, plain_cache), "weapon pose: plain pose evaluates");
+    // Held: the look's weapon is the Boss's grip on the look's own right hand.
+    const std::vector<Transform> held_proxy = proxy_pose(-50, -25, 9);
+    const NpcPoseTransfer::WeaponPose held = weapon_pose(held_proxy);
+    NpcPoseTransfer::Cache held_cache; Check(run(&held, held_cache), "weapon pose: held pose evaluates");
+    Transform grip_boss, grip_look;
+    NpcGripMath::RelativeNativeSafe(held_proxy[WWeapon], held_proxy[WHandR], grip_boss);
+    NpcGripMath::RelativeNativeSafe(held_cache.target_cs[WWeapon], held_cache.target_cs[WHandR], grip_look);
+    Check(SameTransform(grip_boss, grip_look), "held weapon keeps the Boss's grip on the look's hand");
+    Check(SameTransform(held_cache.target_cs[WHandR], plain_cache.target_cs[WHandR]), "the hand itself does not move");
+    Transform tip_local; NpcGripMath::RelativeNativeSafe(held_cache.target_cs[WTip], held_cache.target_cs[WWeapon], tip_local);
+    Check(SameTransform(tip_local, bones[WTip].ref), "the weapon's child follows it");
+    Check(Distance(held_cache.synthetic_source[WWeapon].translation, held_cache.target_cs[WWeapon].translation) < 1e-9, "the CopyPose slot carries it");
+    Check(held_cache.weapon_held == 1 && held_cache.weapon_free == 0 && held_cache.weapon_builds == 1, "counted as held");
+    // The proxy a frame later: the Boss's hand moved and turned, same grip: nothing changes on the look.
+    const std::vector<Transform> later_proxy = proxy_pose(-20, -40, 9);
+    const NpcPoseTransfer::WeaponPose later = weapon_pose(later_proxy);
+    NpcPoseTransfer::Cache later_cache; run(&later, later_cache);
+    Check(SameTransform(later_cache.target_cs[WWeapon], held_cache.target_cs[WWeapon]), "a proxy sampled at another time with the same grip does not move the weapon");
+    // Over an unchanged source pose the same proxy pose takes the cache hit; another proxy pose, or none, rebuilds.
+    const char* reason = ""; NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, &held);
+    Check(held_cache.hits == 1 && held_cache.builds == 1, "the same source and proxy pose take the cache hit");
+    NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, &later);
+    Check(held_cache.hits == 1 && held_cache.builds == 2, "another proxy pose rebuilds over an unchanged source pose");
+    Check(SameTransform(held_cache.target_cs[WWeapon], later_cache.target_cs[WWeapon]), "the rebuilt pose is the other proxy pose's");
+    NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, &later);
+    Check(held_cache.hits == 2 && held_cache.builds == 2, "that proxy pose again takes the cache hit");
+    NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, nullptr);
+    Check(held_cache.builds == 3 && SameTransform(held_cache.target_cs[WWeapon], plain_cache.target_cs[WWeapon]), "dropping the weapon pose rebuilds the plain pose");
+    NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, nullptr);
+    Check(held_cache.hits == 3 && held_cache.builds == 3, "the plain pose again takes the cache hit");
+    NpcPoseTransfer::WeaponPose moved_map = later; moved_map.to_target.translation[0] += 1;
+    NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, &moved_map);
+    NpcPoseTransfer::Evaluate(plan, pose.data(), pose.size(), held_cache, reason, 0, false, nullptr, &later);
+    Check(held_cache.builds == 5, "a changed proxy -> look frame rebuilds");
+    // Free: 120 cm from both hands, the proxy's place mapped into the look's component space; the look's scale kept.
+    const std::vector<Transform> free_proxy = proxy_pose(-50, -25, 120);
+    const NpcPoseTransfer::WeaponPose free = weapon_pose(free_proxy);
+    NpcPoseTransfer::Cache free_cache; run(&free, free_cache);
+    Transform mapped; NpcGripMath::ComposeMount(free_proxy[WWeapon], free.to_target, mapped);
+    Check(Distance(free_cache.target_cs[WWeapon].translation, mapped.translation) < 1e-9 && SameRotation(free_cache.target_cs[WWeapon], mapped), "free weapon takes the proxy's place");
+    Check(std::abs(free_cache.target_cs[WWeapon].scale[0] - plain_cache.target_cs[WWeapon].scale[0]) < 1e-12, "free weapon keeps the look's scale");
+    Check(free_cache.weapon_free == 1 && free_cache.weapon_held == 0, "counted as free");
+    // Letting go: continuous from held (<= 20 cm) to free (>= 40 cm).
+    double worst = 0; Transform last{}; bool first = true;
+    for (double off = 10; off <= 50.0001; off += 0.5) {
+        const std::vector<Transform> cs = proxy_pose(-50, -25, off); const NpcPoseTransfer::WeaponPose w = weapon_pose(cs);
+        NpcPoseTransfer::Cache c; run(&w, c);
+        if (!first) worst = std::max(worst, Distance(c.target_cs[WWeapon].translation, last.translation));
+        last = c.target_cs[WWeapon]; first = false;
+    }
+    Check(worst < 8, "letting go is continuous (largest step for 0.5 cm of the Boss's pose)");
+    // The left hand holds it: the grip is taken on the look's left hand.
+    std::vector<Transform> left_proxy = proxy_pose(-50, -25, 120);
+    Transform near_left = At(4, -3, 6); NpcGripMath::ComposeMount(near_left, left_proxy[WHandL], left_proxy[WWeapon]);
+    const NpcPoseTransfer::WeaponPose left = weapon_pose(left_proxy);
+    NpcPoseTransfer::Cache left_cache; run(&left, left_cache);
+    Transform grip_left_boss, grip_left_look;
+    NpcGripMath::RelativeNativeSafe(left_proxy[WWeapon], left_proxy[WHandL], grip_left_boss);
+    NpcGripMath::RelativeNativeSafe(left_cache.target_cs[WWeapon], left_cache.target_cs[WHandL], grip_left_look);
+    Check(SameTransform(grip_left_boss, grip_left_look), "a weapon in the Boss's left hand rides the look's left hand");
+    // Bad input (a proxy bone out of range) leaves the pose as without it.
+    const int32_t bad[1] = {static_cast<int32_t>(WCount + 3)};
+    NpcPoseTransfer::WeaponPose broken = weapon_pose(held_proxy); broken.proxy_bones = bad;
+    NpcPoseTransfer::Cache broken_cache; Check(run(&broken, broken_cache), "bad weapon input still evaluates");
+    Check(SameTransform(broken_cache.target_cs[WWeapon], plain_cache.target_cs[WWeapon]) && broken_cache.weapon_builds == 0, "bad weapon input changes nothing");
+    NpcPoseTransfer::WeaponPose root_listed = weapon_pose(held_proxy); const int32_t root_bone[1] = {WRoot}; root_listed.bones = root_bone;
+    NpcPoseTransfer::Cache root_cache; run(&root_listed, root_cache);
+    Check(SameTransform(root_cache.target_cs[WRoot], plain_cache.target_cs[WRoot]) && root_cache.weapon_builds == 0, "the root is never a weapon bone");
+}
+
 int main() {
     TestContact();
     TestWeaponFrame();
@@ -829,6 +938,7 @@ int main() {
     TestMountPuppet();
     TestOwnLocomotionPuppet();
     TestWeaponRoutes();
+    TestBossWeaponPose();
     std::printf("npc_pose_transfer_test failures=%d\n", failures);
     return failures ? 1 : 0;
 }

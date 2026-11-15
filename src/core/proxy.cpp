@@ -376,6 +376,8 @@ DWORD WINAPI Worker(void*) {
     GrabExtras::Initialize(&LogLine);
     // With an NPC skin on, a grab's boss weapon follows the NPC display's hands.
     GrabExtras::SetSkinDisplay(&NpcRetarget::GrabDisplay);
+    // On a look of the Boss's own skeleton, the look's weapon bones follow the grab's Boss pose.
+    GrabExtras::SetSkinWeapons(&NpcRetarget::DriveGrabWeapons);
     BossAI::Initialize(&LogLine);
     TestDummy::Initialize(&LogLine);
     BossAssist::Initialize(&LogLine);

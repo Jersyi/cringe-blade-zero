@@ -160,6 +160,13 @@ ULONGLONG chain_deadline_=0;   // a chain grab asked for, tried until then
 // grab trigger test: that one queued request may start while the game window is not focused (the test driver runs the
 // game in the background and never takes the mouse); every other gate still applies.
 bool trigger_test_=false,focus_test_=false; ULONGLONG manual_test_until_=0;  // focus_test_: grab focustest (the next 10 s skip the focus gate)
+// grab switchprobe <index> [ms]: the native GAA_SwitchWeapon's own calls on the player, each followed by read-backs. Begin
+// caches the Main index (CacheCurrent = ResetOnEnd) and calls SetCurrentWeapon(Main, index); an Armed=false action calls
+// nothing else. End, after ms: SetCurrentWeapon(Main, cached). Shows what a Main index the player's layout lacks does
+// (沐小葵 01 switches to 2; her own Main slot has 2 configs). Refused while a grab holds resources.
+struct SwitchProbe { int phase=0,index=-1,cached=-1; ULONGLONG hold_ms=0,began=0,next_read=0,tail_until=0; Object* pawn=nullptr,*weapons=nullptr; };
+SwitchProbe switch_probe_;
+int switch_probe_index_=-1; ULONGLONG switch_probe_ms_=0;  // the request, under request_lock
 constexpr ULONGLONG kChainTriggerMs=1200;
 // A 黑伤 execution that was cancelled and waits for both sides to finish ending.
 struct Redirect {
@@ -463,6 +470,11 @@ bool AlignmentFailure(const wchar_t* text) {
     AlignmentStatus(false,text); Status(L"投技位置修正未通过：%s；未进入成功动作",text); return false;
 }
 bool AlignmentGate(const char* reason) { alignment_gate_=reason; return false; }
+// The executor's spot (PrepareAlignment): bearings around the target from the executor's own line, nearest first; a
+// floor within kLevelCm of the target's counts as level. ApplyAlignment: how far the native teleport fit may move the
+// executor off the planned spot (it settles a capsule touching a curb or a wall; 2 / 8 cm refused a grab on 11-15).
+constexpr int kSpotBearings[]={0,25,-25,50,-50,75,-75,100,-100,130,-130,160,-160,180};
+constexpr double kLevelCm=12,kFitAcrossCm=15,kFitUpCm=20;
 double AuthoredDistance(int32_t variant) {
     // Each pair supplies its own audited success/victim first-key spacing.
     // A missing measurement never falls back to MoTian's alignment.
@@ -532,13 +544,14 @@ struct FloorIgnore {
         return (a&&(!target||b))||AlignmentGate("pawn_list.pair_not_in_world");
     }
 };
-bool GroundAt(Object* context,Vector xy,double expected,const Array& ignore,double slope,Vector& point,Vector& normal) {
+bool GroundAt(Object* context,Vector xy,double expected,const Array& ignore,double slope,Vector& point,Vector& normal,double level=20) {
     Call trace(Default("/Script/Engine.Default__KismetSystemLibrary"),"LineTraceSingle");
-    if (!trace.Set("WorldContextObject",context).Set("Start",Vector{xy.x,xy.y,expected+60}).Set("End",Vector{xy.x,xy.y,expected-150})
+    const double above=(std::max)(60.,level+10);
+    if (!trace.Set("WorldContextObject",context).Set("Start",Vector{xy.x,xy.y,expected+above}).Set("End",Vector{xy.x,xy.y,expected-150})
         .Set("TraceChannel",uint8_t{0}).Set("bTraceComplex",false).Set("ActorsToIgnore",ignore).Set("DrawDebugType",uint8_t{0})
         .Set("bIgnoreSelf",true).Set("TraceColor",TraceColor{}).Set("TraceHitColor",TraceColor{}).Set("DrawTime",0.f).Invoke()) return AlignmentGate("ground.line_trace_native");
     if (!trace.Get<bool>("ReturnValue")) {
-        Logf("MOTIAN_GRAB_ALIGNMENT ground missing at=(%.3f,%.3f) expectedZ=%.3f trace=[%.3f,%.3f]",xy.x,xy.y,expected,expected+60,expected-150);
+        Logf("MOTIAN_GRAB_ALIGNMENT ground missing at=(%.3f,%.3f) expectedZ=%.3f trace=[%.3f,%.3f]",xy.x,xy.y,expected,expected+above,expected-150);
         return AlignmentGate("ground.no_hit");
     }
     const Hit hit=trace.Get<Hit>("OutHit"); Call split(Default("/Script/Engine.Default__GameplayStatics"),"BreakHitResult");
@@ -547,11 +560,18 @@ bool GroundAt(Object* context,Vector xy,double expected,const Array& ignore,doub
         !split.Set("Hit",hit).Invoke()) return AlignmentGate("ground.BreakHitResult");
     if (!split.Get<bool>("bBlockingHit")||split.Get<bool>("bInitialOverlap")) return AlignmentGate("ground.nonblocking_or_penetrating");
     point=split.Get<Vector>("ImpactPoint"); normal=split.Get<Vector>("ImpactNormal");
-    if (!std::isfinite(point.x+point.y+point.z+normal.x+normal.y+normal.z)||normal.z<slope||std::fabs(point.z-expected)>20) {
+    if (!std::isfinite(point.x+point.y+point.z+normal.x+normal.y+normal.z)||normal.z<slope||std::fabs(point.z-expected)>level) {
         Logf("MOTIAN_GRAB_ALIGNMENT ground rejected at=(%.3f,%.3f,%.3f) expectedZ=%.3f normal=(%.6f,%.6f,%.6f) requiredZ=%.6f",point.x,point.y,point.z,expected,normal.x,normal.y,normal.z,slope);
         return AlignmentGate("ground.slope_or_level");
     }
     return true;
+}
+bool LineClear(Object* context,Vector from,Vector to,const Array& ignore) {
+    Call trace(Default("/Script/Engine.Default__KismetSystemLibrary"),"LineTraceSingle");
+    if (!trace.Set("WorldContextObject",context).Set("Start",from).Set("End",to).Set("TraceChannel",uint8_t{0}).Set("bTraceComplex",false)
+        .Set("ActorsToIgnore",ignore).Set("DrawDebugType",uint8_t{0}).Set("bIgnoreSelf",true).Set("TraceColor",TraceColor{}).Set("TraceHitColor",TraceColor{})
+        .Set("DrawTime",0.f).Invoke()) return false;
+    return !trace.Get<bool>("ReturnValue");
 }
 bool WalkableSlope(Object* movement,double& slope) {
     // GetWalkableFloorZ is a C++ inline/Blueprint display name. The exact
@@ -591,39 +611,68 @@ bool PrepareAlignment(const Context& c,Object* target,Alignment& plan,const Arra
     stage_="alignment authored spacing";
     if (!std::isfinite(length)||length<1||plan.distance<1||!std::isfinite(plan.rotation.pitch+plan.rotation.yaw+plan.rotation.roll))
         return AlignmentFailure(L"双方重合或原始配对数据不可用");
-    plan.desired={plan.target.x-dx/length*plan.distance,plan.target.y-dy/length*plan.distance,0};
-    if (std::hypot(plan.desired.x-plan.original.x,plan.desired.y-plan.original.y)>450) return AlignmentFailure(L"单次位移超过安全范围");
     stage_="alignment world pawn list";
     FloorIgnore ignore;
     if (!current_pawns&&!ignore.Load(c.pawn,c.pawn,target)) return AlignmentFailure(L"当前场景 Pawn 列表不可验证");
     const Array& ignored_pawns=current_pawns?*current_pawns:ignore.pawns;
     stage_="alignment native walkable slope";
     double slope=0; if (!WalkableSlope(c.movement,slope)) return AlignmentFailure(L"原生可行走坡度不可验证");
-    Vector target_floor,target_normal,source_floor,source_normal;
+    Vector target_floor,target_normal;
     stage_="alignment target ground trace";
     if (!GroundAt(c.pawn,plan.target,plan.target.z-target_half,ignored_pawns,slope,target_floor,target_normal))
         return AlignmentFailure(L"受投者脚底地面追踪 / 坡度未通过");
-    stage_="alignment executor ground trace";
-    if (!GroundAt(c.pawn,plan.desired,target_floor.z,ignored_pawns,slope,source_floor,source_normal))
-        return AlignmentFailure(L"施放者候选落点地面追踪 / 坡度未通过");
-    stage_="alignment pair floor level";
-    if (std::fabs(source_floor.z-target_floor.z)>12) {
-        Logf("MOTIAN_GRAB_ALIGNMENT floor level source=%.6f target=%.6f delta=%.6f limit=12",source_floor.z,target_floor.z,source_floor.z-target_floor.z);
-        return AlignmentFailure(L"配对脚底不在同一地面，邻近台阶 / 悬空");
-    }
-    plan.desired.z=source_floor.z+plan.half+plan.radius*(1./source_normal.z-1.)+4.;
-    if(Separation(plan.desired,plan.original)>450)return AlignmentFailure(L"地面校正后的三维位移超过 450 cm，未传送");
+    // The executor's spot: the authored spacing on the line from the target to where the executor stands (bearing 0,
+    // the executor's own facing kept); when that spot is off the target's level, blocked or out of reach, the same
+    // spacing at the other bearings around the target, nearest first, in plain sight of the target, the executor turned
+    // to face it. A spot within kLevelCm of the target's floor wins; else the most level one within the executor's own
+    // step height (CharacterMovement MaxStepHeight): a slope or a curb the move then plays across. The user's chain grab
+    // was refused 9 presses in a row with the target on a 16 cm curb (11-15: "修复投技触发不稳定").
+    stage_="alignment executor spot";
+    const float step_read=Property<float>(c.movement,"MaxStepHeight");
+    const double step=std::isfinite(step_read)&&step_read>0?std::clamp(static_cast<double>(step_read),kLevelCm,60.):45.;
     Object* pair[]={c.pawn,target}; const Array pair_ignore{pair,2,2};
-    stage_="alignment candidate environment capsule";
-    // Before GEd activates, the pair may still block one another. The authored
-    // short spacing can overlap those two capsules; preflight excludes only
-    // the pair, then K2_FindFloor validates the actual post-activation fit.
-    if (!CapsuleClear(c.pawn,plan.desired,plan.half,plan.radius,pair_ignore))
-        return AlignmentFailure(L"原始配对落点被环境阻挡");
+    struct Spot { Vector at; double delta=0; int bearing=0; bool found=false; };
+    Spot level,closest; const wchar_t* direct_failure=L"施放者候选落点地面追踪 / 坡度未通过"; const char* direct_gate="ground";
+    double direct_delta=-1; int tried=0;
+    const double ux=-dx/length,uy=-dy/length,eye=plan.half*.5;  // target -> executor; sight lines at the capsules' upper half
+    for (const int bearing:kSpotBearings) {
+        ++tried;
+        const double a=bearing*3.14159265358979323846/180.,rx=ux*std::cos(a)-uy*std::sin(a),ry=ux*std::sin(a)+uy*std::cos(a);
+        Vector at{plan.target.x+rx*plan.distance,plan.target.y+ry*plan.distance,0},ground,normal;
+        const wchar_t* why=nullptr; const char* gate=""; double delta=-1;
+        if (std::hypot(at.x-plan.original.x,at.y-plan.original.y)>450) { why=L"单次位移超过安全范围"; gate="reach"; }
+        else if (!GroundAt(c.pawn,at,target_floor.z,ignored_pawns,slope,ground,normal,step)) { why=L"施放者候选落点地面追踪 / 坡度未通过"; gate=alignment_gate_; }
+        else {
+            delta=std::fabs(ground.z-target_floor.z);
+            at.z=ground.z+plan.half+plan.radius*(1./normal.z-1.)+4.;
+            if (delta>step) { why=L"配对脚底不在同一地面，邻近台阶 / 悬空"; gate="level"; }
+            else if (Separation(at,plan.original)>450) { why=L"地面校正后的三维位移超过 450 cm，未传送"; gate="reach3d"; }
+            // Before GEd activates, the pair may still block one another. The authored short spacing can overlap those
+            // two capsules; preflight excludes only the pair, then K2_FindFloor validates the actual post-activation fit.
+            else if (!CapsuleClear(c.pawn,at,plan.half,plan.radius,pair_ignore)) { why=L"原始配对落点被环境阻挡"; gate="capsule"; }
+            else if (bearing&&!LineClear(c.pawn,Vector{plan.target.x,plan.target.y,plan.target.z+eye},Vector{at.x,at.y,at.z+eye},pair_ignore)) { why=L"原始配对落点被环境阻挡"; gate="sight"; }
+        }
+        if (!bearing) { direct_delta=delta; if (why) { direct_failure=why; direct_gate=gate; } }
+        if (why) continue;
+        if (delta<=kLevelCm) { level={at,delta,bearing,true}; break; }
+        if (!closest.found||delta<closest.delta) closest={at,delta,bearing,true};
+    }
+    const Spot& spot=level.found?level:closest;
+    if (!spot.found) {
+        Logf("MOTIAN_GRAB_ALIGNMENT no spot: direct line refused by %s (floor %.1f cm off the target's, step %.0f cm); %d bearings tried",direct_gate,direct_delta,step,tried);
+        alignment_gate_=direct_gate; return AlignmentFailure(direct_failure);
+    }
+    plan.desired=spot.at;
+    if (spot.bearing) {
+        plan.rotation.yaw=std::atan2(plan.target.y-spot.at.y,plan.target.x-spot.at.x)*180./3.14159265358979323846;
+        Logf("MOTIAN_GRAB_ALIGNMENT spot at bearing %+d deg (direct line: %s, floor %.1f cm off); %d bearings tried; the executor faces the target",
+             spot.bearing,direct_gate,direct_delta,tried);
+    }
+    if (spot.delta>kLevelCm) Logf("MOTIAN_GRAB_ALIGNMENT spot %.1f cm off the target's floor (none level within %d bearings; step %.0f cm)",spot.delta,tried,step);
     plan.enabled=true;
-    Logf("MOTIAN_GRAB_ALIGNMENT planned variant=%s authoredDistance=%.6f from=(%.3f,%.3f,%.3f) to=(%.3f,%.3f,%.3f) target=(%.3f,%.3f,%.3f) floorDelta=%.3f; target/yaw unchanged",
+    Logf("MOTIAN_GRAB_ALIGNMENT planned variant=%s authoredDistance=%.6f from=(%.3f,%.3f,%.3f) to=(%.3f,%.3f,%.3f) target=(%.3f,%.3f,%.3f) floorDelta=%.3f bearing=%d; target unchanged",
         kVariants[run_variant_].id,plan.distance,plan.original.x,plan.original.y,plan.original.z,plan.desired.x,plan.desired.y,plan.desired.z,
-        plan.target.x,plan.target.y,plan.target.z,source_floor.z-target_floor.z);
+        plan.target.x,plan.target.y,plan.target.z,spot.delta,spot.bearing);
     return true;
 }
 bool ApplyAlignment(const Context& c,Object* target,const Alignment& plan) {
@@ -632,8 +681,13 @@ bool ApplyAlignment(const Context& c,Object* target,const Alignment& plan) {
     Call teleport(c.pawn,"K2_TeleportTo");
     const bool moved=teleport.Set("DestLocation",plan.desired).Set("DestRotation",plan.rotation).Invoke()&&teleport.Get<bool>("ReturnValue");
     Vector actual; Object* pair[]={c.pawn,target}; const Array ignore{pair,2,2};
-    const bool positioned=moved&&Position(c.pawn,actual)&&std::hypot(actual.x-plan.desired.x,actual.y-plan.desired.y)<=2&&std::fabs(actual.z-plan.desired.z)<=8&&
-        FloorAt(c.movement,actual)&&CapsuleClear(c.pawn,actual,plan.half,plan.radius,ignore);
+    const bool read=moved&&Position(c.pawn,actual);
+    const double across=read?std::hypot(actual.x-plan.desired.x,actual.y-plan.desired.y):-1,up=read?actual.z-plan.desired.z:0;
+    const bool fit_near=read&&across<=kFitAcrossCm&&std::fabs(up)<=kFitUpCm,fit_floor=fit_near&&FloorAt(c.movement,actual);
+    const bool positioned=fit_floor&&CapsuleClear(c.pawn,actual,plan.half,plan.radius,ignore);
+    if (read&&(!positioned||across>2||std::fabs(up)>8))
+        Logf("MOTIAN_GRAB_ALIGNMENT native fit: planned=(%.1f,%.1f,%.1f) actual=(%.1f,%.1f,%.1f) %.1f cm across, %.1f cm up (limits %.0f / %.0f) floor=%d clear=%d -> %s",
+             plan.desired.x,plan.desired.y,plan.desired.z,actual.x,actual.y,actual.z,across,up,kFitAcrossCm,kFitUpCm,fit_floor?1:0,positioned?1:0,positioned?"kept":"refused");
     if (!positioned) {
         // No timeline has entered the success phase. Roll back only this one
         // placement, immediately on the same GT; never undo authored movement
@@ -2168,6 +2222,9 @@ bool StartAttempt(const Context& c) {
     if(!GrabStateLeases::Capture(c.pawn,target,variant.source_policy,variant.victim_policy,state_lease,adapter_reason)){
         Status(L"%s",adapter_reason.c_str());return false;
     }
+    for(const GrabStateLeases::Side* side:{&state_lease.source,&state_lease.victim})if(side->index_absent)
+        Logf("MOTIAN_GRAB state lease: the %s's Main slot has %d weapons and the move switches to %d; the native switch refuses that index (no change), the lease still restores index %d",
+             side==&state_lease.source?"executor":"victim",side->main.count,side->policy.required_main_index,side->main.committed);
     if(variant.huashan_domain_bridge&&!GrabHuashanAdapter::Capture(c.pawn,target,hua_lease,adapter_reason,HuaLanding)){
         Status(L"%s",adapter_reason.c_str());return false;
     }
@@ -2322,7 +2379,8 @@ bool StartAttempt(const Context& c) {
         ++shown_count;
     }
     double hero_over_boss=1;for(const GrabScaleData& row:kGrabScales)if(variant.id&&!std::strcmp(row.variant,variant.id)){hero_over_boss=row.hero_over_boss;break;}
-    GrabExtras::Begin(c.pawn,target,shown,shown_count,variant.id,hero_over_boss,source_instance,timeline.Get<Object*>("ReturnValue"));
+    GrabExtras::Begin(c.pawn,target,shown,shown_count,variant.id,hero_over_boss,source_instance,timeline.Get<Object*>("ReturnValue"),
+        NpcRetarget::GrabBossWeaponConfigs(Wide(variant.boss_id),Wide(variant.source)));
     if(!session_.phases.empty())session_.phases.front().admitted=true;
     AcquireSRWLockExclusive(&state_lock); ++state_.activations; ++state_.paired_hits; ReleaseSRWLockExclusive(&state_lock);
     Status(L"%s：原生施放 / 受投双能力已配对；伤害与位移由原 Timeline 负责",variant.name);
@@ -2566,6 +2624,47 @@ void DriveTransform(bool cancelled) {
     if (session_.began||HasResources()||manual_deadline_||!class_leases_.empty()) return;
     EndTransform(transform_.started?"grab-ended":"grab-not-cast");
 }
+void LogSwitchState(const char* stage) {
+    Object* w=switch_probe_.weapons; const ue::Name main=ue::MakeName(L"Weapon.Slot.Main");
+    if (!ue::Alive(w)) { Logf("MOTIAN_GRAB switchprobe %s: the weapons component is gone",stage); return; }
+    Call committed(w,"GetCurrentWeaponIndex"),pending(w,"GetCurrentWeaponIndex"),armed(w,"IsArmed"),transition(w,"IsInWeaponTransition");
+    const bool c_ok=committed.Set("SlotTag",main).Set("WithPending",false).Invoke(),p_ok=pending.Set("SlotTag",main).Set("WithPending",true).Invoke();
+    const bool a_ok=armed.Set("SlotTag",main).Invoke(),t_ok=transition.Invoke();
+    GrabStateLeases::Detail::NativeIO io; GrabStateLeases::MainState m; const bool layout=io.Main(w,m);
+    Logf("MOTIAN_GRAB switchprobe %s t=%llu: committed=%d pending=%d armed=%d transition=%d; Main layout %s count=%d",stage,GetTickCount64()-switch_probe_.began,
+         c_ok?committed.Get<int32_t>("ReturnValue"):-99,p_ok?pending.Get<int32_t>("ReturnValue"):-99,a_ok?(armed.Get<bool>("ReturnValue")?1:0):-1,
+         t_ok?(transition.Get<bool>("ReturnValue")?1:0):-1,layout?"read":"unreadable (the stored index differs from the committed one, or the layout changed)",layout?m.count:-1);
+}
+void StepSwitchProbe(int request,ULONGLONG hold) {
+    const ue::Name main=ue::MakeName(L"Weapon.Slot.Main");
+    if (request>=0) {
+        if (switch_probe_.phase) { Logf("MOTIAN_GRAB switchprobe: one is already running"); return; }
+        if (HasResources()) { Logf("MOTIAN_GRAB switchprobe: refused while a grab holds resources"); return; }
+        Context c; std::wstring reason; Object* w=nullptr; GrabStateLeases::Detail::NativeIO io;
+        if (!ContextNow(c)) { Logf("MOTIAN_GRAB switchprobe: no player"); return; }
+        if (!GrabStateLeases::Prepare(reason)) { Logf("MOTIAN_GRAB switchprobe: the native weapon functions are unavailable"); return; }
+        if (!io.Weapons(c.pawn,w) || !ue::Alive(w)) { Logf("MOTIAN_GRAB switchprobe: no weapons component"); return; }
+        switch_probe_={}; switch_probe_.phase=1; switch_probe_.index=request; switch_probe_.hold_ms=hold; switch_probe_.began=GetTickCount64();
+        switch_probe_.pawn=c.pawn; switch_probe_.weapons=w;
+        LogSwitchState("before");
+        Call get(w,"GetCurrentWeaponIndex"); if (get.Set("SlotTag",main).Set("WithPending",false).Invoke()) switch_probe_.cached=get.Get<int32_t>("ReturnValue");
+        Call set(w,"SetCurrentWeapon"); const bool invoked=set.Set("SlotTag",main).Set("Index",request).Invoke();
+        Logf("MOTIAN_GRAB switchprobe begin: cached=%d SetCurrentWeapon(Main,%d) invoked=%d returned=%d",switch_probe_.cached,request,invoked?1:0,invoked&&set.Get<bool>("ReturnValue")?1:0);
+        LogSwitchState("after begin"); switch_probe_.next_read=GetTickCount64()+100;
+        return;
+    }
+    if (!switch_probe_.phase) return;
+    const ULONGLONG now=GetTickCount64();
+    if (!ue::Alive(switch_probe_.weapons)) { Logf("MOTIAN_GRAB switchprobe: the weapons component is gone; stopped"); switch_probe_={}; return; }
+    if (switch_probe_.phase==1 && now-switch_probe_.began>=switch_probe_.hold_ms) {
+        Call set(switch_probe_.weapons,"SetCurrentWeapon"); const bool invoked=switch_probe_.cached>=0&&set.Set("SlotTag",main).Set("Index",switch_probe_.cached).Invoke();
+        Logf("MOTIAN_GRAB switchprobe end: SetCurrentWeapon(Main,%d) invoked=%d returned=%d",switch_probe_.cached,invoked?1:0,invoked&&set.Get<bool>("ReturnValue")?1:0);
+        LogSwitchState("after end"); switch_probe_.phase=2; switch_probe_.tail_until=now+800; switch_probe_.next_read=now+250;
+        return;
+    }
+    if (now>=switch_probe_.next_read) { LogSwitchState(switch_probe_.phase==1?"hold":"after"); switch_probe_.next_read=now+250; }
+    if (switch_probe_.phase==2 && now>=switch_probe_.tail_until) { Logf("MOTIAN_GRAB switchprobe done"); switch_probe_={}; }
+}
 void Tick() {
     if (!initialized_) return;
     bool manual=false,cancel=false;int32_t expected_variant=-1;
@@ -2579,10 +2678,12 @@ void Tick() {
     manual=trigger_;expected_variant=trigger_variant_;const bool may_transform=trigger_transform_;trigger_=false;trigger_variant_=-1;trigger_transform_=true;cancel=cancel_; cancel_=false;
     const bool manual_test=manual&&trigger_test_; trigger_test_=false;
     const bool focus_test=focus_test_; focus_test_=false;
+    const int switch_probe=switch_probe_index_; const ULONGLONG switch_probe_ms=switch_probe_ms_; switch_probe_index_=-1;
     const int32_t chain_move=chain_request_;const bool chain_manual=chain_trigger_;const int32_t chain_manual_variant=chain_trigger_variant_;
     chain_request_=-2;chain_trigger_=false;chain_trigger_variant_=-1;
     const uint32_t cut_token=cut_request_,release_token=release_request_;cut_request_=release_request_=0;
     ReleaseSRWLockExclusive(&request_lock);
+    StepSwitchProbe(switch_probe,switch_probe_ms);
     if (cut_token&&!cancel) StartCut(cut_token,cancel);
     if (release_token&&session_.began&&session_.cut&&session_.cut_token==release_token&&!session_.releasing) {
         session_.releasing=true; cancel=true;
@@ -2884,6 +2985,23 @@ bool HandleCommand(const char* verb,const char* arguments) {
         RequestTrigger();
     }
     else if (action=="focustest") { AcquireSRWLockExclusive(&request_lock); focus_test_=true; ReleaseSRWLockExclusive(&request_lock); }  // tests in the background
+    else if (action=="looksocket") {  // diagnostics: the Boss weapon on a Boss look (auto / on / off / proxy), not saved
+        std::string mode; input>>mode; if (mode!="auto"&&mode!="on"&&mode!="off"&&mode!="proxy") return false;
+        GrabExtras::SetLookSocketMode(mode=="on"?1:mode=="off"?2:mode=="proxy"?3:0);
+    }
+    else if (action=="proxysync") {  // diagnostics: the pose proxy at the player's time and rate, or one step ahead; not saved
+        std::string mode; input>>mode; if (mode!="rate"&&mode!="predict") return false;
+        GrabExtras::SetProxySync(mode=="rate"?1:0);
+    }
+    else if (action=="weaponhide") {  // diagnostics: the hero's own weapons hidden part by part (default) or as whole actors; not saved
+        std::string mode; input>>mode; if (mode!="parts"&&mode!="actor") return false;
+        GrabExtras::SetWeaponHideMode(mode=="parts"?1:0);
+    }
+    else if (action=="switchprobe") {  // diagnostics: the native weapon switch's calls on the player, see SwitchProbe
+        int index=-1; int ms=1500; input>>index; if (!(input>>ms)) ms=1500;
+        if (index<0||index>31) return false;
+        AcquireSRWLockExclusive(&request_lock); switch_probe_index_=index; switch_probe_ms_=static_cast<ULONGLONG>(std::clamp(ms,100,10000)); ReleaseSRWLockExclusive(&request_lock);
+    }
     else if (action=="cancel"||action=="cleanup") RequestCancel();
     else if (action=="variant") {
         std::string id; input>>id; Options o=GetSnapshot().options;
@@ -2896,7 +3014,7 @@ bool HandleCommand(const char* verb,const char* arguments) {
         char alignment[1800]{};
         if (WideCharToMultiByte(CP_UTF8,0,s.alignment_status.c_str(),-1,alignment,static_cast<int>(sizeof(alignment)),nullptr,nullptr))
             Logf("MOTIAN_GRAB alignment_status=%s",alignment);
-    } else Logf("MOTIAN_GRAB usage: grab on|off|bosses 0/1|position 0/1|tang 0/1|variant <move-id>|trigger|cancel|status|list");
+    } else Logf("MOTIAN_GRAB usage: grab on|off|bosses 0/1|position 0/1|tang 0/1|variant <move-id>|trigger|cancel|status|list|looksocket auto/on/off/proxy|proxysync rate/predict|weaponhide parts/actor|switchprobe <index> [ms]");
     return true;
 }
 }

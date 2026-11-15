@@ -1,5 +1,70 @@
 ﻿# 更新日志
 
+## 2026-11-15 · 投技触发不稳定、投技后武器消失、沐小葵投技被投者慢半拍
+
+用户报告：“修复投技触发不稳定 武器会莫名消失 沐小葵投技被投者动画慢半拍”。
+
+- **触发不稳定**（`src/grab/motian_grab.cpp`）：
+  - 原因：站位只试目标正前方一处，主角和目标脚下高差超过 12 cm 就拒绝（用户日志里是 16 cm 的路沿）；传送后的原生贴合只容许横向 2 cm、竖直 8 cm。被拒后派生节点跳过，外观闪一下变回。
+  - 修复：`PrepareAlignment` 绕目标按 0、±25 … ±160、180 度找站位，保持原作距离。站位要满足：落差不超过主角的 MaxStepHeight（限制在 12–60 cm），胶囊放得下，换方向时目标到站位之间没有遮挡。优先取落差 ≤ 12 cm 的位置，换方向后主角面朝目标。贴合放宽到横向 15 cm、竖直 20 cm。
+  - 日志：`MOTIAN_GRAB_ALIGNMENT spot at bearing … / no spot … / native fit …`。
+- **投技后武器消失**（`src/grab/grab_extras.cpp`、`src/grab/grab_weapon_visibility.h`）：
+  - 原因：投技结束时把武器 Actor 的隐藏标记写回开始时的值，盖掉了游戏和变身闪烁在投技期间做的显示。
+  - 修复：投技只隐藏武器的模型部件（`bHiddenInGame`），不再写 Actor 的标记。部件在投技期间被别处显示出来时，当帧再隐藏，结束时显示（`HeldPart`）。
+  - 诊断：`grab weaponhide parts|actor`（actor 为旧做法），日志 `GRAB_EXTRAS hero weapon …`。
+- **被投者慢半拍**（`src/character/npc_retarget.cpp`）：
+  - 原因：NPC 招式的慢动作改给“其他人”时，被投者靠技能类名里的 “GEd” 认出，区分大小写。沐小葵（01、二阶段 01–03）、独眼 01、狂医 01、大刀男 01 写的是 “_Ged”，被投者没被认出，单独吃了慢动作。
+  - 修复：类名按下划线分词，GEd / BEd / BDEd 不分大小写；当前投技抓住的目标也直接算被投者。
+  - 诊断：`GRAB_EXTRAS pair in step #n` 按段记双方蒙太奇的时间差（拆成稳定部分和跳转部分），以及双方的速率和时间膨胀。
+- **测试**：`grab_weapon_visibility_test` 4039 项（`HeldPart` +10）、`grab_state_leases_test` 29 项、`npc_skill_support_test` 13661 项，都通过。
+- **游戏内**（平地、木桩）：
+  - 莫天 02、沐小葵 01、二阶段 03 都正常放出，站位 bearing=0；三招放完后背上的刀都显示。
+  - 二阶段 03 没有人被放慢，被投者整招 +6 ms；01 为 +76 ms。
+  - 没测到：路沿 / 台阶旁的站位，拔刀状态下放投技。
+- **未处理**：莫天 02 的被投者整招落后约 1.5 s。双方速率和时间膨胀都是 1.00，也没有跳转，但主角的蒙太奇比真实时间快约 13%，原因未查。
+- 存档格式没有变化。已安装到 Steam 和 WeGame（SHA256 0359ae64…）。
+
+## 2026-11-15 · 变身投技的 Boss 武器：浮空、抖动；沐小葵投技的武器
+
+用户报告（按时间）：“修复一下投技武器的浮空”；“修复一下武器的抖动 以及沐小葵的隐藏武器的投技”，“直接查原生投技的释放和武器的绑定进行修复”（允许进游戏测试）；装上 6813663d 后“投技武器抖动还存在 以及沐小葵的投技还是有武器 修复”，“可以去读游戏原生的蓝图或者动画seq 有解包key”；测试途中“沐小葵应该有一招投技是带武器的 查看一下带斗篷那个”。
+
+**武器浮空和抖动（`src/character/npc_pose_transfer.h`、`src/character/npc_retarget.cpp`、`src/grab/grab_extras.cpp`）**
+
+- 原生绑定：Boss 的武器是挂在 Boss 自己网格武器插槽上的 Actor，由引擎随骨骼更新，从不逐帧摆放；武器骨骼由投技动画驱动。莫天 02 先把武器握在手里，扔人那段插在地上（离手 87–237 cm）。
+- 浮空：11-12 起替身武器挂在变身外观自己的插槽上，可外观的 weapon_r 是主角骨架的 weapon_r 重定向回来、挂在转过的手骨下，离手 38–111 cm，武器就浮在腰边。
+- 抖动：上午第一版在“外观手骨 / 外观插槽 / 代理插槽”之间切换并逐帧重摆（每次切换跳一下，逐帧摆放又晚一帧）；第二版（6813663d）整招挂在姿势代理（同步播放投技的 Boss 网格）的插槽上，可代理的手和外观画出来的手差几厘米，代理又按预测的时间单独采样，武器在外观的拳头里来回动，用户仍看到抖。
+- 修复：外观是这个 Boss 自己的骨架时，外观自己的武器骨骼（替身武器所挂插槽的骨骼，例如 weapon_r）在外观同一次姿势计算里摆放（`NpcPoseTransfer::WeaponPose`、`NpcRetarget::DriveGrabWeapons`）：
+  - Boss 握着时（代理姿势里武器离那只手 20 cm 内，40 cm 放开，中间平滑过渡，左右手都算），保持 Boss 的握法、套在外观自己的手上，所以武器和画出来的拳头一起动；
+  - 放开时（莫天扔人时把武器插在地上），取代理里的位置换算到外观上；
+  - 武器的子骨骼跟着走，外观在代理之后更新，读代理同一帧的姿势；替身武器挂在外观自己的插槽上，之后不再逐帧设置；
+  - 姿势代理每帧对齐到主角的蒙太奇时间，用同样的播放速率。
+- 姿势缓存：带武器驱动的姿势在源姿势和代理的武器 / 手骨输入都不变时照样命中缓存（缓存键：代理里读到的变换、骨骼下标、过渡距离、代理到外观的换算）。第一次实测没有这条，整个投技几乎每次都重算（1.4–1.7 万次重算、约 900 次命中）。
+- 诊断（不存盘）：`grab looksocket auto|on|off|proxy`：auto 为上述做法（默认），proxy 为 6813663d 的挂代理插槽，on / off 同前；`grab proxysync rate|predict`：代理同时间同速率（默认）/ 旧的提前一步预测。投技结束记 `GRAB_EXTRAS Boss look weapon (...)`（握持时武器在外观手里每帧移动，并列 Boss 动画自身的武器在 Boss 手里每帧移动；离 Boss 姿势位置的距离）、`GRAB_EXTRAS proxy sync`、`NPC_BODY grab weapon pose off`。
+- 测试：`npc_pose_transfer_test` 新增 `TestBossWeaponPose`：握法与 Boss 一致、手不动、子骨骼跟随、CopyPose 槽位带上；代理在别的时刻同样握法时结果不变；放开时取代理位置并保留外观缩放；放开过程连续；左手；错误下标和根骨骼不动；缓存命中 / 换代理姿势重算 / 去掉武器重算 / 换算变化重算。
+- 游戏内（脚本测试、木桩，同一指标 A/B）：莫天 02 握持时武器在外观手里每帧平均 0.21 / 最大 3.7 cm，Boss 动画自身在 Boss 手里 0.19 / 3.6 cm，剩下的是原生动作自己的握法变化；6813663d 的挂代理插槽 0.68 / 12.2 cm。修好缓存后整招重算 2763 次、命中 15235 次（不驱动武器骨骼时 2319 / 17352）。代理与主角的蒙太奇时间平均差 4 ms。
+
+**沐小葵投技的武器（`src/generated/grab_weapons.generated.h`、`src/grab/grab_weapon_visibility.h`、`src/grab/grab_extras.cpp`、`src/grab/motian_grab.cpp`、`src/character/npc_retarget.cpp`）**
+
+- 读游戏文件核对（解包工具 `PBZExtract` 新增 `anim` / `skel`，自写 ACL 2.1 解码，放在 `analysis/pbz_moyuan_20261105/tools/acl_anim`）：
+  - 一阶段（带斗篷）主武器槽 2 个配置，0 号：剑在右手、刀鞘在腰。投技 01 的成功动作里有一个 GAA_SwitchWeapon（主槽、切到 2 号、Armed=false、0.0001–4.5478 s）。一阶段没有 2 号配置，原生切换失败、什么都不变：她整招握着剑（动画里 weapon_r 1.33 s 前跟左手，之后跟右手）。
+  - 二阶段（不带斗篷）主武器槽 3 个配置，0 号：双手各一个 BP_Weapon_MuXiaoKui_P2（继承 BP_WeaponActor_Empty，只有碰撞球、没有网格），剑插在腰间 Pt_Sword_Waist、刀鞘在腰，也就是空手。二阶段投技 02 / 03 / 04 的能力里没有切武器动作，动画里两根武器骨骼只是贴着手。
+- 原因：
+  - 二阶段：`build_grab_weapons.py` 按配置里的插槽名排序挑武器，把腰间那把剑当成手持武器挂到了左手，三招都拿着剑（用户看到的“还是有武器”）。
+  - 一阶段：11-09 起把 Armed=false 的切换窗口一律当成收刀；本日 6813663d 去掉了这条，第二次又按“还是有武器”恢复，投技 01 就整招没有剑；用户指出带斗篷的那招应该带武器。
+- 修复：
+  - 生成器 `analysis/pbz_bossrush_20261030/boss_weapons_20261031/build_grab_weapons.py` 读出配置里每件武器的“武器类 @ 插槽”（与 `build_weapon_sets.py` 同一读法）；两只手上只有没有网格的空武器的配置算空手，不显示手持武器。武器配置和武器类的包名查找不区分大小写：游戏文件现在是 `Mobs/LuanShi`，招式引用 `Mobs/Luanshi`，区分大小写重跑会丢掉乱世 / 铁鬼的武器。重新生成后只少了二阶段三招的 3 行，其余各招与之前逐字相同。
+  - 运行时：Armed=false 的切换只有 Boss 自己有那个配置时才算收刀（`GrabWeaponVisibility::PutsAway`）；Boss 的配置数取投技外观那一行的 `kNpcWeaponSetsBySkin`（新函数 `NpcRetarget::GrabBossWeaponConfigs`，`GrabExtras::Begin` 新参数）。日志：`native Main switch to 2 armed=0 ... (the Boss has 2 configs: natively nothing changes, the weapon stays)`。
+- 测试：`grab_weapon_visibility_test` 4029 项（新增 `PutsAway` 8 项），`grab_state_leases_test` 29 项，`npc_skill_support_test` 13661 项，都通过。
+- 游戏内：二阶段投技 03 `boss_weapons=0/0`，主角武器照旧隐藏，完整放完（原生伤害 297），截图手里没有武器。一阶段投技 01：日志 `(the Boss has 2 configs: natively nothing changes, the weapon stays)`，剑从第 2 帧起挂在外观右手插槽上，3.0 s 截图剑在手里，完整放完（原生伤害 356）；握持时武器在外观手里每帧 0.040 / 2.8 cm（Boss 动画自身 0.030 / 1.6）。毒眼 01（这次没变）左手剑照旧，0.055 / 3.95 cm（Boss 自身 0.049 / 3.93）。
+
+**沐小葵投技 01 放不出（`src/grab/grab_state_leases.h`、`src/grab/motian_grab.cpp`）**
+
+- 现象：投技 01 的 GAA_SwitchWeapon 切到主槽 2 号。生成的租约策略要求主角主槽有 2 号；主角只有 2 个配置，施放前就被拒：“招式要求的主武器索引不存在”。
+- 原生逻辑（`GAA_SwitchWeapon` 蓝图字节码）：开始时缓存当前索引并调用 `SetCurrentWeapon(槽, StartWeapon)`；只有 Armed 为真并且切换成功才 `SetArmed(槽, true)`；结束时切回缓存的索引（ResetOnEnd），否则切到 EndWeapon。`SetCurrentWeapon` 在 PBZ.exe 里被保护壳混淆，改为游戏内实测：新命令 `grab switchprobe <索引> [毫秒]` 照原生顺序缓存、切换、等待、切回并逐步读回。主角切到不存在的 2 号返回 false、什么都不变；切到 0 号成功，切回也成功。
+- 修复：租约不再因为“索引超出槽位布局”拒绝，记 `index_absent` 并写 `MOTIAN_GRAB state lease: ... the native switch refuses that index`；索引真被改了照旧改回。
+- 测试：新增 `grab_state_leases_test`（29 项，替换 IO 跑生产代码的租约事务）：2 槽主角放沐小葵 01 不被拒、不写原生；3 槽主角真切换后被打断能改回；玩家中途自己换武器保留；独眼 01 的弓切换和拔刀能还原；能力未结束不还原；无效策略仍拒绝。
+- 生成表里这几招的说明仍写“尚未实机验证”（生成表不手改）。存档格式没有变化。已安装到 Steam 和 WeGame（SHA256 bab80f09…）。
+
 ## 2026-11-14 · 项目架构文档和 MIT 许可
 
 用户要求：“更新项目架构 方便其他Agent理解 然后更新license为MIT”。

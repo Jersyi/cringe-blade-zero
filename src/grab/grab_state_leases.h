@@ -36,6 +36,9 @@ struct Side {
     std::vector<Identity> configs;
     bool collision_pending=false,index_pending=false,armed_pending=false;
     bool own_index_armed_valid=false,own_index_armed=false,armed_restore=false;
+    // The move switches to a Main index this side's layout lacks: the native SetCurrentWeapon refuses it and nothing
+    // changes (11-15, the player's 2-weapon slot asked for 2), so the switch is a no-op here; the lease still restores.
+    bool index_absent=false;
     bool HasPending() const { return collision_pending||index_pending||armed_pending; }
 };
 struct Ledger {
@@ -76,9 +79,13 @@ template<class IO> bool CaptureSide(IO& io,Object* actor,const Policy& policy,Si
            side.main.interfaces.size()!=side.main.configs.size()||side.main.committed<0||side.main.committed>=side.main.count||
            side.main.pending!=side.main.committed||side.main.transition)
             return Reject(reason,L"主武器槽位缺失或仍有待提交切换");
-        if(policy.required_main_index>=side.main.count)return Reject(reason,L"招式要求的主武器索引不存在");
-        if(policy.main_weapon_index && (policy.allowed_index_mask & ~(side.main.count==32?~uint32_t{0}:((uint32_t{1}<<side.main.count)-1))))
-            return Reject(reason,L"招式允许的主武器索引超出当前槽位布局");
+        // GAA_SwitchWeapon (11-15 bytecode): Begin caches the index and calls SetCurrentWeapon(slot, StartWeapon), then
+        // SetArmed(slot, true) only when Armed and the switch returned true; End calls SetCurrentWeapon(slot, cached when
+        // ResetOnEnd, else EndWeapon). SetCurrentWeapon refuses an index past the slot's layout and changes nothing
+        // (11-15 probe on the player: 2 of 2 returned false, 0 returned true and switched). 沐小葵 01 asks for 2, which
+        // her own Main slot (2 configs) lacks as well. Such an index is a native no-op, not a reason to refuse the move.
+        const uint32_t layout=side.main.count==32?~uint32_t{0}:((uint32_t{1}<<side.main.count)-1);
+        side.index_absent=policy.required_main_index>=side.main.count||(policy.main_weapon_index&&(policy.allowed_index_mask&~layout));
         for(Object* config:side.main.configs) {
             Identity id=io.Identify(config);if(!io.Same(id))return Reject(reason,L"主武器配置对象代际身份不可用");
             side.configs.push_back(id);

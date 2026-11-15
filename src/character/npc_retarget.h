@@ -52,6 +52,13 @@ void SetBossLocomotion(bool enabled); // persisted
 // its hands. size: the skin's height over the hero's (rest pelvis), 1 without a skin; the grab
 // scales the boss weapon by it, the display and the victim keep their own size.
 unsigned char* GrabDisplay(double& size);
+// Game thread. A grab on a look of the Boss's own skeleton: the look's weapon bones (`bones`: the bones the Boss's weapons
+// hang on) take the Boss's weapon pose from the grab's pose proxy (the Boss mesh replaying the move; see
+// NpcPoseTransfer::WeaponPose): held, the Boss's grip on the look's own hand; free, the proxy's place. The look evaluates
+// after the proxy from then on. Called again with the same proxy and bones it only refreshes the proxy -> look frame.
+// Returns how many bones it drives (0: none - no look, bones the look's pose does not carry, unreadable proxy). A null
+// proxy stops it.
+size_t DriveGrabWeapons(unsigned char* proxy, const char* const* bones, size_t count);
 // Any thread, no engine calls. Off queues a normal guarded Restore.
 bool SetExperimental(bool enabled);
 Snapshot GetSnapshot();
@@ -68,6 +75,9 @@ std::wstring MoveLabel(const std::string& ability);
 // source): of that boss's skins (GrabBoss::Key), the one whose blueprint or moves share the longest folder with the
 // grab ability (a P2 grab gets the P2 look), then the one named like the boss; -1 when no skin plays it.
 int32_t SkinForGrab(const std::wstring& boss_id, const std::wstring& source);
+// Any thread, no engine calls: how many Main-slot weapon configs that boss has (the SkinForGrab look's ActorC slot,
+// kNpcWeaponSetsBySkin); 0 when not known.
+size_t GrabBossWeaponConfigs(const std::wstring& boss_id, const std::wstring& source);
 // 招式预览 of a grab: the boss blueprint (package path) of the look that plays the grab's boss; false: no look does.
 bool GrabPreviewMonster(const std::wstring& boss_id, const std::wstring& source, std::string& monster);
 void OnGameThreadGuarded();
