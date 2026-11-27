@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <deque>
 #include <iterator>
@@ -30,6 +31,10 @@ struct DataEntry {
     bool has_destination; const wchar_t* detail;
 };
 #include "boss_catalog.generated.h"
+// Temporary player entry coordinates for the Red-Clad Swordswoman rematch.
+constexpr double kFixedEntryX = 21525.728904;
+constexpr double kFixedEntryY = 81486.076896;
+constexpr double kFixedEntryZ = 10321.449607;
 struct Pending { Action action; int32_t entry; Options options; };
 SRWLOCK snapshot_lock = SRWLOCK_INIT, request_lock = SRWLOCK_INIT;
 Snapshot snapshot_;
@@ -953,8 +958,15 @@ void TickEncounter(const Context& context) {
         if (!context.pawn || !context.controller) return;
         EntryProtection::Protect(context.pawn);
         if (!HoldMovement(context.pawn)) { Fail(L"无法暂停角色移动，已取消不安全入场"); return; }
+        const bool fixed_entry = !returning_ && std::strcmp(kData[current_].id, "BP_Monster_EMei_Sword_Top") == 0;
+        Transform anchor = returning_ ? original_transform_ : kData[current_].destination;
+        if (fixed_entry) {
+            anchor.translation[0] = kFixedEntryX;
+            anchor.translation[1] = kFixedEntryY;
+            anchor.translation[2] = kFixedEntryZ;
+        }
         if (!positioned_ || !Same(positioned_pawn_, positioned_pawn_name_) || positioned_pawn_ != context.pawn) {
-            const Transform target = EntrySafety::ParkingTransform(returning_ ? original_transform_ : kData[current_].destination);
+            const Transform target = EntrySafety::ParkingTransform(anchor);
             const bool no = false, yes = true;
             Call move(context.pawn, "K2_SetActorTransform");
             if (!HoldMovement(context.pawn) || !move.Set("NewTransform", target).Set("bSweep", no).Set("bTeleport", yes).Invoke() ||
@@ -973,8 +985,9 @@ void TickEncounter(const Context& context) {
             if (!ApplyOptions(context)) { Fail(L"设置本场难度或周目失败"); return; }
             entry_options_applied_ = true; player_ready_since_ = 0; return;
         }
-        const Transform anchor = returning_ ? original_transform_ : kData[current_].destination;
-        if (!EntrySafety::IsSafe() && !EntrySafety::PlacePlayer(context.pawn, context.instance, anchor, returning_)) {
+        if (!EntrySafety::IsSafe() &&
+            !(fixed_entry ? EntrySafety::PlacePlayerAtFixedLocation(context.pawn, context.instance, anchor)
+                          : EntrySafety::PlacePlayer(context.pawn, context.instance, anchor, returning_))) {
             Fail(L"未找到可站立且无重叠的落点，角色保持冻结；请停止并返回"); return;
         }
         if (!returning_ && !Heal(context)) { Fail(L"体力恢复未通过读回，已取消开战"); return; }

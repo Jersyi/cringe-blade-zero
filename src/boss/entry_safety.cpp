@@ -329,6 +329,45 @@ bool PlacePlayer(Object* pawn, Object* game_instance, const Transform& raw, bool
     }
     Freeze(hold_); return Fail("no collision-free walkable candidate; no movement release");
 }
+bool PlacePlayerAtFixedLocation(Object* pawn, Object* game_instance, const Transform& target) {
+    const Vector center{target.translation[0], target.translation[1], target.translation[2]};
+    const auto refuse = [&](const char* reason) {
+        Vector location;
+        if (ue::Alive(pawn) && ReadLocation(pawn, location)) {
+            Log("ENTRY_SAFETY fixed failed target=(%.3f,%.3f,%.3f) actual=(%.3f,%.3f,%.3f) reason=%s",
+                center.x, center.y, center.z, location.x, location.y, location.z, reason);
+        } else {
+            Log("ENTRY_SAFETY fixed failed target=(%.3f,%.3f,%.3f) actual=unavailable reason=%s",
+                center.x, center.y, center.z, reason);
+        }
+        return false;
+    };
+    if (!Finite(center) || !ue::Alive(game_instance)) return refuse("invalid placement inputs");
+    if (!HoldPawn(pawn)) return refuse("could not hold player movement");
+    if (!Layout()) return refuse("invalid hit/floor layout");
+    hold_.safe = false; Publish();
+    float height = 0, radius = 0;
+    PawnList ignore;
+    double kill = 0;
+    if (!Capsule(pawn, height, radius)) return refuse("scaled player capsule unavailable");
+    if (!ignore.Load(game_instance, pawn)) return refuse("current-world pawn list unavailable");
+    if (KillZ(pawn, kill) && center.z - height <= kill + 100) return refuse("target too close to KillZ");
+    if (!FloorAt(hold_.movement.object, center)) return refuse("target has no walkable floor");
+    if (!ClearCapsule(game_instance, ignore, center, height, radius)) return refuse("target capsule clearance check failed");
+    Call move(pawn, "K2_SetActorLocation");
+    if (!move.Set("NewLocation", center).Set("bSweep", false).Set("bTeleport", true).Invoke() ||
+        !move.Get<bool>("ReturnValue")) return refuse("teleport call failed");
+    Vector actual;
+    if (!ReadLocation(pawn, actual)) return refuse("could not read back player location");
+    if (Distance2(actual, center) > 1.0) return refuse("player location differs from target");
+    if (!FloorAt(hold_.movement.object, actual)) return refuse("no walkable floor after teleport");
+    if (!ClearCapsule(game_instance, ignore, actual, height, radius)) return refuse("capsule clearance check failed after teleport");
+    if (!Freeze(hold_)) return refuse("cannot hold confirmed fixed position");
+    hold_.safe = true; hold_.safe_location = actual; Publish();
+    Log("ENTRY_SAFETY placed fixed target=(%.3f,%.3f,%.3f) actual=(%.3f,%.3f,%.3f)",
+        center.x, center.y, center.z, actual.x, actual.y, actual.z);
+    return true;
+}
 bool ReleasePawn() {
     Prune();
     if (!Same(hold_.pawn) || !Same(hold_.movement) || !hold_.safe) return Fail("release requires a live held owner and verified safe floor");
