@@ -13,6 +13,7 @@ void Initialize(Logger logger);
 bool HoldPawn(ue::Object* pawn);
 Transform ParkingTransform(const Transform& raw);
 bool PlacePlayer(ue::Object* pawn, ue::Object* game_instance, const Transform& raw_boss_anchor, bool return_to_original = false);
+bool PlacePlayerAtFixedLocation(ue::Object* pawn, ue::Object* game_instance, const Transform& target);
 bool MakeBossTransform(ue::Object* character_class, const Transform& raw, Transform& result);
 bool ReleasePawn();
 // Unsafe old pawns stay MOVE_None; retain their baseline until GC or reclaim.
